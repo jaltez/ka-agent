@@ -85,7 +85,8 @@ chat surfaces) and any write beyond memory proposals and approval decisions.
 - `apps/ka-agent/tests/web_e2e.rs` — the real binary over real sockets:
   unauthenticated `401` on every page, login → cookie flags → page matrix,
   single-use token replay, POST-only mutations, loopback-only bind, the
-  memory editor round-trip, and XSS escaping of seeded turn text.
+  memory editor round-trip, XSS escaping of seeded turn text, and refusal of
+  an oversized declared `Content-Length` (no unbounded buffering).
 
 An approval decision only lands when the live engine still has the ask
 pending (`Runtime::decide` → `UnknownApproval` otherwise); the e2e test

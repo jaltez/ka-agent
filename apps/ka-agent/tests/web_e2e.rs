@@ -326,6 +326,31 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
 }
 
 #[test]
+fn oversized_body_is_refused_without_buffering() {
+    let root = temp_root("oversize");
+    let port = free_port();
+    let daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+
+    // A declared Content-Length beyond the cap must not be buffered: the
+    // server drops the connection instead of reading gigabytes.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(
+            b"POST /memory/edit HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+              Content-Length: 400000000\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).unwrap();
+    assert!(
+        buf.is_empty(),
+        "server should close without a response, got {} bytes",
+        buf.len()
+    );
+}
+
+#[test]
 fn user_derived_text_is_html_escaped() {
     let root = temp_root("xss");
     let port = free_port();

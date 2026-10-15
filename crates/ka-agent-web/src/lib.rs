@@ -150,6 +150,12 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
                 }
             }
             let body_start = head_end + 4;
+            // A declared `Content-Length` is not trusted: stop at the same
+            // cap as the head, so an oversized request cannot grow the buffer
+            // without bound.
+            if body_start + content_length > MAX {
+                return None;
+            }
             while buf.len() < body_start + content_length {
                 let n = tokio::time::timeout(TIMEOUT, socket.read(&mut tmp))
                     .await
@@ -245,10 +251,13 @@ impl Auth {
         }
         let _ = store.meta_set("web_auth_token", "");
         let session = random_hex(32);
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session.clone(), ka_agent_core::now_ms() + 86_400_000);
+        let now = ka_agent_core::now_ms();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        // Drop expired sessions on every login: the map has no other
+        // eviction point and would otherwise grow with each login.
+        sessions.retain(|_, expiry| now < *expiry);
+        sessions.insert(session.clone(), now + 86_400_000);
+        drop(sessions);
         Some(session)
     }
 
