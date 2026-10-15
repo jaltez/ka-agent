@@ -56,9 +56,6 @@ enum Command {
     },
     /// Generate a one-shot auth URL for the web UI (M7).
     WebToken {
-        /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
-        #[arg(short, long)]
-        config: Option<PathBuf>,
         /// Port the web server listens on (must match `run --web-port`).
         #[arg(long, default_value_t = 8480)]
         port: u16,
@@ -224,7 +221,7 @@ fn main() -> std::process::ExitCode {
         Command::Grant { action } => grant_action(action),
         Command::Export { out } => export(&out),
         Command::Purge { confirm } => purge(confirm),
-        Command::WebToken { config, port } => web_token(config_path(&config), port),
+        Command::WebToken { port } => web_token(port),
         Command::Doctor { config } => doctor(config_path(&config)),
     }
 }
@@ -627,9 +624,12 @@ fn purge(confirm: bool) -> std::process::ExitCode {
     }
 }
 
-fn web_token(config: PathBuf, port: u16) -> std::process::ExitCode {
-    let cfg = load_config(&config);
+fn web_token(port: u16) -> std::process::ExitCode {
     let paths = Paths::new(Paths::default_root());
+    if let Err(e) = paths.ensure_dirs() {
+        eprintln!("ka-agent: cannot create {}: {e}", paths.root().display());
+        return std::process::ExitCode::FAILURE;
+    }
     let store = match Store::open(&paths.state_db()) {
         Ok(s) => s,
         Err(e) => {
@@ -637,7 +637,6 @@ fn web_token(config: PathBuf, port: u16) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let _ = cfg;
     match ka_agent_web::issue_auth_url(&store, port) {
         Ok(url) => {
             println!("open within 10 minutes: {url}");

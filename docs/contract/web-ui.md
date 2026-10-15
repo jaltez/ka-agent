@@ -66,6 +66,15 @@ be triggered by a link.
       daemon owns and calls the same runtime methods the console and Telegram
       surfaces call (`remember`, `decide`, `history_search`, `memory_report`).
 
+## Telegram parity (SEED §10 exit criterion)
+
+The approvals inbox matches the Telegram surface: same source
+(`Approval::kind` → `KaAsk`), the question, up to 20 detail lines, the
+`expires HH:MM` footer, and the same two decisions (Allow/Deny), applied
+through the same `Runtime::decide`. Both surfaces are per-session, so an ask
+raised by the live engine appears in both; neither can settle an ask the
+engine no longer holds.
+
 Not covered by the UI on purpose: chat (the console and Telegram remain the
 chat surfaces) and any write beyond memory proposals and approval decisions.
 

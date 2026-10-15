@@ -1098,7 +1098,7 @@ ka-agent/
 
 ## 12. Open questions
 
-1. **Pure Rust vs Rust + TypeScript for the web.** Rust server-rendered pages (one binary, smaller attack surface) or a TypeScript SPA (richer UI, a second toolchain)? Decide at the Phase 4 start; the default leans to server-rendered Rust plus minimal JS.
+1. **Pure Rust vs Rust + TypeScript for the web.** Rust server-rendered pages (one binary, smaller attack surface) or a TypeScript SPA (richer UI, a second toolchain)? Decide at the Phase 4 start; the default leans to server-rendered Rust plus minimal JS. **Decided (M7, 2026-10-15): server-rendered Rust, no JavaScript at all** — a loopback-only HTTP/1.1 server in `ka-agent-web` (no framework, no asset pipeline, no CDN), session auth via a one-shot CLI-issued login link. See `docs/contract/web-ui.md`.
 2. **`ka serve` vs a Rust library.** The MVP leans to the library in a worker (§3.4). This is revisited on every Ka release against the five serve criteria. Should Ka Agent also support driving a remote `ka serve` (Ka on another host)?
 3. **Plugin model: process, WASM, sandbox or manifest convention.** MCP-stdio processes under bubblewrap reuse Ka's MCP client and any language. WASM (WASI components) gives stronger isolation but fewer SDKs and harder I/O. Is a manifest-only convention enough for first-party code? Decide before Phase 5.
 4. **Initial database.** Is SQLite (WAL, bundled FTS5) sufficient through Phase 6? When, if ever, does a server database become necessary (shared multi-user instance)? Should state and the index be split into two files to simplify backups?

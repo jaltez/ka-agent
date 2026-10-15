@@ -206,10 +206,16 @@ pub fn approvals(runtime: &Runtime, store: &Store) -> crate::Response {
                     format!("<pre>{escaped}</pre>")
                 })
                 .unwrap_or_default();
+            // Same expiry rendering as the Telegram card (`HH:MM`).
+            let mins = a.expires_at_ms / 60_000;
+            let local = mins.rem_euclid(24 * 60);
             Some(format!(
-                "<div class='card'><p>{q}</p>{d}<form method=post action=/approvals/decide>\
+                "<div class='card'><p>{q}</p>{d}<p>expires {:02}:{:02}</p>\
+                 <form method=post action=/approvals/decide>\
                  <input type=hidden name=id value={}><button name=decision value=y>Allow</button>\
                  <button name=decision value=n>Deny</button></form></div>",
+                local / 60,
+                local % 60,
                 escape_html(a.id.as_str())
             ))
         })

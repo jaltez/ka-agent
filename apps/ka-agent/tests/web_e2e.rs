@@ -42,15 +42,8 @@ impl Daemon {
 
     /// `ka-agent web-token --port <port>` → the login URL it prints.
     fn web_token(&self) -> String {
-        let config = self.data.parent().unwrap().join("ka-agent.toml");
         let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
-            .args([
-                "web-token",
-                "--config",
-                config.to_str().unwrap(),
-                "--port",
-                &self.port.to_string(),
-            ])
+            .args(["web-token", "--port", &self.port.to_string()])
             .envs(self.env())
             .output()
             .unwrap();
@@ -394,16 +387,30 @@ fn user_derived_text_is_html_escaped() {
 }
 
 #[test]
-fn approvals_page_lists_pending_ask_as_html() {
+fn approvals_card_renders_escaped_and_only_live_asks_decide() {
     let root = temp_root("approvals");
     let port = free_port();
     let daemon = spawn_daemon(&root, port);
     wait_web(port, Duration::from_secs(30));
     let cookie = login(&daemon);
 
+    // The approvals inbox lists the live session's asks, so seed into the
+    // session the daemon actually runs (its id is on the dashboard).
+    let dashboard = request(port, "GET", "/", Some(&cookie), "");
+    let marker = "<td>session</td><td>";
+    let start = dashboard.body.find(marker).expect("session row") + marker.len();
+    let session_id = dashboard.body[start..]
+        .split("</td>")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        !session_id.is_empty(),
+        "session id parsed from the dashboard"
+    );
+
     let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
-    seed_session(&store, "web-approvals", &root.join("ws"));
-    let session = ka_agent_core::SessionId("web-approvals".to_string());
+    let session = ka_agent_core::SessionId(session_id);
     let turn = ka_agent_core::TurnId("t-ask".to_string());
     store
         .insert_turn(&ka_agent_core::Turn {
@@ -434,12 +441,30 @@ fn approvals_page_lists_pending_ask_as_html() {
     let id = approval.id.as_str().to_string();
     store.insert_approval(&approval).unwrap();
 
-    // The daemon runs its own session; the page lists that session's asks, so
-    // assert on the rendered form only when the seeded row is the one shown.
-    let resp = request(port, "GET", "/approvals", Some(&cookie), "");
-    assert_eq!(resp.status, 200);
+    let page = request(port, "GET", "/approvals", Some(&cookie), "");
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains("write &lt;b&gt;bold.txt&lt;/b&gt;?"),
+        "question must be escaped: {}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("<b>bold.txt</b>"),
+        "raw question markup leaked"
+    );
+    assert!(page.body.contains("diff &lt;script&gt;"), "detail escaped");
+    assert!(
+        page.body.contains("expires "),
+        "card shows expiry (parity with Telegram)"
+    );
+    assert!(
+        page.body.contains("Allow") && page.body.contains("Deny"),
+        "buttons"
+    );
+    assert!(page.body.contains(&id), "card carries the approval id");
 
-    // POST with an id the live engine does not know: no crash, no 5xx.
+    // The engine has no such live ask, so the decision must not be applied —
+    // and must not 500 either.
     let decide = request(
         port,
         "POST",
@@ -449,21 +474,18 @@ fn approvals_page_lists_pending_ask_as_html() {
     );
     assert_eq!(decide.status, 200, "decide must render, not 500");
     assert!(
-        decide.body.contains("Error") || decide.body.contains("Approvals"),
-        "decide renders a page"
+        decide.body.contains("decision not applied"),
+        "undeliverable decision is reported"
     );
-
-    // The decision must not have flipped a row it could not deliver.
-    let live = store
+    let row = store
         .pending_approvals(&session)
         .unwrap()
         .into_iter()
-        .find(|a| a.id.as_str() == id);
-    if let Some(a) = live {
-        assert_ne!(
-            a.status,
-            ka_agent_core::ApprovalStatus::Approved,
-            "an undeliverable decision must not mark the ask approved"
-        );
-    }
+        .find(|a| a.id.as_str() == id)
+        .expect("seeded ask still pending");
+    assert_eq!(
+        row.status,
+        ka_agent_core::ApprovalStatus::Pending,
+        "an undeliverable decision must not settle the ask"
+    );
 }
