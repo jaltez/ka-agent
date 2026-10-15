@@ -1,0 +1,20 @@
+[package]
+name = "ka-agent-port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The stable Ka boundary: KaPort trait, worker protocol, subprocess worker host"
+
+[dependencies]
+ka-agent-core = { workspace = true }
+ka-protocol = { workspace = true }
+ka-engine = { workspace = true }
+ka-dialect = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

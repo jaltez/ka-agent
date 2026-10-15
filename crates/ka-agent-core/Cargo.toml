@@ -1,0 +1,15 @@
+[package]
+name = "ka-agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ka Agent domain types and state machines (no I/O, no Ka dependencies)"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

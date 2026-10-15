@@ -1,0 +1,7 @@
+.pi/
+.omp/
+
+/target
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ka-agent-core",
+    "crates/ka-agent-port",
+    "crates/ka-agent-store",
+    "crates/ka-agent-runtime",
+    "apps/ka-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/jaltez/ka-agent"
+
+[workspace.dependencies]
+# Ka engine crates, pinned to an exact revision (SEED.md §3.4: exact pin,
+# upgraded deliberately with the contract suite green). Local file:// mirror
+# of the upstream repository; swap to the public git URL + released crates
+# once ka 0.3.0 is published.
+ka-protocol = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-engine = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-dialect = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+
+ka-agent-core = { path = "crates/ka-agent-core" }
+ka-agent-port = { path = "crates/ka-agent-port" }
+ka-agent-store = { path = "crates/ka-agent-store" }
+ka-agent-runtime = { path = "crates/ka-agent-runtime" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+strip = true
+panic = "abort"
+codegen-units = 1

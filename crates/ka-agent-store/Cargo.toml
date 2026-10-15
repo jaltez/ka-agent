@@ -1,0 +1,17 @@
+[package]
+name = "ka-agent-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite state: schema v1, migrations, repositories, audit hash chain, FTS index"
+
+[dependencies]
+ka-agent-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
