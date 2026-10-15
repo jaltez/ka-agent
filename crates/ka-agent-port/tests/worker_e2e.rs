@@ -36,6 +36,7 @@ impl Env {
             data_dir: self.root.join("ka"),
             state_dir: self.root.join("state"),
             cache_dir: self.root.join("cache"),
+            agent_data_root: self.root.clone(),
         }
     }
 

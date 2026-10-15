@@ -318,6 +318,27 @@ async fn open_engine(
     }
     cfg.cwd = Some(workspace.to_string_lossy().into_owned());
 
+    // MCP bridge: the engine's kagent.* tools (memory_propose, notes_*).
+    // Spawned as this same binary with `__mcp`; it inherits the worker's
+    // sanitized env, including KA_AGENT_DATA_DIR for the store.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut mcp_env = std::collections::HashMap::new();
+        if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR") {
+            mcp_env.insert(
+                "KA_AGENT_DATA_DIR".to_string(),
+                dir.to_string_lossy().into_owned(),
+            );
+        }
+        cfg.mcp.push(ka_engine::mcp::McpServerConfig {
+            name: "kagent".to_string(),
+            command: Some(exe.to_string_lossy().into_owned()),
+            args: vec!["__mcp".to_string()],
+            env: mcp_env,
+            url: None,
+            headers: Vec::new(),
+        });
+    }
+
     let strand_choice = match strand {
         StrandSel::New => ka_engine::StrandChoice::New,
         StrandSel::Path(p) => ka_engine::StrandChoice::Path(PathBuf::from(p)),

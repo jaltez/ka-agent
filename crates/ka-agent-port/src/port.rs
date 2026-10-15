@@ -57,6 +57,8 @@ pub struct WorkerEnv {
     pub state_dir: PathBuf,
     /// `XDG_CACHE_HOME` (feeds the sandbox allowlist).
     pub cache_dir: PathBuf,
+    /// `KA_AGENT_DATA_DIR` for the worker and its spawned MCP bridge.
+    pub agent_data_root: PathBuf,
 }
 
 /// Env-var name markers whose values are ambient operator credentials —
@@ -85,7 +87,8 @@ impl WorkerEnv {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_STATE_HOME", &self.state_dir)
             .env("XDG_CACHE_HOME", &self.cache_dir)
-            .env("KA_DATA_DIR", &self.data_dir);
+            .env("KA_DATA_DIR", &self.data_dir)
+            .env("KA_AGENT_DATA_DIR", &self.agent_data_root);
     }
 }
 
@@ -819,6 +822,7 @@ mod tests {
             data_dir: root.join("ka"),
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
+            agent_data_root: root.clone(),
         };
         let mut cmd = Command::new("env");
         env.sanitize(&mut cmd);

@@ -63,6 +63,9 @@ enum Command {
         #[arg(long, hide = true)]
         scenario: Option<PathBuf>,
     },
+    /// Hidden: the MCP bridge the Ka engine spawns as `kagent`.
+    #[command(name = "__mcp", hide = true)]
+    Mcp,
 }
 
 fn config_path(flag: &Option<PathBuf>) -> PathBuf {
@@ -148,6 +151,13 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
+        Command::Mcp => match ka_agent_channels::run_mcp() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("ka-agent mcp: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
         Command::Chat { config, scenario } => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -219,6 +229,12 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
     tokio::spawn(async move {
         expiry
             .run_expiry_timer(std::time::Duration::from_secs(30))
+            .await;
+    });
+    let sched = runtime.clone();
+    tokio::spawn(async move {
+        sched
+            .run_scheduler(std::time::Duration::from_secs(15))
             .await;
     });
 
@@ -311,6 +327,18 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
                         }
                     }
                 }
+            }
+            cmd if cmd.starts_with("/remind") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                match runtime.add_reminder(rest) {
+                    Ok(Some(id)) => println!("· reminder {id} scheduled"),
+                    Ok(None) => println!("usage: /remind <Ns|Nm|Nh|Nd> <text>"),
+                    Err(e) => println!("! {e}"),
+                }
+            }
+            "/skills" => {
+                println!("· skills are provisioned in <data>/engine-home/.config/ka/skills/");
+                println!("  (SKILL.md directories; ka discovers them per SEED.md §6.1)");
             }
             cmd if cmd.starts_with("/history") => {
                 let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
@@ -539,6 +567,12 @@ async fn run_daemon(config: PathBuf, scenario: Option<PathBuf>) -> std::process:
     tokio::spawn(async move {
         expiry
             .run_expiry_timer(std::time::Duration::from_secs(30))
+            .await;
+    });
+    let sched = runtime.clone();
+    tokio::spawn(async move {
+        sched
+            .run_scheduler(std::time::Duration::from_secs(15))
             .await;
     });
 

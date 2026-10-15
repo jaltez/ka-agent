@@ -6,8 +6,9 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M3 complete and verified.** Working today (`cargo test
---workspace`: 95 tests green; Telegram + memory + history run end to end):
+**Status: M4 complete and verified.** Working today (`cargo test
+--workspace`: 96 tests green; Telegram + memory + history + MCP bridge +
+scheduler):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -36,8 +37,11 @@ and stops.
   surface), `ka-agent doctor`, and the hidden `ka-agent __worker` the
   runtime supervises.
 
-Plugins/connectors (MCP bridge), the scheduler and episode summaries come
-in the next milestones (see `SEED.md` §10). Memory and history are live:
+The MCP bridge is live: the engine gets `kagent.*` tools (memory_propose,
+notes_search/append/read) through the `[[mcp]]` overlay — model-proposed
+memories flow into `/memory review`. The scheduler fires `/remind`
+reminders. Third-party plugins, web UI and multi-user come next
+(see `SEED.md` §10). Memory and history are live:
 `/remember <fact>`, `/memory`, `/forget <id>`, `/history <query>`,
 `/history show <turn_id>` — on both the console and Telegram. Real Telegram
 use: set `[telegram]` in the config, store the bot token

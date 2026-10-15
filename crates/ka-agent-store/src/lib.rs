@@ -853,6 +853,50 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Tasks of a kind whose scheduled time has passed (scheduler).
+    pub fn due_tasks(&self, now_ms: i64, kind: &str) -> Result<Vec<ka_agent_core::Task>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, created_ms, updated_ms
+             FROM tasks
+             WHERE kind = ?1 AND status = 'queued' AND scheduled_at_ms IS NOT NULL AND scheduled_at_ms <= ?2
+             ORDER BY scheduled_at_ms",
+        )?;
+        let rows = stmt.query_map(params![kind, now_ms], row_to_task)?;
+        collect_rows(rows)
+    }
+
+    /// Insert a task row.
+    pub fn insert_task(&self, t: &ka_agent_core::Task) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO tasks(id, session, title, kind, status, read_only, scheduled_at_ms, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                t.id.as_str(),
+                t.session.as_ref().map(|s| s.as_str()),
+                t.title,
+                t.kind,
+                task_status_str(&t.status),
+                t.read_only as i64,
+                t.scheduled_at_ms,
+                t.created_ms,
+                t.updated_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update a task's status.
+    pub fn set_task_status(&self, id: &ka_agent_core::TaskId, status: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tasks SET status = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id.as_str(), status, ka_agent_core::now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Pending candidates with full text, for `/memory review`.
     pub fn pending_candidates_full(&self) -> Result<Vec<CandidateRow>> {
         let conn = self.lock();
@@ -1497,4 +1541,44 @@ mod tests {
             Some("2.50")
         );
     }
+}
+
+fn task_status_str(s: &ka_agent_core::TaskStatus) -> &'static str {
+    match s {
+        ka_agent_core::TaskStatus::Queued => "queued",
+        ka_agent_core::TaskStatus::Running => "running",
+        ka_agent_core::TaskStatus::WaitingApproval => "waiting_approval",
+        ka_agent_core::TaskStatus::Succeeded => "succeeded",
+        ka_agent_core::TaskStatus::Failed => "failed",
+        ka_agent_core::TaskStatus::Cancelled => "cancelled",
+        ka_agent_core::TaskStatus::Interrupted => "interrupted",
+        ka_agent_core::TaskStatus::Unknown => "unknown",
+    }
+}
+
+fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<ka_agent_core::Task> {
+    let session: Option<String> = r.get(1)?;
+    let status: String = r.get(4)?;
+    let read_only: i64 = r.get(5)?;
+    let status = match status.as_str() {
+        "queued" => ka_agent_core::TaskStatus::Queued,
+        "running" => ka_agent_core::TaskStatus::Running,
+        "waiting_approval" => ka_agent_core::TaskStatus::WaitingApproval,
+        "succeeded" => ka_agent_core::TaskStatus::Succeeded,
+        "failed" => ka_agent_core::TaskStatus::Failed,
+        "cancelled" => ka_agent_core::TaskStatus::Cancelled,
+        "interrupted" => ka_agent_core::TaskStatus::Interrupted,
+        _ => ka_agent_core::TaskStatus::Unknown,
+    };
+    Ok(ka_agent_core::Task {
+        id: ka_agent_core::TaskId(r.get::<_, String>(0)?),
+        session: session.map(ka_agent_core::SessionId),
+        title: r.get(2)?,
+        kind: r.get(3)?,
+        status,
+        read_only: read_only != 0,
+        scheduled_at_ms: r.get(6)?,
+        created_ms: r.get(7)?,
+        updated_ms: r.get(8)?,
+    })
 }

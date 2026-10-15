@@ -810,6 +810,24 @@ impl TelegramChannel {
                         };
                         let _ = client.send_message(chat_id, &reply, None).await;
                     }
+                    "/remind" => {
+                        let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                        let reply = match self.runtime.add_reminder(rest) {
+                            Ok(Some(id)) => format!("reminder {id} scheduled"),
+                            Ok(None) => "usage: /remind <Ns|Nm|Nh|Nd> <text>".to_string(),
+                            Err(e) => format!("! [remind] {e}"),
+                        };
+                        let _ = client.send_message(chat_id, &reply, None).await;
+                    }
+                    "/skills" => {
+                        let _ = client
+                            .send_message(
+                                chat_id,
+                                "skills live in <data>/engine-home/.config/ka/skills/ (SKILL.md)",
+                                None,
+                            )
+                            .await;
+                    }
                     "/history" => {
                         let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
                         let reply = if let Some(query) = rest.strip_prefix("show ") {

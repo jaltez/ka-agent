@@ -625,6 +625,56 @@ impl Runtime {
             None => Ok(false),
         }
     }
+
+    // ---- scheduler (SEED.md §7.2, Phase 3) ------------------------------
+
+    /// `/remind <N(s|m|h|d)> <text>`: create a reminder.
+    pub fn add_reminder(&self, text: &str) -> Result<Option<ka_agent_core::TaskId>, Error> {
+        let (duration_str, reminder_text) = text.split_once(' ').unwrap_or(("", ""));
+        let ms = parse_duration(duration_str).ok_or_else(|| Error::Illegal {
+            from: "remind".into(),
+            to: format!("bad duration {duration_str:?}; use Ns, Nm, Nh or Nd"),
+        })?;
+        if reminder_text.is_empty() {
+            return Ok(None);
+        }
+        let mut task = ka_agent_core::Task::new(format!("⏰ {reminder_text}"), "reminder", false);
+        task.scheduled_at_ms = Some(ka_agent_core::now_ms() + ms);
+        self.sh.store.insert_task(&task)?;
+        Ok(Some(task.id))
+    }
+
+    /// Fire due reminders; called from the scheduler timer.
+    pub async fn fire_due_reminders(&self) -> Result<Vec<String>, Error> {
+        let now = ka_agent_core::now_ms();
+        let due = self.sh.store.due_tasks(now, "reminder")?;
+        let mut fired = Vec::new();
+        for task in due {
+            self.sh.store.set_task_status(&task.id, "running")?;
+            let title = task.title.clone();
+            self.sh.surface.on_note(&format!("⏰ {title}"));
+            self.handle_message(&format!("⏰ reminder: {title}"), "scheduler")
+                .await?;
+            self.sh.store.set_task_status(&task.id, "succeeded")?;
+            fired.push(title);
+        }
+        Ok(fired)
+    }
+
+    /// Scheduler loop; run it next to the expiry timer.
+    pub async fn run_scheduler(&self, every: Duration) {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if let Err(e) = self.fire_due_reminders().await {
+                self.sh
+                    .surface
+                    .on_error("internal", &format!("scheduler: {e}"));
+            }
+        }
+    }
     fn live_port(&self) -> Option<Arc<PortSession>> {
         self.lock().live.as_ref().map(|l| Arc::clone(&l.port))
     }
@@ -711,6 +761,7 @@ impl Runtime {
                 data_dir: self.sh.paths.ka_data(),
                 state_dir: self.sh.paths.engine_state(),
                 cache_dir: self.sh.paths.engine_cache(),
+                agent_data_root: self.sh.paths.root().to_path_buf(),
             };
             let layer = self
                 .sh
@@ -1134,6 +1185,23 @@ async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
     rt_persist_status(sh, status);
     sh.surface.on_session_status(status);
     sh.surface.on_note(&note);
+}
+
+/// Parse `Ns`, `Nm`, `Nh`, `Nd` into milliseconds.
+fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(n * 1000),
+        "m" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        "d" => Some(n * 86_400_000),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
