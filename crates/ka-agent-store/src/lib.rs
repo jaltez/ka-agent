@@ -1182,6 +1182,46 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
     })
 }
 
+fn task_status_str(s: &ka_agent_core::TaskStatus) -> &'static str {
+    match s {
+        ka_agent_core::TaskStatus::Queued => "queued",
+        ka_agent_core::TaskStatus::Running => "running",
+        ka_agent_core::TaskStatus::WaitingApproval => "waiting_approval",
+        ka_agent_core::TaskStatus::Succeeded => "succeeded",
+        ka_agent_core::TaskStatus::Failed => "failed",
+        ka_agent_core::TaskStatus::Cancelled => "cancelled",
+        ka_agent_core::TaskStatus::Interrupted => "interrupted",
+        ka_agent_core::TaskStatus::Unknown => "unknown",
+    }
+}
+
+fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<ka_agent_core::Task> {
+    let session: Option<String> = r.get(1)?;
+    let status: String = r.get(4)?;
+    let read_only: i64 = r.get(5)?;
+    let status = match status.as_str() {
+        "queued" => ka_agent_core::TaskStatus::Queued,
+        "running" => ka_agent_core::TaskStatus::Running,
+        "waiting_approval" => ka_agent_core::TaskStatus::WaitingApproval,
+        "succeeded" => ka_agent_core::TaskStatus::Succeeded,
+        "failed" => ka_agent_core::TaskStatus::Failed,
+        "cancelled" => ka_agent_core::TaskStatus::Cancelled,
+        "interrupted" => ka_agent_core::TaskStatus::Interrupted,
+        _ => ka_agent_core::TaskStatus::Unknown,
+    };
+    Ok(ka_agent_core::Task {
+        id: ka_agent_core::TaskId(r.get::<_, String>(0)?),
+        session: session.map(ka_agent_core::SessionId),
+        title: r.get(2)?,
+        kind: r.get(3)?,
+        status,
+        read_only: read_only != 0,
+        scheduled_at_ms: r.get(6)?,
+        created_ms: r.get(7)?,
+        updated_ms: r.get(8)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1541,44 +1581,4 @@ mod tests {
             Some("2.50")
         );
     }
-}
-
-fn task_status_str(s: &ka_agent_core::TaskStatus) -> &'static str {
-    match s {
-        ka_agent_core::TaskStatus::Queued => "queued",
-        ka_agent_core::TaskStatus::Running => "running",
-        ka_agent_core::TaskStatus::WaitingApproval => "waiting_approval",
-        ka_agent_core::TaskStatus::Succeeded => "succeeded",
-        ka_agent_core::TaskStatus::Failed => "failed",
-        ka_agent_core::TaskStatus::Cancelled => "cancelled",
-        ka_agent_core::TaskStatus::Interrupted => "interrupted",
-        ka_agent_core::TaskStatus::Unknown => "unknown",
-    }
-}
-
-fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<ka_agent_core::Task> {
-    let session: Option<String> = r.get(1)?;
-    let status: String = r.get(4)?;
-    let read_only: i64 = r.get(5)?;
-    let status = match status.as_str() {
-        "queued" => ka_agent_core::TaskStatus::Queued,
-        "running" => ka_agent_core::TaskStatus::Running,
-        "waiting_approval" => ka_agent_core::TaskStatus::WaitingApproval,
-        "succeeded" => ka_agent_core::TaskStatus::Succeeded,
-        "failed" => ka_agent_core::TaskStatus::Failed,
-        "cancelled" => ka_agent_core::TaskStatus::Cancelled,
-        "interrupted" => ka_agent_core::TaskStatus::Interrupted,
-        _ => ka_agent_core::TaskStatus::Unknown,
-    };
-    Ok(ka_agent_core::Task {
-        id: ka_agent_core::TaskId(r.get::<_, String>(0)?),
-        session: session.map(ka_agent_core::SessionId),
-        title: r.get(2)?,
-        kind: r.get(3)?,
-        status,
-        read_only: read_only != 0,
-        scheduled_at_ms: r.get(6)?,
-        created_ms: r.get(7)?,
-        updated_ms: r.get(8)?,
-    })
 }
