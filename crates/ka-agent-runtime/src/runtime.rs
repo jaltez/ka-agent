@@ -1105,11 +1105,24 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                 // turn's own record decides.
                 let turn_open = {
                     let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    g.live
-                        .as_ref()
-                        .and_then(|l| l.current_turn.clone())
-                        .and_then(|tid| sh.store.get_turn(&tid).ok().flatten())
-                        .is_some_and(|t| !t.status.is_terminal())
+                    let status = g.session.status;
+                    let current = g.live.as_ref().and_then(|l| l.current_turn.clone());
+                    drop(g);
+                    match current {
+                        // A turn is in flight until its own record says it is over.
+                        Some(tid) => sh
+                            .store
+                            .get_turn(&tid)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|t| !t.status.is_terminal()),
+                        // No turn recorded yet, but an inbound message moved the
+                        // session to `running`: its prompt is still being handed
+                        // over, and the engine's start-up `idle` must not end it
+                        // (that would make the next message overtake the prompt
+                        // ka is about to accept).
+                        None => status == SessionStatus::Running,
+                    }
                 };
                 // A pending ask owns the boundary too: the engine is blocked
                 // until its decision or TTL arrives.

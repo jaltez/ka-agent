@@ -202,13 +202,15 @@ fn message_queues_while_a_turn_is_running() {
     let root = temp_root("queue-busy");
     // A slow response keeps the turn in flight long enough to observe it, so
     // the queue path (gap G4) is exercised without racing the idle signal.
+    // The test quits as soon as the queue note lands, so the length of the
+    // scripted pause costs nothing when the assertion passes.
     let sc = scenario_file(
         &root,
         "slow.json",
         r#"{
             "steps": [
                 {"text": "thinking"},
-                {"sleep_ms": 8000},
+                {"sleep_ms": 30000},
                 {"text": "finished"}
             ],
             "stop": "done", "cost_usd": 0.0, "tokens": 5
@@ -217,11 +219,12 @@ fn message_queues_while_a_turn_is_running() {
     let data = root.join("data");
     let mut chat = spawn_chat(&root, &sc);
     chat.send("first");
-    // Wait for the durable state instead of guessing at wall-clock: the
-    // session is persisted `running` the moment the turn is accepted.
-    if !wait_session_running(&data, Duration::from_secs(20)) {
+    // Wait for the durable state instead of guessing at wall-clock: the turn
+    // is persisted `running` once the engine has accepted the prompt, which is
+    // also when the chat loop can read the next line.
+    if !wait_turn_running(&data, Duration::from_secs(30)) {
         panic!(
-            "session never reached `running`; output so far:\n{}",
+            "turn never reached `running`; output so far:\n{}",
             chat.transcript()
         );
     }
@@ -232,10 +235,11 @@ fn message_queues_while_a_turn_is_running() {
     chat.send("/quit");
 }
 
-/// True once the instance's session is persisted as `running`. Polls with a
-/// fresh read-only connection: the instance owns the database, and a
-/// read-write handle from the test would block its start-up.
-fn wait_session_running(data: &std::path::Path, timeout: Duration) -> bool {
+/// True once the newest turn is persisted as `running` (the engine accepted
+/// the prompt, so the chat loop can read the next line). Polls with a fresh
+/// read-only connection: the instance owns the database, and a read-write
+/// handle from the test would block its start-up.
+fn wait_turn_running(data: &std::path::Path, timeout: Duration) -> bool {
     use rusqlite::OpenFlags;
     let path = data.join("state.db");
     let deadline = Instant::now() + timeout;
@@ -245,7 +249,7 @@ fn wait_session_running(data: &std::path::Path, timeout: Duration) -> bool {
                 .ok()
                 .and_then(|c| {
                     c.query_row(
-                        "SELECT status FROM sessions ORDER BY updated_ms DESC LIMIT 1",
+                        "SELECT status FROM turns ORDER BY created_ms DESC, id DESC LIMIT 1",
                         [],
                         |r| r.get::<_, String>(0),
                     )
