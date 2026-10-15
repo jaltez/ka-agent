@@ -116,11 +116,7 @@ impl Approval {
         self.status == ApprovalStatus::Pending && now_ms >= self.expires_at_ms
     }
 
-    pub fn decide(
-        &mut self,
-        status: ApprovalStatus,
-        at_ms: i64,
-    ) -> Result<(), ApprovalStatus> {
+    pub fn decide(&mut self, status: ApprovalStatus, at_ms: i64) -> Result<(), ApprovalStatus> {
         if self.status.can_transition_to(status) {
             self.status = status;
             self.decided_at_ms = Some(at_ms);

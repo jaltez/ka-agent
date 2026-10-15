@@ -32,7 +32,11 @@ impl TurnStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TurnStatus::Done | TurnStatus::Error | TurnStatus::Aborted | TurnStatus::Interrupted | TurnStatus::Killed
+            TurnStatus::Done
+                | TurnStatus::Error
+                | TurnStatus::Aborted
+                | TurnStatus::Interrupted
+                | TurnStatus::Killed
         )
     }
 

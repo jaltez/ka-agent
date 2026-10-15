@@ -52,6 +52,11 @@ Field notes:
 | ev | line |
 |---|---|
 | `Ready` — worker up, engine spawn pending `open` | `{"ev":"ready"}` |
+
+Spawning: the daemon runs `binary` with `OpenRequest.worker_args` as argv
+prefix (the app passes `["__worker"]`; the port test worker passes none),
+then `--scenario <path>` when a scripted speaker is requested, then the
+NDJSON protocol below over stdio.
 | `Strand` — emitted after `open`, once the strand id is known (from `session_info`) | `{"ev":"strand","id":"01J8Z0W7…"}` |
 | `Ka` — one wrapped ka `Event` (verbatim serde form of ka-protocol's `Event`) | `{"ev":"ka","event":{"type":"delta","kind":"text","text":"Hello"}}` |
 | `EngineClosed` — engine event channel closed (with reason) | `{"ev":"engine_closed","reason":"engine task exited without idle"}` |

@@ -11,10 +11,30 @@ ka-agent-core = { workspace = true }
 ka-protocol = { workspace = true }
 ka-engine = { workspace = true }
 ka-dialect = { workspace = true }
+# Strand-path resolution for the resume records (docs/contract/worker-protocol.md
+# `Strand.path`). Same exact revision pin as the other Ka crates — see the
+# workspace manifest note.
+ka-strand = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# Builds the scripted-speaker test worker binary (`ka-port-test-worker`)
+# used by the e2e suite and the console chat's scenario runs.
+test-support = []
+
+[[bin]]
+name = "ka-port-test-worker"
+path = "src/bin/ka_port_test_worker.rs"
+required-features = ["test-support"]
+
+[dev-dependencies]
+# Self dev-dependency with the feature enabled: `cargo test -p ka-agent-port`
+# builds ka-port-test-worker and exports CARGO_BIN_EXE_ka-port-test-worker to
+# the integration tests (standard cargo trick for feature-gated test bins).
+ka-agent-port = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

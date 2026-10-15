@@ -6,7 +6,9 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M1 in development.** Working today:
+**Status: M1 core complete and verified.** Working today (`cargo test
+--workspace`: 75 tests green; `ka-agent chat` drives the full stack end to
+end through a scripted engine speaker):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -14,7 +16,12 @@ and stops.
 - **`ka-agent-store`** — SQLite persistence (schema, migrations, audit chain).
 - **`ka-agent-port`** — the `KaPort` trait and the crate-backed worker
   boundary (`docs/contract/`).
-- **`ka-agent-runtime`** — session manager, worker supervisor, approvals.
+- **`ka-agent-runtime`** — session manager, durable queue, single-flight
+  submission, approvals with deny-on-expiry, budgets, worker supervisor with
+  backoff and a crash-loop breaker.
+- **`ka-agent` (the binary)** — `ka-agent chat` (local console surface:
+  `/help /status /new /stop /y /n /quit`), `ka-agent doctor`, and the hidden
+  `ka-agent __worker` the runtime supervises.
 
 Telegram, memory, plugins and the scheduler come in later milestones
 (see `SEED.md` §10).

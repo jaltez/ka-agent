@@ -23,9 +23,7 @@ fn next_id() -> String {
 
 macro_rules! string_id {
     ($name:ident, $prefix:literal) => {
-        #[derive(
-            Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-        )]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         pub struct $name(pub String);
 
         impl $name {

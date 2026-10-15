@@ -57,7 +57,8 @@ mod tests {
 
     #[test]
     fn new_record_is_pending_hash_material() {
-        let r = super::AuditRecord::new("operator", super::actions::APPROVAL_DECIDE, "appr_x", None);
+        let r =
+            super::AuditRecord::new("operator", super::actions::APPROVAL_DECIDE, "appr_x", None);
         assert_eq!(r.seq, 0);
         assert_eq!(r.hash, "");
         assert_eq!(r.action, "approval.decide");

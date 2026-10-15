@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 pub enum BudgetVerdict {
     Ok,
     /// At or above 80% of a cap.
-    Warn { pct: u8 },
+    Warn {
+        pct: u8,
+    },
     /// A cap is reached: pause the instance.
     Exceeded,
 }
@@ -53,7 +55,10 @@ impl BudgetState {
 
     pub fn verdict(&self) -> BudgetVerdict {
         let usd = Self::pct(self.spent_usd, self.daily_usd_cap);
-        let tok = Self::pct(self.spent_tokens as f64, self.daily_token_cap.map(|t| t as f64));
+        let tok = Self::pct(
+            self.spent_tokens as f64,
+            self.daily_token_cap.map(|t| t as f64),
+        );
         let worst = match (usd, tok) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),

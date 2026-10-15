@@ -232,6 +232,11 @@ impl Store {
         let Some(current) = parse_session_status(&current) else {
             return Err(StoreError::NotFound(format!("session {}", id)));
         };
+        // Same-status writes are idempotent (engines may emit repeated
+        // `idle` boundaries).
+        if current == next {
+            return Ok(());
+        }
         if !current.can_transition_to(next) {
             return Err(StoreError::IllegalTransition {
                 what: "session",
@@ -400,6 +405,21 @@ impl Store {
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         out.reverse();
         Ok(out)
+    }
+
+    /// One turn by id, if it exists.
+    pub fn get_turn(&self, id: &TurnId) -> Result<Option<Turn>> {
+        let conn = self.lock();
+        let turn = conn
+            .query_row(
+                "SELECT id, session, inbound_text, status, stop, error_class, error_message,
+                        cost_usd, tokens, created_ms, updated_ms
+                 FROM turns WHERE id = ?1",
+                params![id.as_str()],
+                row_to_turn,
+            )
+            .optional()?;
+        Ok(turn)
     }
 
     /// Sum of `cost_usd` and `tokens` over turns created in
@@ -668,7 +688,7 @@ impl Store {
     /// form. `serde_json` emits struct fields in declaration order, so the
     /// bytes are stable across builds; [`Store::verify_audit_chain`]
     /// recomputes them exactly this way.
-    pub fn append_audit(&mut self, record: &mut AuditRecord) -> Result<()> {
+    pub fn append_audit(&self, record: &mut AuditRecord) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let prev_hash: Option<String> = tx
@@ -1273,7 +1293,7 @@ mod tests {
 
     #[test]
     fn audit_chain_append_verify_tamper() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         for i in 0..3 {
             let mut r = AuditRecord::new("operator", "test.event", &format!("s{i}"), None);
             store.append_audit(&mut r).unwrap();
@@ -1328,7 +1348,7 @@ mod tests {
         backup.set_extension("bak.db");
         let _ = std::fs::remove_file(&backup);
         {
-            let mut store = Store::open(&path).unwrap();
+            let store = Store::open(&path).unwrap();
             let s = session();
             store.insert_session(&s).unwrap();
             let mut r = AuditRecord::new("operator", "session.new", s.id.as_str(), None);

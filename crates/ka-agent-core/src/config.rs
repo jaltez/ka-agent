@@ -9,7 +9,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("read {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("parse {path}: {message}")]
     Parse { path: PathBuf, message: String },
     #[error("invalid config: {0}")]
@@ -31,11 +34,16 @@ pub struct WorkerRestart {
 
 impl Default for WorkerRestart {
     fn default() -> Self {
-        Self { backoff_start_ms: 1_000, backoff_max_ms: 60_000, crash_window_secs: 600, crash_max: 5 }
+        Self {
+            backoff_start_ms: 1_000,
+            backoff_max_ms: 60_000,
+            crash_window_secs: 600,
+            crash_max: 5,
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Budgets {
     /// Daily USD cap across sessions (ka usage accounting).
@@ -45,13 +53,7 @@ pub struct Budgets {
     pub daily_tokens: Option<u64>,
 }
 
-impl Default for Budgets {
-    fn default() -> Self {
-        Self { daily_usd: None, daily_tokens: None }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Ka {
     /// Optional ka engine layer (ka's own strict `ka.toml` format), validated
@@ -59,13 +61,7 @@ pub struct Ka {
     pub engine_layer: Option<PathBuf>,
 }
 
-impl Default for Ka {
-    fn default() -> Self {
-        Self { engine_layer: None }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Telegram {
     /// Telegram arrives in the next milestone; the shape is fixed now so the
@@ -75,12 +71,6 @@ pub struct Telegram {
     pub token_secret: Option<String>,
     /// Paired operator user ids (numeric; usernames are never trusted).
     pub allow_user_ids: Vec<i64>,
-}
-
-impl Default for Telegram {
-    fn default() -> Self {
-        Self { enabled: false, token_secret: None, allow_user_ids: Vec::new() }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +132,9 @@ impl DaemonConfig {
             return Err(Error::Validate(format!("unknown mode {:?}", self.mode)));
         }
         if self.approval_ttl_secs == 0 || self.approval_ttl_secs > 86_400 {
-            return Err(Error::Validate("approval_ttl_secs must be in 1..=86400".into()));
+            return Err(Error::Validate(
+                "approval_ttl_secs must be in 1..=86400".into(),
+            ));
         }
         if self.turn_grace_secs == 0 || self.turn_grace_secs > 600 {
             return Err(Error::Validate("turn_grace_secs must be in 1..=600".into()));
@@ -170,7 +162,8 @@ impl DaemonConfig {
 
     /// Engine layer path with `~` expanded.
     pub fn engine_layer_path(&self) -> Option<PathBuf> {
-        self.ka.engine_layer
+        self.ka
+            .engine_layer
             .as_ref()
             .map(|p| crate::expand_home(&p.display().to_string()))
     }
@@ -183,7 +176,8 @@ mod tests {
     use super::*;
 
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ka-agent-core-cfg-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ka-agent-core-cfg-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("ka-agent.toml");
         std::fs::write(&p, content).unwrap();
@@ -201,21 +195,30 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_hard_errors() {
-        let p = write_tmp("unknown", "workspace = \"/tmp/ws\"\ntelegram-token = \"x\"\n");
+        let p = write_tmp(
+            "unknown",
+            "workspace = \"/tmp/ws\"\ntelegram-token = \"x\"\n",
+        );
         let err = DaemonConfig::load(&p).unwrap_err();
         assert!(err.to_string().contains("parse"), "{err}");
     }
 
     #[test]
     fn unknown_mode_rejected() {
-        let cfg = DaemonConfig { mode: "yolo".into(), ..DaemonConfig::default() };
+        let cfg = DaemonConfig {
+            mode: "yolo".into(),
+            ..DaemonConfig::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn telegram_enabled_needs_allowlist() {
         let cfg = DaemonConfig {
-            telegram: Telegram { enabled: true, ..Telegram::default() },
+            telegram: Telegram {
+                enabled: true,
+                ..Telegram::default()
+            },
             ..DaemonConfig::default()
         };
         assert!(cfg.validate().is_err());

@@ -1109,7 +1109,7 @@ ka-agent/
 
 ## 13. Immediate next steps
 
-1. Validate the real Ka interface: pin the Ka crates at commit `a56aae2` (or 0.3.0 once published), build a throwaway worker with `spawn_with_speaker`, and run probes against `ka serve`, `ka acp` and `ka run` to confirm or refute G1–G20; record the results in `docs/ka-interface-validation.md`. The gap table and runtime probes now exist there (2026-10-15); the remaining part of this task is the `spawn_with_speaker` worker spike itself.
+1. Validate the real Ka interface: pin the Ka crates at commit `a56aae2` (or 0.3.0 once published), build a throwaway worker with `spawn_with_speaker`, and run probes against `ka serve`, `ka acp` and `ka run` to confirm or refute G1–G20; record the results in `docs/ka-interface-validation.md`. The gap table and runtime probes now exist there (2026-10-15); the `spawn_with_speaker` worker now exists too (`crates/ka-agent-port`, scripted-speaker e2e in `crates/ka-agent-port/tests/`).
 2. Design the minimal Ka ↔ Ka Agent contract: write `docs/contract/ka-port.md` and the `KaPort` trait (open, submit, answer, abort, close, events), the allowed command subset, the replay and `idle` rules, the ask TTL, and the worker NDJSON envelope.
 3. Create the repository skeleton: Cargo workspace with `ka-agent-core`, `ka-agent-port`, `ka-agent-store` and `apps/ka-agent`, plus CI (fmt, clippy deny list, tests, and the gate that only the port may depend on Ka crates).
 4. Define retry, restart and cancellation tests: encode the expected outcomes for worker kill, daemon kill mid-cycle and mid-approval, `/stop` mid-tool, provider retryable errors via the scripted speaker, Telegram 429/5xx, and duplicate `update_id`s as failing end-to-end tests.
