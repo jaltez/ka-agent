@@ -37,6 +37,8 @@ pub enum Error {
     Store(#[from] StoreError),
     #[error("port: {0}")]
     Port(#[from] PortError),
+    #[error("memory: {0}")]
+    Memory(#[from] ka_agent_memory::Error),
     #[error("illegal state transition {from} -> {to}")]
     Illegal { from: String, to: String },
     #[error("no pending approval {0}")]
@@ -145,6 +147,7 @@ struct Shared {
     cfg: DaemonConfig,
     paths: Paths,
     store: Arc<Store>,
+    memory: ka_agent_memory::MemoryStore,
     port: WorkerPort,
     surface: Arc<dyn Surface>,
     inner: Mutex<Inner>,
@@ -195,11 +198,20 @@ impl Runtime {
                 }
             }
         }
+        let memory = ka_agent_memory::MemoryStore::open(&paths.root().join("memory"))?;
+        // Compile stable memory into the engine's user-tier MEMORY.md; ka
+        // re-reads it per prompt (validation §5), so no worker restart is
+        // needed after updates.
+        memory.install_compiled(
+            &paths.engine_home().join(".config/ka"),
+            ka_agent_memory::DEFAULT_BUDGET_BYTES,
+        )?;
         Ok(Self {
             sh: Arc::new(Shared {
                 cfg,
                 paths,
                 store,
+                memory,
                 port,
                 surface,
                 inner: Mutex::new(Inner {
@@ -329,6 +341,146 @@ impl Runtime {
                 .surface
                 .on_error("internal", &format!("session status persist: {e}"));
         }
+    }
+
+    // ---- memory & history (SEED.md §4) --------------------------------
+
+    /// `/remember <fact>`: explicit operator acceptance (SEED.md §4.4 path
+    /// 1) — append, recompile the engine's MEMORY.md, git-commit.
+    pub fn remember(&self, text: &str, source: &str) -> Result<String, Error> {
+        let id = self
+            .sh
+            .memory
+            .add(ka_agent_memory::MemoryFile::Facts, text, source, None)?;
+        self.refresh_compiled_memory()?;
+        self.sh.memory.commit(&format!("memory: accept {id}"))?;
+        self.audit(
+            audit_actions::MEMORY_ACCEPT,
+            &id,
+            Some(text.chars().take(80).collect()),
+        )?;
+        Ok(id)
+    }
+
+    /// `/forget <id>`: remove the entry and recompile.
+    pub fn forget(&self, id: &str) -> Result<bool, Error> {
+        let removed = self.sh.memory.remove(id)?;
+        if removed {
+            self.refresh_compiled_memory()?;
+            self.sh.memory.commit(&format!("memory: forget {id}"))?;
+            self.audit(audit_actions::MEMORY_EDIT, id, Some("forget".into()))?;
+        }
+        Ok(removed)
+    }
+
+    /// `/memory`: what is injected and at what budget.
+    pub fn memory_report(&self) -> Result<ka_agent_memory::CompileReport, Error> {
+        Ok(self
+            .sh
+            .memory
+            .compile(ka_agent_memory::DEFAULT_BUDGET_BYTES)?)
+    }
+
+    /// Register a memory candidate for review (SEED.md §4.4 path 2; the
+    /// model-side producer arrives with the connector bridge).
+    pub fn propose_memory(
+        &self,
+        source: &str,
+        text: &str,
+        provenance: Option<&str>,
+    ) -> Result<ka_agent_core::MemoryId, Error> {
+        let id = ka_agent_core::MemoryId::generate();
+        self.sh.store.add_candidate(&id, source, text, provenance)?;
+        Ok(id)
+    }
+
+    /// `/memory review`: pending candidates.
+    pub fn pending_candidates(&self) -> Result<Vec<ka_agent_store::CandidateRow>, Error> {
+        Ok(self.sh.store.pending_candidates_full()?)
+    }
+
+    /// `/memory accept <id>`: candidate → stable memory.
+    pub fn accept_candidate(&self, id: &str) -> Result<bool, Error> {
+        let Some(row) = self
+            .sh
+            .store
+            .pending_candidates_full()?
+            .into_iter()
+            .find(|c| c.id.as_str() == id)
+        else {
+            return Ok(false);
+        };
+        let mem_id = self.sh.memory.add(
+            ka_agent_memory::MemoryFile::Facts,
+            &row.text,
+            &row.source,
+            None,
+        )?;
+        self.refresh_compiled_memory()?;
+        self.sh
+            .memory
+            .commit(&format!("memory: accept {mem_id} (candidate)"))?;
+        self.sh.store.set_candidate_status(&row.id, "accepted")?;
+        self.audit(
+            audit_actions::MEMORY_ACCEPT,
+            &mem_id,
+            Some(row.text.chars().take(80).collect()),
+        )?;
+        Ok(true)
+    }
+
+    /// `/memory reject <id>`.
+    pub fn reject_candidate(&self, id: &str) -> Result<bool, Error> {
+        let pending = self.sh.store.pending_candidates()?;
+        if !pending.iter().any(|c| c.as_str() == id) {
+            return Ok(false);
+        }
+        self.sh
+            .store
+            .set_candidate_status(&ka_agent_core::MemoryId(id.to_string()), "rejected")?;
+        self.audit(
+            audit_actions::MEMORY_EDIT,
+            id,
+            Some("candidate rejected".into()),
+        )?;
+        Ok(true)
+    }
+
+    /// `/history <query>`: FTS over episodes (SEED.md §4.5).
+    pub fn history_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ka_agent_store::EpisodeHit>, Error> {
+        Ok(self.sh.store.search_episodes(query, limit)?)
+    }
+
+    /// `/history show <turn>`: the stored exchange.
+    pub fn history_show(&self, turn_id: &str) -> Result<Option<(String, String)>, Error> {
+        let Some(turn) = self
+            .sh
+            .store
+            .get_turn(&ka_agent_core::TurnId(turn_id.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let answer = self
+            .sh
+            .store
+            .chunks_for_turn(&turn.id)?
+            .into_iter()
+            .map(|c| c.text)
+            .collect::<Vec<_>>()
+            .join("");
+        Ok(Some((turn.inbound_text, answer)))
+    }
+
+    fn refresh_compiled_memory(&self) -> Result<(), Error> {
+        self.sh.memory.install_compiled(
+            &self.sh.paths.engine_home().join(".config/ka"),
+            ka_agent_memory::DEFAULT_BUDGET_BYTES,
+        )?;
+        Ok(())
     }
 
     /// `/stop`: abort; escalate to SIGKILL after the configured grace
@@ -811,7 +963,19 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                         sh.store.mark_sent(&oc.turn, oc.chunk_index, i as i64).ok();
                     }
                 }
-                let _ = sid;
+                // Episodic index (SEED.md §4.5): one user and one assistant
+                // row per prompt cycle, at the delivery boundary.
+                if let Some(tid) = &turn_id {
+                    let inbound = sh
+                        .store
+                        .get_turn(tid)
+                        .ok()
+                        .flatten()
+                        .map(|t| t.inbound_text)
+                        .unwrap_or_default();
+                    sh.store.index_episode(&sid, tid, "user", &inbound).ok();
+                    sh.store.index_episode(&sid, tid, "assistant", &text).ok();
+                }
                 let drained = drain_queue(&sh).await;
                 if !drained {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());

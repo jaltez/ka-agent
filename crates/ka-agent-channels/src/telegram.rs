@@ -697,8 +697,145 @@ impl TelegramChannel {
                 match word {
                     "/start" | "/help" => {
                         let _ = client
-                            .send_message(chat_id, "commands: /help /status /new /stop", None)
+                            .send_message(
+                                chat_id,
+                                "commands: /help /status /new /stop\n\
+                                 /remember <fact> · /forget <id> · /memory [review|accept <id>|reject <id>]\n\
+                                 /history <query> · /history show <turn>",
+                                None,
+                            )
                             .await;
+                    }
+                    "/remember" => {
+                        let fact = text.split_once(' ').map(|(_, f)| f.trim()).unwrap_or("");
+                        if fact.is_empty() {
+                            let _ = client
+                                .send_message(chat_id, "usage: /remember <fact>", None)
+                                .await;
+                        } else {
+                            match self.runtime.remember(fact, &format!("telegram:{uid}")) {
+                                Ok(id) => {
+                                    let _ = client
+                                        .send_message(chat_id, &format!("remembered {id}"), None)
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = client
+                                        .send_message(chat_id, &format!("! [memory] {e}"), None)
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    "/forget" => {
+                        let Some((_, id)) = text.split_once(' ') else {
+                            let _ = client
+                                .send_message(chat_id, "usage: /forget <mem_id>", None)
+                                .await;
+                            return;
+                        };
+                        match self.runtime.forget(id.trim()) {
+                            Ok(true) => {
+                                let _ = client.send_message(chat_id, "forgotten", None).await;
+                            }
+                            Ok(false) => {
+                                let _ = client
+                                    .send_message(chat_id, "no such memory id", None)
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = client
+                                    .send_message(chat_id, &format!("! [memory] {e}"), None)
+                                    .await;
+                            }
+                        }
+                    }
+                    "/memory" => {
+                        let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                        let reply = match rest {
+                            "" => match self.runtime.memory_report() {
+                                Ok(report) => {
+                                    let files: Vec<String> = report
+                                        .files
+                                        .iter()
+                                        .map(|f| format!("{} {}B", f.name, f.bytes))
+                                        .collect();
+                                    format!(
+                                        "memory: {}B/{}B{}\n{}",
+                                        report.total_bytes,
+                                        report.budget_bytes,
+                                        if report.truncated { " (truncated)" } else { "" },
+                                        if files.is_empty() {
+                                            "(empty)".to_string()
+                                        } else {
+                                            files.join("\n")
+                                        }
+                                    )
+                                }
+                                Err(e) => format!("! [memory] {e}"),
+                            },
+                            "review" => match self.runtime.pending_candidates() {
+                                Ok(rows) if rows.is_empty() => "no pending candidates".to_string(),
+                                Ok(rows) => rows
+                                    .into_iter()
+                                    .map(|c| {
+                                        format!(
+                                            "{} ({}): {}",
+                                            short_id(c.id.as_str(), 10),
+                                            c.source,
+                                            c.text
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                Err(e) => format!("! [memory] {e}"),
+                            },
+                            other => {
+                                let (verb, id) = other.split_once(' ').unwrap_or((other, ""));
+                                match verb {
+                                    "accept" => match self.runtime.accept_candidate(id.trim()) {
+                                        Ok(true) => "accepted into stable memory".to_string(),
+                                        Ok(false) => "no such pending candidate".to_string(),
+                                        Err(e) => format!("! [memory] {e}"),
+                                    },
+                                    "reject" => match self.runtime.reject_candidate(id.trim()) {
+                                        Ok(true) => "rejected".to_string(),
+                                        Ok(false) => "no such pending candidate".to_string(),
+                                        Err(e) => format!("! [memory] {e}"),
+                                    },
+                                    _ => "usage: /memory [review|accept <id>|reject <id>]"
+                                        .to_string(),
+                                }
+                            }
+                        };
+                        let _ = client.send_message(chat_id, &reply, None).await;
+                    }
+                    "/history" => {
+                        let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                        let reply = if let Some(query) = rest.strip_prefix("show ") {
+                            match self.runtime.history_show(query.trim()) {
+                                Ok(Some((inbound, answer))) => {
+                                    format!("> {inbound}\n{answer}")
+                                }
+                                Ok(None) => "no such turn".to_string(),
+                                Err(e) => format!("! [history] {e}"),
+                            }
+                        } else if rest.is_empty() {
+                            "usage: /history <query> · /history show <turn_id>".to_string()
+                        } else {
+                            match self.runtime.history_search(rest, 5) {
+                                Ok(hits) if hits.is_empty() => {
+                                    format!("no history matches {rest:?}")
+                                }
+                                Ok(hits) => hits
+                                    .into_iter()
+                                    .map(|h| format!("[{}] {}", short_id(&h.turn, 8), h.snippet))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                Err(e) => format!("! [history] {e}"),
+                            }
+                        };
+                        let _ = client.send_message(chat_id, &reply, None).await;
                     }
                     "/status" => {
                         let (status, strand, usd, tokens, crashes) = self.runtime.status();

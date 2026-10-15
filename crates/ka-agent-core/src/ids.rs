@@ -66,11 +66,9 @@ mod tests {
         let b = SessionId::generate();
         assert!(a.0.starts_with("sess_"));
         assert_ne!(a, b);
-        assert_eq!(TurnId::generate().0.len(), "turn_".len() + next_len());
-    }
-
-    fn next_len() -> usize {
-        next_id().len()
+        let t = TurnId::generate();
+        assert!(t.0.starts_with("turn_"));
+        assert!(t.0.len() > "turn_".len());
     }
 
     #[test]

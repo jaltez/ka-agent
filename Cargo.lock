@@ -820,6 +820,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ka-agent-memory"
+version = "0.1.0"
+dependencies = [
+ "ka-agent-core",
+ "thiserror",
+]
+
+[[package]]
 name = "ka-agent-port"
 version = "0.1.0"
 dependencies = [
@@ -840,6 +848,7 @@ name = "ka-agent-runtime"
 version = "0.1.0"
 dependencies = [
  "ka-agent-core",
+ "ka-agent-memory",
  "ka-agent-port",
  "ka-agent-store",
  "serde",

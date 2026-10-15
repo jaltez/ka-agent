@@ -87,6 +87,16 @@ pub struct EpisodeHit {
     pub snippet: String,
 }
 
+/// One pending memory candidate (`/memory review`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateRow {
+    pub id: MemoryId,
+    pub source: String,
+    pub text: String,
+    pub provenance: Option<String>,
+    pub created_ms: i64,
+}
+
 /// The SQLite-backed store. Not `Clone`; share via `Arc<Store>`.
 pub struct Store {
     conn: Mutex<Connection>,
@@ -550,6 +560,28 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Every chunk for a turn (any status), in order — history rendering.
+    pub fn chunks_for_turn(&self, turn: &TurnId) -> Result<Vec<OutboxChunk>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT turn, chunk_index, text, status, channel_message_id, created_ms
+             FROM outbox WHERE turn = ?1
+             ORDER BY chunk_index",
+        )?;
+        let rows = stmt.query_map(params![turn.as_str()], |r| {
+            Ok(OutboxChunk {
+                turn: TurnId(r.get::<_, String>(0)?),
+                chunk_index: r.get::<_, i64>(1)? as u32,
+                text: r.get(2)?,
+                status: parse_outbox_status(&r.get::<_, String>(3)?)
+                    .unwrap_or(OutboxStatus::Failed),
+                channel_message_id: r.get(4)?,
+                created_ms: r.get(5)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Mark a chunk delivered with its channel message id.
     pub fn mark_sent(
         &self,
@@ -818,6 +850,25 @@ impl Store {
             "SELECT id FROM memory_candidates WHERE status = 'pending' ORDER BY created_ms",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0).map(MemoryId))?;
+        collect_rows(rows)
+    }
+
+    /// Pending candidates with full text, for `/memory review`.
+    pub fn pending_candidates_full(&self) -> Result<Vec<CandidateRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, text, provenance, created_ms
+             FROM memory_candidates WHERE status = 'pending' ORDER BY created_ms",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CandidateRow {
+                id: MemoryId(r.get::<_, String>(0)?),
+                source: r.get(1)?,
+                text: r.get(2)?,
+                provenance: r.get(3)?,
+                created_ms: r.get(4)?,
+            })
+        })?;
         collect_rows(rows)
     }
 

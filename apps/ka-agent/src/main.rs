@@ -244,8 +244,95 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
                      /new — fresh session (drops the live worker)\n\
                      /stop — abort the running turn (grace, then kill)\n\
                      /y /n — approve / deny the pending approval\n\
+                     /remember <fact> · /forget <id> · /memory [review|accept <id>|reject <id>]\n\
+                     /history <query> · /history show <turn_id>\n\
                      /quit — exit"
                 );
+            }
+            cmd if cmd.starts_with("/remember") => {
+                let fact = cmd.split_once(' ').map(|(_, f)| f.trim()).unwrap_or("");
+                if fact.is_empty() {
+                    println!("usage: /remember <fact>");
+                } else {
+                    match runtime.remember(fact, "console") {
+                        Ok(id) => println!("· remembered {id}"),
+                        Err(e) => println!("! {e}"),
+                    }
+                }
+            }
+            cmd if cmd.starts_with("/forget") => match cmd.split_once(' ') {
+                Some((_, id)) => match runtime.forget(id.trim()) {
+                    Ok(true) => println!("· forgotten"),
+                    Ok(false) => println!("· no such memory id"),
+                    Err(e) => println!("! {e}"),
+                },
+                None => println!("usage: /forget <mem_id>"),
+            },
+            cmd if cmd.starts_with("/memory") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                match rest {
+                    "" => match runtime.memory_report() {
+                        Ok(report) => {
+                            println!(
+                                "· memory {}/{} bytes{}",
+                                report.total_bytes,
+                                report.budget_bytes,
+                                if report.truncated { " (truncated)" } else { "" }
+                            );
+                            for f in &report.files {
+                                println!("  {} {}B", f.name, f.bytes);
+                            }
+                        }
+                        Err(e) => println!("! {e}"),
+                    },
+                    "review" => match runtime.pending_candidates() {
+                        Ok(rows) if rows.is_empty() => println!("· no pending candidates"),
+                        Ok(rows) => {
+                            for c in rows {
+                                println!("· {} ({}): {}", c.id, c.source, c.text);
+                            }
+                        }
+                        Err(e) => println!("! {e}"),
+                    },
+                    other => {
+                        let (verb, id) = other.split_once(' ').unwrap_or((other, ""));
+                        match verb {
+                            "accept" => match runtime.accept_candidate(id.trim()) {
+                                Ok(true) => println!("· accepted into stable memory"),
+                                Ok(false) => println!("· no such pending candidate"),
+                                Err(e) => println!("! {e}"),
+                            },
+                            "reject" => match runtime.reject_candidate(id.trim()) {
+                                Ok(true) => println!("· rejected"),
+                                Ok(false) => println!("· no such pending candidate"),
+                                Err(e) => println!("! {e}"),
+                            },
+                            _ => println!("usage: /memory [review|accept <id>|reject <id>]"),
+                        }
+                    }
+                }
+            }
+            cmd if cmd.starts_with("/history") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                if let Some(query) = rest.strip_prefix("show ") {
+                    match runtime.history_show(query.trim()) {
+                        Ok(Some((inbound, answer))) => println!("> {inbound}\n{answer}"),
+                        Ok(None) => println!("· no such turn"),
+                        Err(e) => println!("! {e}"),
+                    }
+                } else if rest.is_empty() {
+                    println!("usage: /history <query> · /history show <turn_id>");
+                } else {
+                    match runtime.history_search(rest, 5) {
+                        Ok(hits) if hits.is_empty() => println!("· no history matches"),
+                        Ok(hits) => {
+                            for h in hits {
+                                println!("[{}] {}", h.turn, h.snippet);
+                            }
+                        }
+                        Err(e) => println!("! {e}"),
+                    }
+                }
             }
             "/status" => {
                 let (status, strand, usd, tokens, crashes) = runtime.status();

@@ -6,9 +6,8 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M2 complete and verified.** Working today (`cargo test
---workspace`: 87 tests green; the Telegram flow runs end to end against a
-fake Bot API with the scripted engine):
+**Status: M3 complete and verified.** Working today (`cargo test
+--workspace`: 95 tests green; Telegram + memory + history run end to end):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -19,6 +18,12 @@ fake Bot API with the scripted engine):
 - **`ka-agent-runtime`** — session manager, durable queue, single-flight
   submission, approvals with deny-on-expiry, budgets, worker supervisor with
   backoff and a crash-loop breaker.
+- **`ka-agent-memory`** — stable memory: Markdown files with provenance
+  (`id`/`source`/`accepted` HTML comments), git-backed (every accepted
+  change is a commit), compiled into the engine's `MEMORY.md` with a 6 KB
+  budget (ka re-reads it per prompt, so updates need no worker restart).
+  Candidate review (`/memory review` + `accept`/`reject`), `/remember`,
+  `/forget`, `/memory` report.
 - **`ka-agent-channels`** — Telegram Bot API channel: long polling with a
   persisted offset (at-least-once, deduped), numeric-id allowlist for
   private chats, local command routing (`/help /status /new /stop`),
@@ -31,10 +36,12 @@ fake Bot API with the scripted engine):
   surface), `ka-agent doctor`, and the hidden `ka-agent __worker` the
   runtime supervises.
 
-Memory (compiled `MEMORY.md`, candidates review), `/history` search,
-plugins/connectors and the scheduler come in the next milestones
-(see `SEED.md` §10). Real Telegram use: set `[telegram]` in the config,
-store the bot token (`KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN` or
+Plugins/connectors (MCP bridge), the scheduler and episode summaries come
+in the next milestones (see `SEED.md` §10). Memory and history are live:
+`/remember <fact>`, `/memory`, `/forget <id>`, `/history <query>`,
+`/history show <turn_id>` — on both the console and Telegram. Real Telegram
+use: set `[telegram]` in the config, store the bot token
+(`KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN` or
 `<data>/secrets/telegram.bot_token`), allow your numeric user id, then
 `ka-agent run`.
 
