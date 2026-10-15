@@ -19,8 +19,8 @@ jobs:
       # repository before building; cargo fetches it normally (no --offline).
       - name: Point the ka pin at the public repository
         run: |
-          sed -i 's|git = "file:///home/javier/projects/ka-harness"|git = "https://github.com/jaltez/ka-harness"|g' Cargo.toml
-          grep -q 'https://github.com/jaltez/ka-harness' Cargo.toml
+          sed -i 's|git = "file:///home/javier/projects/ka-harness"|git = "https://github.com/jaltez/ka-harness"|g' Cargo.toml crates/*/Cargo.toml apps/*/Cargo.toml
+          ! grep -rn 'file:///home/javier' Cargo.toml crates/*/Cargo.toml apps/*/Cargo.toml
 
       - name: Format
         run: cargo fmt --all -- --check

@@ -827,8 +827,8 @@ dependencies = [
  "ka-agent-port",
  "ka-dialect",
  "ka-engine",
- "ka-protocol 0.3.0 (git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
- "ka-strand 0.3.0 (git+file:///home/javier/projects/ka?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
+ "ka-protocol",
+ "ka-strand",
  "serde",
  "serde_json",
  "thiserror",
@@ -867,7 +867,7 @@ version = "0.3.0"
 source = "git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0#a56aae2d1b3a4c31c4910979e1033002eacc53a0"
 dependencies = [
  "futures-util",
- "ka-protocol 0.3.0 (git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
+ "ka-protocol",
  "keyring",
  "reqwest",
  "serde",
@@ -883,9 +883,9 @@ source = "git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c49109
 dependencies = [
  "ignore",
  "ka-dialect",
- "ka-protocol 0.3.0 (git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
+ "ka-protocol",
  "ka-sandbox",
- "ka-strand 0.3.0 (git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
+ "ka-strand",
  "parking_lot",
  "regex",
  "reqwest",
@@ -894,16 +894,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
-]
-
-[[package]]
-name = "ka-protocol"
-version = "0.3.0"
-source = "git+file:///home/javier/projects/ka?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0#a56aae2d1b3a4c31c4910979e1033002eacc53a0"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -929,19 +919,9 @@ dependencies = [
 [[package]]
 name = "ka-strand"
 version = "0.3.0"
-source = "git+file:///home/javier/projects/ka?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0#a56aae2d1b3a4c31c4910979e1033002eacc53a0"
-dependencies = [
- "ka-protocol 0.3.0 (git+file:///home/javier/projects/ka?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ka-strand"
-version = "0.3.0"
 source = "git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0#a56aae2d1b3a4c31c4910979e1033002eacc53a0"
 dependencies = [
- "ka-protocol 0.3.0 (git+file:///home/javier/projects/ka-harness?rev=a56aae2d1b3a4c31c4910979e1033002eacc53a0)",
+ "ka-protocol",
  "serde",
  "serde_json",
 ]
