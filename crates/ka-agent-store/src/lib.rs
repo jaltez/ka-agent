@@ -830,6 +830,32 @@ impl Store {
         Ok(count)
     }
 
+    /// The most recent audit records, newest first (web audit view).
+    pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, at_ms, actor, action, subject, detail, prev_hash, hash
+             FROM audit ORDER BY seq DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(AuditRecord {
+                seq: r.get(0)?,
+                at_ms: r.get(1)?,
+                actor: r.get(2)?,
+                action: r.get(3)?,
+                subject: r.get(4)?,
+                detail: r.get(5)?,
+                prev_hash: r.get(6)?,
+                hash: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------
     // memory candidates
     // ------------------------------------------------------------------

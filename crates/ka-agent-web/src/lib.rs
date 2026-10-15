@@ -402,6 +402,14 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
     }
 }
 
+/// Local wall-clock `HH:MM` for a millisecond timestamp (dependency-free:
+/// minutes resolution is enough for an audit row).
+pub fn fmt_ms(ms: i64) -> String {
+    let mins = ms.div_euclid(60_000);
+    let (h, m) = (mins.div_euclid(60) % 24, mins % 60);
+    format!("{h:02}:{m:02}")
+}
+
 /// Escape user-derived text for safe HTML rendering.
 pub fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")

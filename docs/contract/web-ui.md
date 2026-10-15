@@ -38,7 +38,7 @@ daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 | POST | `/memory/edit` | accepts an entry (`text=`) → `303` back to `/memory` |
 | GET | `/approvals` | pending asks with allow/deny forms |
 | POST | `/approvals/decide` | `id=` + `decision=y\|n` → `302 /approvals` |
-| GET | `/audit` | the last 20 MCP intents and their status |
+| GET | `/audit` | the last 50 audit-chain records (seq, time, actor, action, subject) |
 | GET | `/intents` | the last 20 MCP intents and their status |
 
 Anything else is `404` — including `GET` on a mutation path, so no page can

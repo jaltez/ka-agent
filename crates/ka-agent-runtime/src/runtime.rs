@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use ka_agent_core::audit::actions as audit_actions;
 use ka_agent_core::{
-    Approval, ApprovalDecision, ApprovalId, ApprovalKind, AuditRecord, BudgetState, BudgetVerdict,
-    ConfigError, DaemonConfig, OutboxChunk, QueueItem, Session, SessionId, SessionStatus, Turn,
-    TurnId, TurnStatus,
+    Approval, ApprovalDecision, ApprovalId, ApprovalKind, ApprovalStatus, AuditRecord, BudgetState,
+    BudgetVerdict, ConfigError, DaemonConfig, OutboxChunk, QueueItem, Session, SessionId,
+    SessionStatus, Turn, TurnId, TurnStatus,
 };
 use ka_agent_port::{
     KaPort, OpenRequest, PortError, PortEvent, PortSession, StrandSelector, WorkerEnv, WorkerPort,
@@ -304,6 +304,12 @@ impl Runtime {
                 }
             }
         };
+        if submit_now {
+            // Persist immediately: the store is the durable source of truth
+            // for recovery, and a row left at `idle` makes every later status
+            // write look like an illegal transition.
+            self.persist_session_status(SessionStatus::Running);
+        }
         if !submit_now {
             match self.status().0 {
                 SessionStatus::Running
@@ -921,24 +927,60 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     sh.surface
                         .on_error("internal", &format!("approval persist: {e}"));
                 }
-                {
+                // An ask is only actionable while its turn is live. The engine
+                // can raise one after it already reported `idle` (the scripted
+                // speaker finishes its response before the permission gate, and
+                // a real engine can lose the same race), and no surface can
+                // settle an ask for a turn that is over. Deny it (fail closed)
+                // so the engine is never left blocked on its gate.
+                let (awaiting, live_port, status) = {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     let from = g.session.status;
-                    g.session
+                    let awaiting = g
+                        .session
                         .transition(SessionStatus::AwaitingApproval)
                         .map_err(|t| illegal_session(from, t))
-                        .ok();
-                    if let Some(live) = g.live.as_mut() {
-                        live.pending_asks
-                            .insert(approval.id.clone(), ask_id.clone());
+                        .is_ok();
+                    if awaiting {
+                        if let Some(live) = g.live.as_mut() {
+                            live.pending_asks
+                                .insert(approval.id.clone(), ask_id.clone());
+                        }
                     }
+                    let port = g.live.as_ref().map(|l| Arc::clone(&l.port));
                     let status = g.session.status;
                     drop(g);
+                    (awaiting, port, status)
+                };
+                if awaiting {
                     rt_persist_status(&sh, status);
+                    if let Some(card) = card {
+                        sh.surface.on_approval(&card);
+                    }
+                    continue;
                 }
-                if let Some(card) = card {
-                    sh.surface.on_approval(&card);
+                if let Some(port) = live_port {
+                    let _ = port
+                        .answer(ask_id.clone(), ApprovalDecision::Deny.ka_choice())
+                        .await;
                 }
+                if let Err(e) = sh.store.decide_approval(
+                    &approval.id,
+                    ApprovalStatus::Denied,
+                    ka_agent_core::now_ms(),
+                ) {
+                    sh.surface
+                        .on_error("internal", &format!("ask deny persist: {e}"));
+                }
+                let mut rec = AuditRecord::new(
+                    "runtime",
+                    audit_actions::APPROVAL_DECIDE,
+                    approval.id.as_str(),
+                    Some("deny: the turn this ask belongs to already finished".into()),
+                );
+                let _ = sh.store.append_audit(&mut rec);
+                sh.surface
+                    .on_note("ask auto-denied: its turn already finished (nothing to approve)");
             }
             PortEvent::TurnFinished {
                 stop,
@@ -1042,8 +1084,35 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     sh.store.index_episode(&sid, tid, "user", &inbound).ok();
                     sh.store.index_episode(&sid, tid, "assistant", &text).ok();
                 }
-                let drained = drain_queue(&sh).await;
-                if !drained {
+                // `idle` is a delivery boundary, not the end of the turn. ka
+                // reports it for the cycle — including while a submitted turn
+                // is still open (engine start-up, a permission gate about to
+                // open) — and acting on it as if the turn were over orphans
+                // the turn: later messages would be submitted on top of it
+                // instead of queuing, an ask would arrive for a session that
+                // no longer looks busy, and draining the queue here would
+                // hand ka a prompt it drops (`PortError::Busy`, gap G4). The
+                // turn's own record decides.
+                let turn_open = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.live
+                        .as_ref()
+                        .and_then(|l| l.current_turn.clone())
+                        .and_then(|tid| sh.store.get_turn(&tid).ok().flatten())
+                        .is_some_and(|t| !t.status.is_terminal())
+                };
+                // A pending ask owns the boundary too: the engine is blocked
+                // until its decision or TTL arrives.
+                let ask_pending = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.live.as_ref().is_some_and(|l| !l.pending_asks.is_empty())
+                };
+                let drained = if ask_pending || turn_open {
+                    false
+                } else {
+                    drain_queue(&sh).await
+                };
+                if !drained && !ask_pending && !turn_open {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if g.session.status != SessionStatus::Idle {
                         let from = g.session.status;

@@ -242,24 +242,28 @@ pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response 
 }
 
 pub fn audit(store: &Store) -> crate::Response {
-    let intents = store.recent_intents(20).unwrap_or_default();
-    let rows: Vec<String> = intents
+    let records = store.recent_audit(50).unwrap_or_default();
+    if records.is_empty() {
+        return Response::html(html_page("Audit", "<p>no audit records</p>".into()));
+    }
+    let rows: Vec<String> = records
         .iter()
-        .map(|i| {
+        .map(|r| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{:?}</td><td>{}</td></tr>",
-                escape_html(&i.id),
-                escape_html(&i.tool),
-                i.status,
-                escape_html(i.summary.as_deref().unwrap_or(""))
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                r.seq,
+                crate::fmt_ms(r.at_ms),
+                escape_html(&r.actor),
+                escape_html(&r.action),
+                escape_html(&r.subject)
             )
         })
         .collect();
     let body = format!(
-        "<table><tr><th>id</th><th>tool</th><th>status</th><th>summary</th></tr>{}</table>",
+        "<table><tr><th>seq</th><th>at</th><th>actor</th><th>action</th><th>subject</th></tr>{}</table>",
         rows.join("")
     );
-    Response::html(html_page("Intents", body))
+    Response::html(html_page("Audit", body))
 }
 
 pub fn intents(store: &Store) -> crate::Response {

@@ -74,6 +74,39 @@ impl Chat {
         stdin.flush().unwrap();
     }
 
+    /// Everything the surface has printed so far (for failure messages).
+    fn transcript(&self) -> String {
+        self.seen.borrow().clone()
+    }
+
+    /// Wait until the output so far contains any of `needles`; returns the
+    /// one that matched. Used where the engine can legitimately take either
+    /// path (a live ask vs. an ask that arrives after the cycle reported
+    /// idle), so the test asserts each path instead of racing.
+    fn expect_any(&mut self, needles: &[&'static str], timeout: Duration) -> &'static str {
+        let deadline = Instant::now() + timeout;
+        loop {
+            while let Ok(line) = self.rx.try_recv() {
+                self.seen.borrow_mut().push_str(&line);
+                self.seen.borrow_mut().push('\n');
+            }
+            let hit = {
+                let seen = self.seen.borrow();
+                needles.iter().find(|n| seen.contains(**n)).copied()
+            };
+            if let Some(n) = hit {
+                return n;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for any of {needles:?}; output so far:\n{}",
+                    self.seen.borrow()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait until the whole output so far contains `needle`.
     fn expect(&mut self, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
@@ -141,14 +174,88 @@ fn approval_flow_and_queue() {
     );
     let mut chat = spawn_chat(&root, &sc);
     chat.send("please run the thing");
-    chat.expect("approve:", Duration::from_secs(60));
-    // While the approval is pending, a second message must queue (gap G4).
-    chat.send("and then summarize");
-    chat.expect("queued (#1)", Duration::from_secs(30));
-    chat.send("/y");
-    chat.expect("done anyway", Duration::from_secs(60));
-    // The queued message runs next and gets its own scripted answer.
-    chat.expect("turn done", Duration::from_secs(60));
+    // The ask surfaces as a card while its turn is live. ka can also report
+    // the cycle idle before its permission gate opens (the scripted speaker
+    // finishes its response first), and then the runtime denies the ask
+    // fail-closed rather than leave an approval no surface can settle.
+    // Assert whichever happened: both are contract-correct.
+    match chat.expect_any(&["approve:", "ask auto-denied"], Duration::from_secs(60)) {
+        "approve:" => {
+            // While the approval is pending, a second message must queue (gap G4).
+            chat.send("and then summarize");
+            chat.expect("queued (#1)", Duration::from_secs(30));
+            chat.send("/y");
+            chat.expect("done anyway", Duration::from_secs(60));
+            // The queued message runs next and gets its own scripted answer.
+            chat.expect("turn done", Duration::from_secs(60));
+        }
+        _ => {
+            chat.expect("already finished", Duration::from_secs(10));
+        }
+    }
     let _ = std::fs::remove_file("/tmp/ka-agent-e2e-should-not-exist");
     chat.send("/quit");
+}
+
+#[test]
+fn message_queues_while_a_turn_is_running() {
+    let root = temp_root("queue-busy");
+    // A slow response keeps the turn in flight long enough to observe it, so
+    // the queue path (gap G4) is exercised without racing the idle signal.
+    let sc = scenario_file(
+        &root,
+        "slow.json",
+        r#"{
+            "steps": [
+                {"text": "thinking"},
+                {"sleep_ms": 8000},
+                {"text": "finished"}
+            ],
+            "stop": "done", "cost_usd": 0.0, "tokens": 5
+        }"#,
+    );
+    let data = root.join("data");
+    let mut chat = spawn_chat(&root, &sc);
+    chat.send("first");
+    // Wait for the durable state instead of guessing at wall-clock: the
+    // session is persisted `running` the moment the turn is accepted.
+    if !wait_session_running(&data, Duration::from_secs(20)) {
+        panic!(
+            "session never reached `running`; output so far:\n{}",
+            chat.transcript()
+        );
+    }
+    chat.send("second");
+    // The invariant is the queue, not the turn's ending: assert it while the
+    // turn is still running and quit (the pending sleep is abandoned).
+    chat.expect("queued (#1)", Duration::from_secs(20));
+    chat.send("/quit");
+}
+
+/// True once the instance's session is persisted as `running`. Polls with a
+/// fresh read-only connection: the instance owns the database, and a
+/// read-write handle from the test would block its start-up.
+fn wait_session_running(data: &std::path::Path, timeout: Duration) -> bool {
+    use rusqlite::OpenFlags;
+    let path = data.join("state.db");
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let running =
+            rusqlite::Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT status FROM sessions ORDER BY updated_ms DESC LIMIT 1",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                })
+                .is_some_and(|status| status == "running");
+        if running {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }

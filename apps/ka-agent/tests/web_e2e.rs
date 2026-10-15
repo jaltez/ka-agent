@@ -270,7 +270,7 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
         ("/memory", "Memory"),
         ("/history", "History"),
         ("/approvals", "Approvals"),
-        ("/audit", "Intents"),
+        ("/audit", "Audit"),
         ("/intents", "Intents"),
         ("/history?q=anything", "History"),
     ] {

@@ -7,7 +7,7 @@ reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
 **Status: M7 complete and verified.** Working today (`cargo test
---workspace`: 110 tests green; Telegram + memory + history + MCP bridge +
+--workspace`: 111 tests green; Telegram + memory + history + MCP bridge +
 scheduler + loopback web UI):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,

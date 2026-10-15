@@ -100,6 +100,13 @@ V-06b — HTTP 200, no events for the dropped prompt). Ka Agent therefore:
   is valid *because* of the single-writer rule (a cycle may contain several
   `turn_started…turn_finished` pairs: auto-poke, verify, queued input —
   `idle` is the delivery boundary, `crates/ka-protocol/src/lib.rs:681-683`).
+- does **not** end the turn on an `idle` that arrives while the turn is still
+  open (`submitted`/`running` in the store) or while an ask is pending. Ka
+  reports `idle` for the cycle during worker start-up and around its
+  permission gate, and ending the turn there makes the next message overtake
+  the running one (nothing queues behind it) and orphans the ask. The turn's
+  own terminal status ends the turn; the ask's decision or TTL resolves the
+  ask.
 
 `submit` while a cycle is live is a caller bug: the port returns
 `PortError::Busy` and never sends the command.
@@ -113,7 +120,12 @@ G3; `crates/ka-engine/src/voice.rs:2786-2823`). Ka Agent therefore owns expiry:
   default 900 s);
 - if the TTL lapses with no operator decision, Ka Agent answers **`deny`**
   (fail closed) and records the expiry in the audit log;
-- `abort` while awaiting an ask is allowed and cancels the cycle.
+- `abort` while awaiting an ask is allowed and cancels the cycle;
+- an `ask` that arrives when no turn is open (the engine reported `idle`
+  before its gate, or the turn already finished) is answered **`deny`**
+  immediately and recorded as a settled approval: no surface could act on it,
+  and leaving it pending would block the engine on its permission gate
+  forever.
 
 ## 6. Resume and mandatory re-assertion
 

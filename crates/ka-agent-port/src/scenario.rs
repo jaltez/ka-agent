@@ -8,6 +8,7 @@
 //!   "steps": [
 //!     {"text": "hi"},
 //!     {"thought": "hmm"},
+//!     {"sleep_ms": 800},
 //!     {"call": {"tool": "bash", "args": {"command": "touch x"}}},
 //!     {"fail": {"class": "auth", "retryable": false, "message": "bad key"}}
 //!   ],
@@ -24,8 +25,9 @@
 //! retryable failure can be followed by a scripted recovery). The engine
 //! loops requests within one turn (tool results feed back in), so a
 //! `call` step's result — allow or deny — is observed by the request
-//! that follows it. `tokens` count as input tokens; the engine
-//! recomputes cost from the catalog row.
+//! that follows it. A `sleep_ms` step pauses before the next step, which
+//! is how a slow (still running) turn is scripted. `tokens` count as
+//! input tokens; the engine recomputes cost from the catalog row.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -77,6 +79,13 @@ pub enum Step {
         tool: String,
         /// Parsed tool arguments.
         arguments: serde_json::Value,
+    },
+    /// Pause before the next step. Models take time; a slow turn is what
+    /// makes "a message that arrives mid-turn queues" testable without
+    /// racing the engine's idle signal.
+    Sleep {
+        /// Milliseconds to wait before the next step is emitted.
+        ms: u64,
     },
     /// Terminal wire failure.
     Fail {
@@ -138,6 +147,7 @@ impl Scenario {
         enum StepSpec {
             Text { text: String },
             Thought { thought: String },
+            Sleep { sleep_ms: u64 },
             Call { call: CallSpec },
             Fail { fail: FailSpec },
         }
@@ -154,6 +164,7 @@ impl Scenario {
             let step = match spec {
                 StepSpec::Text { text } => Step::Text(text),
                 StepSpec::Thought { thought } => Step::Thought(thought),
+                StepSpec::Sleep { sleep_ms } => Step::Sleep { ms: sleep_ms },
                 StepSpec::Call { call } => {
                     if !call.args.is_object() {
                         return Err(format!(
@@ -230,6 +241,10 @@ impl Speaker for ScenarioSpeaker {
                 let event = match next {
                     Some(Step::Text(text)) => StreamEvent::Text(text),
                     Some(Step::Thought(text)) => StreamEvent::Thought(text),
+                    Some(Step::Sleep { ms }) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        continue;
+                    }
                     Some(Step::Call { tool, arguments }) => {
                         let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
                         StreamEvent::Call(ToolCall {
@@ -298,6 +313,7 @@ mod tests {
                 "steps": [
                     {"text": "hi"},
                     {"thought": "hmm"},
+                    {"sleep_ms": 250},
                     {"call": {"tool": "bash", "args": {"command": "touch x"}}},
                     {"fail": {"class": "auth", "retryable": false, "message": "bad key"}}
                 ],
@@ -312,6 +328,7 @@ mod tests {
             &[
                 Step::Text("hi".into()),
                 Step::Thought("hmm".into()),
+                Step::Sleep { ms: 250 },
                 Step::Call {
                     tool: "bash".into(),
                     arguments: serde_json::json!({"command": "touch x"}),
