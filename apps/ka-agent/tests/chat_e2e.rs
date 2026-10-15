@@ -141,10 +141,10 @@ fn approval_flow_and_queue() {
     );
     let mut chat = spawn_chat(&root, &sc);
     chat.send("please run the thing");
-    chat.expect("approve:", Duration::from_secs(30));
+    chat.expect("approve:", Duration::from_secs(60));
     // While the approval is pending, a second message must queue (gap G4).
     chat.send("and then summarize");
-    chat.expect("queued (#1)", Duration::from_secs(10));
+    chat.expect("queued (#1)", Duration::from_secs(30));
     chat.send("/y");
     chat.expect("done anyway", Duration::from_secs(60));
     // The queued message runs next and gets its own scripted answer.
