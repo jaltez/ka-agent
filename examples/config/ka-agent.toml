@@ -47,10 +47,13 @@ crash_max = 5
 # engine_layer = "~/.config/ka-agent/engine.toml"
 
 [telegram]
-# Telegram arrives in the next milestone; the shape is fixed now so the
-# config schema does not churn. Enabling requires at least one allow_user_ids
-# entry (paired numeric operator ids; usernames are never trusted).
+# The Telegram channel (M2). Enabling requires token_secret (a secret-store
+# name) and at least one allow_user_ids entry (numeric operator ids; private
+# chats only; usernames are never trusted).
+# The token resolves from $KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN or a 0600 file
+# under <data>/secrets/<token_secret>.
 enabled = false
 # Name of the bot token in the secret store.
-# token_secret = "telegram-bot-token"
+# token_secret = "telegram.bot_token"
+# api_base = "https://api.telegram.org"   # tests point this at a fake server
 allow_user_ids = []

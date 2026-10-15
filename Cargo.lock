@@ -782,6 +782,7 @@ name = "ka-agent"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ka-agent-channels",
  "ka-agent-core",
  "ka-agent-port",
  "ka-agent-runtime",
@@ -791,6 +792,22 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "ka-agent-channels"
+version = "0.1.0"
+dependencies = [
+ "ka-agent-core",
+ "ka-agent-port",
+ "ka-agent-runtime",
+ "ka-agent-store",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

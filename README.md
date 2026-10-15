@@ -6,9 +6,9 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M1 core complete and verified.** Working today (`cargo test
---workspace`: 75 tests green; `ka-agent chat` drives the full stack end to
-end through a scripted engine speaker):
+**Status: M2 complete and verified.** Working today (`cargo test
+--workspace`: 87 tests green; the Telegram flow runs end to end against a
+fake Bot API with the scripted engine):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -19,12 +19,24 @@ end through a scripted engine speaker):
 - **`ka-agent-runtime`** — session manager, durable queue, single-flight
   submission, approvals with deny-on-expiry, budgets, worker supervisor with
   backoff and a crash-loop breaker.
-- **`ka-agent` (the binary)** — `ka-agent chat` (local console surface:
-  `/help /status /new /stop /y /n /quit`), `ka-agent doctor`, and the hidden
-  `ka-agent __worker` the runtime supervises.
+- **`ka-agent-channels`** — Telegram Bot API channel: long polling with a
+  persisted offset (at-least-once, deduped), numeric-id allowlist for
+  private chats, local command routing (`/help /status /new /stop`),
+  throttled delivery with typing indicator and progress edits, fence-balanced
+  chunking, approval cards with inline keyboards, secret store (env +
+  0600-file tiers).
+- **`ka-agent` (the binary)** — `ka-agent run` (daemon: runtime + optional
+  Telegram channel + admin unix socket + graceful SIGINT/SIGTERM),
+  `ka-agent status` (admin socket client), `ka-agent chat` (local console
+  surface), `ka-agent doctor`, and the hidden `ka-agent __worker` the
+  runtime supervises.
 
-Telegram, memory, plugins and the scheduler come in later milestones
-(see `SEED.md` §10).
+Memory (compiled `MEMORY.md`, candidates review), `/history` search,
+plugins/connectors and the scheduler come in the next milestones
+(see `SEED.md` §10). Real Telegram use: set `[telegram]` in the config,
+store the bot token (`KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN` or
+`<data>/secrets/telegram.bot_token`), allow your numeric user id, then
+`ka-agent run`.
 
 ## Layout
 

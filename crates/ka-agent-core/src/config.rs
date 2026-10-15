@@ -64,13 +64,23 @@ pub struct Ka {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Telegram {
-    /// Telegram arrives in the next milestone; the shape is fixed now so the
-    /// config schema does not churn.
+    /// Enable the Telegram channel in the daemon.
     pub enabled: bool,
     /// Name of the bot token in the secret store.
     pub token_secret: Option<String>,
     /// Paired operator user ids (numeric; usernames are never trusted).
     pub allow_user_ids: Vec<i64>,
+    /// Bot API base URL. Default `https://api.telegram.org`; tests point it
+    /// at a local fake server.
+    pub api_base: Option<String>,
+}
+
+impl Telegram {
+    pub fn api_base(&self) -> &str {
+        self.api_base
+            .as_deref()
+            .unwrap_or("https://api.telegram.org")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,10 +157,17 @@ impl DaemonConfig {
                 return Err(Error::Validate("budgets.daily_usd must be positive".into()));
             }
         }
-        if self.telegram.enabled && self.telegram.allow_user_ids.is_empty() {
-            return Err(Error::Validate(
-                "telegram.enabled requires at least one allow_user_ids entry".into(),
-            ));
+        if self.telegram.enabled {
+            if self.telegram.allow_user_ids.is_empty() {
+                return Err(Error::Validate(
+                    "telegram.enabled requires at least one allow_user_ids entry".into(),
+                ));
+            }
+            if self.telegram.token_secret.is_none() {
+                return Err(Error::Validate(
+                    "telegram.enabled requires telegram.token_secret (a secret-store name)".into(),
+                ));
+            }
         }
         Ok(())
     }

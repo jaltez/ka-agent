@@ -5,6 +5,7 @@ members = [
     "crates/ka-agent-port",
     "crates/ka-agent-store",
     "crates/ka-agent-runtime",
+    "crates/ka-agent-channels",
     "apps/ka-agent",
 ]
 
@@ -28,6 +29,7 @@ ka-agent-core = { path = "crates/ka-agent-core" }
 ka-agent-port = { path = "crates/ka-agent-port" }
 ka-agent-store = { path = "crates/ka-agent-store" }
 ka-agent-runtime = { path = "crates/ka-agent-runtime" }
+ka-agent-channels = { path = "crates/ka-agent-channels" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,7 +37,8 @@ sha2 = { version = "0.10", default-features = false }
 toml = "0.9"
 thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
