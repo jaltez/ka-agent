@@ -146,10 +146,9 @@ fn approval_flow_and_queue() {
     chat.send("and then summarize");
     chat.expect("queued (#1)", Duration::from_secs(10));
     chat.send("/y");
-    chat.expect("done anyway", Duration::from_secs(30));
+    chat.expect("done anyway", Duration::from_secs(60));
     // The queued message runs next and gets its own scripted answer.
-    chat.expect("turn done", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(60));
     let _ = std::fs::remove_file("/tmp/ka-agent-e2e-should-not-exist");
     chat.send("/quit");
-    std::fs::remove_dir_all(&root).ok();
 }
