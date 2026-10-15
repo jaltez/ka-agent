@@ -1,0 +1,23 @@
+[package]
+name = "ka-agent-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ka Agent web UI: loopback-only server with session auth"
+
+[dependencies]
+ka-agent-core = { workspace = true }
+ka-agent-store = { workspace = true }
+ka-agent-runtime = { workspace = true }
+ka-agent-memory = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+
+[lints]
+workspace = true

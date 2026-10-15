@@ -6,6 +6,7 @@ members = [
     "crates/ka-agent-store",
     "crates/ka-agent-runtime",
     "crates/ka-agent-channels",
+    "crates/ka-agent-web",
     "crates/ka-agent-memory",
     "apps/ka-agent",
 ]
@@ -32,6 +33,7 @@ ka-agent-port = { path = "crates/ka-agent-port" }
 ka-agent-store = { path = "crates/ka-agent-store" }
 ka-agent-runtime = { path = "crates/ka-agent-runtime" }
 ka-agent-channels = { path = "crates/ka-agent-channels" }
+ka-agent-web = { path = "crates/ka-agent-web" }
 ka-agent-memory = { path = "crates/ka-agent-memory" }
 
 serde = { version = "1", features = ["derive"] }

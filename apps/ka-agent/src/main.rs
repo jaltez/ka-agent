@@ -44,12 +44,24 @@ enum Command {
         /// Hidden test hook: run the engine worker with a scripted speaker.
         #[arg(long, hide = true)]
         scenario: Option<PathBuf>,
+        /// Enable the loopback-only web UI on this port (default: disabled).
+        #[arg(long)]
+        web_port: Option<u16>,
     },
     /// Query a running daemon over its admin socket.
     Status {
         /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+    /// Generate a one-shot auth URL for the web UI (M7).
+    WebToken {
+        /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Port the web server listens on (must match `run --web-port`).
+        #[arg(long, default_value_t = 8480)]
+        port: u16,
     },
     /// Instance health report.
     Doctor {
@@ -194,7 +206,11 @@ fn main() -> std::process::ExitCode {
             };
             rt.block_on(chat(config_path(&config), scenario))
         }
-        Command::Run { config, scenario } => {
+        Command::Run {
+            config,
+            scenario,
+            web_port,
+        } => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -202,12 +218,13 @@ fn main() -> std::process::ExitCode {
                 eprintln!("ka-agent: cannot build async runtime");
                 return std::process::ExitCode::FAILURE;
             };
-            rt.block_on(run_daemon(config_path(&config), scenario))
+            rt.block_on(run_daemon(config_path(&config), scenario, web_port))
         }
         Command::Status { config } => status_client(config_path(&config)),
         Command::Grant { action } => grant_action(action),
         Command::Export { out } => export(&out),
         Command::Purge { confirm } => purge(confirm),
+        Command::WebToken { config, port } => web_token(config_path(&config), port),
         Command::Doctor { config } => doctor(config_path(&config)),
     }
 }
@@ -610,6 +627,29 @@ fn purge(confirm: bool) -> std::process::ExitCode {
     }
 }
 
+fn web_token(config: PathBuf, port: u16) -> std::process::ExitCode {
+    let cfg = load_config(&config);
+    let paths = Paths::new(Paths::default_root());
+    let store = match Store::open(&paths.state_db()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ka-agent: cannot open {}: {e}", paths.state_db().display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let _ = cfg;
+    match ka_agent_web::issue_auth_url(&store, port) {
+        Ok(url) => {
+            println!("open within 10 minutes: {url}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ka-agent: web-token: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 fn doctor(config: PathBuf) -> std::process::ExitCode {
     let cfg = DaemonConfig::load(&config).unwrap_or_else(|e| {
         eprintln!("config: {e} (continuing with defaults)");
@@ -695,7 +735,11 @@ fn current_uid() -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-async fn run_daemon(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitCode {
+async fn run_daemon(
+    config: PathBuf,
+    scenario: Option<PathBuf>,
+    web_port: Option<u16>,
+) -> std::process::ExitCode {
     // Strict, unlike chat: a daemon with a broken config must not silently
     // run with defaults.
     let cfg = match DaemonConfig::load(&config) {
@@ -814,6 +858,19 @@ async fn run_daemon(config: PathBuf, scenario: Option<PathBuf>) -> std::process:
         }
     }
     println!("admin socket {}", sock_path.display());
+
+    // Web UI (M7): loopback-only, session auth; enabled with --web-port.
+    if let Some(web_port) = web_port {
+        let web = ka_agent_web::WebServer::new(web_port, runtime.clone(), Arc::clone(&store));
+        tokio::spawn(async move {
+            if let Err(e) = web.run(shutdown_rx.clone()).await {
+                eprintln!("ka-agent: web server: {e}");
+            }
+        });
+        println!(
+            "web UI http://127.0.0.1:{web_port} (login: ka-agent web-token --port {web_port})"
+        );
+    }
 
     let admin_runtime = runtime.clone();
     let admin_store = Arc::clone(&store);

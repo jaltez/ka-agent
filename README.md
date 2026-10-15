@@ -6,9 +6,9 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M6 complete and verified.** Working today (`cargo test
---workspace`: 104 tests green; Telegram + memory + history + MCP bridge +
-scheduler):
+**Status: M7 complete and verified.** Working today (`cargo test
+--workspace`: 109 tests green; Telegram + memory + history + MCP bridge +
+scheduler + loopback web UI):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -31,16 +31,22 @@ scheduler):
   throttled delivery with typing indicator and progress edits, fence-balanced
   chunking, approval cards with inline keyboards, secret store (env +
   0600-file tiers).
+- **`ka-agent-web`** — the loopback-only web UI (SEED §10 Phase 4):
+  server-rendered HTML, no JS/asset pipeline, session auth via a one-shot
+  CLI-issued login link, and every user-derived string HTML-escaped. Pages:
+  dashboard, history (+ per-turn view), memory (with an entry editor),
+  approvals, audit, intents.
 - **`ka-agent` (the binary)** — `ka-agent run` (daemon: runtime + optional
-  Telegram channel + admin unix socket + graceful SIGINT/SIGTERM),
-  `ka-agent status` (admin socket client), `ka-agent chat` (local console
-  surface), `ka-agent doctor`, and the hidden `ka-agent __worker` the
-  runtime supervises.
+  Telegram channel + admin unix socket + optional web UI + graceful
+  SIGINT/SIGTERM), `ka-agent status` (admin socket client), `ka-agent chat`
+  (local console surface), `ka-agent web-token`, `ka-agent doctor`, and the
+  hidden `ka-agent __worker` the runtime supervises.
 
 The MCP bridge is live: the engine gets `kagent.*` tools (memory_propose,
 notes_search/append/read) through the `[[mcp]]` overlay — model-proposed
 memories flow into `/memory review`. The scheduler fires `/remind`
-reminders. Third-party plugins, web UI and multi-user come next
+reminders. The web UI is live too (`ka-agent run --web-port 8480`, then
+`ka-agent web-token`). Third-party plugins and multi-user come next
 (see `SEED.md` §10). Memory and history are live:
 `/remember <fact>`, `/memory`, `/forget <id>`, `/history <query>`,
 `/history show <turn_id>` — on both the console and Telegram. Real Telegram
@@ -62,8 +68,11 @@ ka-agent/
                           # (besides apps/ka-agent) that may depend on ka-*
     ka-agent-store/       # SQLite schema, migrations, backups, audit chain
     ka-agent-runtime/     # session manager, queue, approvals, supervisor
+    ka-agent-memory/      # stable memory: git-backed Markdown + compiled MEMORY.md
+    ka-agent-channels/    # Telegram channel (polling, allowlist, approvals)
+    ka-agent-web/         # loopback-only web UI (session auth, HTML pages)
   docs/
-    contract/             # ka-port.md, worker-protocol.md
+    contract/             # ka-port.md, worker-protocol.md, web-ui.md, …
     ka-interface-validation.md
   examples/
     config/               # ka-agent.toml, engine.toml
@@ -100,6 +109,23 @@ approval_ttl_secs = 900
 Secrets never go in this file: the Telegram token is referenced by name in
 the secret store (`telegram.token_secret`).
 
+## Web UI
+
+Loopback-only, off by default:
+
+```sh
+ka-agent run --web-port 8480     # daemon + web UI
+ka-agent web-token --port 8480   # prints a one-shot login URL (10 min TTL)
+```
+
+Open the printed URL: it sets an `HttpOnly; SameSite=Strict` session cookie
+and redirects to the dashboard. Every page requires that cookie; the login
+token is single-use, and mutations are POST-only. Pages: dashboard
+(session/strand/budget/crashes), history search + per-turn view, memory
+(entry editor + accepted entries + the exact compiled text), approvals
+(with allow/deny), audit and intents. Details and the security checklist:
+`docs/contract/web-ui.md`.
+
 ## The ka pin
 
 The Ka crates (`ka-protocol`, `ka-engine`, `ka-dialect`) are pinned to an
@@ -124,3 +150,4 @@ dependencies and delete the CI rewrite step.
   runtime probes, findings F-1…F-8.
 - `docs/contract/ka-port.md`, `docs/contract/worker-protocol.md` — the Ka
   boundary contracts.
+- `docs/contract/web-ui.md` — routes, auth flow, security checklist.

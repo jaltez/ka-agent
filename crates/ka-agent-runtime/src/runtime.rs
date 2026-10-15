@@ -381,6 +381,21 @@ impl Runtime {
             .compile(ka_agent_memory::DEFAULT_BUDGET_BYTES)?)
     }
 
+    /// Accepted memory entries, newest first, for the web memory view.
+    pub fn memory_entries(&self) -> Result<Vec<ka_agent_memory::Entry>, Error> {
+        let mut entries = self.sh.memory.entries()?;
+        entries.sort_by_key(|e| std::cmp::Reverse(e.accepted_ms));
+        Ok(entries)
+    }
+
+    /// The exact text injected into the engine at the current budget.
+    pub fn memory_compiled_text(&self) -> Result<String, Error> {
+        Ok(self
+            .sh
+            .memory
+            .compiled_text(ka_agent_memory::DEFAULT_BUDGET_BYTES)?)
+    }
+
     /// Register a memory candidate for review (SEED.md §4.4 path 2; the
     /// model-side producer arrives with the connector bridge).
     pub fn propose_memory(
