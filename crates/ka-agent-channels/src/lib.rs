@@ -2,6 +2,7 @@
 //! messages + approval keyboards out). M4: the MCP bridge.
 
 pub mod fake;
+pub mod grants;
 pub mod mcp;
 pub mod secret;
 pub mod telegram;

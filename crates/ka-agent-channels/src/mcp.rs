@@ -6,6 +6,7 @@
 //! The server opens the store directly (SQLite WAL allows concurrent
 //! access with the daemon).
 
+use crate::grants;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -94,7 +95,7 @@ fn sanitize_note_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
+fn handle_tool_call(name: &str, args: &Value, grants: &grants::Grants) -> Result<String, String> {
     match name {
         "memory_propose" => {
             let text = args["text"].as_str().ok_or("missing 'text'")?;
@@ -176,8 +177,129 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                 Err(_) => Ok(format!("{name}.md is empty or does not exist")),
             }
         }
+        "http_get" => {
+            let url = args["url"].as_str().ok_or("missing 'url'")?;
+            let parsed = url::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                return Err(format!("unsupported scheme: {}", parsed.scheme()));
+            }
+            let host = parsed.host_str().ok_or("missing host")?.to_string();
+            let scope = format!("http:get:{host}");
+            if !grants.check(&scope) {
+                return Err(format!(
+                    "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
+                ));
+            }
+            // SSRF: refuse private/loopback IPs unless explicitly granted.
+            if !grants.check("http:get:private")
+                && (host == "127.0.0.1"
+                    || host == "localhost"
+                    || host.starts_with("10.")
+                    || host.starts_with("192.168.")
+                    || host.starts_with("172."))
+            {
+                return Err("private/loopback hosts require the http:get:private grant".into());
+            }
+            let body = http_get_sync(&parsed, 15)?;
+            if body.len() > 200_000 {
+                Ok(format!("{}… (truncated at 200 KB)", &body[..200_000]))
+            } else {
+                Ok(body)
+            }
+        }
+        "github_issues_list" => {
+            let repo = args["repo"].as_str().ok_or("missing 'repo'")?;
+            let state = args["state"].as_str().unwrap_or("open");
+            let limit = args["limit"].as_u64().unwrap_or(10).min(30) as usize;
+            let scope = "github:issues:read";
+            if !grants.check(scope) {
+                return Err(format!(
+                    "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
+                ));
+            }
+            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
+                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let body = github_api(
+                &token,
+                &format!("/repos/{repo}/issues?state={state}&per_page={limit}"),
+            )?;
+            let issues = body.as_array().ok_or("unexpected GitHub response")?;
+            let lines: Vec<String> = issues
+                .iter()
+                .filter_map(|i| {
+                    let num = i["number"].as_u64()?;
+                    let title = i["title"].as_str()?;
+                    let state = i["state"].as_str()?;
+                    Some(format!("#{num} [{state}] {title}"))
+                })
+                .collect();
+            if lines.is_empty() {
+                Ok(format!("no {state} issues in {repo}"))
+            } else {
+                Ok(lines.join("\n"))
+            }
+        }
+        "github_pulls_get" => {
+            let repo = args["repo"].as_str().ok_or("missing 'repo'")?;
+            let number = args["number"].as_u64().ok_or("missing 'number'")?;
+            let scope = "github:pulls:read";
+            if !grants.check(scope) {
+                return Err(format!(
+                    "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
+                ));
+            }
+            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
+                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let body = github_api(&token, &format!("/repos/{repo}/pulls/{number}"))?;
+            let title = body["title"].as_str().unwrap_or("?");
+            let state = body["state"].as_str().unwrap_or("?");
+            let user = body["user"]["login"].as_str().unwrap_or("?");
+            let body_text = body["body"].as_str().unwrap_or("");
+            Ok(format!(
+                "#{number} [{state}] {title}\nby {user}\n{body_text}"
+            ))
+        }
         _ => Err(format!("unknown tool: {name}")),
     }
+}
+
+/// Blocking HTTP GET with a 15 s timeout, returns the response body as text.
+fn http_get_sync(url: &url::Url, timeout_secs: u64) -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build();
+    let resp = agent
+        .get(url.as_str())
+        .call()
+        .map_err(|e| format!("http: {e}"))?;
+    let content_type = resp.header("content-type").unwrap_or("").to_string();
+    if !content_type.starts_with("text/")
+        && !content_type.starts_with("application/json")
+        && !content_type.starts_with("application/xml")
+    {
+        return Err(format!("unsupported content-type: {content_type}"));
+    }
+    resp.into_string().map_err(|e| format!("read body: {e}"))
+}
+
+/// Simple GitHub API GET using ureq.
+fn github_api(token: &str, path: &str) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let url = format!("https://api.github.com{path}");
+    let response = agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "ka-agent")
+        .call()
+        .map_err(|e| format!("github: {e}"))?;
+    let text = response
+        .into_string()
+        .map_err(|e| format!("github body: {e}"))?;
+    let body: Value = serde_json::from_str(&text).map_err(|e| format!("github json: {e}"))?;
+    Ok(body)
 }
 
 /// Entry point for `ka-agent __mcp`. Reads JSON-RPC from stdin, writes to
@@ -221,14 +343,30 @@ pub fn run_mcp() -> Result<(), String> {
             "tools/call" => {
                 let tool = msg["params"]["name"].as_str().unwrap_or("");
                 let args = &msg["params"]["arguments"];
-                match handle_tool_call(tool, args) {
-                    Ok(text) => json!({
-                        "content": [{"type": "text", "text": text}]
-                    }),
-                    Err(e) => json!({
-                        "isError": true,
-                        "content": [{"type": "text", "text": e}]
-                    }),
+                // Load grants fresh on every call (the daemon may change them).
+                let grants_result = grants::open_store()
+                    .and_then(|store| grants::Grants::load(&store))
+                    .map_err(|e| format!("grants: {e}"));
+                match grants_result {
+                    Err(e) => {
+                        let resp =
+                            json!({"isError": true, "content": [{"type": "text", "text": e}]});
+                        if let Some(id) = id.clone() {
+                            let response = json!({"jsonrpc": "2.0", "id": id, "result": resp});
+                            let _ = writeln!(stdout, "{response}");
+                            stdout.flush().ok();
+                        }
+                        continue;
+                    }
+                    Ok(grants) => match handle_tool_call(tool, args, &grants) {
+                        Ok(text) => json!({
+                            "content": [{"type": "text", "text": text}]
+                        }),
+                        Err(e) => json!({
+                            "isError": true,
+                            "content": [{"type": "text", "text": e}]
+                        }),
+                    },
                 }
             }
             _ => {
