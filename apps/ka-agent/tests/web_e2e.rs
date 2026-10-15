@@ -329,7 +329,8 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
 fn oversized_body_is_refused_without_buffering() {
     let root = temp_root("oversize");
     let port = free_port();
-    let daemon = spawn_daemon(&root, port);
+    // Held for the lifetime of the test: dropping it kills the server.
+    let _daemon = spawn_daemon(&root, port);
     wait_web(port, Duration::from_secs(30));
 
     // A declared Content-Length beyond the cap must not be buffered: the
