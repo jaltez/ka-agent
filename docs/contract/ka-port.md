@@ -106,7 +106,11 @@ V-06b — HTTP 200, no events for the dropped prompt). Ka Agent therefore:
   permission gate, and ending the turn there makes the next message overtake
   the running one (nothing queues behind it) and orphans the ask. The turn's
   own terminal status ends the turn; the ask's decision or TTL resolves the
-  ask.
+  ask;
+- returns the session to `idle` at `turn_finished` — the turn boundary — when
+  no ask is pending and the queue is empty, and only then. `idle` remains the
+  delivery boundary (flush, episodic index, queue drain), and it never drains
+  the queue into a live cycle (`PortError::Busy` is a dropped prompt).
 
 `submit` while a cycle is live is a caller bug: the port returns
 `PortError::Busy` and never sends the command.
