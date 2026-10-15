@@ -6,7 +6,7 @@ Conventions used throughout:
 
 - **[Requirement]**: must hold for the MVP and every later phase. Changing one needs a written decision record (`docs/adr/`).
 - **[Provisional]**: the current best decision. It may change after the validation named next to it (usually the Phase 0 spike).
-- Evidence: paths such as `crates/ka-harness/src/serve.rs:241-277` point into the Ka repository (`github.com/jaltez/ka`) at commit `a56aae2`. That is workspace version 0.3.0, which is not yet released; the `ka` binary installed on the analysis machine was 0.2.8. Everything was established by reading source; nothing in Ka was built or run beyond `--version`. Claims marked *(code-read inference)* follow from the code but were not exercised.
+- Evidence: paths such as `crates/ka-harness/src/serve.rs:241-277` point into the Ka repository (`github.com/jaltez/ka-harness`, renamed from `ka`) at commit `a56aae2`. That is workspace version 0.3.0, which is not yet released; the `ka` binary installed on the analysis machine was 0.2.8. Everything was established by reading source; nothing in Ka was built or run beyond `--version`. Claims marked *(code-read inference)* follow from the code but were not exercised.
 - Ka's own vocabulary is kept where it exists: strand, record, digest, Hands, clearance, hardstops.
 
 ## 1. Product thesis

@@ -19,11 +19,12 @@ repository = "https://github.com/jaltez/ka-agent"
 [workspace.dependencies]
 # Ka engine crates, pinned to an exact revision (SEED.md §3.4: exact pin,
 # upgraded deliberately with the contract suite green). Local file:// mirror
-# of the upstream repository; swap to the public git URL + released crates
+# of the upstream repository (github.com/jaltez/ka-harness); swap to the public
+# git URL + released crates
 # once ka 0.3.0 is published.
-ka-protocol = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
-ka-engine = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
-ka-dialect = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-protocol = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-engine = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-dialect = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
 
 ka-agent-core = { path = "crates/ka-agent-core" }
 ka-agent-port = { path = "crates/ka-agent-port" }

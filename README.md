@@ -1,6 +1,6 @@
 # Ka Agent
 
-A resident assistant on the [Ka](https://github.com/jaltez/ka) coding engine:
+A resident assistant on the [Ka](https://github.com/jaltez/ka-harness) coding engine:
 one always-on daemon per operator that keeps working across sessions and
 channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
@@ -94,10 +94,10 @@ the secret store (`telegram.token_secret`).
 The Ka crates (`ka-protocol`, `ka-engine`, `ka-dialect`) are pinned to an
 exact git revision — `a56aae2d1b3a4c31c4910979e1033002eacc53a0` (ka
 workspace 0.3.0, unreleased) — via a **local file:// mirror** of
-`https://github.com/jaltez/ka`:
+`https://github.com/jaltez/ka-harness`:
 
 ```toml
-ka-engine = { git = "file:///home/javier/projects/ka", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-engine = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
 ```
 
 Upgrades are deliberate: bump the pin, keep the port contract suite green
