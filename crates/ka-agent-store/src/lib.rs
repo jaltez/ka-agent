@@ -60,7 +60,7 @@ pub enum StoreError {
 /// Forward-only migrations, one per schema version. Entry `i` upgrades a
 /// database at `user_version == i` to `i + 1`; each runs in its own
 /// transaction and sets `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[include_str!("schema_v1.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("schema_v1.sql"), include_str!("schema_v2.sql")];
 
 /// One run of a background job (task runner, memory compaction, ...).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +95,20 @@ pub struct CandidateRow {
     pub text: String,
     pub provenance: Option<String>,
     pub created_ms: i64,
+}
+
+/// One external-write intent (SEED.md §7.3). Inserted before the API call,
+/// updated after, so a crash mid-call is visible as `executing` (never auto-retried).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentRow {
+    pub id: String,
+    pub tool: String,
+    pub args_hash: String,
+    pub status: String,
+    pub external_ref: Option<String>,
+    pub summary: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
 }
 
 /// The SQLite-backed store. Not `Clone`; share via `Arc<Store>`.
@@ -916,6 +930,65 @@ impl Store {
         collect_rows(rows)
     }
 
+    // ------------------------------------------------------------------
+    // intents
+    // ------------------------------------------------------------------
+
+    /// Insert a new external-write intent (status `proposed`).
+    pub fn insert_intent(&self, i: &IntentRow) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO intents(id, tool, args_hash, status, external_ref, summary, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                i.id, i.tool, i.args_hash, i.status,
+                i.external_ref, i.summary, i.created_ms, i.updated_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update an intent's status (and optionally its external_ref).
+    pub fn update_intent_status(
+        &self,
+        id: &str,
+        status: &str,
+        external_ref: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE intents SET status = ?2, external_ref = COALESCE(?3, external_ref), updated_ms = ?4
+             WHERE id = ?1",
+            params![id, status, external_ref, ka_agent_core::now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("intent {id}")));
+        }
+        Ok(())
+    }
+
+    /// Recent intents (for reporting).
+    pub fn recent_intents(&self, limit: usize) -> Result<Vec<IntentRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, tool, args_hash, status, external_ref, summary, created_ms, updated_ms
+             FROM intents ORDER BY created_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(IntentRow {
+                id: r.get(0)?,
+                tool: r.get(1)?,
+                args_hash: r.get(2)?,
+                status: r.get(3)?,
+                external_ref: r.get(4)?,
+                summary: r.get(5)?,
+                created_ms: r.get(6)?,
+                updated_ms: r.get(7)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Set a candidate's review outcome (`accepted`/`rejected`/`discarded`;
     /// anything else is rejected by the schema CHECK).
     pub fn set_candidate_status(&self, id: &MemoryId, status: &str) -> Result<()> {
@@ -1563,6 +1636,69 @@ mod tests {
         assert_eq!(store.pending_candidates().unwrap(), vec![mem.clone()]);
         store.set_candidate_status(&mem, "accepted").unwrap();
         assert!(store.pending_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn intent_lifecycle() {
+        let store = Store::open_in_memory().unwrap();
+        let now = ka_agent_core::now_ms();
+        let intent = IntentRow {
+            id: "int_test1".to_string(),
+            tool: "github_issue_comment".to_string(),
+            args_hash: "abc123".to_string(),
+            status: "executing".to_string(),
+            external_ref: None,
+            summary: Some("comment on #42 in owner/repo".to_string()),
+            created_ms: now,
+            updated_ms: now,
+        };
+        store.insert_intent(&intent).unwrap();
+        // executing → done with external_ref
+        store
+            .update_intent_status(
+                "int_test1",
+                "done",
+                Some("https://api.github.com/repos/o/r/issues/comments/12345"),
+            )
+            .unwrap();
+        let intents = store.recent_intents(10).unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].status, "done");
+        assert!(
+            intents[0]
+                .external_ref
+                .as_deref()
+                .unwrap_or("")
+                .contains("12345")
+        );
+        // failed path
+        let intent2 = IntentRow {
+            id: "int_test2".to_string(),
+            tool: "github_pull_review".to_string(),
+            args_hash: "def456".to_string(),
+            status: "executing".to_string(),
+            external_ref: None,
+            summary: None,
+            created_ms: now,
+            updated_ms: now,
+        };
+        store.insert_intent(&intent2).unwrap();
+        store
+            .update_intent_status("int_test2", "failed", None)
+            .unwrap();
+        let intents = store.recent_intents(10).unwrap();
+        assert_eq!(intents.len(), 2);
+        assert!(intents.iter().any(|i| i.status == "failed"));
+    }
+
+    #[test]
+    fn schema_v2_migration_from_v1() {
+        // Open a fresh store: it should be at v2
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.user_version().unwrap(), 2);
+        // The intents table exists
+        let intents = store.recent_intents(0).unwrap();
+        assert!(intents.is_empty());
     }
 
     #[test]

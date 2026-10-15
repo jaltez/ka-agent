@@ -787,6 +787,7 @@ dependencies = [
  "ka-agent-port",
  "ka-agent-runtime",
  "ka-agent-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror",

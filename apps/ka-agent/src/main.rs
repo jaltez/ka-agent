@@ -71,6 +71,17 @@ enum Command {
         #[command(subcommand)]
         action: GrantAction,
     },
+    /// Export instance data to a directory.
+    Export {
+        /// Output directory (created if absent).
+        out: PathBuf,
+    },
+    /// Delete all instance data.
+    Purge {
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -195,6 +206,8 @@ fn main() -> std::process::ExitCode {
         }
         Command::Status { config } => status_client(config_path(&config)),
         Command::Grant { action } => grant_action(action),
+        Command::Export { out } => export(&out),
+        Command::Purge { confirm } => purge(confirm),
         Command::Doctor { config } => doctor(config_path(&config)),
     }
 }
@@ -464,6 +477,137 @@ fn grant_action(action: GrantAction) -> std::process::ExitCode {
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+fn export(out: &std::path::Path) -> std::process::ExitCode {
+    let paths = Paths::new(Paths::default_root());
+    std::fs::create_dir_all(out).unwrap_or_else(|e| {
+        eprintln!("ka-agent: cannot create {out:?}: {e}");
+        std::process::exit(1);
+    });
+    let mut manifest = Vec::new();
+    // Memory Markdown
+    let mem = paths.root().join("memory");
+    if mem.is_dir() {
+        let dest = out.join("memory");
+        if std::fs::create_dir_all(&dest).is_ok() {
+            copy_tree(&mem, &dest, &mut manifest);
+        }
+    }
+    // Notes
+    let notes = paths.root().join("notes");
+    if notes.is_dir() {
+        let dest = out.join("notes");
+        if std::fs::create_dir_all(&dest).is_ok() {
+            copy_tree(&notes, &dest, &mut manifest);
+        }
+    }
+    // State tables as JSONL
+    {
+        for (table, file) in [
+            ("sessions", "sessions.jsonl"),
+            ("turns", "turns.jsonl"),
+            ("approvals", "approvals.jsonl"),
+            ("intents", "intents.jsonl"),
+            ("audit", "audit.jsonl"),
+            ("tasks", "tasks.jsonl"),
+        ] {
+            let sql = format!("SELECT * FROM {table}");
+            if let Ok(conn) = rusqlite::Connection::open(paths.state_db()) {
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let cols: Vec<String> =
+                        stmt.column_names().into_iter().map(String::from).collect();
+                    let path = out.join(file);
+                    if let Ok(f) = std::fs::File::create(&path) {
+                        let mut w = std::io::BufWriter::new(f);
+                        if let Ok(mut rows) = stmt.query([]) {
+                            while let Ok(Some(row)) = rows.next() {
+                                let obj: std::collections::BTreeMap<String, serde_json::Value> =
+                                    cols.iter()
+                                        .map(|c| {
+                                            (
+                                                c.clone(),
+                                                row.get_ref(c.as_str())
+                                                    .map(cell_to_json)
+                                                    .unwrap_or(serde_json::Value::Null),
+                                            )
+                                        })
+                                        .collect();
+                                if let Ok(line) = serde_json::to_string(&obj) {
+                                    writeln!(w, "{line}").ok();
+                                }
+                            }
+                        }
+                    }
+                    manifest.push(file.to_string());
+                }
+            }
+        }
+    }
+    // Manifest
+    use std::io::Write;
+    let mpath = out.join("manifest.txt");
+    if let Ok(mut f) = std::fs::File::create(&mpath) {
+        for entry in &manifest {
+            writeln!(f, "{entry}").ok();
+        }
+    }
+    println!("exported {} files to {}", manifest.len(), out.display());
+    std::process::ExitCode::SUCCESS
+}
+
+fn cell_to_json(cell: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match cell {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => serde_json::Value::Number(i.into()),
+        ValueRef::Real(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => serde_json::Value::Array(
+            b.iter()
+                .map(|&x| serde_json::Value::Number(x.into()))
+                .collect(),
+        ),
+    }
+}
+
+fn copy_tree(src: &std::path::Path, dest: &std::path::Path, manifest: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(src).unwrap_or(&path).to_path_buf();
+            let dest_path = dest.join(&rel);
+            if path.is_dir() {
+                std::fs::create_dir_all(&dest_path).ok();
+                copy_tree(&path, &dest_path, manifest);
+            } else if std::fs::copy(&path, &dest_path).is_ok() {
+                manifest.push(rel.display().to_string());
+            }
+        }
+    }
+}
+
+fn purge(confirm: bool) -> std::process::ExitCode {
+    let paths = Paths::new(Paths::default_root());
+    if !confirm {
+        println!(
+            "this will delete all ka-agent data in {}\nre-run with --confirm",
+            paths.root().display()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    match std::fs::remove_dir_all(paths.root()) {
+        Ok(()) => {
+            println!("purged {}", paths.root().display());
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ka-agent: purge: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 fn doctor(config: PathBuf) -> std::process::ExitCode {

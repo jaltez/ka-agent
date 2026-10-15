@@ -259,8 +259,109 @@ fn handle_tool_call(name: &str, args: &Value, grants: &grants::Grants) -> Result
                 "#{number} [{state}] {title}\nby {user}\n{body_text}"
             ))
         }
+        "github_issue_comment" => {
+            let repo = args["repo"].as_str().ok_or("missing 'repo'")?;
+            let number = args["number"].as_u64().ok_or("missing 'number'")?;
+            let body_text = args["body"].as_str().ok_or("missing 'body'")?;
+            let scope = "github:issues:write";
+            if !grants.check(scope) {
+                return Err(format!(
+                    "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
+                ));
+            }
+            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
+                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let root = data_root()?;
+            let store = ka_agent_store::Store::open(&root.join("state.db"))
+                .map_err(|e| format!("store: {e}"))?;
+            let now = ka_agent_core::now_ms();
+            let intent_id = ka_agent_core::IntentId::generate();
+            let intent = ka_agent_store::IntentRow {
+                id: intent_id.to_string(),
+                tool: "github_issue_comment".to_string(),
+                args_hash: format!("{:x}", ka_agent_core::now_ms() as u64 * 31),
+                status: "executing".to_string(),
+                external_ref: None,
+                summary: Some(format!("comment on #{number} in {repo}")),
+                created_ms: now,
+                updated_ms: now,
+            };
+            store.insert_intent(&intent).ok(); // intent log is best-effort
+            let body = github_api_post(
+                &token,
+                &format!("/repos/{repo}/issues/{number}/comments"),
+                &json!({"body": body_text}),
+            )?;
+            let html_url = body["html_url"].as_str().unwrap_or("?");
+            store
+                .update_intent_status(&intent_id.to_string(), "done", Some(html_url))
+                .ok();
+            Ok(format!("comment posted: {html_url}"))
+        }
+        "github_pull_review" => {
+            let repo = args["repo"].as_str().ok_or("missing 'repo'")?;
+            let number = args["number"].as_u64().ok_or("missing 'number'")?;
+            let body_text = args["body"].as_str().ok_or("missing 'body'")?;
+            let event = args["event"].as_str().unwrap_or("COMMENT");
+            let scope = "github:pulls:write";
+            if !grants.check(scope) {
+                return Err(format!(
+                    "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
+                ));
+            }
+            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
+                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let root = data_root()?;
+            let store = ka_agent_store::Store::open(&root.join("state.db"))
+                .map_err(|e| format!("store: {e}"))?;
+            let now = ka_agent_core::now_ms();
+            let intent_id = ka_agent_core::IntentId::generate();
+            let intent = ka_agent_store::IntentRow {
+                id: intent_id.to_string(),
+                tool: "github_pull_review".to_string(),
+                args_hash: format!("{:x}", ka_agent_core::now_ms() as u64 * 37),
+                status: "executing".to_string(),
+                external_ref: None,
+                summary: Some(format!("review on PR #{number} in {repo}")),
+                created_ms: now,
+                updated_ms: now,
+            };
+            store.insert_intent(&intent).ok(); // intent log is best-effort
+            let body = github_api_post(
+                &token,
+                &format!("/repos/{repo}/pulls/{number}/reviews"),
+                &json!({"body": body_text, "event": event}),
+            )?;
+            let html_url = body["html_url"].as_str().unwrap_or("?");
+            store
+                .update_intent_status(&intent_id.to_string(), "done", Some(html_url))
+                .ok();
+            Ok(format!("review posted: {html_url}"))
+        }
         _ => Err(format!("unknown tool: {name}")),
     }
+}
+
+/// GitHub API POST helper (write operations).
+fn github_api_post(token: &str, path: &str, body: &Value) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let url = format!("https://api.github.com{path}");
+    let body_text = serde_json::to_string(body).map_err(|e| format!("serialize: {e}"))?;
+    let response = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "ka-agent")
+        .send_string(&body_text)
+        .map_err(|e| format!("github: {e}"))?;
+    let text = response
+        .into_string()
+        .map_err(|e| format!("github body: {e}"))?;
+    let result: Value = serde_json::from_str(&text).map_err(|e| format!("github json: {e}"))?;
+    Ok(result)
 }
 
 /// Blocking HTTP GET with a 15 s timeout, returns the response body as text.

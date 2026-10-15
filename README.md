@@ -6,8 +6,8 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M5 complete and verified.** Working today (`cargo test
---workspace`: 102 tests green; Telegram + memory + history + MCP bridge +
+**Status: M6 complete and verified.** Working today (`cargo test
+--workspace`: 104 tests green; Telegram + memory + history + MCP bridge +
 scheduler):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
