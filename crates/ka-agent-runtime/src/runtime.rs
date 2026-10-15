@@ -188,6 +188,16 @@ impl Runtime {
         if store.get_session(&session.id).is_err() {
             store.insert_session(&session)?;
             session.status = ka_agent_core::SessionStatus::Idle;
+            // `new_session` audits this; the daemon's own bootstrap session
+            // must land in the chain too, or the log starts with a session
+            // nothing explains (SEED.md §8.7).
+            let mut rec = AuditRecord::new(
+                "system",
+                audit_actions::SESSION_NEW,
+                session.id.as_str(),
+                Some("daemon bootstrap".into()),
+            );
+            store.append_audit(&mut rec)?;
         }
         let session = session;
         let mut budget = BudgetState::new(cfg.budgets.daily_usd, cfg.budgets.daily_tokens);
