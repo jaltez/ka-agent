@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The workspace pins the ka crates to a local file:// mirror of
+      # github.com/jaltez/ka (see README.md). Rewrite the pin to the public
+      # repository before building; cargo fetches it normally (no --offline).
+      - name: Point the ka pin at the public repository
+        run: |
+          sed -i 's|git = "file:///home/javier/projects/ka"|git = "https://github.com/jaltez/ka"|g' Cargo.toml
+          grep -q 'https://github.com/jaltez/ka' Cargo.toml
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Ka dependency boundary gate
+        run: ./scripts/check-ka-deps.sh
+
+      - name: Tests
+        run: cargo test --workspace --quiet

@@ -1,0 +1,56 @@
+# ka-agent daemon configuration.
+# Schema: crates/ka-agent-core/src/config.rs (DaemonConfig). Strict TOML:
+# unknown keys are hard errors. Secrets never live in this file — the
+# Telegram token is a name in the secret store (see [telegram] below).
+
+# The single workspace directory every engine runs in (MVP).
+# `~` expands against $HOME.
+workspace = "~/projects/ka-agent-workspace"
+
+# Default ka model selector for new sessions (e.g. "anthropic/claude-sonnet-4-5").
+# Omit to let the engine layer decide.
+# model = "anthropic/claude-sonnet-4-5"
+
+# Permission mode for new sessions: "guarded" (default) | "accept_edits"
+# | "free" | "plan". Re-asserted by the worker after every attach.
+mode = "guarded"
+
+# Approval card TTL in seconds; unanswered approvals deny on expiry
+# (fail closed). Range 1..=86400.
+approval_ttl_secs = 900
+
+# Grace in seconds after /stop before escalating abort -> SIGTERM -> SIGKILL.
+# Range 1..=600.
+turn_grace_secs = 10
+
+[worker_restart]
+# First backoff after a worker crash, in milliseconds.
+backoff_start_ms = 1000
+# Backoff ceiling, in milliseconds.
+backoff_max_ms = 60000
+# Crash-loop window (seconds) and threshold: this many crashes inside the
+# window degrade the session (resume then needs /resume or /new).
+crash_window_secs = 600
+crash_max = 5
+
+[budgets]
+# Daily USD cap across sessions (ka usage accounting). Positive; omit = none.
+# daily_usd = 5.0
+# Daily token cap (input+output+cache); the only cap that binds for
+# unpriced models. Omit = none.
+# daily_tokens = 2_000_000
+
+[ka]
+# Optional ka engine layer in ka's own strict ka.toml format, validated with
+# Config::parse_layer by the worker. See examples/config/engine.toml.
+# The worker's security overlay is applied after it and always wins.
+# engine_layer = "~/.config/ka-agent/engine.toml"
+
+[telegram]
+# Telegram arrives in the next milestone; the shape is fixed now so the
+# config schema does not churn. Enabling requires at least one allow_user_ids
+# entry (paired numeric operator ids; usernames are never trusted).
+enabled = false
+# Name of the bot token in the secret store.
+# token_secret = "telegram-bot-token"
+allow_user_ids = []

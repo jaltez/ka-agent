@@ -12,6 +12,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = "0.12"
 
 [lints]
 workspace = true

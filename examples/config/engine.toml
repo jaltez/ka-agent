@@ -1,0 +1,35 @@
+# Ka Agent's ka engine layer — ka's own strict `ka.toml` format
+# (the format `ka config schema` documents; validated with
+# Config::parse_layer by the worker). Referenced from ka-agent.toml as
+# [ka] engine_layer = "…" and composed over ka's engine defaults.
+#
+# SECURITY OVERLAY: whatever is configured here, the worker ALWAYS applies
+# its own security layer last, which wins over this file:
+#   mode = "guarded"
+#   [tools.bash] background_after_ms = 0   (no detaching bash jobs, gap G15)
+#   [features] disable = ["tool:remember"] (memory goes through Ka Agent)
+#   [guards] spend_usd from the daemon budgets
+# So this file can tune the engine, never loosen policy.
+
+# Model selector for new sessions (may be overridden by the daemon's
+# `model`, which is re-asserted after every attach).
+model = "anthropic/claude-sonnet-4-5"
+
+# Permission mode; the worker's overlay forces "guarded" for daemon-driven
+# sessions regardless of this value.
+mode = "guarded"
+
+# Allow read-only bash commands without an ask. ka evaluates [[rules]] as
+# data, first match wins. Ka Agent adds its own rules on top; remote
+# channels never send "always".
+[[rules]]
+tool = "bash"
+allow = true
+# Read-only commands only: any write, network or pipe still asks.
+readonly = true
+
+[tools.bash]
+# Detach bash jobs immediately? The overlay forces 0 (never background),
+# so a killed worker always kills its tool children too. Kept here for
+# documentation.
+background_after_ms = 0
