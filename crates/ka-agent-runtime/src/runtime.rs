@@ -1052,6 +1052,35 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     sh.surface
                         .on_note("turn ended in error; see /status — nothing was re-submitted");
                 }
+                // The turn is terminal: return to `idle` here, where the turn
+                // boundary is known, rather than at the engine's `idle` — that
+                // event may arrive before this and is only the delivery
+                // boundary. With an ask pending or a message queued the
+                // session stays busy and the ask's decision or the queue drain
+                // moves it on.
+                let pending = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    (
+                        g.session.id.clone(),
+                        g.live.as_ref().is_some_and(|l| !l.pending_asks.is_empty()),
+                    )
+                };
+                let (sid, ask_pending) = pending;
+                let queued = sh.store.queue_len(&sid).unwrap_or(0);
+                if !ask_pending && queued == 0 {
+                    let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.session.status != SessionStatus::Idle {
+                        let from = g.session.status;
+                        g.session
+                            .transition(SessionStatus::Idle)
+                            .map_err(|t| illegal_session(from, t))
+                            .ok();
+                        let status = g.session.status;
+                        drop(g);
+                        rt_persist_status(&sh, status);
+                        sh.surface.on_session_status(status);
+                    }
+                }
             }
             PortEvent::Idle => {
                 // Delivery boundary (SEED.md §3.7): flush the buffered final
