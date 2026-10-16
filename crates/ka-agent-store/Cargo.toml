@@ -17,3 +17,6 @@ parking_lot = "0.12"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

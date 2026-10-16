@@ -252,3 +252,173 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
     });
     json!({ "ok": true, "result": result }).to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Fake Matrix homeserver (Phase 6): the CS-API subset the channel uses —
+// `GET /sync` (returns queued events once per `since`, then long-poll
+// empties) and `PUT …/send` (records outbound bodies).
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct MatrixState {
+    /// The room timeline the server is holding, FIFO: every sync delivers
+    /// whatever arrived since the last one served (a homeserver queues
+    /// server-side; tokens do not "attach" to events).
+    timeline: Vec<(String, Value)>,
+    next_batch: u64,
+    since_seen: Vec<Option<String>>,
+    sent: Vec<CapturedRequest>,
+}
+
+pub struct FakeHomeserver {
+    state: Arc<Mutex<MatrixState>>,
+}
+
+impl FakeHomeserver {
+    pub fn spawn() -> (Self, String) {
+        let state = Arc::new(Mutex::new(MatrixState::default()));
+        let server = Self {
+            state: Arc::clone(&state),
+        };
+        let rt_state = Arc::clone(&state);
+        let Ok(std_listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            eprintln!("fake homeserver: bind failed");
+            std::process::exit(1);
+        };
+        let addr = std_listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "127.0.0.1:0".to_string());
+        tokio::spawn(async move {
+            let _ = std_listener.set_nonblocking(true);
+            let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) else {
+                return;
+            };
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    continue;
+                };
+                let state = Arc::clone(&rt_state);
+                tokio::spawn(async move {
+                    if let Some((path, body)) = read_request(&mut socket).await {
+                        let response = matrix_handle(&state, &path, &body);
+                        let _ = socket
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                                    response.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        (server, format!("http://{addr}"))
+    }
+
+    /// Queue one room message from `sender`: before the first sync it waits
+    /// with the initial batch; afterwards it waits for the token the client
+    /// will sync with next (the latest `next_batch` handed out).
+    pub fn push_room_message(&self, room: &str, sender: &str, body: &str) {
+        let event = serde_json::json!({
+            "type": "m.room.message",
+            "sender": sender,
+            "content": {"msgtype": "m.text", "body": body},
+        });
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .timeline
+            .push((room.to_string(), event));
+    }
+
+    /// Wait until the homeserver saw a send with this text fragment.
+    pub fn await_sent(
+        &self,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> Option<CapturedRequest> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let hit = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sent
+                .iter()
+                .find(|c| c.body["body"].as_str().is_some_and(|t| t.contains(needle)))
+                .cloned();
+            if let Some(hit) = hit {
+                return Some(hit);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Every recorded send, oldest first (test diagnostics).
+    pub fn sent_all(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sent
+            .iter()
+            .map(|c| c.body["body"].as_str().unwrap_or("<no body>").to_string())
+            .collect()
+    }
+
+    /// Every `since` token the channel has synced with, in order.
+    pub fn since_history(&self) -> Vec<Option<String>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .since_seen
+            .clone()
+    }
+}
+
+fn matrix_handle(state: &Arc<Mutex<MatrixState>>, path: &str, body: &Value) -> String {
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    if path.starts_with("/_matrix/client/v3/sync") {
+        let since = path
+            .split("since=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .map(str::to_string);
+        st.since_seen.push(since.clone());
+        // Deliver everything that arrived since the last sync served
+        // (server-side FIFO timeline; tokens do not attach to events).
+        let events: Vec<(String, Value)> = std::mem::take(&mut st.timeline);
+        st.next_batch += 1;
+        let next = format!("s{}", st.next_batch);
+        let mut rooms = serde_json::Map::new();
+        for (room, event) in events {
+            if let Some(arr) =
+                rooms
+                    .entry(room)
+                    .or_insert_with(|| serde_json::json!({"timeline": {"events": []}}))["timeline"]
+                    ["events"]
+                    .as_array_mut()
+            {
+                arr.push(event);
+            }
+        }
+        serde_json::json!({
+            "next_batch": next,
+            "rooms": {"join": rooms, "invite": {}, "leave": {}},
+        })
+        .to_string()
+    } else if path.contains("/send/m.room.message/") {
+        st.sent.push(CapturedRequest {
+            method: "PUT".into(),
+            body: body.clone(),
+        });
+        serde_json::json!({"event_id": format!("$k{}", st.sent.len())}).to_string()
+    } else {
+        serde_json::json!({}).to_string()
+    }
+}

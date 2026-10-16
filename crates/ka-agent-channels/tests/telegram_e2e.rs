@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ka_agent_channels::fake::FakeBotServer;
 use ka_agent_channels::{TelegramChannel, TelegramConfig, TelegramSurface};
@@ -43,6 +43,13 @@ async fn spawn_channel(allow: Vec<i64>, token: &str) -> Stack {
     let db_path = dir.join("state.db");
     std::fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(Store::open(&db_path).unwrap());
+    // The gate reads the identities table (§8.1): link what the caller
+    // allows, exactly as the CLI would.
+    for uid in &allow {
+        store
+            .link_identity("telegram", &uid.to_string(), "test")
+            .unwrap();
+    }
     let surface = TelegramSurface::new(base.clone(), token.to_string());
     let cfg = DaemonConfig {
         workspace: dir.clone(),
@@ -185,12 +192,21 @@ async fn offset_persists_and_dedupes() {
         )
         .expect("first status sent");
     assert!(first.body["text"].as_str().unwrap_or("").contains("strand"));
+    // The next poll must carry the persisted offset (update_id 1 → 2);
+    // wait for it explicitly instead of racing the loop.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stack.server.last_offset() < Some(2) {
+        assert!(
+            Instant::now() < deadline,
+            "the channel never re-polled with offset 2"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     stop(&mut stack).await;
     assert_eq!(
         stack.store.meta_get("telegram.offset").unwrap().as_deref(),
         Some("2")
     );
-    assert_eq!(stack.server.last_offset(), Some(2));
     // replay the same update_id: nothing re-delivers
     stack.server.push_text_message(1, 3, 42, "/status");
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -254,6 +270,7 @@ async fn approval_card_and_callback_settle() {
     let db_path = dir.join("state.db");
     std::fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(Store::open(&db_path).unwrap());
+    store.link_identity("telegram", "42", "test").unwrap();
     let cfg = DaemonConfig {
         workspace: dir.clone(),
         telegram: TelegramSettings {

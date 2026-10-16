@@ -54,6 +54,11 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Link channel identities to this instance's operator (SEED.md §8.1).
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Install, inspect and manage plugins (SEED.md §6).
     Plugin {
         #[command(subcommand)]
@@ -143,6 +148,136 @@ enum PluginAction {
         /// Plugin id.
         id: String,
     },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+enum IdentityAction {
+    /// List the identities linked to this operator.
+    List,
+    /// Link a channel identity (`ka-agent identity link telegram 12345`).
+    Link {
+        /// Channel name: telegram, matrix, …
+        channel: String,
+        /// The channel's stable address (numeric id, @user:domain, …).
+        address: String,
+    },
+    /// Unlink a channel identity.
+    Unlink {
+        /// Channel name.
+        channel: String,
+        /// The address to unlink.
+        address: String,
+    },
+}
+
+fn identity_action(action: IdentityAction) -> std::process::ExitCode {
+    let paths = Paths::new(Paths::default_root());
+    if let Err(e) = paths.ensure_dirs() {
+        eprintln!("ka-agent: cannot create {}: {e}", paths.root().display());
+        return std::process::ExitCode::FAILURE;
+    }
+    let Ok(store) = Store::open(&paths.state_db()) else {
+        eprintln!("ka-agent: cannot open {}", paths.state_db().display());
+        return std::process::ExitCode::FAILURE;
+    };
+    let audit = |action: &str, subject: &str| {
+        let mut rec = ka_agent_core::AuditRecord::new("operator", action, subject, None);
+        let _ = store.append_audit(&mut rec);
+    };
+    match action {
+        IdentityAction::List => {
+            let ids = match store.list_identities() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    eprintln!("ka-agent: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            if ids.is_empty() {
+                println!("no identities linked (this instance answers nobody)");
+            }
+            for id in ids {
+                println!(
+                    "{}:{}  via {} at {}",
+                    id.channel,
+                    id.address,
+                    id.via,
+                    crate::fmt_ts(id.linked_ms)
+                );
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        IdentityAction::Link { channel, address } => {
+            if !valid_channel_name(&channel) {
+                eprintln!("ka-agent: channel name {channel:?}: [a-z0-9-] only");
+                return std::process::ExitCode::FAILURE;
+            }
+            if address.trim().is_empty() || address.contains(char::is_control) {
+                eprintln!("ka-agent: address must be non-empty printable text");
+                return std::process::ExitCode::FAILURE;
+            }
+            match store.link_identity(&channel, address.trim(), "cli") {
+                Ok(true) => {
+                    audit(
+                        ka_agent_core::audit::actions::IDENTITY_LINK,
+                        &format!("{channel}:{}", address.trim()),
+                    );
+                    println!("linked {}:{}", channel, address.trim());
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    println!("{channel}:{} was already linked", address.trim());
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("ka-agent: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        IdentityAction::Unlink { channel, address } => {
+            match store.unlink_identity(&channel, address.trim()) {
+                Ok(true) => {
+                    audit(
+                        ka_agent_core::audit::actions::IDENTITY_UNLINK,
+                        &format!("{channel}:{}", address.trim()),
+                    );
+                    println!("unlinked {}:{}", channel, address.trim());
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(false) => {
+                    eprintln!("ka-agent: no such identity {channel}:{}", address.trim());
+                    std::process::ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("ka-agent: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn valid_channel_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Migrate the deprecated `[telegram] allow_user_ids` into the identities
+/// table (idempotent; provenance `config-migration`). Returns how many rows
+/// were added, so the caller can tell the operator.
+pub fn migrate_config_identities(store: &Store, cfg: &DaemonConfig) -> usize {
+    let mut added = 0;
+    for uid in &cfg.telegram.allow_user_ids {
+        if store
+            .link_identity("telegram", &uid.to_string(), "config-migration")
+            .unwrap_or(false)
+        {
+            added += 1;
+        }
+    }
+    added
 }
 
 fn plugins_root() -> PathBuf {
@@ -478,6 +613,7 @@ fn main() -> std::process::ExitCode {
         Command::Grant { action } => grant_action(action),
         Command::Export { out } => export(&out),
         Command::Purge { confirm } => purge(confirm),
+        Command::Identity { action } => identity_action(action),
         Command::Plugin { action } => plugin_action(action),
         Command::WebToken { port } => web_token(port),
         Command::Doctor { config } => doctor(config_path(&config)),
@@ -1018,6 +1154,15 @@ async fn run_daemon(
             return std::process::ExitCode::FAILURE;
         }
     };
+    // The deprecated config allowlist migrates into the identities table
+    // (§8.1): pairing is CLI-only now.
+    let migrated = migrate_config_identities(&store, &cfg);
+    if migrated > 0 {
+        println!(
+            "migrated {migrated} telegram.allow_user_ids entr(ies) into identities \
+             — remove the key from ka-agent.toml; manage links with `ka-agent identity`"
+        );
+    }
 
     // Telegram token, resolved once (surface and channel share it).
     let token = if cfg.telegram.enabled {
@@ -1041,13 +1186,54 @@ async fn run_daemon(
     } else {
         None
     };
-    // Surface: Telegram when enabled, otherwise local-print NullSurface.
-    let surface: Arc<dyn Surface> = match &token {
-        Some(t) => Arc::new(ka_agent_channels::TelegramSurface::new(
-            cfg.telegram.api_base().to_string(),
-            t.clone(),
-        )),
-        None => Arc::new(NullSurface),
+    // Matrix token (resolved once; the surface and channel share it).
+    let matrix_token = if cfg.matrix.enabled {
+        let secret_name = cfg
+            .matrix
+            .token_secret
+            .clone()
+            .unwrap_or_else(|| "matrix.access_token".to_string());
+        match ka_agent_channels::secret::resolve(&secret_name, &paths.root().join("secrets")) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!(
+                    "ka-agent: cannot resolve matrix token {secret_name:?}: {e}\n\
+                     set KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN or place a 0600 file at \
+                     {}/secrets/{secret_name}",
+                    paths.root().display()
+                );
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    // Surfaces fan out to every enabled channel (Phase 6); a channel-less
+    // daemon keeps the local NullSurface so it stays observable.
+    let mut surfaces: Vec<Arc<dyn Surface>> = Vec::new();
+    let _telegram_surface = token.as_ref().map(|t| {
+        let s: Arc<ka_agent_channels::TelegramSurface> = Arc::new(
+            ka_agent_channels::TelegramSurface::new(cfg.telegram.api_base().to_string(), t.clone()),
+        );
+        surfaces.push(s.clone());
+        s
+    });
+    let matrix_surface = matrix_token.as_ref().map(|t| {
+        let homeserver = cfg.matrix.homeserver.clone().unwrap_or_default();
+        let s: Arc<ka_agent_channels::MatrixSurface> = Arc::new(
+            ka_agent_channels::MatrixSurface::new(ka_agent_channels::MatrixConfig {
+                homeserver,
+                user_id: cfg.matrix.user_id.clone(),
+                token: t.clone(),
+            }),
+        );
+        surfaces.push(s.clone());
+        s
+    });
+    let surface: Arc<dyn Surface> = if surfaces.is_empty() {
+        Arc::new(NullSurface)
+    } else {
+        Arc::new(ka_agent_channels::MultiSurface::new(surfaces))
     };
 
     let mut port = WorkerPort::with_current_exe();
@@ -1088,12 +1274,31 @@ async fn run_daemon(
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Telegram channel (inbound) when enabled.
+    // Channels (inbound) when enabled: one task each, same runtime.
     if let Some(token) = token {
         let tcfg = ka_agent_channels::TelegramConfig::from_config(&cfg, token);
         let channel =
             ka_agent_channels::TelegramChannel::new(tcfg, runtime.clone(), Arc::clone(&store));
         tokio::spawn(channel.run(shutdown_rx.clone()));
+    }
+    if let (Some(surface), Some(token)) = (matrix_surface, matrix_token) {
+        let mcfg = ka_agent_channels::MatrixConfig {
+            homeserver: cfg.matrix.homeserver.clone().unwrap_or_default(),
+            user_id: cfg.matrix.user_id.clone(),
+            token,
+        };
+        let channel = ka_agent_channels::MatrixChannel::new(
+            mcfg,
+            runtime.clone(),
+            Arc::clone(&store),
+            surface,
+        );
+        use ka_agent_channels::Channel as _;
+        tokio::spawn(channel.run(shutdown_rx.clone()));
+        println!(
+            "matrix channel on {}",
+            cfg.matrix.homeserver.clone().unwrap_or_default()
+        );
     }
 
     // Admin socket: one newline-delimited JSON request per connection.

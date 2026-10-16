@@ -20,7 +20,7 @@ pub mod turn;
 pub use approval::{Approval, ApprovalDecision, ApprovalKind, ApprovalStatus};
 pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
-pub use config::{DaemonConfig, Error as ConfigError};
+pub use config::{DaemonConfig, Error as ConfigError, MatrixSettings};
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus};
 pub use queue::QueueItem;

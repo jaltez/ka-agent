@@ -6,9 +6,10 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M7 complete and verified.** Working today (`cargo test
---workspace`: 114 tests green; Telegram + memory + history + MCP bridge +
-scheduler + loopback web UI):
+**Status: M9 complete and verified.** Working today (`cargo test
+--workspace`: 137 tests green; Telegram + Matrix + memory + history + MCP
+bridge + scheduler + loopback web UI + sandboxed third-party plugins +
+cross-channel identity linking):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -25,7 +26,14 @@ scheduler + loopback web UI):
   budget (ka re-reads it per prompt, so updates need no worker restart).
   Candidate review (`/memory review` + `accept`/`reject`), `/remember`,
   `/forget`, `/memory` report.
-- **`ka-agent-channels`** — Telegram Bot API channel: long polling with a
+- **`ka-agent-channels`** — channels: Telegram (Bot API long polling,
+  allowlisted via identities, approval keyboards) and **Matrix** (CS API v3
+  `/sync` + `/send`, text-command approvals) behind one `Channel` trait with
+  a shared command router; `MultiSurface` fans runtime output to every
+  enabled channel. Identities (§8.1, ADR-0001): `ka-agent identity
+  link|list|unlink` gates every channel, audited, with automatic migration
+  of the deprecated Telegram `allow_user_ids`.
+- **`ka-agent-channels` (Telegram)** — Telegram Bot API channel: long polling with a
   persisted offset (at-least-once, deduped), numeric-id allowlist for
   private chats, local command routing (`/help /status /new /stop`),
   throttled delivery with typing indicator and progress edits, fence-balanced

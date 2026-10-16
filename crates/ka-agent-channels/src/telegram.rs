@@ -3,6 +3,7 @@
 //! never set, so model output is never interpreted as markup.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -518,6 +519,16 @@ pub struct TelegramChannel {
     store: Arc<Store>,
 }
 
+impl crate::channel::Channel for TelegramChannel {
+    fn name(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn run(self, shutdown: watch::Receiver<bool>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(Self::run(self, shutdown))
+    }
+}
+
 impl TelegramChannel {
     pub fn new(cfg: TelegramConfig, runtime: Runtime, store: Arc<Store>) -> Self {
         Self {
@@ -632,15 +643,22 @@ impl TelegramChannel {
         }
     }
 
-    /// Private chats from allowlisted users only. Everything else is
-    /// dropped with (rate-limited) stderr noise + an audit row and NO reply.
+    /// Private chats from **linked identities** only (SEED.md §8.1): the
+    /// config allowlist is a migration source, the identities table is the
+    /// authority. Everything else is dropped with (rate-limited) stderr
+    /// noise + an audit row and NO reply.
     async fn gate(
         &self,
         uid: i64,
         chat_type: &str,
         unauthorized_last: &mut HashMap<i64, i64>,
     ) -> bool {
-        if chat_type == "private" && self.cfg.allow_user_ids.contains(&uid) {
+        let linked = chat_type == "private"
+            && self
+                .store
+                .is_linked("telegram", &uid.to_string())
+                .unwrap_or(false);
+        if linked {
             return true;
         }
         let now = now_ms();
@@ -692,217 +710,14 @@ impl TelegramChannel {
             return;
         };
 
-        if let Some(word) = text.split_whitespace().next() {
-            if word.starts_with('/') {
-                match word {
-                    "/start" | "/help" => {
-                        let _ = client
-                            .send_message(
-                                chat_id,
-                                "commands: /help /status /new /stop\n\
-                                 /remember <fact> · /forget <id> · /memory [review|accept <id>|reject <id>]\n\
-                                 /history <query> · /history show <turn>",
-                                None,
-                            )
-                            .await;
-                    }
-                    "/remember" => {
-                        let fact = text.split_once(' ').map(|(_, f)| f.trim()).unwrap_or("");
-                        if fact.is_empty() {
-                            let _ = client
-                                .send_message(chat_id, "usage: /remember <fact>", None)
-                                .await;
-                        } else {
-                            match self.runtime.remember(fact, &format!("telegram:{uid}")) {
-                                Ok(id) => {
-                                    let _ = client
-                                        .send_message(chat_id, &format!("remembered {id}"), None)
-                                        .await;
-                                }
-                                Err(e) => {
-                                    let _ = client
-                                        .send_message(chat_id, &format!("! [memory] {e}"), None)
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                    "/forget" => {
-                        let Some((_, id)) = text.split_once(' ') else {
-                            let _ = client
-                                .send_message(chat_id, "usage: /forget <mem_id>", None)
-                                .await;
-                            return;
-                        };
-                        match self.runtime.forget(id.trim()) {
-                            Ok(true) => {
-                                let _ = client.send_message(chat_id, "forgotten", None).await;
-                            }
-                            Ok(false) => {
-                                let _ = client
-                                    .send_message(chat_id, "no such memory id", None)
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = client
-                                    .send_message(chat_id, &format!("! [memory] {e}"), None)
-                                    .await;
-                            }
-                        }
-                    }
-                    "/memory" => {
-                        let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
-                        let reply = match rest {
-                            "" => match self.runtime.memory_report() {
-                                Ok(report) => {
-                                    let files: Vec<String> = report
-                                        .files
-                                        .iter()
-                                        .map(|f| format!("{} {}B", f.name, f.bytes))
-                                        .collect();
-                                    format!(
-                                        "memory: {}B/{}B{}\n{}",
-                                        report.total_bytes,
-                                        report.budget_bytes,
-                                        if report.truncated { " (truncated)" } else { "" },
-                                        if files.is_empty() {
-                                            "(empty)".to_string()
-                                        } else {
-                                            files.join("\n")
-                                        }
-                                    )
-                                }
-                                Err(e) => format!("! [memory] {e}"),
-                            },
-                            "review" => match self.runtime.pending_candidates() {
-                                Ok(rows) if rows.is_empty() => "no pending candidates".to_string(),
-                                Ok(rows) => rows
-                                    .into_iter()
-                                    .map(|c| {
-                                        format!(
-                                            "{} ({}): {}",
-                                            short_id(c.id.as_str(), 10),
-                                            c.source,
-                                            c.text
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                Err(e) => format!("! [memory] {e}"),
-                            },
-                            other => {
-                                let (verb, id) = other.split_once(' ').unwrap_or((other, ""));
-                                match verb {
-                                    "accept" => match self.runtime.accept_candidate(id.trim()) {
-                                        Ok(true) => "accepted into stable memory".to_string(),
-                                        Ok(false) => "no such pending candidate".to_string(),
-                                        Err(e) => format!("! [memory] {e}"),
-                                    },
-                                    "reject" => match self.runtime.reject_candidate(id.trim()) {
-                                        Ok(true) => "rejected".to_string(),
-                                        Ok(false) => "no such pending candidate".to_string(),
-                                        Err(e) => format!("! [memory] {e}"),
-                                    },
-                                    _ => "usage: /memory [review|accept <id>|reject <id>]"
-                                        .to_string(),
-                                }
-                            }
-                        };
-                        let _ = client.send_message(chat_id, &reply, None).await;
-                    }
-                    "/remind" => {
-                        let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
-                        let reply = match self.runtime.add_reminder(rest) {
-                            Ok(Some(id)) => format!("reminder {id} scheduled"),
-                            Ok(None) => "usage: /remind <Ns|Nm|Nh|Nd> <text>".to_string(),
-                            Err(e) => format!("! [remind] {e}"),
-                        };
-                        let _ = client.send_message(chat_id, &reply, None).await;
-                    }
-                    "/skills" => {
-                        let _ = client
-                            .send_message(
-                                chat_id,
-                                "skills live in <data>/engine-home/.config/ka/skills/ (SKILL.md)",
-                                None,
-                            )
-                            .await;
-                    }
-                    "/history" => {
-                        let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
-                        let reply = if let Some(query) = rest.strip_prefix("show ") {
-                            match self.runtime.history_show(query.trim()) {
-                                Ok(Some((inbound, answer))) => {
-                                    format!("> {inbound}\n{answer}")
-                                }
-                                Ok(None) => "no such turn".to_string(),
-                                Err(e) => format!("! [history] {e}"),
-                            }
-                        } else if rest.is_empty() {
-                            "usage: /history <query> · /history show <turn_id>".to_string()
-                        } else {
-                            match self.runtime.history_search(rest, 5) {
-                                Ok(hits) if hits.is_empty() => {
-                                    format!("no history matches {rest:?}")
-                                }
-                                Ok(hits) => hits
-                                    .into_iter()
-                                    .map(|h| format!("[{}] {}", short_id(&h.turn, 8), h.snippet))
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                Err(e) => format!("! [history] {e}"),
-                            }
-                        };
-                        let _ = client.send_message(chat_id, &reply, None).await;
-                    }
-                    "/status" => {
-                        let (status, strand, usd, tokens, crashes) = self.runtime.status();
-                        let session = short_id(self.runtime.session_id().as_str(), 8);
-                        let strand = strand
-                            .as_deref()
-                            .map(|s| short_id(s, 8))
-                            .unwrap_or_else(|| "new".to_string());
-                        let _ = client
-                            .send_message(
-                                chat_id,
-                                &format!(
-                                    "session {session} · {status:?}\nstrand: {strand}\nbudget: ${usd:.4} + {tokens} tokens · crashes: {crashes}"
-                                ),
-                                None,
-                            )
-                            .await;
-                    }
-                    "/new" => match self.runtime.new_session().await {
-                        Ok(id) => {
-                            let _ = client
-                                .send_message(
-                                    chat_id,
-                                    &format!("new session {}", short_id(id.as_str(), 8)),
-                                    None,
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            let _ = client
-                                .send_message(chat_id, &format!("! [session] {e}"), None)
-                                .await;
-                        }
-                    },
-                    "/stop" => {
-                        if let Err(e) = self.runtime.stop_turn().await {
-                            let _ = client
-                                .send_message(chat_id, &format!("! [stop] {e}"), None)
-                                .await;
-                        }
-                    }
-                    _ => {
-                        let _ = client
-                            .send_message(chat_id, &format!("unknown command: {word}"), None)
-                            .await;
-                    }
-                }
-                return;
+        // Commands route through the shared router; replies go to the same
+        // chat. Approvals additionally offer the inline keyboard below.
+        match crate::commands::route(&self.runtime, &format!("telegram:{uid}"), text).await {
+            crate::commands::Outcome::Reply(reply) => {
+                let _ = client.send_message(chat_id, &reply, None).await;
             }
+            crate::commands::Outcome::Silent => {}
+            crate::commands::Outcome::NotACommand => {}
         }
 
         if let Err(e) = self

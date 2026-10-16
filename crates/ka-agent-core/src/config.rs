@@ -61,6 +61,19 @@ pub struct Ka {
     pub engine_layer: Option<PathBuf>,
 }
 
+/// The Matrix channel (Phase 6): strict `[matrix]` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MatrixSettings {
+    pub enabled: bool,
+    /// Base URL of the homeserver; tests point it at a local fake.
+    pub homeserver: Option<String>,
+    /// The bot account, `@ka-agent:example.org`.
+    pub user_id: String,
+    /// Name of the access token in the secret store.
+    pub token_secret: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Telegram {
@@ -68,7 +81,9 @@ pub struct Telegram {
     pub enabled: bool,
     /// Name of the bot token in the secret store.
     pub token_secret: Option<String>,
-    /// Paired operator user ids (numeric; usernames are never trusted).
+    /// Deprecated: paired operator user ids. Migrated into the identities
+    /// table at startup (SEED.md §8.1); link identities with
+    /// `ka-agent identity link` instead.
     pub allow_user_ids: Vec<i64>,
     /// Bot API base URL. Default `https://api.telegram.org`; tests point it
     /// at a local fake server.
@@ -101,6 +116,9 @@ pub struct DaemonConfig {
     pub budgets: Budgets,
     pub ka: Ka,
     pub telegram: Telegram,
+    /// The Matrix channel (Phase 6).
+    #[serde(default)]
+    pub matrix: MatrixSettings,
 }
 
 impl Default for DaemonConfig {
@@ -115,6 +133,7 @@ impl Default for DaemonConfig {
             budgets: Budgets::default(),
             ka: Ka::default(),
             telegram: Telegram::default(),
+            matrix: MatrixSettings::default(),
         }
     }
 }
@@ -157,15 +176,25 @@ impl DaemonConfig {
                 return Err(Error::Validate("budgets.daily_usd must be positive".into()));
             }
         }
-        if self.telegram.enabled {
-            if self.telegram.allow_user_ids.is_empty() {
+        if self.telegram.enabled && self.telegram.token_secret.is_none() {
+            return Err(Error::Validate(
+                "telegram.enabled requires telegram.token_secret (a secret-store name)".into(),
+            ));
+        }
+        if self.matrix.enabled {
+            if self.matrix.homeserver.is_none() {
                 return Err(Error::Validate(
-                    "telegram.enabled requires at least one allow_user_ids entry".into(),
+                    "matrix.enabled requires matrix.homeserver".into(),
                 ));
             }
-            if self.telegram.token_secret.is_none() {
+            if self.matrix.user_id.is_empty() || !self.matrix.user_id.starts_with('@') {
                 return Err(Error::Validate(
-                    "telegram.enabled requires telegram.token_secret (a secret-store name)".into(),
+                    "matrix.enabled requires matrix.user_id (@user:domain)".into(),
+                ));
+            }
+            if self.matrix.token_secret.is_none() {
+                return Err(Error::Validate(
+                    "matrix.enabled requires matrix.token_secret (a secret-store name)".into(),
                 ));
             }
         }
@@ -230,15 +259,18 @@ mod tests {
     }
 
     #[test]
-    fn telegram_enabled_needs_allowlist() {
+    fn telegram_no_longer_requires_allow_user_ids() {
+        // Enabled with no allow_user_ids is valid: identities live in the
+        // store now and the config list is only a migration source.
         let cfg = DaemonConfig {
             telegram: Telegram {
                 enabled: true,
+                token_secret: Some("telegram.bot_token".into()),
                 ..Telegram::default()
             },
             ..DaemonConfig::default()
         };
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
