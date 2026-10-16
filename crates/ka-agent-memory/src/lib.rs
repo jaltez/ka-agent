@@ -157,6 +157,15 @@ impl MemoryStore {
         })
     }
 
+    /// The raw text of one well-known file, `None` before it exists.
+    pub fn file_text(&self, file: &MemoryFile) -> Result<Option<String>, Error> {
+        let path = self.root().join(file.path());
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read_to_string(&path)?))
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

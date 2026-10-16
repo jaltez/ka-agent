@@ -326,6 +326,189 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
 }
 
 #[test]
+fn memory_editor_stages_diffs_and_applies_decisions() {
+    let root = temp_root("editor");
+    let port = free_port();
+    let daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    // A proposal is staged for review, not written.
+    let staged = request(
+        port,
+        "POST",
+        "/memory/edit",
+        Some(&cookie),
+        "text=Facts+stay+<i>escaped</i>",
+    );
+    assert_eq!(staged.status, 303, "proposal should redirect");
+    let page = request(port, "GET", "/memory", Some(&cookie), "");
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains("proposes:"),
+        "the review inbox must list the proposal"
+    );
+    // The diff preview carries the added line, escaped.
+    assert!(
+        page.body
+            .contains("+ - Facts stay &lt;i&gt;escaped&lt;/i&gt;"),
+        "diff must show the escaped addition"
+    );
+    assert!(
+        !page.body.contains("<i>escaped</i>"),
+        "raw markup leaked into the diff"
+    );
+    let id = page
+        .body
+        .split("name=id value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("candidate id in the form")
+        .to_string();
+
+    // Accept: the entry lands and the queue empties.
+    let accepted = request(
+        port,
+        "POST",
+        "/memory/candidate",
+        Some(&cookie),
+        &format!("id={id}&decision=y"),
+    );
+    assert_eq!(accepted.status, 303, "accept should redirect");
+    let after = request(port, "GET", "/memory", Some(&cookie), "");
+    assert!(
+        after.body.contains("none awaiting review"),
+        "review queue must drain: {}",
+        after.body
+    );
+    assert!(
+        after.body.contains("&lt;i&gt;escaped&lt;/i&gt;"),
+        "accepted entry must render"
+    );
+    let facts = std::fs::read_to_string(daemon.data.join("memory/facts.md")).unwrap_or_default();
+    assert!(
+        facts.contains("Facts stay <i>escaped</i>"),
+        "facts.md must carry the entry: {facts}"
+    );
+
+    // Reject: staged and dropped without touching the file.
+    request(
+        port,
+        "POST",
+        "/memory/edit",
+        Some(&cookie),
+        "text=Rejected+proposal",
+    );
+    let page = request(port, "GET", "/memory", Some(&cookie), "");
+    let id = page
+        .body
+        .split("name=id value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("second candidate id")
+        .to_string();
+    let rejected = request(
+        port,
+        "POST",
+        "/memory/candidate",
+        Some(&cookie),
+        &format!("id={id}&decision=n"),
+    );
+    assert_eq!(rejected.status, 303, "reject should redirect");
+    // An unknown id is reported escaped — it is operator input, and the
+    // crate's invariant is that every user-derived string is escaped.
+    let reflected = request(
+        port,
+        "POST",
+        "/memory/candidate",
+        Some(&cookie),
+        "id=<img src=x onerror=alert(1)>&decision=n",
+    );
+    assert_eq!(reflected.status, 200, "unknown id renders a page");
+    assert!(
+        reflected.body.contains("&lt;img"),
+        "reflected id must be escaped: {}",
+        reflected.body
+    );
+    assert!(
+        !reflected.body.contains("<img "),
+        "raw markup leaked through the unknown-id path"
+    );
+    let facts = std::fs::read_to_string(daemon.data.join("memory/facts.md")).unwrap_or_default();
+    assert!(
+        !facts.contains("Rejected proposal"),
+        "a rejected candidate must not touch facts.md: {facts}"
+    );
+}
+
+#[test]
+fn malformed_requests_do_not_kill_the_server() {
+    let root = temp_root("malformed");
+    let port = free_port();
+    // Held for the lifetime of the test: dropping it kills the server.
+    let _daemon_holder = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+
+    // A header flood plus a cookie flood, built once and borrowed below.
+    let mut flood = b"GET / HTTP/1.1\r\n".to_vec();
+    for _ in 0..2000 {
+        flood.extend_from_slice(b"X-Pad: 0\r\n");
+    }
+    flood.extend_from_slice(b"Cookie: ");
+    for _ in 0..500 {
+        flood.extend_from_slice(b"a=1; ");
+    }
+    flood.extend_from_slice(b"ka_session=x\r\nConnection: close\r\n\r\n");
+
+    let cases: Vec<&[u8]> = vec![
+        // Not HTTP at all.
+        b"\x00\x01garbage\x00\xff\xfe",
+        // Request line with NULs and no terminator shape.
+        b"GET /\x00 HTTP/1.1\r\n\r\n",
+        // Headers only, no request line.
+        b"Host: x\r\n\r\n",
+        // Absolute-form target (must not match a route → 404, no bypass).
+        b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        // Path normalization attempts.
+        b"GET /history/../ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"GET //memory HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        // Header flood (many small headers) and a cookie flood.
+        &flood,
+        // POST without Content-Length (empty body) and with a lying one.
+        b"POST /memory/edit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"POST /memory/edit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nab",
+        // Chunked encoding is not supported: no Content-Length → empty body.
+        b"POST /memory/edit HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        // usize::MAX in Content-Length: must be refused before any
+        // arithmetic (overflow → panic), not just as "too large".
+        b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 18446744073709551615\r\nConnection: close\r\n\r\n",
+        // Two declarations of Content-Length (request smuggling shape).
+        b"POST /memory/edit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\nhello",
+    ];
+    for (i, raw) in cases.iter().enumerate() {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(raw).unwrap();
+        // Done writing: EOF lets the parser settle a short body immediately
+        // instead of holding the connection to its deadline.
+        use std::net::Shutdown;
+        let _ = stream.shutdown(Shutdown::Write);
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        // Whatever comes back (a response or a closed connection), the server
+        // must survive: check liveness after each case.
+        let alive = request(port, "GET", "/healthz", None, "");
+        assert_eq!(alive.status, 200, "server died after case {i}");
+        if !buf.is_empty() {
+            let head = String::from_utf8_lossy(&buf[..buf.len().min(40)]).into_owned();
+            assert!(
+                head.starts_with("HTTP/1.1 "),
+                "case {i}: unexpected bytes {head:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn oversized_body_is_refused_without_buffering() {
     let root = temp_root("oversize");
     let port = free_port();

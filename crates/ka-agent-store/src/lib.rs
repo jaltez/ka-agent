@@ -214,6 +214,18 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically clear a key only while it still holds `expected`
+    /// (compare-and-swap): exactly one caller wins, which is what makes a
+    /// one-shot token single-use under concurrent redemption.
+    pub fn consume_meta(&self, key: &str, expected: &str) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE meta SET value = '' WHERE key = ?1 AND value = ?2",
+            params![key, expected],
+        )?;
+        Ok(changed == 1)
+    }
+
     // ------------------------------------------------------------------
     // sessions
     // ------------------------------------------------------------------
@@ -367,7 +379,10 @@ impl Store {
         let Some(current) = parse_turn_status(&current) else {
             return Err(StoreError::NotFound(format!("turn {}", t.id)));
         };
-        if !current.can_transition_to(t.status) {
+        // A same-status write is a payload refresh, not a transition: ka
+        // cycles can emit several `turn_finished` events (auto-poke, verify)
+        // and the later ones carry the cumulative usage.
+        if current != t.status && !current.can_transition_to(t.status) {
             return Err(StoreError::IllegalTransition {
                 what: "turn",
                 from: status_str(&current),
@@ -1662,6 +1677,19 @@ mod tests {
         assert_eq!(store.pending_candidates().unwrap(), vec![mem.clone()]);
         store.set_candidate_status(&mem, "accepted").unwrap();
         assert!(store.pending_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn consume_meta_is_single_shot_and_exact() {
+        let store = Store::open_in_memory().unwrap();
+        store.meta_set("t", "tok").unwrap();
+        // Wrong value never clears the stored one.
+        assert!(!store.consume_meta("t", "wrong").unwrap());
+        assert_eq!(store.meta_get("t").unwrap().as_deref(), Some("tok"));
+        // The right value clears exactly once.
+        assert!(store.consume_meta("t", "tok").unwrap());
+        assert!(!store.consume_meta("t", "tok").unwrap());
+        assert_eq!(store.meta_get("t").unwrap().as_deref(), Some(""));
     }
 
     #[test]

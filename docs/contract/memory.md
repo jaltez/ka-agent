@@ -41,7 +41,9 @@ operator accepts stable-memory writes.
   text, provenance, status (`pending`/`accepted`/`rejected`/`discarded`).
 - **No conversational auto-promotion** (SEED.md §4.4): the only paths to
   stable memory are (1) explicit `/remember` from the operator and
-  (2) acceptance of a candidate via `/memory accept`.
+  (2) acceptance of a candidate via `/memory accept` — or the web review
+  inbox (`POST /memory/edit` stages, `POST /memory/candidate` decides), the
+  same runtime paths as the console commands.
 - The model-side producer (`memory.propose` through the connector bridge)
   arrives with the MCP bridge in the next milestone.
 

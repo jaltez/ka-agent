@@ -100,17 +100,13 @@ fn status_reason(code: u16) -> &'static str {
 /// Parse one HTTP/1.1 request from a stream (bounded, timeout-guarded).
 pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
     const MAX: usize = 1024 * 1024;
-    const TIMEOUT: Duration = Duration::from_secs(10);
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
         if buf.len() > MAX {
             return None;
         }
-        let n = tokio::time::timeout(TIMEOUT, socket.read(&mut tmp))
-            .await
-            .ok()?
-            .ok()?;
+        let n = socket.read(&mut tmp).await.ok()?;
         if n == 0 {
             return None;
         }
@@ -123,7 +119,7 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
             let method = parts.next()?.to_string();
             let target = parts.next()?.to_string();
             let mut cookies = HashMap::new();
-            let mut content_length = 0usize;
+            let mut content_length: Option<u64> = None;
             for line in lines {
                 if let Some(v) = line
                     .strip_prefix("Cookie: ")
@@ -139,9 +135,20 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
                     .strip_prefix("Content-Length: ")
                     .or_else(|| line.strip_prefix("content-length: "))
                 {
-                    content_length = v.trim().parse().unwrap_or(0);
+                    // One declaration only (smuggling hardening), and the
+                    // value is validated before any arithmetic: `usize::MAX`
+                    // must not reach an addition or a slice range.
+                    if content_length.is_some() {
+                        return None;
+                    }
+                    let cl: u64 = v.trim().parse().unwrap_or(u64::MAX);
+                    if cl > MAX as u64 {
+                        return None;
+                    }
+                    content_length = Some(cl);
                 }
             }
+            let content_length = content_length.unwrap_or(0) as usize;
             let (path, query_str) = target.split_once('?').unwrap_or((target.as_str(), ""));
             let mut query = HashMap::new();
             for pair in query_str.split('&') {
@@ -157,10 +164,7 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
                 return None;
             }
             while buf.len() < body_start + content_length {
-                let n = tokio::time::timeout(TIMEOUT, socket.read(&mut tmp))
-                    .await
-                    .ok()?
-                    .ok()?;
+                let n = socket.read(&mut tmp).await.ok()?;
                 if n == 0 {
                     break;
                 }
@@ -246,10 +250,22 @@ impl Auth {
         let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
         let stored = parsed["token"].as_str()?;
         let expires = parsed["expires_ms"].as_i64()?;
-        if stored != token || ka_agent_core::now_ms() > expires {
+        // Constant-time: an unauthenticated caller must not learn the
+        // token's prefix through compare timing.
+        let same = stored.len() == token.len()
+            && stored
+                .bytes()
+                .zip(token.bytes())
+                .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                == 0;
+        if !same || ka_agent_core::now_ms() > expires {
             return None;
         }
-        let _ = store.meta_set("web_auth_token", "");
+        // Single-use under concurrent redemption: exactly one caller's
+        // compare-and-swap wins, even if several read the token first.
+        if !store.consume_meta("web_auth_token", &raw).unwrap_or(false) {
+            return None;
+        }
         let session = random_hex(32);
         let now = ka_agent_core::now_ms();
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -337,6 +353,10 @@ impl WebServer {
             .map_err(|e| WebError::Bind(format!("bind {addr}: {e}")))?;
         eprintln!("ka-agent web: listening on {addr}");
         let auth = Arc::new(Auth::new());
+        // Bounded concurrency: a local process must not exhaust the shared
+        // daemon's tasks and file descriptors with idle connections. Beyond
+        // the cap the connection is dropped immediately (fail closed).
+        let slots = Arc::new(tokio::sync::Semaphore::new(64));
         let mut shutdown = shutdown;
         loop {
             tokio::select! {
@@ -346,11 +366,25 @@ impl WebServer {
                 }
                 accepted = listener.accept() => {
                     let Ok((mut socket, _)) = accepted else { continue };
+                    let Ok(slot) = slots.clone().try_acquire_owned() else {
+                        // Over capacity: nothing was read, nothing leaks.
+                        continue;
+                    };
                     let auth = Arc::clone(&auth);
                     let runtime = self.runtime.clone();
                     let store = Arc::clone(&self.store);
                     tokio::spawn(async move {
-                        if let Some(req) = parse_request(&mut socket).await {
+                        let _slot = slot;
+                        // One deadline for head and body alike: a dribbling
+                        // connection cannot reset it byte by byte.
+                        let req = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            parse_request(&mut socket),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(req) = req {
                             let resp = route(&req, &auth, &runtime, &store).await;
                             write_response(&mut socket, resp).await;
                         }
@@ -390,6 +424,10 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
         ("POST", "/memory/edit") => {
             let body = String::from_utf8_lossy(&req.body);
             pages::memory_edit(runtime, &body)
+        }
+        ("POST", "/memory/candidate") => {
+            let body = String::from_utf8_lossy(&req.body);
+            pages::memory_candidate(runtime, &body)
         }
         ("GET", "/approvals") => pages::approvals(runtime, store),
         ("POST", "/approvals/decide") => {

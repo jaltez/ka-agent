@@ -132,12 +132,14 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
         .memory_compiled_text()
         .map(|text| format!("<pre>{}</pre>", escape_html(&text)))
         .unwrap_or_else(|e| format!("<p>compile error: {}</p>", escape_html(&e.to_string())));
+    let candidates = render_candidates(runtime);
     let body = format!(
         "<p>memory: {}B / {}B{}</p><ul>{}</ul>\
          <h2>propose an entry</h2>\
          <form method=post action=/memory/edit>\
          <textarea name=text rows=4 cols=60 placeholder=\"one durable fact\"></textarea><br>\
-         <button>remember</button></form>\
+         <button>propose</button></form>\
+         {candidates}\
          <h2>accepted entries</h2>{entries}\
          <h2>compiled (injected)</h2>{compiled}",
         report.total_bytes,
@@ -156,7 +158,7 @@ pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
             "<p>nothing to remember (empty text)</p><p><a href=\"/memory\">back</a></p>".into(),
         ));
     }
-    match runtime.remember(&text, "web") {
+    match runtime.propose_memory("web", &text, None) {
         Ok(_id) => {
             // 303 so a refresh does not re-submit the form.
             let mut resp = Response::redirect("/memory");
@@ -166,6 +168,88 @@ pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
         Err(e) => Response::html(html_page(
             "Error",
             format!("<p>{}</p>", escape_html(&e.to_string())),
+        )),
+    }
+}
+
+/// The review inbox: each candidate with the diff accepting it would apply
+/// to its target file, and accept/reject forms (SEED.md §4.4). Accepting
+/// appends `- {text}` plus a provenance comment to facts.md
+/// (`MemoryStore::add`); the id/timestamp are generated on accept, so the
+/// preview marks them.
+fn render_candidates(runtime: &Runtime) -> String {
+    let rows = runtime.pending_candidates().unwrap_or_default();
+    if rows.is_empty() {
+        return "<h2>candidates</h2><p>none awaiting review</p>".into();
+    }
+    let facts = runtime
+        .memory_facts_text()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let context: String = facts
+        .lines()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|l| format!("  {l}\n"))
+        .collect::<String>()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let cards: Vec<String> = rows
+        .iter()
+        .map(|c| {
+            let diff = format!(
+                "{context}+ - {}\n+ <!-- id: …; source: {}; accepted: …; valid_until: - -->\n",
+                escape_html(&c.text),
+                escape_html(&c.source)
+            );
+            format!(
+                "<div class='card'><p><b>{}</b> proposes:</p><pre>{diff}</pre>\
+                 <form method=post action=/memory/candidate>\
+                 <input type=hidden name=id value=\"{}\">\
+                 <button name=decision value=y>Accept</button>\
+                 <button name=decision value=n>Reject</button></form></div>",
+                escape_html(&c.source),
+                escape_html(c.id.as_str())
+            )
+        })
+        .collect();
+    format!("<h2>candidates</h2>{}", cards.join(""))
+}
+
+/// `POST /memory/candidate`: apply a review decision.
+pub fn memory_candidate(runtime: &Runtime, body: &str) -> crate::Response {
+    let id = form_field(body, "id");
+    let applied = match form_field(body, "decision").as_str() {
+        "y" => runtime.accept_candidate(&id),
+        _ => runtime.reject_candidate(&id),
+    };
+    match applied {
+        // Ok(false): unknown or already-settled candidate — say so instead of
+        // silently reporting success.
+        Ok(true) => {
+            let mut resp = Response::redirect("/memory");
+            resp.status = 303;
+            resp
+        }
+        Ok(false) => Response::html(html_page(
+            "Memory",
+            format!(
+                "<p>no pending candidate {}: it may already be settled</p>\
+                 <p><a href=\"/memory\">back</a></p>",
+                escape_html(&id)
+            ),
+        )),
+        Err(e) => Response::html(html_page(
+            "Memory",
+            format!(
+                "<p>decision not applied: {}</p><p><a href=\"/memory\">back</a></p>",
+                escape_html(&e.to_string())
+            ),
         )),
     }
 }
@@ -212,7 +296,7 @@ pub fn approvals(runtime: &Runtime, store: &Store) -> crate::Response {
             Some(format!(
                 "<div class='card'><p>{q}</p>{d}<p>expires {:02}:{:02}</p>\
                  <form method=post action=/approvals/decide>\
-                 <input type=hidden name=id value={}><button name=decision value=y>Allow</button>\
+                 <input type=hidden name=id value=\"{}\"><button name=decision value=y>Allow</button>\
                  <button name=decision value=n>Deny</button></form></div>",
                 local / 60,
                 local % 60,

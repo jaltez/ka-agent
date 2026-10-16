@@ -34,8 +34,9 @@ daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 | GET | `/` | dashboard: session, status, strand, budget (USD + tokens), crashes |
 | GET | `/history` | search form; `?q=` runs FTS over episodes |
 | GET | `/history/show/<turn>` | one turn: inbound text + the outbound answer |
-| GET | `/memory` | report (bytes/budget), proposal form, accepted entries, compiled text |
-| POST | `/memory/edit` | accepts an entry (`text=`) → `303` back to `/memory` |
+| GET | `/memory` | report (bytes/budget), proposal form, the review inbox (candidates with diffs), accepted entries, compiled text |
+| POST | `/memory/edit` | stages a candidate (`text=`) → `303` back to `/memory` |
+| POST | `/memory/candidate` | `id=` + `decision=y\|n` applies a review decision → `303` |
 | GET | `/approvals` | pending asks with allow/deny forms |
 | POST | `/approvals/decide` | `id=` + `decision=y\|n` → `302 /approvals` |
 | GET | `/audit` | the last 50 audit-chain records (seq, time, actor, action, subject) |
@@ -45,6 +46,9 @@ Anything else is `404` — including `GET` on a mutation path, so no page can
 be triggered by a link.
 
 ## Security checklist (SEED §10 exit criteria)
+
+Reviewed 2026-10-16 (M7.1) by a read-only security pass over the HTTP
+surface; every finding fixed and covered by tests:
 
 - [x] **Loopback only.** The bind address is the literal `127.0.0.1`; there is
       no configuration that widens it. The e2e test reads the listening
@@ -62,6 +66,17 @@ be triggered by a link.
 - [x] **No external surface.** No CDN, no external asset, no outbound request
       is made by the UI; the responses are inline HTML + a small inline
       stylesheet.
+- [x] **Parser hardening.** One `Content-Length` per request, validated as
+      `u64` and capped before any arithmetic (an overflowing value is
+      refused, never sliced); the head+body phase runs under one 30 s
+      deadline, so a dribbling connection cannot hold a task; concurrent
+      connections are capped at 64 (beyond that the connection is dropped
+      without being read). Covered by `malformed_requests_do_not_kill_the_server`.
+- [x] **Single-use token under concurrent redemption.** The token is
+      consumed by a store-side compare-and-swap (`Store::consume_meta`):
+      exactly one racing `GET /auth` wins.
+- [x] **Constant-time token compare.** The stored token is compared in
+      constant time; `/auth` timing leaks no prefix.
 - [x] **No privilege beyond the daemon.** The UI reads the same store the
       daemon owns and calls the same runtime methods the console and Telegram
       surfaces call (`remember`, `decide`, `history_search`, `memory_report`).
