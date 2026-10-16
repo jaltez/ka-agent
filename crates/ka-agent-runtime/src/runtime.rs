@@ -754,6 +754,18 @@ impl Runtime {
         turn.transition(TurnStatus::Submitted)
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
+        // Claim the turn for this live session *before* the submit handshake:
+        // the engine can stream and finish the turn while we are still
+        // awaiting `port.submit`, and a late claim loses `turn_finished`
+        // (the record would never go terminal, and the session would never
+        // return to idle).
+        {
+            let mut g = self.lock();
+            if let Some(live) = g.live.as_mut() {
+                live.current_turn = Some(turn.id.clone());
+                live.live_text.clear();
+            }
+        }
         match port.submit(text.to_string(), Vec::new(), Vec::new()).await {
             Ok(()) => {}
             Err(PortError::EngineClosed) => {
@@ -765,16 +777,22 @@ impl Runtime {
             }
             Err(e) => return Err(e.into()),
         }
+        // The engine may have finished the turn already (fast scripted
+        // speaker): its record is then terminal and there is nothing left
+        // for this handshake to record.
+        if self
+            .sh
+            .store
+            .get_turn(&turn.id)
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.status.is_terminal())
+        {
+            return Ok(());
+        }
         turn.transition(TurnStatus::Running)
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
-        {
-            let mut g = self.lock();
-            if let Some(live) = g.live.as_mut() {
-                live.current_turn = Some(turn.id.clone());
-                live.live_text.clear();
-            }
-        }
         self.sh.surface.on_turn_started();
         Ok(())
     }
@@ -1015,6 +1033,13 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                         t.stop = Some(stop.clone());
                         t.cost_usd = cost_usd;
                         t.tokens = tokens;
+                        // The engine can finish a turn before the submit
+                        // handshake recorded it as running: walk the record
+                        // up so the finish always lands on a legal edge.
+                        if t.status == TurnStatus::Submitted {
+                            t.transition(TurnStatus::Running).ok();
+                            sh.store.update_turn(&t).ok();
+                        }
                         let next = match stop.as_str() {
                             "done" | "length" => Some(TurnStatus::Done),
                             "error" => Some(TurnStatus::Error),
