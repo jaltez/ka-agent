@@ -371,6 +371,15 @@ impl FakeHomeserver {
             .collect()
     }
 
+    /// Forget the sync history (between daemon restarts in a test).
+    pub fn reset_since_history(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .since_seen
+            .clear();
+    }
+
     /// Every `since` token the channel has synced with, in order.
     pub fn since_history(&self) -> Vec<Option<String>> {
         self.state

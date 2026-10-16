@@ -1133,6 +1133,14 @@ async fn run_daemon(
     scenario: Option<PathBuf>,
     web_port: Option<u16>,
 ) -> std::process::ExitCode {
+    // Signals first: from the first line of startup, SIGINT/SIGTERM must be
+    // graceful — a kill arriving during init would otherwise terminate the
+    // process by default (verified by the matrix e2e restart race).
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| eprintln!("ka-agent: cannot watch SIGTERM: {e}"))
+        .ok();
+    let ctrl_c = tokio::signal::ctrl_c();
+
     // Strict, unlike chat: a daemon with a broken config must not silently
     // run with defaults.
     let cfg = match DaemonConfig::load(&config) {
@@ -1352,12 +1360,10 @@ async fn run_daemon(
         }
     });
 
-    // Graceful shutdown: SIGINT or SIGTERM, whichever first.
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| eprintln!("ka-agent: cannot watch SIGTERM: {e}"))
-        .ok();
+    // Graceful shutdown: SIGINT or SIGTERM, whichever first (the streams
+    // were registered before any channel started).
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = ctrl_c => {}
         _ = async {
             match term.as_mut() {
                 Some(s) => {

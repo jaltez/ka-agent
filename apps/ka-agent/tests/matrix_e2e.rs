@@ -152,6 +152,9 @@ async fn simple_turn_and_next_batch_persistence_across_restart() {
     };
     assert!(since.is_some(), "next_batch must be persisted");
 
+    // Daemon #1's own final sync already used the stored token; forget the
+    // history so the wait below can only be satisfied by daemon #2.
+    fake.reset_since_history();
     let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
     let deadline = Instant::now() + Duration::from_secs(10);
     let resumed = loop {
