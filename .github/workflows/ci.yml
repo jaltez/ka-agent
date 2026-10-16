@@ -32,7 +32,12 @@ jobs:
         run: ./scripts/check-ka-deps.sh
 
       - name: Install bubblewrap (plugin sandbox)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          # Ubuntu 23.10+ restricts unprivileged user namespaces, which
+          # bubblewrap needs; the runner is unprivileged.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --version
       - name: Build (the example plugin binary the tests install)
         run: cargo build --workspace --quiet
       - name: Tests

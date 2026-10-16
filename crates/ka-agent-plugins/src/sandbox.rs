@@ -133,9 +133,33 @@ impl Sandbox {
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": tool, "arguments": args}
         }))?;
-        let answer = self.read_answer(&mut child)?;
-        let _ = child.kill();
-        let _ = child.wait();
+        let answer = self.read_answer(&mut child);
+        let status = child.wait().ok();
+        let stderr_tail = child
+            .stderr
+            .take()
+            .map(|err| {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                let _ = err.take(2048).read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).trim().to_string()
+            })
+            .unwrap_or_default();
+        let answer = match answer {
+            Err(SandboxError::Protocol(ref e)) if e.contains("exited before answering") => {
+                // A sandbox that never started (missing bubblewrap support,
+                // restricted user namespaces) or a plugin that crashed:
+                // say which.
+                let code = status.map(|s| s.to_string()).unwrap_or_default();
+                Err(SandboxError::Failed(if stderr_tail.is_empty() {
+                    format!("plugin exited before answering ({code})")
+                } else {
+                    format!("plugin exited before answering ({code}): {stderr_tail}")
+                }))
+            }
+            other => other,
+        };
+        let answer = answer?;
         let _ = started;
         // The answer's text, capped.
         let mut text = answer;
@@ -151,12 +175,12 @@ impl Sandbox {
         cmd.args(self.bwrap_argv())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Plugin stderr is noise by default; KAGENT_PLUGIN_DEBUG=1 shows
-            // it (authoring and ops).
+            // Captured for the failure message; KAGENT_PLUGIN_DEBUG=1 also
+            // streams it live (authoring and ops).
             .stderr(if std::env::var("KAGENT_PLUGIN_DEBUG").is_ok() {
                 Stdio::inherit()
             } else {
-                Stdio::null()
+                Stdio::piped()
             });
         cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

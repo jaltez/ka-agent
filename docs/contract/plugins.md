@@ -73,7 +73,21 @@ bwrap --unshare-net --die-with-parent
   provider keys are never in the environment.
 - **Limits**: 30 s wall clock per call (watchdog `kill -9`), 64 KiB output
   cap (truncated), and the bridge caps concurrent plugin connections at 64.
-- `KAGENT_PLUGIN_DEBUG=1` passes the plugin's stderr through (authoring).
+- `KAGENT_PLUGIN_DEBUG=1` streams the plugin's stderr (authoring).
+
+### Host prerequisites
+
+Bubblewrap needs **unprivileged user namespaces**. Ubuntu 23.10+ restricts
+them by default, so an unprivileged operator must either
+
+```
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # or set it in sysctl.d
+```
+
+or ship an AppArmor profile that grants `userns` to `/usr/bin/bwrap`.
+Without it `bwrap` exits immediately; the bridge reports the plugin's exit
+status and stderr tail (e.g. `setting up uid map: Permission denied`) rather
+than a bare timeout.
 
 ## Signing and distribution
 
