@@ -38,3 +38,12 @@ if [[ $fail -ne 0 ]]; then
     exit 1
 fi
 echo "ok: no ka-* dependencies outside ka-agent-port and ka-agent"
+
+# The pin constant the binary reports must match the manifest's git rev.
+manifest_rev="$(grep -o 'rev = "[0-9a-f]\{40\}"' Cargo.toml | head -1 | cut -d'"' -f2)"
+const_rev="$(grep -o 'KA_PIN_REV: &str = "[0-9a-f]\{40\}"' crates/ka-agent-port/src/lib.rs | cut -d'"' -f2)"
+if [ "$manifest_rev" != "$const_rev" ]; then
+  echo "error: ka-agent-port KA_PIN_REV ($const_rev) != Cargo.toml rev ($manifest_rev)"
+  exit 1
+fi
+echo "ok: pin constant matches the manifest ($const_rev)"

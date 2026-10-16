@@ -1,0 +1,38 @@
+# Ka Agent — resident assistant (user unit).
+# Install:
+#   cp dist/systemd/ka-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ka-agent
+# journalctl --user -u ka-agent -f
+[Unit]
+Description=Ka Agent resident assistant
+After=network-online.target
+Wants=network-online.target
+# A crash-looping worker or a broken config must not spin: 5 restarts in
+# 10 minutes stops the unit until the operator intervenes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+ExecStart=%h/.local/bin/ka-agent run
+Restart=always
+RestartSec=3
+# A clean exit is also a restart: `ka-agent restart` drives it.
+Type=simple
+
+# The data root (state, memory, plugins, secrets) — the isolation boundary
+# (ADR-0001). One instance per operator; a second operator = a second
+# user/template instance with its own root.
+Environment=KA_AGENT_DATA_DIR=%h/.local/share/ka-agent
+# Config: ~/.config/ka-agent/ka-agent.toml (the default; omit if default).
+
+# Hardening (safe: no third-party code runs in this process; plugin
+# subprocesses carry their own bubblewrap profile).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/ka-agent %h/.config/ka-agent
+
+[Install]
+WantedBy=default.target

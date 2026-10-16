@@ -48,6 +48,12 @@ enum Command {
         #[arg(long)]
         web_port: Option<u16>,
     },
+    /// Ask a running daemon to exit gracefully (the systemd unit restarts it).
+    Restart {
+        /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     /// Query a running daemon over its admin socket.
     Status {
         /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
@@ -89,6 +95,22 @@ enum Command {
     Grant {
         #[command(subcommand)]
         action: GrantAction,
+    },
+    /// Write a restorable backup (state + memory + notes + config).
+    Backup {
+        /// Output directory (created; must not already exist).
+        out: PathBuf,
+        /// Config path (copied into the backup).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Restore an instance from a backup into the data root.
+    Restore {
+        /// Backup directory (as written by `ka-agent backup`).
+        dir: PathBuf,
+        /// Allow restoring over a non-empty data root.
+        #[arg(long)]
+        force: bool,
     },
     /// Export instance data to a directory.
     Export {
@@ -609,8 +631,11 @@ fn main() -> std::process::ExitCode {
             };
             rt.block_on(run_daemon(config_path(&config), scenario, web_port))
         }
+        Command::Restart { config } => restart_client(config_path(&config)),
         Command::Status { config } => status_client(config_path(&config)),
         Command::Grant { action } => grant_action(action),
+        Command::Backup { out, config } => backup_to(out, config_path(&config)),
+        Command::Restore { dir, force } => restore_from(dir, force),
         Command::Export { out } => export(&out),
         Command::Purge { confirm } => purge(confirm),
         Command::Identity { action } => identity_action(action),
@@ -887,6 +912,173 @@ fn grant_action(action: GrantAction) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// `ka-agent backup <dir>`: a restorable snapshot — the SQLite state via
+/// `VACUUM INTO` (consistent even while the daemon writes), the memory repo
+/// (git history included), notes, and the config. Written to a staging dir
+/// and renamed, so a half-written backup is never visible.
+/// `YYYY-MM-DDTHH:MM:SSZ` for backup manifests (dependency-free).
+fn backup_ts(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // days since epoch → civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn backup_to(out: PathBuf, config: PathBuf) -> std::process::ExitCode {
+    if out.exists() {
+        eprintln!("ka-agent: {} already exists", out.display());
+        return std::process::ExitCode::FAILURE;
+    }
+    let paths = Paths::new(Paths::default_root());
+    let store = match Store::open(&paths.state_db()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ka-agent: cannot open {}: {e}", paths.state_db().display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let staging = out.with_extension("staging");
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        eprintln!("ka-agent: {}: {e}", staging.display());
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Err(e) = store.backup_to(&staging.join("state.db")) {
+        eprintln!("ka-agent: state backup: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    for dir in ["memory", "notes"] {
+        let src = paths.root().join(dir);
+        if src.exists() {
+            let mut files = Vec::new();
+            copy_tree(&src, &staging.join(dir), &mut files);
+        }
+    }
+    if config.exists() {
+        if let Err(e) = std::fs::copy(&config, staging.join("config.toml")) {
+            eprintln!("ka-agent: copy config: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let manifest = serde_json::json!({
+        "version": 1,
+        "at": backup_ts(ka_agent_core::now_ms()),
+        "ka_agent": env!("CARGO_PKG_VERSION"),
+        "ka_pin": ka_agent_port::KA_PIN_REV,
+    });
+    if let Err(e) = std::fs::write(
+        staging.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    ) {
+        eprintln!("ka-agent: manifest: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::rename(&staging, &out) {
+        eprintln!("ka-agent: rename to {}: {e}", out.display());
+        return std::process::ExitCode::FAILURE;
+    }
+    // A pointer so `doctor` can report freshness without copying anything.
+    let pointers = paths.root().join("backups");
+    let _ = std::fs::create_dir_all(&pointers);
+    let _ = std::fs::write(
+        pointers.join("latest.json"),
+        serde_json::to_string(&serde_json::json!({
+            "path": out.display().to_string(),
+            "at": manifest["at"],
+        }))
+        .unwrap_or_default(),
+    );
+    println!(
+        "backup at {} ({})",
+        out.display(),
+        manifest["at"].as_str().unwrap_or("?")
+    );
+    std::process::ExitCode::SUCCESS
+}
+
+/// `ka-agent restore <dir>`: unpack a backup into the data root. Refuses a
+/// non-empty root unless `--force` (restoring over a live instance is how
+/// data dies).
+fn restore_from(dir: PathBuf, force: bool) -> std::process::ExitCode {
+    for required in ["state.db", "manifest.json"] {
+        if !dir.join(required).exists() {
+            eprintln!(
+                "ka-agent: {} is not a backup (no {required})",
+                dir.display()
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let paths = Paths::new(Paths::default_root());
+    let root = paths.root();
+    let root_is_empty = std::fs::read_dir(root)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true);
+    if !root_is_empty && !force {
+        eprintln!(
+            "ka-agent: data root {} is not empty — pass --force to restore over it",
+            root.display()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Err(e) = paths.ensure_dirs() {
+        eprintln!("ka-agent: {}: {e}", root.display());
+        return std::process::ExitCode::FAILURE;
+    }
+    // A daemon holds SQLite locks; refuse rather than fight it.
+    if root.join("admin.sock").exists() {
+        eprintln!("ka-agent: daemon appears to be running (admin.sock) — stop it first");
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::copy(dir.join("state.db"), root.join("state.db")) {
+        eprintln!("ka-agent: state: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    for name in ["memory", "notes"] {
+        let src = dir.join(name);
+        if src.exists() {
+            let dst = root.join(name);
+            if dst.exists() {
+                let _ = std::fs::remove_dir_all(&dst);
+            }
+            let mut files = Vec::new();
+            copy_tree(&src, &dst, &mut files);
+        }
+    }
+    // The restored store must open and report a known schema.
+    match Store::open(&root.join("state.db")) {
+        Ok(s) => {
+            let v = s.user_version().unwrap_or(0);
+            println!("restored into {} (schema v{v})", root.display());
+        }
+        Err(e) => {
+            eprintln!("ka-agent: restored store does not open: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    if dir.join("config.toml").exists() {
+        println!(
+            "config backup at {} — install it at your config path if needed",
+            dir.join("config.toml").display()
+        );
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 fn export(out: &std::path::Path) -> std::process::ExitCode {
     let paths = Paths::new(Paths::default_root());
     std::fs::create_dir_all(out).unwrap_or_else(|e| {
@@ -1043,6 +1235,66 @@ fn web_token(port: u16) -> std::process::ExitCode {
     }
 }
 
+/// sha256 of the shipped contract suite (docs/contract/*.md, sorted by
+/// name, embedded at build time): the behavioral contract this binary was
+/// built against. Support compares this before reasoning about behavior.
+fn contract_suite_hash() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (name, bytes) in CONTRACT_DOCS {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(bytes);
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The contract documents, embedded: (file name, bytes), sorted by name.
+static CONTRACT_DOCS: &[(&str, &[u8])] = &[
+    (
+        "admin-socket.md",
+        include_bytes!("../../../docs/contract/admin-socket.md"),
+    ),
+    (
+        "grants.md",
+        include_bytes!("../../../docs/contract/grants.md"),
+    ),
+    (
+        "ka-port.md",
+        include_bytes!("../../../docs/contract/ka-port.md"),
+    ),
+    (
+        "matrix.md",
+        include_bytes!("../../../docs/contract/matrix.md"),
+    ),
+    (
+        "mcp-bridge.md",
+        include_bytes!("../../../docs/contract/mcp-bridge.md"),
+    ),
+    (
+        "memory.md",
+        include_bytes!("../../../docs/contract/memory.md"),
+    ),
+    (
+        "plugins.md",
+        include_bytes!("../../../docs/contract/plugins.md"),
+    ),
+    (
+        "telegram.md",
+        include_bytes!("../../../docs/contract/telegram.md"),
+    ),
+    (
+        "web-ui.md",
+        include_bytes!("../../../docs/contract/web-ui.md"),
+    ),
+    (
+        "worker-protocol.md",
+        include_bytes!("../../../docs/contract/worker-protocol.md"),
+    ),
+];
+
 fn doctor(config: PathBuf) -> std::process::ExitCode {
     let cfg = DaemonConfig::load(&config).unwrap_or_else(|e| {
         eprintln!("config: {e} (continuing with defaults)");
@@ -1050,7 +1302,16 @@ fn doctor(config: PathBuf) -> std::process::ExitCode {
     });
     let paths = Paths::new(Paths::default_root());
     println!("ka-agent {}", env!("CARGO_PKG_VERSION"));
-    println!("ka pin: rev a56aae2d1b3a4c31c4910979e1033002eacc53a0");
+    println!(
+        "ka pin : rev {} (ka workspace 0.3.0)",
+        ka_agent_port::KA_PIN_REV
+    );
+    let hash = contract_suite_hash();
+    println!(
+        "contract suite: {}… ({} documents)",
+        &hash[..16],
+        CONTRACT_DOCS.len()
+    );
     println!(
         "config : {} (workspace {})",
         config.display(),
@@ -1080,6 +1341,43 @@ fn doctor(config: PathBuf) -> std::process::ExitCode {
         println!("config validate: FAIL {e}");
     } else {
         println!("config validate: ok");
+    }
+    // Sandbox prerequisite (M8): bubblewrap, present and runnable.
+    match std::process::Command::new("bwrap")
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+            let v = raw.trim().strip_prefix("bubblewrap ").unwrap_or("?");
+            println!("sandbox: bubblewrap {v}");
+        }
+        _ => println!("sandbox: FAIL bubblewrap missing (plugins cannot run)"),
+    }
+    // Instance state a support conversation needs at a glance.
+    if let Ok(store) = Store::open(&paths.state_db()) {
+        let ids = store.list_identities().map(|v| v.len()).unwrap_or(0);
+        println!("identities: {ids} linked");
+        let lock = ka_agent_plugins::Lockfile::load(&paths.root().join("plugins/installed.json"));
+        match lock {
+            Ok(l) => {
+                let enabled = l.plugins.iter().filter(|p| p.enabled).count();
+                println!("plugins : {} installed, {enabled} enabled", l.plugins.len());
+            }
+            Err(e) => println!("plugins : lockfile error: {e}"),
+        }
+    }
+    // Last backup: `backup` records a pointer at <data>/backups/latest.json.
+    let pointer = paths.root().join("backups/latest.json");
+    match std::fs::read_to_string(&pointer)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    {
+        Some(m) => {
+            let at = m["at"].as_str().unwrap_or("?");
+            println!("backup : latest {at}");
+        }
+        None => println!("backup : none yet (run `ka-agent backup` or install the timer)"),
     }
     std::process::ExitCode::SUCCESS
 }
@@ -1280,7 +1578,7 @@ async fn run_daemon(
             .await;
     });
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Channels (inbound) when enabled: one task each, same runtime.
     if let Some(token) = token {
@@ -1332,8 +1630,9 @@ async fn run_daemon(
     // Web UI (M7): loopback-only, session auth; enabled with --web-port.
     if let Some(web_port) = web_port {
         let web = ka_agent_web::WebServer::new(web_port, runtime.clone(), Arc::clone(&store));
+        let web_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = web.run(shutdown_rx.clone()).await {
+            if let Err(e) = web.run(web_rx).await {
                 eprintln!("ka-agent: web server: {e}");
             }
         });
@@ -1344,6 +1643,7 @@ async fn run_daemon(
 
     let admin_runtime = runtime.clone();
     let admin_store = Arc::clone(&store);
+    let admin_shutdown = shutdown_tx.clone();
     let admin = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -1352,16 +1652,18 @@ async fn run_daemon(
             eprintln!("ka-agent: admin connection");
             let rt = admin_runtime.clone();
             let st = Arc::clone(&admin_store);
+            let tx = admin_shutdown.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_admin(stream, rt, st).await {
+                if let Err(e) = serve_admin(stream, rt, st, tx).await {
                     eprintln!("ka-agent: admin request: {e}");
                 }
             });
         }
     });
 
-    // Graceful shutdown: SIGINT or SIGTERM, whichever first (the streams
-    // were registered before any channel started).
+    // Graceful shutdown: SIGINT, SIGTERM, or the admin socket's `shutdown`
+    // op (which is what `ka-agent restart` drives). The streams were
+    // registered before any channel started.
     tokio::select! {
         _ = ctrl_c => {}
         _ = async {
@@ -1372,6 +1674,7 @@ async fn run_daemon(
                 None => std::future::pending::<()>().await,
             }
         } => {}
+        _ = shutdown_rx.changed() => {}
     }
     eprintln!("ka-agent: shutting down");
     let _ = shutdown_tx.send(true);
@@ -1385,6 +1688,7 @@ async fn serve_admin(
     mut stream: tokio::net::UnixStream,
     runtime: Runtime,
     store: Arc<Store>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let peer_uid = stream.peer_cred().map(|c| c.uid()).unwrap_or(u32::MAX);
@@ -1424,6 +1728,13 @@ async fn serve_admin(
                     "queue": queue,
                 })
             }
+            // Graceful stop (CLI-only policy, §5): the process exits 0 and
+            // the supervisor (systemd unit) brings it back — this is what
+            // `ka-agent restart` drives.
+            Some(req) if req.get("op").and_then(|o| o.as_str()) == Some("shutdown") => {
+                let _ = shutdown_tx.send(true);
+                serde_json::json!({"ok": true, "shutting_down": true})
+            }
             Some(_) => serde_json::json!({"error": "unknown op"}),
             None => serde_json::json!({"error": "bad json"}),
         }
@@ -1432,6 +1743,37 @@ async fn serve_admin(
     drop(r);
     w.write_all(format!("{reply}\n").as_bytes()).await?;
     w.flush().await
+}
+
+/// `ka-agent restart`: graceful stop over the admin socket. Without a
+/// supervisor the daemon simply stops; with the systemd unit
+/// (`Restart=always`) it comes straight back — that pairing is the restart.
+fn restart_client(config: PathBuf) -> std::process::ExitCode {
+    let _cfg = load_config(&config);
+    let sock = Paths::new(Paths::default_root()).root().join("admin.sock");
+    let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "ka-agent: cannot connect {}: {e} (is the daemon running?)",
+                sock.display()
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    use std::io::{BufRead, BufReader, Write};
+    if let Err(e) = stream.write_all(b"{\"op\":\"shutdown\"}\n") {
+        eprintln!("ka-agent: send: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let _ = stream.flush();
+    let reply: Option<String> = BufReader::new(stream).lines().next().and_then(|l| l.ok());
+    match reply {
+        Some(line) => println!("{line}"),
+        None => println!("\"no reply\""),
+    }
+    println!("daemon stopping (systemd restarts it if the unit is installed)");
+    std::process::ExitCode::SUCCESS
 }
 
 fn status_client(config: PathBuf) -> std::process::ExitCode {

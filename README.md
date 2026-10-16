@@ -6,10 +6,11 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M9 complete and verified.** Working today (`cargo test
---workspace`: 137 tests green; Telegram + Matrix + memory + history + MCP
+**Status: M10 complete and verified.** Working today (`cargo test
+--workspace`: 140 tests green; Telegram + Matrix + memory + history + MCP
 bridge + scheduler + loopback web UI + sandboxed third-party plugins +
-cross-channel identity linking):
+cross-channel identity linking + ops packaging (systemd units, backups,
+doctor)):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -55,7 +56,10 @@ cross-channel identity linking):
 - **`ka-agent` (the binary)** — `ka-agent run` (daemon: runtime + optional
   Telegram channel + admin unix socket + optional web UI + graceful
   SIGINT/SIGTERM), `ka-agent status` (admin socket client), `ka-agent chat`
-  (local console surface), `ka-agent web-token`, `ka-agent doctor`, and the
+  (local console surface), `ka-agent web-token`, `ka-agent backup|restore`,
+  `ka-agent restart` (graceful stop; systemd brings it back), `ka-agent
+  doctor` (ka pin, contract-suite hash, sandbox, plugins, identities,
+  backup age), and the
   hidden `ka-agent __worker` the runtime supervises.
 
 The MCP bridge is live: the engine gets `kagent.*` tools (memory_propose,
@@ -124,6 +128,22 @@ approval_ttl_secs = 900
 
 Secrets never go in this file: the Telegram token is referenced by name in
 the secret store (`telegram.token_secret`).
+
+## Ops
+
+Run it as a resident service (ADR-0001: one instance per operator):
+
+```
+cp dist/systemd/ka-agent.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now ka-agent
+```
+
+Nightly backups with the included timer (`ka-agent-backup.timer`,
+`Persistent=true`), restore with `ka-agent restore <dir>` (refuses a
+non-empty root; the drill is `ops_e2e.rs`). `ka-agent doctor` prints the
+ka pin, the contract-suite hash, sandbox prerequisites and instance state.
+Details: `docs/contract/ops.md`; the dogfooding checklist and the Phase 1
+exit review live in `docs/ops/`.
 
 ## Web UI
 
