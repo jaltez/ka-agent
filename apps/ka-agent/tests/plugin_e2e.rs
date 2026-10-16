@@ -32,9 +32,18 @@ fn ka(root: &std::path::Path) -> Command {
 /// `cargo test --workspace`).
 fn probe_bin() -> std::path::PathBuf {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/probe");
+    if !path.exists() {
+        // `cargo test` does not build a bin-only member's plain binary, so
+        // build the example plugin on demand.
+        let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-q", "-p", "ka-plugin-probe"])
+            .status()
+            .expect("run cargo");
+        assert!(status.success(), "cargo build -p ka-plugin-probe failed");
+    }
     assert!(
         path.exists(),
-        "probe binary missing at {}: build the workspace first",
+        "probe binary missing at {} after building ka-plugin-probe",
         path.display()
     );
     path

@@ -33,5 +33,7 @@ jobs:
 
       - name: Install bubblewrap (plugin sandbox)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+      - name: Build (the example plugin binary the tests install)
+        run: cargo build --workspace --quiet
       - name: Tests
         run: cargo test --workspace --quiet
