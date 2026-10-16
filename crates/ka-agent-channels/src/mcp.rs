@@ -14,16 +14,158 @@ use serde_json::{Value, json};
 
 /// Tool definition: name, description, JSON schema, effect class.
 struct ToolDef {
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
     schema: Value,
 }
 
-fn tools() -> Vec<ToolDef> {
-    vec![
+/// One loadable plugin: its validated manifest and installed root. Loaded
+/// once per bridge start; a digest mismatch or invalid manifest disables the
+/// plugin with a visible reason (never half-loaded, SEED.md §6.5).
+pub struct LoadedPlugin {
+    pub manifest: ka_agent_plugins::Manifest,
+    pub root: PathBuf,
+}
+
+/// Load every enabled, verified plugin under `<data>/plugins`. Returns the
+/// plugins plus (id, reason) for each refused one, for `tools/list` stderr
+/// and `plugin list`.
+pub fn load_plugins() -> (Vec<LoadedPlugin>, Vec<(String, String)>) {
+    let mut ok = Vec::new();
+    let mut refused = Vec::new();
+    let Some(root) = data_root().ok() else {
+        return (ok, refused);
+    };
+    let plugins_root = root.join("plugins");
+    let lock = match ka_agent_plugins::Lockfile::load(&plugins_root.join("installed.json")) {
+        Ok(l) => l,
+        Err(e) => {
+            refused.push(("<lockfile>".into(), e.to_string()));
+            return (ok, refused);
+        }
+    };
+    for record in &lock.plugins {
+        if !record.enabled {
+            continue;
+        }
+        let dir = plugins_root.join(&record.id);
+        let mut refuse = |reason: String| refused.push((record.id.clone(), reason));
+        match ka_agent_plugins::Manifest::load(&dir.join(ka_agent_plugins::MANIFEST_NAME)) {
+            Err(e) => refuse(format!("manifest: {e}")),
+            Ok(manifest) => match ka_agent_plugins::tree_digest(&dir) {
+                Err(e) => refuse(format!("digest: {e}")),
+                Ok(digest) => {
+                    if digest != record.digest {
+                        refuse(
+                            "installed files no longer match the pinned digest \
+                                   — reinstall the plugin or run `ka-agent plugin rm`"
+                                .to_string(),
+                        );
+                    } else {
+                        ok.push(LoadedPlugin {
+                            manifest,
+                            root: dir,
+                        });
+                    }
+                }
+            },
+        }
+    }
+    (ok, refused)
+}
+
+/// Run one plugin tool call: scope grants → intent (write effects) → the
+/// bubblewrap sandbox → the plugin's answer.
+fn call_plugin(
+    plugin: &LoadedPlugin,
+    tool: &ka_agent_plugins::manifest::ToolSection,
+    args: &Value,
+    grants: &grants::Grants,
+) -> Result<String, String> {
+    for scope in &tool.scopes {
+        if !grants.check(scope) {
+            return Err(format!(
+                "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
+            ));
+        }
+    }
+    // Declared secrets only (SEED.md §6.4): resolved from the instance store,
+    // never inherited from this process.
+    let secrets_dir = data_root().map_err(|e| e.to_string())?.join("secrets");
+    let mut secrets = std::collections::HashMap::new();
+    for name in &plugin.manifest.requires.secrets {
+        let value = crate::secret::resolve(name, &secrets_dir)
+            .map_err(|e| format!("secret {name:?}: {e}"))?;
+        secrets.insert(name.clone(), value);
+    }
+    // Write effects are intents, exactly like first-party writes: logged
+    // before the call, settled after.
+    let mut intent: Option<(String, String)> = None; // (id, summary)
+    if tool.effect != "read" {
+        let root = data_root().map_err(|e| e.to_string())?;
+        let store = ka_agent_store::Store::open(&root.join("state.db"))
+            .map_err(|e| format!("store: {e}"))?;
+        let now = ka_agent_core::now_ms();
+        let id = ka_agent_core::IntentId::generate();
+        let row = ka_agent_store::IntentRow {
+            id: id.to_string(),
+            tool: tool.name.clone(),
+            args_hash: format!("{:x}", sha256_of(args)),
+            status: "executing".to_string(),
+            external_ref: None,
+            summary: Some(format!(
+                "plugin {} · {}",
+                plugin.manifest.plugin.id, tool.name
+            )),
+            created_ms: now,
+            updated_ms: now,
+        };
+        store.insert_intent(&row).ok();
+        intent = Some((id.to_string(), tool.name.clone()));
+    }
+    let sandbox = ka_agent_plugins::Sandbox {
+        plugin_root: plugin.root.clone(),
+        command: plugin.manifest.plugin.entry.command.clone(),
+        args: plugin.manifest.plugin.entry.args.clone(),
+        secrets,
+    };
+    let answer = sandbox.call(&tool.name, args).map_err(|e| {
+        settle_intent(intent.as_ref().map(|(id, _)| id.as_str()), "failed");
+        format!("plugin {}: {e}", plugin.manifest.plugin.id)
+    })?;
+    if intent.is_some() {
+        settle_intent(Some("done"), "done");
+    }
+    Ok(answer)
+}
+
+fn settle_intent(id: Option<&str>, status: &str) {
+    let Some(id) = id else { return };
+    let Ok(root) = data_root() else { return };
+    let Ok(store) = ka_agent_store::Store::open(&root.join("state.db")) else {
+        return;
+    };
+    store.update_intent_status(id, status, None).ok();
+}
+
+/// Stable short digest of the call arguments (the intent's idempotency key
+/// material).
+fn sha256_of(args: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let text = serde_json::to_string(args).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// First-party tools plus every enabled plugin's declared tools. Plugin
+/// tools carry a generic v1 schema (the manifest declares names, effects
+/// and scopes; per-argument schemas arrive with plugin API v2).
+fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
+    let mut out = vec![
         ToolDef {
-            name: "memory_propose",
-            description: "Propose a durable memory about the operator for their review. Keep it atomic (one fact, <=300 chars), state it in third person, and never include secrets. The operator reviews and accepts/rejects proposals; nothing is stored until they do.",
+            name: "memory_propose".into(),
+            description: "Propose a durable memory about the operator for their review. Keep it atomic (one fact, <=300 chars), state it in third person, and never include secrets. The operator reviews and accepts/rejects proposals; nothing is stored until they do.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -33,8 +175,8 @@ fn tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "notes_search",
-            description: "Search the operator's local markdown notes under the notes/ directory. Returns matching lines with file paths.",
+            name: "notes_search".into(),
+            description: "Search the operator's local markdown notes under the notes/ directory. Returns matching lines with file paths.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -44,8 +186,8 @@ fn tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "notes_append",
-            description: "Append a line to a note file in the notes/ directory. Creates the file if it does not exist. File names: [a-z0-9-] only.",
+            name: "notes_append".into(),
+            description: "Append a line to a note file in the notes/ directory. Creates the file if it does not exist. File names: [a-z0-9-] only.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -56,8 +198,8 @@ fn tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "notes_read",
-            description: "Read a note file from the notes/ directory.",
+            name: "notes_read".into(),
+            description: "Read a note file from the notes/ directory.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -66,7 +208,83 @@ fn tools() -> Vec<ToolDef> {
                 "required": ["file"]
             }),
         },
-    ]
+        ToolDef {
+            name: "http_get".into(),
+            description: "Fetch a URL (GET) from allowlisted hosts. The URL host must match a granted scope; private, loopback and link-local addresses are refused.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to fetch"}
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolDef {
+            name: "github_issues_list".into(),
+            description: "List open issues of a GitHub repository (read).".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "owner/name"}
+                },
+                "required": ["repo"]
+            }),
+        },
+        ToolDef {
+            name: "github_pulls_get".into(),
+            description: "Read one pull request: number, title, state, author, body.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "owner/name"},
+                    "number": {"type": "integer"}
+                },
+                "required": ["repo", "number"]
+            }),
+        },
+        ToolDef {
+            name: "github_issue_comment".into(),
+            description: "Comment on a GitHub issue (external write: logged as an intent, needs the github:issues:write grant).".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "owner/name"},
+                    "number": {"type": "integer"},
+                    "body": {"type": "string"}
+                },
+                "required": ["repo", "number", "body"]
+            }),
+        },
+        ToolDef {
+            name: "github_pull_review".into(),
+            description: "Submit a pull request review (external write: needs github:pulls:write).".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "owner/name"},
+                    "number": {"type": "integer"},
+                    "body": {"type": "string"},
+                    "event": {"type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"]}
+                },
+                "required": ["repo", "number", "body", "event"]
+            }),
+        },
+    ];
+    for plugin in plugins {
+        for tool in &plugin.manifest.tools {
+            out.push(ToolDef {
+                name: tool.name.clone(),
+                description: format!(
+                    "[plugin {} v{}] {}",
+                    plugin.manifest.plugin.id,
+                    plugin.manifest.plugin.version,
+                    plugin.manifest.plugin.description
+                ),
+                schema: json!({"type": "object"}),
+            });
+        }
+    }
+    out
 }
 
 fn data_root() -> Result<PathBuf, String> {
@@ -95,7 +313,19 @@ fn sanitize_note_name(name: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-fn handle_tool_call(name: &str, args: &Value, grants: &grants::Grants) -> Result<String, String> {
+fn handle_tool_call(
+    name: &str,
+    args: &Value,
+    grants: &grants::Grants,
+    plugins: &[LoadedPlugin],
+) -> Result<String, String> {
+    // Plugin tools are namespaced `<id>.<tool>`; first-party names have no
+    // dot in their first segment, so the check is exact, never a prefix.
+    for plugin in plugins {
+        if let Some(tool) = plugin.manifest.tool(name) {
+            return call_plugin(plugin, tool, args, grants);
+        }
+    }
     match name {
         "memory_propose" => {
             let text = args["text"].as_str().ok_or("missing 'text'")?;
@@ -406,6 +636,16 @@ fn github_api(token: &str, path: &str) -> Result<Value, String> {
 /// Entry point for `ka-agent __mcp`. Reads JSON-RPC from stdin, writes to
 /// stdout, logs to stderr.
 pub fn run_mcp() -> Result<(), String> {
+    let (plugins, refused) = load_plugins();
+    for (id, reason) in &refused {
+        eprintln!("kagent: plugin {id} disabled: {reason}");
+    }
+    eprintln!(
+        "kagent: {} plugin(s) loaded, {} refused, data={:?}",
+        plugins.len(),
+        refused.len(),
+        std::env::var_os("KA_AGENT_DATA_DIR")
+    );
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut line = String::new();
@@ -435,7 +675,7 @@ pub fn run_mcp() -> Result<(), String> {
                 continue;
             }
             "tools/list" => json!({
-                "tools": tools().iter().map(|t| json!({
+                "tools": tools(&plugins).iter().map(|t| json!({
                     "name": t.name,
                     "description": t.description,
                     "inputSchema": t.schema,
@@ -459,7 +699,7 @@ pub fn run_mcp() -> Result<(), String> {
                         }
                         continue;
                     }
-                    Ok(grants) => match handle_tool_call(tool, args, &grants) {
+                    Ok(grants) => match handle_tool_call(tool, args, &grants, &plugins) {
                         Ok(text) => json!({
                             "content": [{"type": "text", "text": text}]
                         }),

@@ -1,0 +1,13 @@
+[package]
+name = "ka-plugin-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

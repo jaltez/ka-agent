@@ -8,6 +8,7 @@ description = "Channel adapters: Telegram Bot API inbound/outbound, surfaces"
 
 [dependencies]
 ka-agent-core = { workspace = true }
+ka-agent-plugins = { workspace = true }
 ka-agent-store = { workspace = true }
 ka-agent-runtime = { workspace = true }
 serde = { workspace = true }

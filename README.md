@@ -31,6 +31,14 @@ scheduler + loopback web UI):
   throttled delivery with typing indicator and progress edits, fence-balanced
   chunking, approval cards with inline keyboards, secret store (env +
   0600-file tiers).
+- **`ka-agent-plugins`** — the plugin host (SEED §10 Phase 5): strict
+  manifest v1, ed25519-signed archives with TOFU pinning, install/enable
+  lifecycle (`ka-agent plugin …`), and an MCP-stdio runtime inside a
+  bubblewrap sandbox (`--unshare-net`, read-only system, private tmp, 30 s
+  wall clock, 64 KiB output cap, only declared secrets). The bridge
+  advertises plugin tools to engines as `kagent.<tool>` behind the same
+  grants and intents as first-party tools. Contract and authoring:
+  `docs/contract/plugins.md`; example: `examples/plugins/probe`.
 - **`ka-agent-web`** — the loopback-only web UI (SEED §10 Phase 4):
   server-rendered HTML, no JS/asset pipeline, session auth via a one-shot
   CLI-issued login link, and every user-derived string HTML-escaped. Pages:

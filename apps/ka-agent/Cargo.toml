@@ -16,6 +16,7 @@ ka-agent-port = { workspace = true }
 ka-agent-store = { workspace = true }
 ka-agent-runtime = { workspace = true }
 ka-agent-channels = { workspace = true }
+ka-agent-plugins = { workspace = true }
 ka-agent-web = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

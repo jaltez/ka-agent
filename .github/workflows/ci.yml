@@ -31,5 +31,7 @@ jobs:
       - name: Ka dependency boundary gate
         run: ./scripts/check-ka-deps.sh
 
+      - name: Install bubblewrap (plugin sandbox)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
       - name: Tests
         run: cargo test --workspace --quiet
