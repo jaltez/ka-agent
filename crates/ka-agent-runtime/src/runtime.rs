@@ -132,10 +132,6 @@ struct Live {
     pending_asks: HashMap<ApprovalId, String>,
     live_text: String,
     current_turn: Option<TurnId>,
-    /// The engine reported `idle` for the cycle in progress. The session may
-    /// return to `idle` only once the cycle is over AND its turn record is
-    /// terminal — in whichever order those two arrive.
-    cycle_idle: bool,
 }
 
 struct Inner {
@@ -777,7 +773,6 @@ impl Runtime {
             if let Some(live) = g.live.as_mut() {
                 live.current_turn = Some(turn.id.clone());
                 live.live_text.clear();
-                live.cycle_idle = false;
             }
         }
         self.sh.surface.on_turn_started();
@@ -850,7 +845,6 @@ impl Runtime {
                 pending_asks: HashMap::new(),
                 live_text: String::new(),
                 current_turn: None,
-                cycle_idle: true,
             });
         }
         tokio::spawn(drive(Arc::clone(&self.sh), port, rx));
@@ -1149,14 +1143,6 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     g.live.as_ref().is_some_and(|l| !l.pending_asks.is_empty())
                 };
-                // The cycle is over from the engine's side; the session may
-                // return to `idle` once its turn record is terminal too.
-                {
-                    let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(live) = g.live.as_mut() {
-                        live.cycle_idle = true;
-                    }
-                }
                 if !ask_pending && !turn_open {
                     drain_queue(&sh).await;
                 }
@@ -1242,7 +1228,6 @@ async fn drain_queue(sh: &Arc<Shared>) -> bool {
             if let Some(live) = g.live.as_mut() {
                 live.current_turn = Some(turn.id.clone());
                 live.live_text.clear();
-                live.cycle_idle = false;
             }
             true
         }
@@ -1256,23 +1241,23 @@ async fn drain_queue(sh: &Arc<Shared>) -> bool {
     }
 }
 
-/// Return the session to `idle` once nothing is left in flight: the engine
-/// reported `idle` for the cycle, the turn's record is terminal (or no turn
-/// was ever recorded), no ask is pending and the queue is empty. Called from
-/// both the `turn_finished` and `idle` handlers, so whichever arrives first
-/// the transition happens exactly when both conditions hold.
+/// Return the session to `idle` once nothing is left in flight: the turn's
+/// record is terminal (or no turn is recorded and no prompt is being handed
+/// over), no ask is pending and the queue is empty. Called from both the
+/// `turn_finished` and `idle` handlers — the turn record going terminal is
+/// what proves the cycle is over, so the engine's `idle` event is only the
+/// delivery boundary and its timing can never stall the status.
 fn rt_maybe_idle(sh: &Arc<Shared>) {
-    let (sid, status, ask_pending, current, cycle_idle) = {
+    let (sid, status, ask_pending, current) = {
         let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
         (
             g.session.id.clone(),
             g.session.status,
             g.live.as_ref().is_some_and(|l| !l.pending_asks.is_empty()),
             g.live.as_ref().and_then(|l| l.current_turn.clone()),
-            g.live.as_ref().is_some_and(|l| l.cycle_idle),
         )
     };
-    if status == SessionStatus::Idle || ask_pending || !cycle_idle {
+    if status == SessionStatus::Idle || ask_pending {
         return;
     }
     // No turn recorded, but an inbound message set the session `running`: its
