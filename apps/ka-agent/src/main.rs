@@ -836,6 +836,11 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
                 Ok(id) => println!("· new session {id}"),
                 Err(e) => println!("! {e}"),
             },
+            "/resume" => match runtime.resume() {
+                Ok(true) => println!("· resumed"),
+                Ok(false) => println!("· nothing to resume (not paused)"),
+                Err(e) => println!("! [resume] {e}"),
+            },
             "/stop" => {
                 if let Err(e) = runtime.stop_turn().await {
                     println!("! {e}");
@@ -1039,10 +1044,21 @@ fn restore_from(dir: PathBuf, force: bool) -> std::process::ExitCode {
         eprintln!("ka-agent: {}: {e}", root.display());
         return std::process::ExitCode::FAILURE;
     }
-    // A daemon holds SQLite locks; refuse rather than fight it.
-    if root.join("admin.sock").exists() {
-        eprintln!("ka-agent: daemon appears to be running (admin.sock) — stop it first");
-        return std::process::ExitCode::FAILURE;
+    // A live daemon holds SQLite locks; refuse rather than fight it. Probe
+    // the socket instead of testing existence: a stale file left by a crash
+    // or an unclean stop is not a running daemon.
+    let sock = root.join("admin.sock");
+    if sock.exists() {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => {
+                eprintln!("ka-agent: daemon is running (admin.sock answers) — stop it first");
+                return std::process::ExitCode::FAILURE;
+            }
+            Err(_) => {
+                println!("removing stale admin socket (no daemon answers)");
+                let _ = std::fs::remove_file(&sock);
+            }
+        }
     }
     if let Err(e) = std::fs::copy(dir.join("state.db"), root.join("state.db")) {
         eprintln!("ka-agent: state: {e}");
@@ -1679,6 +1695,11 @@ async fn run_daemon(
     eprintln!("ka-agent: shutting down");
     let _ = shutdown_tx.send(true);
     admin.abort();
+    // The admin socket is created (and removed) at startup normally; leaving
+    // it behind on exit made `ka-agent restore` refuse after any clean stop
+    // ("daemon appears to be running") — remove it here so a stopped daemon
+    // looks stopped.
+    let _ = std::fs::remove_file(paths.root().join("admin.sock"));
     // Give the Telegram channel a moment to finish its in-flight poll.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     std::process::ExitCode::SUCCESS

@@ -202,26 +202,37 @@ async fn offset_persists_and_dedupes() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    stop(&mut stack).await;
     assert_eq!(
         stack.store.meta_get("telegram.offset").unwrap().as_deref(),
         Some("2")
     );
-    // replay the same update_id: nothing re-delivers
-    stack.server.push_text_message(1, 3, 42, "/status");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let status_sends = stack
+    // Replay the same update_id WHILE the channel is live: exactly one more
+    // reply may appear (the fresh id), never a second for the replayed one.
+    let before = stack.server.captured().len();
+    stack.server.push_text_message(9, 3, 42, "/memory");
+    stack
         .server
-        .captured()
-        .into_iter()
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").contains("memory")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("the fresh update must be answered");
+    stack.server.push_text_message(1, 3, 42, "/status");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let status_sends = stack.server.captured()[before..]
+        .iter()
         .filter(|c| {
             c.method == "sendMessage" && c.body["text"].as_str().unwrap_or("").contains("session")
         })
         .count();
     assert_eq!(
-        status_sends, 1,
-        "duplicate update_id must be deduped by offset"
+        status_sends, 0,
+        "duplicate update_id must be deduped by offset while live"
     );
+    stop(&mut stack).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

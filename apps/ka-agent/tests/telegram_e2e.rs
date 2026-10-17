@@ -160,12 +160,20 @@ async fn simple_turn_and_offset_persistence_across_restart() {
         .iter()
         .any(|c| send_message_text(c).is_some_and(|t| t.contains("Hello from scripted")));
     assert!(!replayed, "stale update 1 was re-delivered after restart");
-    fake.push_text_message(5, 42, 42, "/status");
+    // A /status reply in the post-restart window only (the fake's capture
+    // history already holds one from before; matching on "session" alone
+    // would be satisfied instantly by it).
+    fake.push_text_message(5, 42, 42, "/memory");
     fake.await_capture(
-        |c| send_message_text(c).is_some_and(|t| t.contains("session")),
+        |c| send_message_text(c).is_some_and(|t| t.contains("memory:")),
         Duration::from_secs(30),
     )
-    .expect("no /status reply after restart");
+    .expect("no /memory reply after restart");
+    // And the stale-id replay produced no answer in the same window.
+    let stale_answer = fake.captured()[before..]
+        .iter()
+        .any(|c| send_message_text(c).is_some_and(|t| t.contains("Hello from scripted")));
+    assert!(!stale_answer, "stale update answered after restart");
     daemon2.sigterm_wait(Duration::from_secs(10));
 
     std::fs::remove_dir_all(&root).ok();
@@ -234,5 +242,71 @@ async fn guarded_approval_over_inline_keyboard() {
 
     daemon.sigterm_wait(Duration::from_secs(10));
     let _ = std::fs::remove_file(MARKER);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F4 (review): a `/command` from Telegram must be answered by the router and
+/// must NOT be submitted to the engine. The old code did both: `/status`
+/// answered and then burned a real turn (cost, strand, a duplicate
+/// "session…" answer from the model), and `/new` sent the literal "/new" as
+/// the fresh session's first prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_never_reach_the_engine() {
+    let root = temp_root("cmdonly");
+    let (fake, base) = FakeBotServer::spawn();
+    let cfg = write_config(&root, &base);
+    // The scenario's text is unique: if any command leaks to the engine, this
+    // text comes back and the test fails.
+    let sc = scenario_file(
+        &root,
+        "leak.json",
+        r#"{ "steps": [ {"text": "ENGINE-LEAK-MARKER"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let data = root.join("data");
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    wait_polling(&fake);
+
+    for (update_id, cmd) in [
+        (10, "/status"),
+        (11, "/help"),
+        (12, "/memory"),
+        (13, "/history leak"),
+        (14, "/y"),
+    ] {
+        let before = fake.captured().len();
+        fake.push_text_message(update_id, 42, 42, cmd);
+        // The router answers something (status/help text, an error note)…
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let answered = fake.captured()[before..]
+                .iter()
+                .any(|c| send_message_text(c).is_some_and(|t| !t.is_empty()));
+            if answered {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{cmd} was never answered; captured: {:?}",
+                &fake.captured()[before..]
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // …and nothing from the engine: the scripted marker must not appear.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let leaked = fake.captured()[before..]
+            .iter()
+            .any(|c| send_message_text(c).is_some_and(|t| t.contains("ENGINE-LEAK-MARKER")));
+        assert!(!leaked, "{cmd} leaked to the engine and ran a turn");
+    }
+
+    // Control: free text DOES run the engine (the marker arrives).
+    fake.push_text_message(20, 42, 42, "hello");
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("ENGINE-LEAK-MARKER")),
+        Duration::from_secs(30),
+    )
+    .expect("free text should have run the engine");
+
+    daemon.sigterm_wait(Duration::from_secs(10));
     std::fs::remove_dir_all(&root).ok();
 }

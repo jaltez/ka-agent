@@ -343,7 +343,10 @@ When to use each:
   3. Persist the strand id.
   4. Submit the prompt.
 - **[Requirement]** The strand file appears only after the first completed turn (`crates/ka-strand/src/lib.rs:425-440`). A session with a recorded strand id but no file is treated as empty and reopened with `StrandChoice::New`.
-- `/sessions` lists recent sessions; `/resume <short-id>` rebinds the chat.
+- `/sessions` lists recent sessions — **not implemented** (the operator
+  inspects `ka-agent status` / the web history view instead); `/resume`
+  lifts a paused session back to idle (implemented in M10; rebinding to an
+  arbitrary past session is not).
 
 ### 3.6 Resuming a session after a restart
 

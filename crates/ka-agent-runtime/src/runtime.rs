@@ -43,6 +43,8 @@ pub enum Error {
     Illegal { from: String, to: String },
     #[error("no pending approval {0}")]
     UnknownApproval(String),
+    #[error("{0}")]
+    Refused(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -132,6 +134,9 @@ struct Live {
     pending_asks: HashMap<ApprovalId, String>,
     live_text: String,
     current_turn: Option<TurnId>,
+    /// We killed this worker on purpose (`/new`, the `/stop` escalation): its
+    /// exit must not be booked as a crash.
+    deliberate_close: bool,
 }
 
 struct Inner {
@@ -199,6 +204,30 @@ impl Runtime {
             );
             store.append_audit(&mut rec)?;
         }
+        // An adopted session can carry a status from a previous process whose
+        // turn died with it (`running`, `awaiting_approval`, `stopping`):
+        // those states make `handle_message` queue instead of submit, and the
+        // queue only drains from a worker's `idle` — so the daemon would look
+        // alive and answer nothing, forever (trace: crash, `systemctl stop`,
+        // `ka-agent restart` mid-turn). Reconciliation marked the turns
+        // interrupted above; the status follows.
+        let resumable = [
+            ka_agent_core::SessionStatus::Running,
+            ka_agent_core::SessionStatus::AwaitingApproval,
+            ka_agent_core::SessionStatus::Stopping,
+        ];
+        if resumable.contains(&session.status) {
+            let from = session.status;
+            if session
+                .transition(ka_agent_core::SessionStatus::Idle)
+                .is_ok()
+            {
+                store.update_session_status(&session.id, session.status)?;
+                surface.on_note(&format!(
+                    "recovered session status {from:?} → idle (its turn died with the previous process)"
+                ));
+            }
+        }
         let session = session;
         let mut budget = BudgetState::new(cfg.budgets.daily_usd, cfg.budgets.daily_tokens);
         if let Some(saved) = store.meta_get("budget")? {
@@ -265,6 +294,16 @@ impl Runtime {
 
     /// `/new`: drop the live worker and start a fresh session/strand.
     pub async fn new_session(&self) -> Result<SessionId, Error> {
+        // `/new` kills the worker on purpose: its exit is not a crash, and a
+        // fresh session starts with a clean crash history (five `/new` in ten
+        // minutes used to degrade the brand-new session).
+        {
+            let mut g = self.lock();
+            if let Some(live) = g.live.as_mut() {
+                live.deliberate_close = true;
+            }
+            g.crashes.clear();
+        }
         let live_port = {
             let mut g = self.lock();
             g.live.take().map(|l| l.port)
@@ -284,6 +323,34 @@ impl Runtime {
         Ok(session.id)
     }
 
+    /// `/resume`: lift a pause (budget override or a fixed auth key) back to
+    /// idle. Refuses when the budget verdict is still exceeded — the
+    /// operator asked explicitly, so say why instead of silently ignoring.
+    pub fn resume(&self) -> Result<bool, Error> {
+        let mut g = self.lock();
+        if g.session.status != SessionStatus::Paused {
+            return Ok(false);
+        }
+        if g.budget.verdict() == ka_agent_core::BudgetVerdict::Exceeded {
+            return Err(Error::Refused(
+                "budget still exceeded for this window; raise it in ka-agent.toml or /new".into(),
+            ));
+        }
+        let from = g.session.status;
+        g.session
+            .transition(SessionStatus::Idle)
+            .map_err(|t| illegal_session(from, t))?;
+        let status = g.session.status;
+        drop(g);
+        self.persist_session_status(status);
+        self.audit(
+            audit_actions::SESSION_RESUME,
+            self.session_id().as_str(),
+            None,
+        )?;
+        Ok(true)
+    }
+
     /// Inbound message: submit now when idle, otherwise enqueue durably
     /// (gap G4 — ka drops mid-cycle prompts, HTTP 200 notwithstanding).
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
@@ -301,10 +368,28 @@ impl Runtime {
                 | SessionStatus::AwaitingApproval
                 | SessionStatus::Stopping => false,
                 SessionStatus::Paused => {
-                    self.sh
-                        .surface
-                        .on_note("paused (budget or auth): message dropped; check /status");
-                    false
+                    // A budget pause lifts itself when the day window rolls
+                    // (the verdict is recomputed from the recorded window);
+                    // an auth pause needs /resume, which is why the note
+                    // says so honestly.
+                    let verdict = {
+                        let g = self.lock();
+                        g.budget.verdict()
+                    };
+                    if verdict == ka_agent_core::BudgetVerdict::Exceeded {
+                        self.sh.surface.on_note(
+                            "paused: budget reached for this window; use /resume to                              override or wait for the window to roll",
+                        );
+                        false
+                    } else {
+                        // From is always Paused here.
+                        g.session
+                            .transition(SessionStatus::Running)
+                            .map_err(|t| illegal_session(SessionStatus::Paused, t))?;
+                        drop(g);
+                        self.persist_session_status(SessionStatus::Running);
+                        true
+                    }
                 }
                 SessionStatus::Degraded => {
                     self.sh
@@ -547,11 +632,32 @@ impl Runtime {
         self.sh.surface.on_note("stopping…");
         port.abort().await.ok();
         let grace = Duration::from_secs(self.sh.cfg.turn_grace_secs);
-        let watcher = Arc::clone(&port);
+        // Escalate on the *turn*, not the process: a successful abort leaves
+        // the worker attached (it is reused for the next turn), and the old
+        // `is_closed()` test therefore always killed it — SIGKILLing a turn
+        // the abort had already drained into.
+        let sh = Arc::clone(&self.sh);
+        let turn = {
+            let g = self.lock();
+            g.live.as_ref().and_then(|l| l.current_turn.clone())
+        };
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            if !watcher.is_closed() {
-                watcher.kill().await;
+            let turn_still_open = turn
+                .as_ref()
+                .and_then(|t| sh.store.get_turn(t).ok().flatten())
+                .is_some_and(|t| !t.status.is_terminal());
+            if turn_still_open && !port.is_closed() {
+                if let Some(live) = sh
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .live
+                    .as_mut()
+                {
+                    live.deliberate_close = true;
+                }
+                port.kill().await;
             }
         });
         Ok(())
@@ -571,6 +677,15 @@ impl Runtime {
             };
             (ask_id, Arc::clone(&live.port))
         };
+        // Deny-on-expiry is an invariant, not a schedule: a decision that
+        // arrives between the TTL and the next sweep must not allow the ask.
+        if let Ok(row) = self.sh.store.get_approval(&id) {
+            if row.status == ka_agent_core::ApprovalStatus::Pending
+                && ka_agent_core::now_ms() >= row.expires_at_ms
+            {
+                return Err(Error::UnknownApproval(approval_id.to_string()));
+            }
+        }
         let status = match decision {
             ApprovalDecision::Allow | ApprovalDecision::Always => {
                 ka_agent_core::ApprovalStatus::Approved
@@ -629,6 +744,21 @@ impl Runtime {
                     .ok();
             }
         }
+        // The engine has its deny; the ask is settled. Leaving it in the map
+        // would keep `ask_pending` true forever, which blocks the idle
+        // transition and the queue drain — every later message would queue
+        // with no engine left to consume it.
+        {
+            let mut g = self.lock();
+            if let Some(live) = g.live.as_mut() {
+                for id in &expired {
+                    live.pending_asks.remove(id);
+                }
+            }
+        }
+        // An expired ask while the session sat in `awaiting_approval` is the
+        // end of that wait: with nothing else pending the turn must settle.
+        rt_maybe_idle(&self.sh);
         Ok(expired)
     }
 
@@ -863,6 +993,7 @@ impl Runtime {
                 pending_asks: HashMap::new(),
                 live_text: String::new(),
                 current_turn: None,
+                deliberate_close: false,
             });
         }
         tokio::spawn(drive(Arc::clone(&self.sh), port, rx));
@@ -1331,13 +1462,19 @@ async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
     port.kill().await;
     let now = ka_agent_core::now_ms();
     let window_ms = (sh.cfg.worker_restart.crash_window_secs as i64) * 1000;
+    let deliberate = {
+        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.live.as_ref().is_some_and(|l| l.deliberate_close)
+    };
     let (status, note) = {
         let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.live = None;
-        g.crashes.retain(|t| now - *t < window_ms);
-        g.crashes.push(now);
-        g.restart_attempt = g.restart_attempt.saturating_add(1);
-        let degraded = g.crashes.len() >= sh.cfg.worker_restart.crash_max as usize;
+        if !deliberate {
+            g.crashes.retain(|t| now - *t < window_ms);
+            g.crashes.push(now);
+            g.restart_attempt = g.restart_attempt.saturating_add(1);
+        }
+        let degraded = !deliberate && g.crashes.len() >= sh.cfg.worker_restart.crash_max as usize;
         let from = g.session.status;
         let target = if degraded {
             SessionStatus::Degraded

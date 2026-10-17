@@ -49,3 +49,56 @@ mod tests {
         assert_eq!(c.status, super::OutboxStatus::Queued);
     }
 }
+
+/// Truncate a string to at most `cap` **bytes** without splitting a UTF-8
+/// character: a plain `String::truncate`/slice panics when the cut lands
+/// mid-character, and every caller here cuts model- or network-generated
+/// text where that is the common case, not the edge.
+pub fn truncate_at_char(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut cut = cap;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::truncate_at_char;
+
+    #[test]
+    fn ascii_cuts_at_the_cap() {
+        assert_eq!(truncate_at_char("abcdef", 3), "abc");
+        assert_eq!(truncate_at_char("abc", 3), "abc");
+        assert_eq!(truncate_at_char("", 3), "");
+    }
+
+    #[test]
+    fn multibyte_never_splits_a_character() {
+        // "ñ" is 2 bytes; the cut at byte 3 lands inside the second "ñ".
+        let s = "año año año";
+        let cut = truncate_at_char(s, 3);
+        assert_eq!(cut, "añ", "byte 3 is a boundary: ñ ends there");
+        // Byte 2 would split ñ → falls back to the boundary before it.
+        assert_eq!(truncate_at_char(s, 2), "a");
+        // Every cut point in a CJK-heavy string yields valid text.
+        let cjk = "日本語日本語日本語";
+        for cap in 0..=cjk.len() {
+            let cut = truncate_at_char(cjk, cap);
+            assert!(cut.chars().all(|c| !c.is_ascii()), "cap {cap}: {cut:?}");
+        }
+        // Emoji (4 bytes) at the boundary.
+        assert_eq!(truncate_at_char("a🦀🦀🦀", 2), "a");
+        assert_eq!(truncate_at_char("a🦀🦀🦀", 5), "a🦀");
+    }
+
+    #[test]
+    fn cap_zero_yields_empty() {
+        assert_eq!(truncate_at_char("abc", 0), "");
+    }
+}

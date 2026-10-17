@@ -147,9 +147,10 @@ impl Sandbox {
             .unwrap_or_default();
         let answer = match answer {
             Err(SandboxError::Protocol(ref e)) if e.contains("exited before answering") => {
-                // A sandbox that never started (missing bubblewrap support,
-                // restricted user namespaces) or a plugin that crashed:
-                // say which.
+                // The sandbox never started (bubblewrap missing, restricted
+                // user namespaces) or the plugin crashed before answering:
+                // say which, with the stderr tail that was collected for
+                // exactly this case.
                 let code = status.map(|s| s.to_string()).unwrap_or_default();
                 Err(SandboxError::Failed(if stderr_tail.is_empty() {
                     format!("plugin exited before answering ({code})")
@@ -164,7 +165,9 @@ impl Sandbox {
         // The answer's text, capped.
         let mut text = answer;
         if text.len() > OUTPUT_CAP {
-            text.truncate(OUTPUT_CAP);
+            // Char-boundary cut: model output is routinely non-ASCII and a
+            // byte cut would panic.
+            text.truncate(ka_agent_core::truncate_at_char(&text, OUTPUT_CAP).len());
             text.push_str("… (truncated)");
         }
         Ok(text)
@@ -195,7 +198,9 @@ impl Sandbox {
     /// process dies, or the watchdog kills it at the deadline.
     fn read_answer(&self, child: &mut Child) -> Result<String, SandboxError> {
         let done = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicBool::new(false));
         let watchdog_done = Arc::clone(&done);
+        let watchdog_killed = Arc::clone(&killed);
         let pid = child.id();
         let watchdog = std::thread::spawn(move || {
             let deadline = Instant::now() + CALL_TIMEOUT;
@@ -206,6 +211,7 @@ impl Sandbox {
                 std::thread::sleep(Duration::from_millis(50));
             }
             // Wall clock exceeded: hard-kill (the read below then sees EOF).
+            watchdog_killed.store(true, Ordering::Relaxed);
             let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
         });
         let answer = (|| -> Result<String, SandboxError> {
@@ -240,14 +246,14 @@ impl Sandbox {
                 "plugin exited before answering".into(),
             ))
         })();
+        let watchdog_killed = killed.load(Ordering::Relaxed);
         done.store(true, Ordering::Relaxed);
         let _ = watchdog.join();
-        // Distinguish a watchdog kill (EOF after the deadline) from a plugin
-        // that genuinely exited early.
-        if let Err(SandboxError::Protocol(e)) = &answer {
-            if e.contains("exited before answering") {
-                return Err(SandboxError::Timeout);
-            }
+        // A watchdog kill is the timeout; an EOF without it means the
+        // sandbox never started or the plugin crashed — the caller has the
+        // stderr tail for that case.
+        if watchdog_killed {
+            return Err(SandboxError::Timeout);
         }
         answer
     }

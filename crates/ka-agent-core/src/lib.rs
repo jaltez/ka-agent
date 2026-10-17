@@ -22,7 +22,7 @@ pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
 pub use config::{DaemonConfig, Error as ConfigError, MatrixSettings};
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
-pub use outbox::{OutboxChunk, OutboxStatus};
+pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use queue::QueueItem;
 pub use session::{Session, SessionStatus};
 pub use task::{Task, TaskStatus};

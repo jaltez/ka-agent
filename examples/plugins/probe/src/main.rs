@@ -37,6 +37,9 @@ fn main() {
                 let report = env_report();
                 serde_json::json!({"content": [{"type": "text", "text": report}]})
             }
+            ("tools/call", Some("probe.mark")) => {
+                serde_json::json!({"content": [{"type": "text", "text": "marked"}]})
+            }
             ("tools/call", Some("probe.echo")) => {
                 let text = msg["params"]["arguments"]["text"].as_str().unwrap_or("");
                 serde_json::json!({"content": [{"type": "text", "text": text}]})

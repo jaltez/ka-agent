@@ -179,10 +179,8 @@ fn split_reply(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
     while rest.len() > REPLY_CAP {
-        let cut = rest[..REPLY_CAP]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(REPLY_CAP);
+        let capped = ka_agent_core::truncate_at_char(rest, REPLY_CAP);
+        let cut = capped.rfind('\n').map(|i| i + 1).unwrap_or(capped.len());
         out.push(rest[..cut].to_string());
         rest = &rest[cut..];
     }
@@ -315,6 +313,22 @@ impl Channel for MatrixChannel {
                 eprintln!("matrix: outbound queue already taken; not starting");
                 return;
             };
+            // Crash recovery (SEED §3.7): undelivered chunks go out before
+            // any new traffic, once a room is known (the first inbound sets
+            // it; until then they stay queued, not dropped).
+            let recover = self
+                .store
+                .pending_chunks_for_session(&self.runtime.session_id())
+                .unwrap_or_default();
+            for chunk in &recover {
+                self.surface.enqueue(&chunk.text);
+                self.store
+                    .mark_sent(&chunk.turn, chunk.chunk_index, chunk.chunk_index as i64)
+                    .ok();
+            }
+            if !recover.is_empty() {
+                eprintln!("matrix: recovered {} queued chunk(s)", recover.len());
+            }
             eprintln!(
                 "matrix: syncing as {} (since {:?})",
                 self.cfg.user_id, since

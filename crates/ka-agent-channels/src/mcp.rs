@@ -133,8 +133,8 @@ fn call_plugin(
         settle_intent(intent.as_ref().map(|(id, _)| id.as_str()), "failed");
         format!("plugin {}: {e}", plugin.manifest.plugin.id)
     })?;
-    if intent.is_some() {
-        settle_intent(Some("done"), "done");
+    if let Some((id, _)) = intent.as_ref() {
+        settle_intent(Some(id), "done");
     }
     Ok(answer)
 }
@@ -399,7 +399,10 @@ fn handle_tool_call(
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if content.len() > 8000 {
-                        Ok(format!("{}… (truncated)", &content[..8000]))
+                        Ok(format!(
+                            "{}… (truncated)",
+                            ka_agent_core::truncate_at_char(&content, 8000)
+                        ))
                     } else {
                         Ok(content)
                     }
@@ -420,19 +423,19 @@ fn handle_tool_call(
                     "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
                 ));
             }
-            // SSRF: refuse private/loopback IPs unless explicitly granted.
-            if !grants.check("http:get:private")
-                && (host == "127.0.0.1"
-                    || host == "localhost"
-                    || host.starts_with("10.")
-                    || host.starts_with("192.168.")
-                    || host.starts_with("172."))
-            {
-                return Err("private/loopback hosts require the http:get:private grant".into());
+            // SSRF: refuse private/loopback/link-local targets unless
+            // explicitly granted; every redirect hop re-checks the same rule.
+            if !grants.check("http:get:private") && http_target_is_private(&host) {
+                return Err(
+                    "private/loopback/link-local hosts require the http:get:private grant".into(),
+                );
             }
-            let body = http_get_sync(&parsed, 15)?;
+            let body = http_get_no_redirect(&parsed, 15, grants)?;
             if body.len() > 200_000 {
-                Ok(format!("{}… (truncated at 200 KB)", &body[..200_000]))
+                Ok(format!(
+                    "{}… (truncated at 200 KB)",
+                    ka_agent_core::truncate_at_char(&body, 200_000)
+                ))
             } else {
                 Ok(body)
             }
@@ -447,8 +450,7 @@ fn handle_tool_call(
                     "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
                 ));
             }
-            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
-                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let token = github_token()?;
             let body = github_api(
                 &token,
                 &format!("/repos/{repo}/issues?state={state}&per_page={limit}"),
@@ -478,8 +480,7 @@ fn handle_tool_call(
                     "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
                 ));
             }
-            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
-                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let token = github_token()?;
             let body = github_api(&token, &format!("/repos/{repo}/pulls/{number}"))?;
             let title = body["title"].as_str().unwrap_or("?");
             let state = body["state"].as_str().unwrap_or("?");
@@ -499,8 +500,7 @@ fn handle_tool_call(
                     "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
                 ));
             }
-            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
-                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let token = github_token()?;
             let root = data_root()?;
             let store = ka_agent_store::Store::open(&root.join("state.db"))
                 .map_err(|e| format!("store: {e}"))?;
@@ -539,8 +539,7 @@ fn handle_tool_call(
                     "no grant for {scope} — ask the operator to run: ka-agent grant add {scope}"
                 ));
             }
-            let token = std::env::var("KA_AGENT_GITHUB_TOKEN")
-                .map_err(|_| "no GitHub token: set KA_AGENT_GITHUB_TOKEN env".to_string())?;
+            let token = github_token()?;
             let root = data_root()?;
             let store = ka_agent_store::Store::open(&root.join("state.db"))
                 .map_err(|e| format!("store: {e}"))?;
@@ -572,6 +571,63 @@ fn handle_tool_call(
     }
 }
 
+/// Resolve the GitHub token: env first (the worker injects it), then the
+/// secret-store file tier (`<data>/secrets/github.token`). The worker's env
+/// sanitizer strips credential-shaped variables, so the file tier is the
+/// durable path (F13).
+fn github_token() -> Result<String, String> {
+    if let Ok(t) = std::env::var("KA_AGENT_GITHUB_TOKEN") {
+        if !t.trim().is_empty() {
+            return Ok(t);
+        }
+    }
+    let root = data_root().map_err(|e| e.to_string())?;
+    let path = root.join("secrets/github.token");
+    std::fs::read_to_string(&path)
+        .map(|t| t.trim().to_string())
+        .ok()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            "no GitHub token: set KA_AGENT_GITHUB_TOKEN or place one at              <data>/secrets/github.token"
+                .to_string()
+        })
+}
+
+/// SSRF guard for `http_get`: refuse loopback, link-local (cloud metadata),
+/// unique-local, private and unspecified targets — as IP literals in any
+/// form (v4/v6, bracketed) — unless the operator granted `http:get:private`.
+/// Redirects are followed manually and every hop re-checks the same guard.
+fn http_target_is_private(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_private()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    // 172.16/12 is `is_private`, but 169.254/16 (metadata)
+                    // and 0.0.0.0/8 are covered above.
+                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64/10 CGNAT
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+            }
+        };
+    }
+    // Names: only the canonical localhost forms; a resolving name is checked
+    // after resolution by the caller when possible.
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.eq_ignore_ascii_case("localhost.localdomain")
+        || bare.ends_with(".localhost")
+        || bare.ends_with(".local")
+        || bare.ends_with(".internal")
+}
+
 /// GitHub API POST helper (write operations).
 fn github_api_post(token: &str, path: &str, body: &Value) -> Result<Value, String> {
     let agent = ureq::AgentBuilder::new()
@@ -595,22 +651,49 @@ fn github_api_post(token: &str, path: &str, body: &Value) -> Result<Value, Strin
 }
 
 /// Blocking HTTP GET with a 15 s timeout, returns the response body as text.
-fn http_get_sync(url: &url::Url, timeout_secs: u64) -> Result<String, String> {
+/// `http_get` with manual redirects: each hop's host must pass the same
+/// SSRF guard as the first (a public host redirecting to 169.254.169.254
+/// must not become a metadata read).
+fn http_get_no_redirect(
+    url: &url::Url,
+    timeout_secs: u64,
+    grants: &grants::Grants,
+) -> Result<String, String> {
+    let allow_private = grants.check("http:get:private");
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirects(0)
         .build();
-    let resp = agent
-        .get(url.as_str())
-        .call()
-        .map_err(|e| format!("http: {e}"))?;
-    let content_type = resp.header("content-type").unwrap_or("").to_string();
-    if !content_type.starts_with("text/")
-        && !content_type.starts_with("application/json")
-        && !content_type.starts_with("application/xml")
-    {
-        return Err(format!("unsupported content-type: {content_type}"));
+    let mut current = url.clone();
+    for _ in 0..5 {
+        let resp = match agent.get(current.as_str()).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, resp)) if (301..=308).contains(&code) => {
+                let location = resp.header("location").unwrap_or("").to_string();
+                let next = url::Url::parse(&location)
+                    .or_else(|_| current.join(&location))
+                    .map_err(|e| format!("redirect target: {e}"))?;
+                if !allow_private && http_target_is_private(next.host_str().unwrap_or("")) {
+                    return Err(format!(
+                        "redirect to private target {} refused (grant http:get:private to allow)",
+                        next.host_str().unwrap_or("?")
+                    ));
+                }
+                current = next;
+                continue;
+            }
+            Err(e) => return Err(format!("http: {e}")),
+        };
+        let content_type = resp.header("content-type").unwrap_or("").to_string();
+        if !content_type.starts_with("text/")
+            && !content_type.starts_with("application/json")
+            && !content_type.starts_with("application/xml")
+        {
+            return Err(format!("unsupported content-type: {content_type}"));
+        }
+        return resp.into_string().map_err(|e| format!("read body: {e}"));
     }
-    resp.into_string().map_err(|e| format!("read body: {e}"))
+    Err("too many redirects".into())
 }
 
 /// Simple GitHub API GET using ureq.
@@ -738,5 +821,56 @@ mod tests {
         assert!(sanitize_note_name(" Ideas").is_err());
         assert!(sanitize_note_name("../etc/passwd").is_err());
         assert!(sanitize_note_name(&"x".repeat(65)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::http_target_is_private;
+
+    #[test]
+    fn private_and_metadata_targets_are_refused() {
+        // Loopback in full, not just 127.0.0.1.
+        for host in [
+            "127.0.0.1",
+            "127.8.8.8",
+            "0.0.0.0",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.0.9",
+            "169.254.169.254",
+            "100.64.0.1",
+            "255.255.255.255",
+            "localhost",
+            "LOCALHOST",
+            "foo.localhost",
+            "printer.local",
+            "db.internal",
+        ] {
+            assert!(http_target_is_private(host), "{host} must be private");
+        }
+        // IPv6: loopback, unspecified, unique-local, link-local (bracketed or bare).
+        for host in [
+            "::1",
+            "[::1]",
+            "0:0:0:0:0:0:0:0",
+            "fd00::1",
+            "[fd12::9]",
+            "fe80::1",
+            "[fe80::1]",
+        ] {
+            assert!(http_target_is_private(host), "{host} must be private");
+        }
+        // Public targets stay reachable.
+        for host in [
+            "example.com",
+            "api.github.com",
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+        ] {
+            assert!(!http_target_is_private(host), "{host} must not be private");
+        }
     }
 }

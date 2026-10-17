@@ -557,6 +557,32 @@ impl TelegramChannel {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
 
+        // Crash recovery (SEED §3.7): chunks queued but never delivered go
+        // out first, oldest first, before any new traffic.
+        let recover = self
+            .store
+            .pending_chunks_for_session(&self.runtime.session_id())
+            .unwrap_or_default();
+        for chunk in &recover {
+            if let Some(chat) = surface.chat() {
+                if client.send_message(chat, &chunk.text, None).await.is_ok() {
+                    self.store
+                        .mark_sent(&chunk.turn, chunk.chunk_index, chunk.chunk_index as i64)
+                        .ok();
+                }
+            } else {
+                eprintln!(
+                    "telegram: {} undelivered chunk(s) from before the crash, \
+                     but no chat to send them to; they stay queued",
+                    recover.len()
+                );
+                break;
+            }
+        }
+        if !recover.is_empty() {
+            eprintln!("telegram: recovered {} queued chunk(s)", recover.len());
+        }
+
         // Startup token check: fail fast on a bad token instead of
         // discovering it on the first poll.
         if let Err(e) = client.get_me().await {
@@ -712,20 +738,24 @@ impl TelegramChannel {
 
         // Commands route through the shared router; replies go to the same
         // chat. Approvals additionally offer the inline keyboard below.
+        // Only free text reaches the engine (the router's contract): a
+        // command both answered *and* submitted used to burn a real turn —
+        // `/new` answered, then sent the literal "/new" as the fresh
+        // session's first prompt.
         match crate::commands::route(&self.runtime, &format!("telegram:{uid}"), text).await {
             crate::commands::Outcome::Reply(reply) => {
                 let _ = client.send_message(chat_id, &reply, None).await;
             }
             crate::commands::Outcome::Silent => {}
-            crate::commands::Outcome::NotACommand => {}
-        }
-
-        if let Err(e) = self
-            .runtime
-            .handle_message(text, &format!("telegram:{uid}"))
-            .await
-        {
-            eprintln!("telegram: handle_message: {e}");
+            crate::commands::Outcome::NotACommand => {
+                if let Err(e) = self
+                    .runtime
+                    .handle_message(text, &format!("telegram:{uid}"))
+                    .await
+                {
+                    eprintln!("telegram: handle_message: {e}");
+                }
+            }
         }
     }
 

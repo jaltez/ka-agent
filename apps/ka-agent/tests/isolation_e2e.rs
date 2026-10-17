@@ -35,7 +35,7 @@ fn write_config(root: &std::path::Path) -> std::path::PathBuf {
 
 /// Drive instance A's chat: one scripted turn plus a `/remember`, keeping
 /// the process alive until both are observed.
-fn drive_instance_a(root: &std::path::Path) {
+fn drive_instance_a(root: &std::path::Path, marker: &str, grant_scope: &str) {
     let sc = root.join("a.json");
     std::fs::write(
         &sc,
@@ -86,7 +86,7 @@ fn drive_instance_a(root: &std::path::Path) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = writeln!(stdin, "/remember {MARKER}");
+    let _ = writeln!(stdin, "/remember {marker}");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         while let Ok(line) = rx.try_recv() {
@@ -104,57 +104,61 @@ fn drive_instance_a(root: &std::path::Path) {
     }
     let _ = writeln!(stdin, "/quit");
     let _ = child.wait();
-    // Positive control: the memory file and a grant exist in A.
+    // Positive control: the memory file exists in this instance.
     let facts = std::fs::read_to_string(root.join("data/memory/facts.md")).unwrap_or_default();
-    assert!(facts.contains(MARKER), "A's facts.md missing the marker");
+    assert!(facts.contains(marker), "facts.md missing its own marker");
     let grant = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
-        .args(["grant", "add", "github:issues:read"])
+        .args(["grant", "add", grant_scope])
         .env("KA_AGENT_DATA_DIR", root.join("data"))
         .output()
         .unwrap();
-    assert!(grant.status.success(), "grant add in A failed");
+    assert!(grant.status.success(), "grant add failed");
 }
 
 #[test]
 fn nothing_crosses_instances() {
     let a = temp_root("a");
     let b = temp_root("b");
-    drive_instance_a(&a);
-    write_config(&b);
+    drive_instance_a(&a, MARKER, "github:issues:read");
+    // Drive instance B too (its own scripted turn): an *empty* root proves
+    // nothing — the invariant is that a *working* second instance sees none
+    // of A's state (F10).
+    drive_instance_a(&b, "instance b own fact", "github:pulls:read");
 
-    // B's durable state: no grant, no identity, and no episode or memory
-    // row mentioning A's traffic. An untouched instance has no database at
-    // all; if one exists (a daemonless CLI can create it), every table
-    // must still be empty.
-    use rusqlite::OptionalExtension;
-    if !b.join("data/state.db").exists() {
-        let facts = std::fs::read_to_string(b.join("data/memory/facts.md")).unwrap_or_default();
-        assert!(
-            !facts.contains(MARKER),
-            "B has no database but its memory carries A's fact"
-        );
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
-        return;
-    }
     let conn = rusqlite::Connection::open_with_flags(
         b.join("data/state.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    let episodes: Option<i64> = conn
+    let episodes: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM episodes_fts WHERE episodes_fts MATCH ?",
-            ["isolation OR marker OR forty"],
+            ["isolation OR marker"],
             |r| r.get(0),
         )
+        .unwrap_or(0);
+    // B has its own traffic (forty-two), but none of A's marker words.
+    assert_eq!(episodes, 0, "B's history must not contain A's marker");
+    use rusqlite::OptionalExtension;
+    let grants: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'grants'", [], |r| {
+            r.get(0)
+        })
         .optional()
         .unwrap();
-    assert_eq!(episodes, Some(0), "B's history must be empty");
-    let grants: i64 = conn
-        .query_row("SELECT COUNT(*) FROM grants", [], |r| r.get(0))
-        .unwrap_or(-1);
-    assert_eq!(grants, 0, "B must have no grants");
+    // A's grant must not leak; B's own (different) grant is the control.
+    assert!(
+        !grants
+            .as_deref()
+            .is_some_and(|j| j.contains("github:issues:read")),
+        "A's grant leaked into B: {grants:?}"
+    );
+    assert!(
+        grants
+            .as_deref()
+            .is_some_and(|j| j.contains("github:pulls:read")),
+        "B's own grant missing (the control): {grants:?}"
+    );
     let identities: i64 = conn
         .query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0))
         .unwrap_or(-1);
@@ -171,10 +175,18 @@ fn nothing_crosses_instances() {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    let grants: i64 = conn
-        .query_row("SELECT COUNT(*) FROM grants", [], |r| r.get(0))
+    let grants: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'grants'", [], |r| {
+            r.get(0)
+        })
+        .optional()
         .unwrap();
-    assert!(grants >= 1, "A's grant must exist in A");
+    assert!(
+        grants
+            .as_deref()
+            .is_some_and(|j| j.contains("github:issues:read")),
+        "A's grant must exist in A: {grants:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);

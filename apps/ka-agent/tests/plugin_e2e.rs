@@ -77,6 +77,10 @@ effect = "read"
 [[tools]]
 name = "probe.echo"
 effect = "read"
+
+[[tools]]
+name = "probe.mark"
+effect = "local_write"
 "#,
     )
     .unwrap();
@@ -242,7 +246,7 @@ fn plugin_lifecycle_sandbox_and_integrity() {
     let (names, stderr, _) = bridge_tools_list(&data);
     let lock_debug =
         std::fs::read_to_string(data.join("plugins/installed.json")).unwrap_or_default();
-    for expected in ["probe.sandbox", "probe.env", "probe.echo"] {
+    for expected in ["probe.sandbox", "probe.env", "probe.echo", "probe.mark"] {
         assert!(
             names.iter().any(|n| n == expected),
             "tools/list missing {expected}: {names:?}\nbridge stderr: {stderr}\nlockfile: {lock_debug}"
@@ -296,6 +300,33 @@ fn plugin_lifecycle_sandbox_and_integrity() {
         names.iter().any(|n| n == "probe.sandbox"),
         "reinstalled plugin must be offered again: {names:?}"
     );
+
+    // F7: a write-effect plugin call must settle its intent (the row used to
+    // stay `executing` forever because the settlement passed the status
+    // string as the id).
+    let marked = bridge_call(&data, "probe.mark", "{}");
+    assert_eq!(marked, "marked");
+    {
+        use rusqlite::OptionalExtension;
+        let conn = rusqlite::Connection::open_with_flags(
+            data.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let intent: Option<(String, String)> = conn
+            .query_row(
+                "SELECT tool, status FROM intents WHERE tool = 'probe.mark' ORDER BY created_ms DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        let Some((tool, status)) = intent else {
+            panic!("no intent row for the write-effect call");
+        };
+        assert_eq!(tool, "probe.mark");
+        assert_eq!(status, "done", "the intent must settle, not stay executing");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

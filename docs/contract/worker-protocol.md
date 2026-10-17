@@ -32,18 +32,21 @@ Direction: D→W (daemon to worker, written to the worker's stdin), W→D
 
 Field notes:
 
-- `Open.strand`: a strand **path**. `null` means "new strand"
-  (`StrandChoice::New`); a path means resume (`StrandChoice::Path`).
+- `Open.strand`: the **sentinel `"new"`** (fresh strand) or a strand
+  **path** string (resume). `null` is not valid — the field deserializes
+  exactly those two shapes (`proto.rs: StrandSel`).
 - `Open.mode`: `"guarded" | "accept_edits" | "free" | "plan"`.
-- `Open.engine_layer_toml`: optional path to a ka engine layer file in ka's
-  own strict `ka.toml` format (see `examples/config/engine.toml`). The
+- `Open.engine_layer_toml`: the ka engine layer **document itself** (ka's
+  strict `ka.toml` grammar, as text — the daemon reads
+  `examples/config/engine.toml` off disk and passes its contents). The
   worker's security overlay is applied **after** it and always wins.
 - `Open.scenario`: reserved for the scripted-speaker test scenario (contract
   tests, `spawn_with_speaker`); `null` in production.
 - `Submit.images`: image inputs for multimodal prompts; `Submit.skills`:
   skill names to enable for this turn.
-- `Answer.choice`: `"allow" | "always" | "deny"` — `"always"` is never sent
-  from remote channels (gap G12).
+- `Answer.choice`: a **numeric index into the ask's `options`** in request
+  order (`0` = allow, `1` = always, `2` = deny for the standard engine
+  ordering). Remote channels never send the always index (gap G12).
 - After `open`, the daemon **must** send `set_mode` and `set_model` before
   the first `submit` (validation finding F-1; see `ka-port.md` §6).
 

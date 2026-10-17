@@ -15,7 +15,7 @@ pub enum Outcome {
     NotACommand,
 }
 
-const HELP: &str = "commands: /help /status /new /stop\n\
+const HELP: &str = "commands: /help /status /new /stop /resume\n\
                     /remember <fact> · /forget <id> · /memory [review|accept <id>|reject <id>]\n\
                     /history <query> · /history show <turn_id> · /remind <Nd> <text> · /y /n";
 
@@ -117,6 +117,11 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
                 Err(e) => Outcome::Reply(format!("! [remind] {e}")),
             }
         }
+        "/resume" => match runtime.resume() {
+            Ok(true) => Outcome::Reply("resumed".into()),
+            Ok(false) => Outcome::Reply("nothing to resume (not paused)".into()),
+            Err(e) => Outcome::Reply(format!("! [resume] {e}")),
+        },
         "/skills" => {
             Outcome::Reply("skills live in <data>/engine-home/.config/ka/skills/ (SKILL.md)".into())
         }

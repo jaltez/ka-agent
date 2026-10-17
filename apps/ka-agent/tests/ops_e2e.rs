@@ -357,3 +357,143 @@ fn backup_then_restore_drill() {
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
 }
+
+/// F13 (review): the GitHub connector's token must be resolvable. The
+/// worker's env sanitizer strips anything matching TOKEN/KEY/…, so the
+/// bridge could never see a token from the environment; the worker now
+/// re-injects it from the secret-store file tier into the bridge's env.
+/// With a token present the tool's failure mode changes from "no GitHub
+/// token" to a network/API error — no live GitHub needed.
+#[test]
+fn github_tools_see_the_secret_store_token() {
+    let root = temp_root("gh-token");
+    let data = root.join("data");
+    let secrets = data.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join("github.token"), "ghp_testtoken123").unwrap();
+    let grant = ka(&data)
+        .args(["grant", "add", "github:issues:read"])
+        .output()
+        .unwrap();
+    assert!(grant.status.success());
+
+    // Drive the bridge directly: initialize + tools/call.
+    use std::io::Write as _;
+    let _cfg_holder = write_config(&root);
+    let mut child = ka(&data)
+        .arg("__mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"github_issues_list","arguments":{"repo":"ka-agent/ka-agent"}}}"#,
+    ] {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+    }
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let answer = text
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .expect("bridge answered tools/call");
+    assert!(
+        !answer.contains("no GitHub token"),
+        "the token from the secret store did not reach the bridge: {answer}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// F9 (review): `restore` must work after a *clean stop*. The daemon only
+/// removed its admin socket at startup, so SIGTERM/restart left it behind
+/// and restore refused with "daemon appears to be running" — the disaster
+/// recovery path failing right after the disaster.
+#[test]
+fn restore_works_after_a_clean_stop() {
+    let root = temp_root("restore-stop");
+    let cfg = write_config(&root);
+    let data = root.join("data");
+
+    // Run a real daemon so the socket exists, then stop it gracefully
+    // (exactly `ka-agent restart`'s mechanism).
+    let mut daemon = Daemon {
+        child: ka(&data)
+            .args(["run", "--config", cfg.to_str().unwrap()])
+            .env_remove("KA_MODEL")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    };
+    wait_admin_socket(&data, Duration::from_secs(15));
+    let sock = data.join("admin.sock");
+    assert!(sock.exists(), "socket should exist while running");
+    let out = ka(&data)
+        .arg("restart")
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match daemon.child.try_wait().unwrap() {
+            Some(code) => {
+                assert!(code.success());
+                break;
+            }
+            None if Instant::now() > deadline => panic!("daemon did not stop"),
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    // The socket is gone after a clean stop…
+    assert!(
+        !sock.exists(),
+        "a cleanly stopped daemon must remove its admin socket"
+    );
+
+    // …so a backup+restore over that root no longer refuses.
+    let backup_dir = root.join("bk");
+    let out = ka(&data)
+        .arg("backup")
+        .arg(&backup_dir)
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = ka(&data)
+        .arg("restore")
+        .arg(&backup_dir)
+        .arg("--force")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "restore after a clean stop: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And a stale socket (crash simulation) is probed, not feared.
+    std::fs::write(&sock, b"").unwrap();
+    let out = ka(&data)
+        .arg("restore")
+        .arg(&backup_dir)
+        .arg("--force")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a stale socket must not block restore: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

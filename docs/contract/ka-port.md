@@ -15,24 +15,25 @@ and the behavioral rules.
 
 ## 1. The trait
 
+The trait is deliberately minimal: **one method**. Everything else a session
+does lives on the returned handle, not the trait, so the port stays swappable
+with a single construction site.
+
 ```rust
-pub trait KaPort: Send {
-    fn open_session(&mut self, req: OpenRequest) -> Result<SessionHandle, PortError>;
-    fn submit(&mut self, prompt: Prompt) -> Result<TurnSpan, PortError>;
-    fn answer(&mut self, ask_id: AskId, choice: AnswerChoice) -> Result<(), PortError>;
-    fn abort(&mut self) -> Result<(), PortError>;
-    fn set_mode(&mut self, mode: Mode) -> Result<(), PortError>;
-    fn set_model(&mut self, selector: String) -> Result<(), PortError>;
-    fn set_name(&mut self, name: String) -> Result<(), PortError>;
-    fn compact(&mut self) -> Result<(), PortError>;
-    fn close(&mut self) -> Result<(), PortError>;
-    fn events(&mut self) -> &mut dyn Stream<Item = PortEvent>;
+pub trait KaPort: Send + Sync {
+    /// Start or resume one engine on one strand. Returns the live session
+    /// handle with its event stream.
+    fn open<'a>(&'a self, req: OpenRequest)
+        -> BoxFut<'a, Result<PortSession, PortError>>;
 }
 ```
 
+The handle (`PortSession`) exposes the rest; the table maps handle methods
+to what they send over the worker protocol (`worker-protocol.md`):
+
 | Operation | Ka command | Meaning |
 |---|---|---|
-| `open_session` | engine spawn + attach (`StrandChoice::{New,Path}`) | Start or resume one engine on one strand, with explicit model/mode and Ka Agent's config layers. Returns a handle carrying the strand id (from `session_info`). |
+| `open` | engine spawn + attach (`StrandSel::{New,Path}`) | Start or resume one engine on one strand, with explicit model/mode and Ka Agent's config layers. Returns a handle carrying the strand id (from `session_info`). |
 | `submit` | `prompt` | Begin one prompt cycle. Returns the span descriptor; live output is the event stream until `idle`. |
 | `answer` | `answer` | Resolve a pending Ka `ask` (`allow` / `always` / `deny`). |
 | `abort` | `abort` | Cancel the running prompt cycle; engine emits `turn_finished{stop:"aborted"}` then `idle`. |
@@ -177,10 +178,12 @@ crash (event channel closed without `idle`, gap G13): mark the cycle
 
 - **Graceful stop:** `abort`, then wait `turn_grace_secs` (default 10 s,
   provisional) for `turn_finished{stop:"aborted"}` + `idle`.
-- **Escalation:** if grace lapses, SIGTERM to the worker's **process group**
-  (so tool children die too; the MVP engine layer sets
-  `[tools.bash] background_after_ms = 0` so nothing detaches, gap G15), then
-  SIGKILL after a further 5 s. The turn is marked `aborted` or `killed`.
+- **Escalation:** if grace lapses (or the turn is still open), the runtime
+  SIGKILLs the worker's **process group** directly (so tool children die
+  too; the MVP engine layer sets `[tools.bash] background_after_ms = 0` so
+  nothing detaches, gap G15). There is no intermediate SIGTERM step: the
+  kill is immediate, bounded by a 3 s wait. The turn is marked `aborted`
+  or `interrupted`.
 - **EngineClosed detection:** the worker reports `EngineClosed{reason}` (see
   `worker-protocol.md`) and exits with code 3 when the engine channel closes
   without a terminal `idle`. The daemon treats any worker exit ≠ 0 without
