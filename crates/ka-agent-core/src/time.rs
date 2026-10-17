@@ -1,7 +1,12 @@
 //! Time helpers shared by every crate (no I/O).
 
-/// Parse `Ns`, `Nm`, `Nh`, `Nd` into milliseconds. One grammar for
-/// `/remind`, `/cron` and the `cron_manage` tool.
+/// Upper bound for any parsed duration (366 days). Keeps `now + ms` and
+/// recurrence arithmetic inside i64 by construction; larger requests are
+/// rejected, not wrapped.
+pub const MAX_DURATION_MS: u64 = 366 * 86_400_000;
+
+/// Parse `Ns`, `Nm`, `Nh`, `Nd` into milliseconds (max 366 days). One
+/// grammar for `/remind`, `/cron` and the `cron_manage` tool.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.len() < 2 {
@@ -16,7 +21,8 @@ pub fn parse_duration(s: &str) -> Option<u64> {
         "d" => 86_400_000,
         _ => return None,
     };
-    n.checked_mul(mult)
+    let ms = n.checked_mul(mult)?;
+    (ms <= MAX_DURATION_MS).then_some(ms)
 }
 
 #[cfg(test)]
@@ -43,5 +49,9 @@ mod tests {
         assert_eq!(parse_duration("1e9d"), None);
         // u64 overflow saturates to None instead of wrapping.
         assert_eq!(parse_duration("999999999999999999d"), None);
+        // Anything beyond 366 days is refused, not wrapped.
+        assert_eq!(parse_duration("367d"), None);
+        assert_eq!(parse_duration("9223372036854775s"), None);
+        assert_eq!(parse_duration("366d"), Some(MAX_DURATION_MS));
     }
 }

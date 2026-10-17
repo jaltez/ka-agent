@@ -88,10 +88,11 @@ fn path_ref(workspace: &Path, rel: &str, token: &str) -> String {
         workspace.join(base)
     };
     if path.is_file() {
-        match std::fs::read_to_string(&path) {
+        match read_bounded(&path) {
             Ok(content) => {
+                let truncated = content.chars().count() > REF_ITEM_MAX;
                 let body = ka_agent_core::truncate_at_char(&content, REF_ITEM_MAX);
-                let ellipsis = if content.chars().count() > REF_ITEM_MAX {
+                let ellipsis = if truncated {
                     "\n… [ref truncated]"
                 } else {
                     ""
@@ -112,6 +113,20 @@ fn path_ref(workspace: &Path, rel: &str, token: &str) -> String {
     } else {
         format!("[ref {token}: not found]")
     }
+}
+
+/// Read at most `REF_ITEM_MAX` chars' worth of bytes from the source (4
+/// bytes is the widest UTF-8 char, +4 guarantees the truncation flag is
+/// detectable for any content). Never loads an unbounded file — `/dev/zero`
+/// or a multi-GB log costs the same as a small note.
+fn read_bounded(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    f.by_ref()
+        .take((REF_ITEM_MAX as u64) * 4 + 4)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Shallow listing: depth-bounded, entry-capped, directories get `/`.
@@ -299,6 +314,21 @@ mod tests {
         let store = store_at(&root.join("data"));
         let text = "plain text\nsecond line, mail me at bob@example.com ok";
         assert_eq!(expand(&store, &ws, text).await, text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn huge_file_ref_is_read_bounded() {
+        let root = temp_root("huge");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // Far beyond the 8k cap: the read itself must be bounded and the
+        // expansion truncated, never an unbounded load.
+        std::fs::write(ws.join("huge.txt"), "y".repeat(400_000)).unwrap();
+        let store = store_at(&root.join("data"));
+        let out = expand(&store, &ws, "@huge.txt").await;
+        assert!(out.contains("[ref truncated]"), "{out}");
+        assert!(out.chars().count() < 9_000, "{}", out.chars().count());
         let _ = std::fs::remove_dir_all(&root);
     }
 

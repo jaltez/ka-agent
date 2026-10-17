@@ -642,6 +642,9 @@ fn handle_tool_call(
                 }
                 "pause" | "resume" | "remove" | "trigger" => {
                     let id = args["id"].as_str().ok_or("missing 'id'")?;
+                    if id.trim().is_empty() {
+                        return Err("missing 'id'".into());
+                    }
                     let crons = store.cron_tasks().map_err(|e| format!("store: {e}"))?;
                     let task = crons
                         .iter()

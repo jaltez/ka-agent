@@ -31,10 +31,19 @@ A cron job is a `kind = 'cron'` task whose `payload` is a `CronSpec`:
   never reminders.
 
 **Recurrence semantics**: fixed interval (`every N…`), not calendar
-expressions. After a successful fire the next occurrence is computed by
-skipping missed occupations (`while next <= now`), so a laptop that slept
-for three days fires once, not 72 times. `pause` maps to the existing
-`interrupted` status (operator-driven reconciliation), `resume` re-queues.
+expressions. Durations are capped at 366 days (`parse_duration` refuses
+more; `now + ms` can never wrap i64). After a successful fire the next
+occurrence is computed by skipping missed occupations (`while next <= now`,
+overflow-checked), so a laptop that slept for three days fires once, not 72
+times; an unrepresentable schedule fails visibly instead of spinning.
+
+**Races and restarts**: firing claims the row `queued → running`
+conditionally — a cancel or pause that lands first or mid-flight wins and
+the fire loop skips or leaves the row alone (never resurrects a cancelled
+job). A crash mid-fire leaves the row `running`; the next boot reconciles
+it to `interrupted`, shown as `[paused]` and resumable. `pause` maps to
+the existing `interrupted` status (operator-driven reconciliation),
+`resume` re-queues.
 
 ## @references
 
@@ -43,7 +52,7 @@ word starting with `@`:
 
 | Form | Expansion |
 | --- | --- |
-| `@<path>` | file content (8 000-char cap), workspace-relative or absolute |
+| `@<path>` | file content (8 000-char cap, read is byte-bounded at the source), workspace-relative or absolute |
 | `@<dir>` | shallow listing (depth 2, 50 entries, dirs get `/`) |
 | `@turn:<prefix>` / `@t:<prefix>` | that turn's question and answer |
 | `@https://…` | the URL body, under the `http_get` grant + SSRF rules |

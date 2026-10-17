@@ -188,6 +188,16 @@ impl Runtime {
                 interrupted.len()
             ));
         }
+        // A crash mid-fire leaves scheduled tasks `running`; without this
+        // they sit invisible to the scheduler forever while `/cron list`
+        // still shows them. Marked `interrupted` (= paused, resumable).
+        let stuck_tasks = store.reconcile_running_tasks(ka_agent_core::now_ms())?;
+        if !stuck_tasks.is_empty() {
+            surface.on_note(&format!(
+                "recovered after restart: {} scheduled task(s) interrupted mid-fire marked paused",
+                stuck_tasks.len()
+            ));
+        }
         let mut session = store
             .list_recent_sessions(1)?
             .into_iter()
@@ -872,6 +882,9 @@ impl Runtime {
 
     /// Cancel a live cron by id prefix; `Ok(false)` when nothing matches.
     pub fn cancel_cron(&self, id_prefix: &str) -> Result<bool, Error> {
+        if id_prefix.trim().is_empty() {
+            return Ok(false);
+        }
         let crons = self.list_crons()?;
         let Some(task) = crons
             .iter()
@@ -885,14 +898,19 @@ impl Runtime {
     }
 
     /// Fire due tasks (reminders and crons); called from the scheduler
-    /// timer. Each item is marked `running` before it acts and settled
-    /// after; one failing item never stops the batch.
+    /// timer. Each item is claimed (`queued -> running`) before it acts and
+    /// settled after; a concurrent cancel/pause wins both races (claim and
+    /// settle are conditional), and one failing item never stops the batch.
     pub async fn fire_due_tasks(&self) -> Result<Vec<String>, Error> {
         let now = ka_agent_core::now_ms();
         let due = self.sh.store.due_tasks(now)?;
         let mut fired = Vec::new();
         for task in due {
-            let _ = self.sh.store.set_task_status(&task.id, "running");
+            // Claim: the snapshot is stale the moment another surface
+            // (cancel, pause, remove) touched the row. Skip what we lost.
+            if !self.sh.store.claim_task(&task.id).unwrap_or(false) {
+                continue;
+            }
             match task.kind.as_str() {
                 "reminder" => {
                     let title = task.title.clone();
@@ -904,17 +922,17 @@ impl Runtime {
                         self.sh
                             .surface
                             .on_error("cron", &format!("reminder {}: {e}", task.id.as_str()));
-                        let _ = self.sh.store.set_task_status(&task.id, "failed");
+                        let _ = self.sh.store.settle_task(&task.id, "failed");
                         continue;
                     }
-                    let _ = self.sh.store.set_task_status(&task.id, "succeeded");
+                    let _ = self.sh.store.settle_task(&task.id, "succeeded");
                     fired.push(title);
                 }
                 "cron" => {
                     let Some(spec) = ka_agent_core::CronSpec::from_payload(
                         task.payload.as_deref().unwrap_or(""),
                     ) else {
-                        let _ = self.sh.store.set_task_status(&task.id, "failed");
+                        let _ = self.sh.store.settle_task(&task.id, "failed");
                         continue;
                     };
                     let ok = match &spec.mode {
@@ -948,28 +966,34 @@ impl Runtime {
                     if !ok {
                         // Failed jobs are not re-armed: the failure is
                         // visible on the surface and the row stays `failed`.
-                        let _ = self.sh.store.set_task_status(&task.id, "failed");
+                        let _ = self.sh.store.settle_task(&task.id, "failed");
                         continue;
                     }
                     match spec.recurrence_ms {
                         Some(rec) if rec > 0 => {
-                            // Skip missed occupations: arm at the next
-                            // occurrence strictly after now.
-                            let mut next = task.scheduled_at_ms.unwrap_or(now) + rec;
-                            while next <= now {
-                                next += rec;
+                            match next_occurrence(task.scheduled_at_ms.unwrap_or(now), rec, now) {
+                                // Re-arm only if the row is still `running` (a
+                                // cancel mid-flight wins).
+                                Some(next) => {
+                                    let _ = self.sh.store.rearm_task(&task.id, next);
+                                }
+                                // Overflowing schedule: unarmable, fail visibly.
+                                None => {
+                                    self.sh.surface.on_error(
+                                        "cron",
+                                        &format!("{}: recurrence overflow", task.id.as_str()),
+                                    );
+                                    let _ = self.sh.store.settle_task(&task.id, "failed");
+                                    continue;
+                                }
                             }
-                            let _ =
-                                self.sh
-                                    .store
-                                    .update_task_schedule(&task.id, Some(next), "queued");
                         }
                         Some(_) => {
-                            let _ = self.sh.store.set_task_status(&task.id, "failed");
+                            let _ = self.sh.store.settle_task(&task.id, "failed");
                             continue;
                         }
                         None => {
-                            let _ = self.sh.store.set_task_status(&task.id, "succeeded");
+                            let _ = self.sh.store.settle_task(&task.id, "succeeded");
                         }
                     }
                     fired.push(spec.text);
@@ -978,7 +1002,7 @@ impl Runtime {
                     self.sh
                         .surface
                         .on_error("cron", &format!("unknown scheduled kind {other:?}"));
-                    let _ = self.sh.store.set_task_status(&task.id, "failed");
+                    let _ = self.sh.store.settle_task(&task.id, "failed");
                 }
             }
         }
@@ -1698,6 +1722,17 @@ pub fn next_daily_utc(hour: u8) -> i64 {
     } else {
         today + 86_400_000
     }
+}
+
+/// Next occurrence strictly after `now`, skipping missed occupations.
+/// `None` on i64 overflow (an unarmable schedule, e.g. a hand-crafted
+/// payload with an absurd interval).
+fn next_occurrence(base_ms: i64, recurrence_ms: i64, now: i64) -> Option<i64> {
+    let mut next = base_ms.checked_add(recurrence_ms)?;
+    while next <= now {
+        next = next.checked_add(recurrence_ms)?;
+    }
+    Some(next)
 }
 
 #[cfg(test)]

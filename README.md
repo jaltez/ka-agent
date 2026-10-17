@@ -7,7 +7,7 @@ reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
 **Status: M11 complete and verified.** Working today (`cargo test
---workspace`: 181 tests green; Telegram + Matrix + memory + history + MCP
+--workspace`: 185 tests green; Telegram + Matrix + memory + history + MCP
 bridge + scheduler + loopback web UI + sandboxed third-party plugins +
 cross-channel identity linking + ops packaging (systemd units, backups,
 doctor) + cron/@refs/AGENTS.md/calendar):

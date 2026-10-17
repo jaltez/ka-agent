@@ -196,3 +196,79 @@ fn agents_md_seeded_once_never_overwritten() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Review F1: a cancel that lands mid-flight (while the row is `running`)
+/// must win — the fire loop's settle/re-arm are conditional on `running`.
+#[tokio::test]
+async fn concurrent_cancel_wins_over_rearm() {
+    let root = root("cancel-race");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), notes);
+    rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
+
+    let now = ka_agent_core::now_ms();
+    let id = rt.add_cron(spec("tick", Some(60_000)), now - 1).unwrap();
+
+    // Simulate the fire loop having claimed the row (queued -> running)…
+    assert!(store.claim_task(&id).unwrap(), "first claim takes the row");
+    assert!(!store.claim_task(&id).unwrap(), "double claim is refused");
+    // …the operator cancelling mid-flight…
+    assert!(rt.cancel_cron(&id.as_str()[..8]).unwrap());
+    // …and the loop finishing: settle and re-arm must both be no-ops.
+    assert!(!store.settle_task(&id, "succeeded").unwrap());
+    assert!(!store.rearm_task(&id, now + 60_000).unwrap());
+    let row = store.get_task(&id).unwrap().unwrap();
+    assert_eq!(row.status, ka_agent_core::TaskStatus::Cancelled);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Review F3: a crash mid-fire leaves the row `running`; the next boot
+/// reconciles it to `interrupted` (visible as paused, resumable), not stuck
+/// invisible forever.
+#[test]
+fn startup_reconciles_tasks_left_running() {
+    let root = root("reconcile-tasks");
+    let store = store_at(&root.join("data"));
+
+    // A previous process died between claim and settle.
+    let mut task = ka_agent_core::Task::new("tick".into(), "cron", false);
+    task.scheduled_at_ms = Some(ka_agent_core::now_ms() - 60_000);
+    task.payload = Some(spec("tick", Some(60_000)).to_payload());
+    task.status = ka_agent_core::TaskStatus::Running;
+    store.insert_task(&task).unwrap();
+
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::new(Notes::default()));
+    let crons = rt.list_crons().unwrap();
+    assert_eq!(crons.len(), 1);
+    assert_eq!(crons[0].status, ka_agent_core::TaskStatus::Interrupted);
+    // And it no longer pretends to be claimable by the scheduler.
+    assert!(!store.claim_task(&crons[0].id).unwrap());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Review F2: absurd recurrence values (hand-crafted payloads — creation is
+/// capped by `parse_duration`) must fail visibly, never wrap or spin.
+#[tokio::test]
+async fn overflowing_recurrence_fails_visibly() {
+    let root = root("overflow");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+    rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
+
+    let now = ka_agent_core::now_ms();
+    let mut s = spec("boom", Some(i64::MAX));
+    s.mode = CronMode::NoAgent("echo".into());
+    let mut task = ka_agent_core::Task::new(s.text.clone(), "cron", false);
+    task.scheduled_at_ms = Some(now - 1);
+    task.payload = Some(s.to_payload());
+    store.insert_task(&task).unwrap();
+
+    rt.fire_due_tasks().await.unwrap();
+    let row = store.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(row.status, ka_agent_core::TaskStatus::Failed);
+    let seen = notes.0.lock().unwrap().join("\n");
+    assert!(seen.contains("recurrence overflow"), "surface saw: {seen}");
+    let _ = std::fs::remove_dir_all(&root);
+}

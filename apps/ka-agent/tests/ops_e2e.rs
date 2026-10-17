@@ -436,6 +436,8 @@ fn cron_manage_tool_schedules_and_lists() {
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"list"}}}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"1h","text":"bridge smoke"}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":""}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":"nosuchprefix"}}}"#,
     ] {
         stdin.write_all(msg.as_bytes()).unwrap();
         stdin.write_all(b"\n").unwrap();
@@ -455,6 +457,17 @@ fn cron_manage_tool_schedules_and_lists() {
         .find(|l| l.contains("\"id\":3"))
         .expect("schedule answered");
     assert!(scheduled.contains("scheduled"), "{scheduled}");
+    // Review F5: an empty id must be rejected, not match the first job.
+    let empty_id = text
+        .lines()
+        .find(|l| l.contains("\"id\":4"))
+        .expect("empty-id remove answered");
+    assert!(empty_id.contains("isError"), "{empty_id}");
+    let no_match = text
+        .lines()
+        .find(|l| l.contains("\"id\":5"))
+        .expect("no-match remove answered");
+    assert!(no_match.contains("isError"), "{no_match}");
 
     // The row is in the store with a valid payload (the daemon's scheduler
     // will pick it up from here).

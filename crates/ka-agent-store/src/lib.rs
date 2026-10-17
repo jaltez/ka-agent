@@ -1100,6 +1100,62 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically claim a queued task for firing (`queued -> running`).
+    /// `Ok(false)` when the row left `queued` first (a concurrent cancel
+    /// or pause wins the race) — the caller must skip it.
+    pub fn claim_task(&self, id: &ka_agent_core::TaskId) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE tasks SET status = 'running', updated_ms = ?2
+             WHERE id = ?1 AND status = 'queued'",
+            params![id.as_str(), ka_agent_core::now_ms()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Settle a claimed task (`running -> status`) only if it is still
+    /// `running`. `Ok(false)` when a concurrent cancel/pause already took
+    /// the row — the operator's decision wins.
+    pub fn settle_task(&self, id: &ka_agent_core::TaskId, status: &str) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE tasks SET status = ?2, updated_ms = ?3
+             WHERE id = ?1 AND status = 'running'",
+            params![id.as_str(), status, ka_agent_core::now_ms()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Re-arm a claimed recurring task (`running -> queued` at the next
+    /// occurrence). `Ok(false)` when a concurrent cancel/pause already took
+    /// the row.
+    pub fn rearm_task(&self, id: &ka_agent_core::TaskId, scheduled_at_ms: i64) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE tasks SET scheduled_at_ms = ?2, status = 'queued', updated_ms = ?3
+             WHERE id = ?1 AND status = 'running'",
+            params![id.as_str(), scheduled_at_ms, ka_agent_core::now_ms()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Restart reconciliation for tasks: a crash mid-fire leaves rows
+    /// `running` forever; they become `interrupted` (visible as paused for
+    /// crons, resumable via `cron_manage`). Returns the reconciled ids.
+    pub fn reconcile_running_tasks(&self, now_ms: i64) -> Result<Vec<ka_agent_core::TaskId>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id FROM tasks WHERE status = 'running'")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0).map(ka_agent_core::TaskId))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        conn.execute(
+            "UPDATE tasks SET status = 'interrupted', updated_ms = ?1 WHERE status = 'running'",
+            params![now_ms],
+        )?;
+        Ok(ids)
+    }
+
     /// Live cron tasks (queued, running or operator-paused), next fire
     /// first. Terminal crons are history, not schedule.
     pub fn cron_tasks(&self) -> Result<Vec<ka_agent_core::Task>> {
