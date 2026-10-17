@@ -288,9 +288,10 @@ impl MatrixChannel {
             }
             Outcome::Silent => {}
             Outcome::NotACommand => {
+                let body = crate::refs::expand(&self.store, &self.runtime.workspace(), body).await;
                 if let Err(e) = self
                     .runtime
-                    .handle_message(body, &format!("matrix:{sender}"))
+                    .handle_message(&body, &format!("matrix:{sender}"))
                     .await
                 {
                     eprintln!("matrix: handle_message: {e}");

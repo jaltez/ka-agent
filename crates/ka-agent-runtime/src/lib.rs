@@ -7,5 +7,5 @@ pub mod runtime;
 pub mod surface;
 
 pub use paths::Paths;
-pub use runtime::{Error, Runtime};
+pub use runtime::{Error, Runtime, next_daily_utc};
 pub use surface::{ApprovalCard, Surface};

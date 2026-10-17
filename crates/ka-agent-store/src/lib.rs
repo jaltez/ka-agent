@@ -64,6 +64,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v1.sql"),
     include_str!("schema_v2.sql"),
     include_str!("schema_v3.sql"),
+    include_str!("schema_v4.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -469,6 +470,23 @@ impl Store {
                         cost_usd, tokens, created_ms, updated_ms
                  FROM turns WHERE id = ?1",
                 params![id.as_str()],
+                row_to_turn,
+            )
+            .optional()?;
+        Ok(turn)
+    }
+
+    /// Most recent turn whose id starts with `prefix` — `@turn:<prefix>`
+    /// references resolve through this. Global, not per-session: one
+    /// instance is one operator (SEED.md §8.1).
+    pub fn find_turn_by_prefix(&self, prefix: &str) -> Result<Option<Turn>> {
+        let conn = self.lock();
+        let turn = conn
+            .query_row(
+                "SELECT id, session, inbound_text, status, stop, error_class, error_message,
+                        cost_usd, tokens, created_ms, updated_ms
+                 FROM turns WHERE id LIKE ?1 || '%' ORDER BY created_ms DESC LIMIT 1",
+                params![prefix],
                 row_to_turn,
             )
             .optional()?;
@@ -1015,16 +1033,17 @@ impl Store {
         collect_rows(rows)
     }
 
-    /// Tasks of a kind whose scheduled time has passed (scheduler).
-    pub fn due_tasks(&self, now_ms: i64, kind: &str) -> Result<Vec<ka_agent_core::Task>> {
+    /// Tasks whose scheduled time has passed: reminders and crons (the
+    /// scheduler branches on `kind`).
+    pub fn due_tasks(&self, now_ms: i64) -> Result<Vec<ka_agent_core::Task>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, created_ms, updated_ms
+            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
              FROM tasks
-             WHERE kind = ?1 AND status = 'queued' AND scheduled_at_ms IS NOT NULL AND scheduled_at_ms <= ?2
+             WHERE status = 'queued' AND scheduled_at_ms IS NOT NULL AND scheduled_at_ms <= ?1
              ORDER BY scheduled_at_ms",
         )?;
-        let rows = stmt.query_map(params![kind, now_ms], row_to_task)?;
+        let rows = stmt.query_map(params![now_ms], row_to_task)?;
         collect_rows(rows)
     }
 
@@ -1032,8 +1051,8 @@ impl Store {
     pub fn insert_task(&self, t: &ka_agent_core::Task) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO tasks(id, session, title, kind, status, read_only, scheduled_at_ms, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO tasks(id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 t.id.as_str(),
                 t.session.as_ref().map(|s| s.as_str()),
@@ -1042,6 +1061,7 @@ impl Store {
                 task_status_str(&t.status),
                 t.read_only as i64,
                 t.scheduled_at_ms,
+                t.payload,
                 t.created_ms,
                 t.updated_ms
             ],
@@ -1057,6 +1077,55 @@ impl Store {
             params![id.as_str(), status, ka_agent_core::now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Update a task's schedule and status in one write (cron re-arming
+    /// after a fire; pausing clears the schedule).
+    pub fn update_task_schedule(
+        &self,
+        id: &ka_agent_core::TaskId,
+        scheduled_at_ms: Option<i64>,
+        status: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tasks SET scheduled_at_ms = ?2, status = ?3, updated_ms = ?4 WHERE id = ?1",
+            params![
+                id.as_str(),
+                scheduled_at_ms,
+                status,
+                ka_agent_core::now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Live cron tasks (queued, running or operator-paused), next fire
+    /// first. Terminal crons are history, not schedule.
+    pub fn cron_tasks(&self) -> Result<Vec<ka_agent_core::Task>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
+             FROM tasks
+             WHERE kind = 'cron' AND status IN ('queued','running','interrupted')
+             ORDER BY scheduled_at_ms",
+        )?;
+        let rows = stmt.query_map([], row_to_task)?;
+        collect_rows(rows)
+    }
+
+    /// One task by id, if it exists (any status).
+    pub fn get_task(&self, id: &ka_agent_core::TaskId) -> Result<Option<ka_agent_core::Task>> {
+        let conn = self.lock();
+        let task = conn
+            .query_row(
+                "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
+                 FROM tasks WHERE id = ?1",
+                params![id.as_str()],
+                row_to_task,
+            )
+            .optional()?;
+        Ok(task)
     }
 
     /// Pending candidates with full text, for `/memory review`.
@@ -1438,8 +1507,9 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<ka_agent_core::Task> {
         status,
         read_only: read_only != 0,
         scheduled_at_ms: r.get(6)?,
-        created_ms: r.get(7)?,
-        updated_ms: r.get(8)?,
+        payload: r.get(7)?,
+        created_ms: r.get(8)?,
+        updated_ms: r.get(9)?,
     })
 }
 
@@ -1828,9 +1898,51 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.user_version().unwrap(), 3);
+        assert_eq!(store.user_version().unwrap(), MIGRATIONS.len());
         assert!(store.link_identity("telegram", "1", "cli").unwrap());
         assert!(store.recent_intents(1).is_ok());
+    }
+
+    #[test]
+    fn schema_v4_migration_from_v3() {
+        // Build a real v3 database, then reopen: the payload column appears
+        // and a cron task with payload round-trips.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(include_str!("schema_v1.sql")).unwrap();
+            conn.execute_batch(include_str!("schema_v2.sql")).unwrap();
+            conn.execute_batch(include_str!("schema_v3.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.user_version().unwrap(), 4);
+        let spec = ka_agent_core::CronSpec {
+            text: "daily digest".into(),
+            source: "operator".into(),
+            recurrence_ms: Some(86_400_000),
+            mode: ka_agent_core::CronMode::NoAgent("calendar".into()),
+        };
+        let mut task = ka_agent_core::Task::new("cron".into(), "cron", false);
+        task.scheduled_at_ms = Some(ka_agent_core::now_ms() + 60_000);
+        task.payload = Some(spec.to_payload());
+        store.insert_task(&task).unwrap();
+        let crons = store.cron_tasks().unwrap();
+        assert_eq!(crons.len(), 1);
+        assert_eq!(
+            ka_agent_core::CronSpec::from_payload(crons[0].payload.as_deref().unwrap_or("")),
+            Some(spec)
+        );
+        // Pre-v4 rows (payload NULL) keep loading; the cron is due at +60 s
+        // and not before.
+        let plain = ka_agent_core::Task::new("⏰ old".into(), "reminder", false);
+        store.insert_task(&plain).unwrap();
+        let now = ka_agent_core::now_ms();
+        assert!(store.due_tasks(now + 30_000).unwrap().is_empty());
+        assert_eq!(store.due_tasks(now + 61_000).unwrap().len(), 1);
+        assert!(store.due_tasks(now + 61_000).unwrap()[0].payload.is_some());
     }
 
     #[test]

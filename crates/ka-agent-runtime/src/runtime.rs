@@ -147,6 +147,8 @@ struct Inner {
     crashes: Vec<i64>,
     restart_attempt: u32,
 }
+/// A no-agent cron handler: input is the spec text, output the digest text.
+pub type NoAgentFn = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
 struct Shared {
     cfg: DaemonConfig,
@@ -156,6 +158,9 @@ struct Shared {
     port: WorkerPort,
     surface: Arc<dyn Surface>,
     inner: Mutex<Inner>,
+    /// No-agent cron handlers, registered by kind (e.g. "calendar").
+    /// Registered by the app binary; the runtime only dispatches (M11).
+    no_agent: Mutex<HashMap<String, NoAgentFn>>,
 }
 
 /// The runtime handle. Cheap to clone; the event loop and the expiry timer
@@ -245,6 +250,11 @@ impl Runtime {
             &paths.engine_home().join(".config/ka"),
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
         )?;
+        // Operator-facing workspace context (M11): never overwrite an
+        // existing AGENTS.md; a read-only workspace must not fail startup.
+        if let Err(e) = write_agents_md(&cfg) {
+            eprintln!("runtime: AGENTS.md not written: {e}");
+        }
         Ok(Self {
             sh: Arc::new(Shared {
                 cfg,
@@ -253,6 +263,7 @@ impl Runtime {
                 memory,
                 port,
                 surface,
+                no_agent: Mutex::new(HashMap::new()),
                 inner: Mutex::new(Inner {
                     session,
                     live: None,
@@ -272,6 +283,11 @@ impl Runtime {
 
     pub fn cfg(&self) -> &DaemonConfig {
         &self.sh.cfg
+    }
+
+    /// The operator's workspace: where `@` file references resolve.
+    pub fn workspace(&self) -> std::path::PathBuf {
+        self.sh.cfg.workspace_path()
     }
 
     /// (session status, strand id, spent USD, spent tokens, recent crashes)
@@ -796,12 +812,12 @@ impl Runtime {
         }
     }
 
-    // ---- scheduler (SEED.md §7.2, Phase 3) ------------------------------
+    // ---- scheduler (SEED.md §7.2; generalized cron M11) -----------------
 
     /// `/remind <N(s|m|h|d)> <text>`: create a reminder.
     pub fn add_reminder(&self, text: &str) -> Result<Option<ka_agent_core::TaskId>, Error> {
         let (duration_str, reminder_text) = text.split_once(' ').unwrap_or(("", ""));
-        let ms = parse_duration(duration_str).ok_or_else(|| Error::Illegal {
+        let ms = ka_agent_core::parse_duration(duration_str).ok_or_else(|| Error::Illegal {
             from: "remind".into(),
             to: format!("bad duration {duration_str:?}; use Ns, Nm, Nh or Nd"),
         })?;
@@ -809,24 +825,162 @@ impl Runtime {
             return Ok(None);
         }
         let mut task = ka_agent_core::Task::new(format!("⏰ {reminder_text}"), "reminder", false);
-        task.scheduled_at_ms = Some(ka_agent_core::now_ms() + ms);
+        task.scheduled_at_ms = Some(ka_agent_core::now_ms() + ms as i64);
         self.sh.store.insert_task(&task)?;
         Ok(Some(task.id))
     }
 
-    /// Fire due reminders; called from the scheduler timer.
-    pub async fn fire_due_reminders(&self) -> Result<Vec<String>, Error> {
+    /// Register a no-agent cron handler by kind (e.g. "calendar"). The app
+    /// binary does this at startup; handlers run on the scheduler tick and
+    /// never touch the engine.
+    pub fn set_no_agent_handler(&self, kind: &str, f: NoAgentFn) {
+        let mut reg = self.sh.no_agent.lock().unwrap_or_else(|e| e.into_inner());
+        reg.insert(kind.to_string(), f);
+    }
+
+    /// Dispatch a no-agent cron handler by kind.
+    pub fn run_no_agent(&self, kind: &str, arg: &str) -> Result<String, Error> {
+        let handler = {
+            let reg = self.sh.no_agent.lock().unwrap_or_else(|e| e.into_inner());
+            reg.get(kind).cloned()
+        };
+        match handler {
+            Some(f) => f(arg).map_err(Error::Refused),
+            None => Err(Error::Refused(format!("no handler for kind {kind:?}"))),
+        }
+    }
+
+    /// Schedule a cron job: a `kind = "cron"` task carrying its
+    /// [`ka_agent_core::CronSpec`] as payload, first firing at
+    /// `first_at_ms`.
+    pub fn add_cron(
+        &self,
+        spec: ka_agent_core::CronSpec,
+        first_at_ms: i64,
+    ) -> Result<ka_agent_core::TaskId, Error> {
+        let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
+        task.scheduled_at_ms = Some(first_at_ms);
+        task.payload = Some(spec.to_payload());
+        self.sh.store.insert_task(&task)?;
+        Ok(task.id)
+    }
+
+    /// Live cron jobs (queued, running or operator-paused), next fire first.
+    pub fn list_crons(&self) -> Result<Vec<ka_agent_core::Task>, Error> {
+        Ok(self.sh.store.cron_tasks()?)
+    }
+
+    /// Cancel a live cron by id prefix; `Ok(false)` when nothing matches.
+    pub fn cancel_cron(&self, id_prefix: &str) -> Result<bool, Error> {
+        let crons = self.list_crons()?;
+        let Some(task) = crons
+            .iter()
+            .find(|t| t.id.as_str().starts_with(id_prefix))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        self.sh.store.set_task_status(&task.id, "cancelled")?;
+        Ok(true)
+    }
+
+    /// Fire due tasks (reminders and crons); called from the scheduler
+    /// timer. Each item is marked `running` before it acts and settled
+    /// after; one failing item never stops the batch.
+    pub async fn fire_due_tasks(&self) -> Result<Vec<String>, Error> {
         let now = ka_agent_core::now_ms();
-        let due = self.sh.store.due_tasks(now, "reminder")?;
+        let due = self.sh.store.due_tasks(now)?;
         let mut fired = Vec::new();
         for task in due {
-            self.sh.store.set_task_status(&task.id, "running")?;
-            let title = task.title.clone();
-            self.sh.surface.on_note(&format!("⏰ {title}"));
-            self.handle_message(&format!("⏰ reminder: {title}"), "scheduler")
-                .await?;
-            self.sh.store.set_task_status(&task.id, "succeeded")?;
-            fired.push(title);
+            let _ = self.sh.store.set_task_status(&task.id, "running");
+            match task.kind.as_str() {
+                "reminder" => {
+                    let title = task.title.clone();
+                    self.sh.surface.on_note(&format!("⏰ {title}"));
+                    if let Err(e) = self
+                        .handle_message(&format!("⏰ reminder: {title}"), "scheduler")
+                        .await
+                    {
+                        self.sh
+                            .surface
+                            .on_error("cron", &format!("reminder {}: {e}", task.id.as_str()));
+                        let _ = self.sh.store.set_task_status(&task.id, "failed");
+                        continue;
+                    }
+                    let _ = self.sh.store.set_task_status(&task.id, "succeeded");
+                    fired.push(title);
+                }
+                "cron" => {
+                    let Some(spec) = ka_agent_core::CronSpec::from_payload(
+                        task.payload.as_deref().unwrap_or(""),
+                    ) else {
+                        let _ = self.sh.store.set_task_status(&task.id, "failed");
+                        continue;
+                    };
+                    let ok = match &spec.mode {
+                        ka_agent_core::CronMode::Agent => {
+                            self.sh.surface.on_note(&format!("cron: {}", spec.text));
+                            match self.handle_message(&spec.text, "cron").await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    self.sh
+                                        .surface
+                                        .on_error("cron", &format!("{}: {e}", task.id.as_str()));
+                                    false
+                                }
+                            }
+                        }
+                        ka_agent_core::CronMode::NoAgent(kind) => {
+                            match self.run_no_agent(kind, &spec.text) {
+                                Ok(out) => {
+                                    self.sh.surface.on_note(&out);
+                                    true
+                                }
+                                Err(e) => {
+                                    self.sh
+                                        .surface
+                                        .on_error("cron", &format!("{}: {e}", task.id.as_str()));
+                                    false
+                                }
+                            }
+                        }
+                    };
+                    if !ok {
+                        // Failed jobs are not re-armed: the failure is
+                        // visible on the surface and the row stays `failed`.
+                        let _ = self.sh.store.set_task_status(&task.id, "failed");
+                        continue;
+                    }
+                    match spec.recurrence_ms {
+                        Some(rec) if rec > 0 => {
+                            // Skip missed occupations: arm at the next
+                            // occurrence strictly after now.
+                            let mut next = task.scheduled_at_ms.unwrap_or(now) + rec;
+                            while next <= now {
+                                next += rec;
+                            }
+                            let _ =
+                                self.sh
+                                    .store
+                                    .update_task_schedule(&task.id, Some(next), "queued");
+                        }
+                        Some(_) => {
+                            let _ = self.sh.store.set_task_status(&task.id, "failed");
+                            continue;
+                        }
+                        None => {
+                            let _ = self.sh.store.set_task_status(&task.id, "succeeded");
+                        }
+                    }
+                    fired.push(spec.text);
+                }
+                other => {
+                    self.sh
+                        .surface
+                        .on_error("cron", &format!("unknown scheduled kind {other:?}"));
+                    let _ = self.sh.store.set_task_status(&task.id, "failed");
+                }
+            }
         }
         Ok(fired)
     }
@@ -838,7 +992,7 @@ impl Runtime {
         tick.tick().await;
         loop {
             tick.tick().await;
-            if let Err(e) = self.fire_due_reminders().await {
+            if let Err(e) = self.fire_due_tasks().await {
                 self.sh
                     .surface
                     .on_error("internal", &format!("scheduler: {e}"));
@@ -1501,20 +1655,48 @@ async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
     sh.surface.on_note(&note);
 }
 
-/// Parse `Ns`, `Nm`, `Nh`, `Nd` into milliseconds.
-fn parse_duration(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.len() < 2 {
-        return None;
+/// Seed the workspace with an `AGENTS.md` context file (M11). Written only
+/// when absent — an operator's own file is never touched.
+fn write_agents_md(cfg: &DaemonConfig) -> std::io::Result<()> {
+    let ws = cfg.workspace_path();
+    let path = ws.join("AGENTS.md");
+    if path.exists() {
+        return Ok(());
     }
-    let (num, unit) = s.split_at(s.len() - 1);
-    let n: i64 = num.parse().ok()?;
-    match unit {
-        "s" => Some(n * 1000),
-        "m" => Some(n * 60_000),
-        "h" => Some(n * 3_600_000),
-        "d" => Some(n * 86_400_000),
-        _ => None,
+    std::fs::create_dir_all(&ws)?;
+    std::fs::write(&path, AGENTS_MD)
+}
+
+const AGENTS_MD: &str = r#"# Ka Agent
+
+This workspace is served by ka-agent, a resident personal assistant running
+on the Ka engine. One operator per instance; everything is auditable.
+
+- Memory: durable facts live under `<data>/memory/` and are compiled into the
+  engine's MEMORY.md. Propose new facts with the `memory_propose` tool for
+  operator review; never store them yourself.
+- Operator commands: /status /new /stop /resume /remember /memory /history
+  /remind /cron /calendar /y /n.
+- Scheduling: `/cron add in 10m <text>` (one-shot) or
+  `/cron add every 1h <text>` (recurring) run prompts on a schedule; the
+  `cron_manage` tool does the same from the engine.
+- References: `@<file>`, `@<dir>/`, `@turn:<id-prefix>`, `@https://…` inline
+  in a message inject that context into the turn.
+- External effects (HTTP writes, GitHub) require operator grants and
+  approvals; a daily budget applies.
+- Health and audit: `ka-agent doctor`, `ka-agent history`; backups under
+  `<data>/backups/`.
+"#;
+
+/// Next `hour:00` UTC strictly after now (fixed-hour scheduling: the
+/// calendar digest fires at 08:00 UTC).
+pub fn next_daily_utc(hour: u8) -> i64 {
+    let now = ka_agent_core::now_ms();
+    let today = now.div_euclid(86_400_000) * 86_400_000 + (hour as i64) * 3_600_000;
+    if today > now {
+        today
+    } else {
+        today + 86_400_000
     }
 }
 

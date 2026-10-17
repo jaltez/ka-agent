@@ -17,10 +17,99 @@ pub enum Outcome {
 
 const HELP: &str = "commands: /help /status /new /stop /resume\n\
                     /remember <fact> · /forget <id> · /memory [review|accept <id>|reject <id>]\n\
-                    /history <query> · /history show <turn_id> · /remind <Nd> <text> · /y /n";
+                    /history <query> · /history show <turn_id> · /remind <Nd> <text>\n\
+                    /cron [list] · /cron add (in|every) <Nd> <text> · /cron rm <id>\n\
+                    /calendar add <url-or-path> · /calendar today · /y /n";
 
 fn short_id(id: &str, n: usize) -> String {
     id.chars().take(n).collect()
+}
+
+/// `YYYY-MM-DD HH:MMZ` for timestamps in replies (dependency-free civil
+/// conversion; Howard Hinnant's days-from-epoch inverse).
+pub fn utc_compact(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m) = (rem / 3600, (rem % 3600) / 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}Z")
+}
+
+/// Render an interval compactly (`1h`, `30m`, `2d`, `45s`).
+pub fn fmt_interval(ms: i64) -> String {
+    for (unit, mult) in [("d", 86_400_000i64), ("h", 3_600_000), ("m", 60_000)] {
+        if ms % mult == 0 {
+            return format!("{}{unit}", ms / mult);
+        }
+    }
+    format!("{}s", ms / 1000)
+}
+
+/// One line per live cron: `id every|once next-UTC text [paused]`.
+pub fn cron_list_text(tasks: &[ka_agent_core::Task]) -> String {
+    tasks
+        .iter()
+        .map(|t| {
+            let spec = t
+                .payload
+                .as_deref()
+                .and_then(ka_agent_core::CronSpec::from_payload);
+            let cadence = match spec.as_ref().and_then(|s| s.recurrence_ms) {
+                Some(ms) => format!("every {}", fmt_interval(ms)),
+                None => "once".to_string(),
+            };
+            let next = t
+                .scheduled_at_ms
+                .map(utc_compact)
+                .unwrap_or_else(|| "-".to_string());
+            let paused = if t.status == ka_agent_core::TaskStatus::Interrupted {
+                " [paused]"
+            } else {
+                ""
+            };
+            let text: String = t.title.chars().take(40).collect();
+            format!(
+                "{} {cadence} {next} {text}{paused}",
+                short_id(t.id.as_str(), 8)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `/cron add (in|every) <Ns|Nm|Nh|Nd> <text>` → reply text. Shared by the
+/// router and the console.
+pub fn cron_add(runtime: &Runtime, args: &str) -> String {
+    let mut parts = args.trim().splitn(3, ' ');
+    let which = parts.next().unwrap_or("");
+    let dur = parts.next().unwrap_or("");
+    let text = parts.next().unwrap_or("").trim();
+    if !matches!(which, "in" | "every") || text.is_empty() {
+        return "usage: /cron add (in|every) <Ns|Nm|Nh|Nd> <text>".into();
+    }
+    let Some(ms) = ka_agent_core::parse_duration(dur) else {
+        return format!("bad duration {dur:?}; use Ns, Nm, Nh or Nd");
+    };
+    let spec = ka_agent_core::CronSpec {
+        text: text.to_string(),
+        source: "operator".into(),
+        recurrence_ms: which.eq("every").then_some(ms as i64),
+        mode: ka_agent_core::CronMode::Agent,
+    };
+    match runtime.add_cron(spec, ka_agent_core::now_ms() + ms as i64) {
+        Ok(id) => format!("cron {} scheduled", short_id(id.as_str(), 8)),
+        Err(e) => format!("! [cron] {e}"),
+    }
 }
 
 /// Route one inbound line. `source` is the channel identity
@@ -116,6 +205,68 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
                 Ok(None) => Outcome::Reply("usage: /remind <Ns|Nm|Nh|Nd> <text>".into()),
                 Err(e) => Outcome::Reply(format!("! [remind] {e}")),
             }
+        }
+        "/cron" => {
+            let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+            let reply = match rest {
+                "" | "list" => match runtime.list_crons() {
+                    Ok(rows) if rows.is_empty() => "no crons (use /cron add)".to_string(),
+                    Ok(rows) => cron_list_text(&rows),
+                    Err(e) => format!("! [cron] {e}"),
+                },
+                other => match other.split_once(' ') {
+                    Some(("add", args)) => cron_add(runtime, args),
+                    Some(("rm", id)) => match runtime.cancel_cron(id.trim()) {
+                        Ok(true) => "cron removed".to_string(),
+                        Ok(false) => "no such cron".to_string(),
+                        Err(e) => format!("! [cron] {e}"),
+                    },
+                    _ => "usage: /cron [list] · /cron add (in|every) <Ns|Nm|Nh|Nd> <text> · /cron rm <id>"
+                        .to_string(),
+                },
+            };
+            Outcome::Reply(reply)
+        }
+        "/calendar" => {
+            let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+            let (verb, arg) = match rest.split_once(' ') {
+                Some((v, a)) => (v, a.trim()),
+                None => (rest, ""),
+            };
+            let reply = match verb {
+                "add" if !arg.is_empty() => {
+                    let spec = ka_agent_core::CronSpec {
+                        text: arg.to_string(),
+                        source: "operator".into(),
+                        recurrence_ms: Some(86_400_000),
+                        mode: ka_agent_core::CronMode::NoAgent("calendar".into()),
+                    };
+                    match runtime.add_cron(spec, ka_agent_runtime::next_daily_utc(8)) {
+                        Ok(_) => "calendar digest daily at 08:00 UTC".to_string(),
+                        Err(e) => format!("! [calendar] {e}"),
+                    }
+                }
+                "today" => {
+                    let configured = runtime.list_crons().ok().and_then(|rows| {
+                        rows.iter().find_map(|t| {
+                            ka_agent_core::CronSpec::from_payload(t.payload.as_deref()?).filter(
+                                |s| s.mode == ka_agent_core::CronMode::NoAgent("calendar".into()),
+                            )
+                        })
+                    });
+                    match configured {
+                        Some(spec) => match runtime.run_no_agent("calendar", &spec.text) {
+                            Ok(d) => d,
+                            Err(e) => format!("! [calendar] {e}"),
+                        },
+                        None => {
+                            "no calendar configured (use /calendar add <url-or-path>)".to_string()
+                        }
+                    }
+                }
+                _ => "usage: /calendar add <url-or-path> · /calendar today".to_string(),
+            };
+            Outcome::Reply(reply)
         }
         "/resume" => match runtime.resume() {
             Ok(true) => Outcome::Reply("resumed".into()),

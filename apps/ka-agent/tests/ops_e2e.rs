@@ -412,6 +412,65 @@ fn github_tools_see_the_secret_store_token() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// M11: the `cron_manage` bridge tool operates directly on the store. A
+/// fresh bridge lists empty, schedules a recurring job, and the row lands
+/// with a valid CronSpec payload.
+#[test]
+fn cron_manage_tool_schedules_and_lists() {
+    let root = temp_root("cron-bridge");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let _cfg = write_config(&root);
+
+    use std::io::Write as _;
+    let mut child = ka(&data)
+        .arg("__mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"list"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"1h","text":"bridge smoke"}}}"#,
+    ] {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+    }
+    stdin.flush().unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let listed = text
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .expect("list answered");
+    assert!(!listed.contains("isError"), "{listed}");
+    assert!(listed.contains("no crons"), "{listed}");
+    let scheduled = text
+        .lines()
+        .find(|l| l.contains("\"id\":3"))
+        .expect("schedule answered");
+    assert!(scheduled.contains("scheduled"), "{scheduled}");
+
+    // The row is in the store with a valid payload (the daemon's scheduler
+    // will pick it up from here).
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    let crons = store.cron_tasks().unwrap();
+    assert_eq!(crons.len(), 1, "{crons:?}");
+    assert_eq!(crons[0].kind, "cron");
+    let spec = ka_agent_core::CronSpec::from_payload(crons[0].payload.as_deref().unwrap_or(""))
+        .expect("valid CronSpec payload");
+    assert_eq!(spec.recurrence_ms, Some(3_600_000));
+    assert_eq!(spec.mode, ka_agent_core::CronMode::Agent);
+    assert_eq!(spec.source, "kagent");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// F9 (review): `restore` must work after a *clean stop*. The daemon only
 /// removed its admin socket at startup, so SIGTERM/restart left it behind
 /// and restore refused with "daemon appears to be running" — the disaster

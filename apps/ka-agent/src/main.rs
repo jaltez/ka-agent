@@ -670,7 +670,7 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
     let runtime = match Runtime::new(
         cfg,
         paths.clone(),
-        store,
+        Arc::clone(&store),
         port,
         Arc::clone(&surface) as Arc<dyn Surface>,
     ) {
@@ -685,6 +685,15 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
         runtime.session_id(),
         paths.root().display()
     );
+    // No-agent cron handlers (M11): the calendar digest runs without the
+    // engine. Registered right after the runtime exists, before any tick.
+    {
+        let st = Arc::clone(&store);
+        runtime.set_no_agent_handler(
+            "calendar",
+            Arc::new(move |src| ka_agent_channels::calendar::digest(src, &st)),
+        );
+    }
     println!("commands: /help /status /new /stop /y /n /quit");
 
     let expiry = runtime.clone();
@@ -841,6 +850,75 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
                 Ok(false) => println!("· nothing to resume (not paused)"),
                 Err(e) => println!("! [resume] {e}"),
             },
+            cmd if cmd.starts_with("/cron") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                match rest {
+                    "" | "list" => match runtime.list_crons() {
+                        Ok(rows) if rows.is_empty() => println!("· no crons (use /cron add)"),
+                        Ok(rows) => {
+                            println!("{}", ka_agent_channels::commands::cron_list_text(&rows))
+                        }
+                        Err(e) => println!("! {e}"),
+                    },
+                    other => match other.split_once(' ') {
+                        Some(("add", args)) => println!(
+                            "· {}",
+                            ka_agent_channels::commands::cron_add(&runtime, args)
+                        ),
+                        Some(("rm", id)) => match runtime.cancel_cron(id.trim()) {
+                            Ok(true) => println!("· cron removed"),
+                            Ok(false) => println!("· no such cron"),
+                            Err(e) => println!("! {e}"),
+                        },
+                        _ => println!(
+                            "usage: /cron [list] · /cron add (in|every) <Ns|Nm|Nh|Nd> <text> · /cron rm <id>"
+                        ),
+                    },
+                }
+            }
+            cmd if cmd.starts_with("/calendar") => {
+                let rest = cmd.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                let (verb, arg) = match rest.split_once(' ') {
+                    Some((v, a)) => (v, a.trim()),
+                    None => (rest, ""),
+                };
+                match verb {
+                    "add" if !arg.is_empty() => {
+                        let spec = ka_agent_core::CronSpec {
+                            text: arg.to_string(),
+                            source: "operator".into(),
+                            recurrence_ms: Some(86_400_000),
+                            mode: ka_agent_core::CronMode::NoAgent("calendar".into()),
+                        };
+                        match runtime.add_cron(spec, ka_agent_runtime::next_daily_utc(8)) {
+                            Ok(_) => println!("· calendar digest daily at 08:00 UTC"),
+                            Err(e) => println!("! {e}"),
+                        }
+                    }
+                    "today" => {
+                        let configured = runtime.list_crons().ok().and_then(|rows| {
+                            rows.iter().find_map(|t| {
+                                ka_agent_core::CronSpec::from_payload(t.payload.as_deref()?).filter(
+                                    |s| {
+                                        s.mode
+                                            == ka_agent_core::CronMode::NoAgent("calendar".into())
+                                    },
+                                )
+                            })
+                        });
+                        match configured {
+                            Some(spec) => match runtime.run_no_agent("calendar", &spec.text) {
+                                Ok(d) => println!("{d}"),
+                                Err(e) => println!("! {e}"),
+                            },
+                            None => println!(
+                                "· no calendar configured (use /calendar add <url-or-path>)"
+                            ),
+                        }
+                    }
+                    _ => println!("usage: /calendar add <url-or-path> · /calendar today"),
+                }
+            }
             "/stop" => {
                 if let Err(e) = runtime.stop_turn().await {
                     println!("! {e}");
@@ -859,7 +937,9 @@ async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitC
                 }
             }
             _ => {
-                if let Err(e) = runtime.handle_message(text, "console").await {
+                let text =
+                    ka_agent_channels::refs::expand(&store, &runtime.workspace(), text).await;
+                if let Err(e) = runtime.handle_message(&text, "console").await {
                     println!("! {e}");
                 }
             }
@@ -1575,6 +1655,15 @@ async fn run_daemon(
             return std::process::ExitCode::FAILURE;
         }
     };
+    // No-agent cron handlers (M11): the calendar digest runs without the
+    // engine. Registered right after the runtime exists, before any tick.
+    {
+        let st = Arc::clone(&store);
+        runtime.set_no_agent_handler(
+            "calendar",
+            Arc::new(move |src| ka_agent_channels::calendar::digest(src, &st)),
+        );
+    }
     println!(
         "ka-agent run · session {} · data {}",
         runtime.session_id(),

@@ -79,6 +79,9 @@ pub struct Task {
     /// True for read-only kinds, which may be re-queued automatically once.
     pub read_only: bool,
     pub scheduled_at_ms: Option<i64>,
+    /// JSON payload for kinds that need one (`kind = "cron"` stores its
+    /// [`CronSpec`] here); NULL for every other kind.
+    pub payload: Option<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
 }
@@ -94,6 +97,7 @@ impl Task {
             status: TaskStatus::Queued,
             read_only,
             scheduled_at_ms: None,
+            payload: None,
             created_ms: now,
             updated_ms: now,
         }
@@ -107,6 +111,99 @@ impl Task {
         } else {
             Err(next)
         }
+    }
+}
+
+/// What a cron task runs when it fires (M11): a prompt for the agent, or a
+/// no-agent handler registered by kind in the runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronMode {
+    /// The text is submitted to the engine as a prompt (a normal turn).
+    Agent,
+    /// The text is the argument for a runtime-registered handler (e.g.
+    /// "calendar"): no engine, no LLM, deterministic output.
+    NoAgent(String),
+}
+
+impl Serialize for CronMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(if matches!(self, CronMode::Agent) {
+            1
+        } else {
+            2
+        }))?;
+        match self {
+            CronMode::Agent => map.serialize_entry("mode", "agent")?,
+            CronMode::NoAgent(kind) => {
+                map.serialize_entry("mode", "no_agent")?;
+                map.serialize_entry("kind", kind)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CronMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = CronMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a cron mode object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<CronMode, A::Error> {
+                let mut mode: Option<String> = None;
+                let mut kind: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "mode" => mode = Some(map.next_value()?),
+                        "kind" => kind = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                match mode.as_deref() {
+                    Some("agent") => Ok(CronMode::Agent),
+                    Some("no_agent") => Ok(CronMode::NoAgent(kind.unwrap_or_default())),
+                    _ => Err(serde::de::Error::custom("missing or unknown mode")),
+                }
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+/// One generalized cron entry (M11), persisted as the `payload` of a
+/// `kind = "cron"` task row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronSpec {
+    /// The prompt (Agent) or the handler argument (NoAgent).
+    pub text: String,
+    /// Who created it: "operator", "kagent", ...
+    pub source: String,
+    /// Fixed interval between fires in ms; `None` = one-shot.
+    pub recurrence_ms: Option<i64>,
+    pub mode: CronMode,
+}
+
+impl CronSpec {
+    /// Serialize to the task-row payload (plain JSON, one line).
+    ///
+    /// Infallible for this plain struct (strings + integers); the scoped
+    /// allow covers the workspace's `expect_used` gate.
+    #[allow(clippy::expect_used)]
+    pub fn to_payload(&self) -> String {
+        serde_json::to_string(self).expect("CronSpec always serializes")
+    }
+
+    /// Parse a task-row payload; `None` on malformed or foreign JSON.
+    pub fn from_payload(payload: &str) -> Option<Self> {
+        serde_json::from_str(payload).ok()
     }
 }
 
@@ -134,5 +231,44 @@ mod tests {
         // only the operator can re-queue
         assert!(t.transition(TaskStatus::Running).is_err());
         t.transition(TaskStatus::Queued).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cron_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn cronspec_payload_roundtrip() {
+        let one_shot = CronSpec {
+            text: "say \"ping\" \\ now".into(),
+            source: "kagent".into(),
+            recurrence_ms: None,
+            mode: CronMode::Agent,
+        };
+        assert_eq!(
+            CronSpec::from_payload(&one_shot.to_payload()),
+            Some(one_shot)
+        );
+
+        let recurring = CronSpec {
+            text: "/home/op/cal.ics".into(),
+            source: "operator".into(),
+            recurrence_ms: Some(86_400_000),
+            mode: CronMode::NoAgent("calendar".into()),
+        };
+        let payload = recurring.to_payload();
+        assert!(payload.contains(r#""mode":"no_agent""#), "{payload}");
+        assert!(payload.contains(r#""kind":"calendar""#), "{payload}");
+        assert_eq!(CronSpec::from_payload(&payload), Some(recurring));
+    }
+
+    #[test]
+    fn cronspec_payload_rejects_malformed() {
+        assert_eq!(CronSpec::from_payload(""), None);
+        assert_eq!(CronSpec::from_payload("not json"), None);
+        assert_eq!(CronSpec::from_payload(r#"{"text":"x"}"#), None);
     }
 }

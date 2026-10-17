@@ -15,6 +15,7 @@ pub mod outbox;
 pub mod queue;
 pub mod session;
 pub mod task;
+pub mod time;
 pub mod turn;
 
 pub use approval::{Approval, ApprovalDecision, ApprovalKind, ApprovalStatus};
@@ -25,7 +26,8 @@ pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId,
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use queue::QueueItem;
 pub use session::{Session, SessionStatus};
-pub use task::{Task, TaskStatus};
+pub use task::{CronMode, CronSpec, Task, TaskStatus};
+pub use time::parse_duration;
 pub use turn::{Turn, TurnStatus};
 
 /// Milliseconds since the Unix epoch (UTC). All timestamps in Ka Agent state

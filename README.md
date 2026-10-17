@@ -6,11 +6,11 @@ channels — durable memory, tasks, approvals, Telegram — while all model
 reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
 and stops.
 
-**Status: M10 complete and verified.** Working today (`cargo test
---workspace`: 153 tests green; Telegram + Matrix + memory + history + MCP
+**Status: M11 complete and verified.** Working today (`cargo test
+--workspace`: 181 tests green; Telegram + Matrix + memory + history + MCP
 bridge + scheduler + loopback web UI + sandboxed third-party plugins +
 cross-channel identity linking + ops packaging (systemd units, backups,
-doctor)):
+doctor) + cron/@refs/AGENTS.md/calendar):
 
 - **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
   approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
@@ -186,4 +186,6 @@ dependencies and delete the CI rewrite step.
   runtime probes, findings F-1…F-8.
 - `docs/contract/ka-port.md`, `docs/contract/worker-protocol.md` — the Ka
   boundary contracts.
+- `docs/contract/cron-and-refs.md` — cron grammar and recurrence semantics,
+  `@` reference budget, AGENTS.md seeding, ICS digest limits.
 - `docs/contract/web-ui.md` — routes, auth flow, security checklist.

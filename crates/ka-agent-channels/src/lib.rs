@@ -1,6 +1,7 @@
 //! Channel adapters. M2: Telegram (Bot API long polling in, throttled
 //! messages + approval keyboards out). M4: the MCP bridge.
 
+pub mod calendar;
 pub mod channel;
 pub mod commands;
 pub mod fake;
@@ -8,10 +9,12 @@ pub mod grants;
 pub mod matrix;
 pub mod mcp;
 pub mod multi;
+pub mod refs;
 pub mod secret;
 pub mod telegram;
 
 pub use channel::Channel;
+pub use commands::{cron_add, cron_list_text, fmt_interval, utc_compact};
 pub use matrix::{MatrixChannel, MatrixConfig, MatrixSurface};
 pub use mcp::run_mcp;
 pub use multi::MultiSurface;

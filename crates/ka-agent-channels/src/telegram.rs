@@ -748,9 +748,10 @@ impl TelegramChannel {
             }
             crate::commands::Outcome::Silent => {}
             crate::commands::Outcome::NotACommand => {
+                let text = crate::refs::expand(&self.store, &self.runtime.workspace(), text).await;
                 if let Err(e) = self
                     .runtime
-                    .handle_message(text, &format!("telegram:{uid}"))
+                    .handle_message(&text, &format!("telegram:{uid}"))
                     .await
                 {
                     eprintln!("telegram: handle_message: {e}");

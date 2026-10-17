@@ -269,6 +269,21 @@ fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
                 "required": ["repo", "number", "body", "event"]
             }),
         },
+        ToolDef {
+            name: "cron_manage".into(),
+            description: "Manage ka-agent cron jobs: schedule prompts to run later (one-shot 'in') or on a fixed interval ('every'), and list/pause/resume/remove/trigger existing jobs. A scheduled prompt runs as a normal operator turn through the approval flow.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["schedule", "list", "pause", "resume", "remove", "trigger"]},
+                    "text": {"type": "string", "description": "schedule: the prompt to run"},
+                    "in": {"type": "string", "description": "schedule: one-shot delay, Ns/Nm/Nh/Nd"},
+                    "every": {"type": "string", "description": "schedule: recurring interval, Ns/Nm/Nh/Nd"},
+                    "id": {"type": "string", "description": "pause/resume/remove/trigger: job id or id prefix"}
+                },
+                "required": ["action"]
+            }),
+        },
     ];
     for plugin in plugins {
         for tool in &plugin.manifest.tools {
@@ -567,6 +582,130 @@ fn handle_tool_call(
                 .ok();
             Ok(format!("review posted: {html_url}"))
         }
+        "cron_manage" => {
+            // The bridge is a separate process: it operates on the store
+            // directly (same pattern as memory_propose). It only ever
+            // touches `kind = 'cron'` rows, never reminders.
+            let action = args["action"].as_str().ok_or("missing 'action'")?;
+            let root = data_root()?;
+            let store = ka_agent_store::Store::open(&root.join("state.db"))
+                .map_err(|e| format!("store: {e}"))?;
+            match action {
+                "schedule" => {
+                    let text = args["text"].as_str().ok_or("missing 'text'")?;
+                    if text.trim().is_empty() {
+                        return Err("text must not be empty".into());
+                    }
+                    let every = args["every"].as_str();
+                    let once = args["in"].as_str();
+                    let (recurrence_ms, delay) = match (every, once) {
+                        (Some(d), None) | (None, Some(d)) => {
+                            let ms = ka_agent_core::parse_duration(d).ok_or_else(|| {
+                                format!("bad duration {d:?}; use Ns, Nm, Nh or Nd")
+                            })?;
+                            (every.map(|_| ms as i64), ms as i64)
+                        }
+                        _ => {
+                            return Err(
+                                "give exactly one of 'in' (one-shot) or 'every' (recurring)".into(),
+                            );
+                        }
+                    };
+                    let spec = ka_agent_core::CronSpec {
+                        text: text.to_string(),
+                        source: "kagent".into(),
+                        recurrence_ms,
+                        mode: ka_agent_core::CronMode::Agent,
+                    };
+                    let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
+                    task.scheduled_at_ms = Some(ka_agent_core::now_ms() + delay);
+                    task.payload = Some(spec.to_payload());
+                    store
+                        .insert_task(&task)
+                        .map_err(|e| format!("insert: {e}"))?;
+                    Ok(format!(
+                        "cron {} scheduled ({})",
+                        &task.id.as_str()[..8],
+                        match recurrence_ms {
+                            Some(ms) => format!("every {}", crate::commands::fmt_interval(ms)),
+                            None => "once".to_string(),
+                        }
+                    ))
+                }
+                "list" => {
+                    let crons = store.cron_tasks().map_err(|e| format!("store: {e}"))?;
+                    Ok(if crons.is_empty() {
+                        "no crons".to_string()
+                    } else {
+                        crate::commands::cron_list_text(&crons)
+                    })
+                }
+                "pause" | "resume" | "remove" | "trigger" => {
+                    let id = args["id"].as_str().ok_or("missing 'id'")?;
+                    let crons = store.cron_tasks().map_err(|e| format!("store: {e}"))?;
+                    let task = crons
+                        .iter()
+                        .find(|t| t.id.as_str().starts_with(id))
+                        .ok_or_else(|| format!("no live cron id starts with {id:?}"))?;
+                    let short = &task.id.as_str()[..8];
+                    match action {
+                        "pause" => {
+                            store
+                                .set_task_status(&task.id, "interrupted")
+                                .map_err(|e| format!("pause: {e}"))?;
+                            Ok(format!("cron {short} paused"))
+                        }
+                        "remove" => {
+                            store
+                                .set_task_status(&task.id, "cancelled")
+                                .map_err(|e| format!("remove: {e}"))?;
+                            Ok(format!("cron {short} removed"))
+                        }
+                        "trigger" => {
+                            store
+                                .update_task_schedule(
+                                    &task.id,
+                                    Some(ka_agent_core::now_ms()),
+                                    "queued",
+                                )
+                                .map_err(|e| format!("trigger: {e}"))?;
+                            Ok(format!(
+                                "cron {short} armed; fires on the next scheduler tick"
+                            ))
+                        }
+                        _ => {
+                            // Resume: skip missed occupations for recurring
+                            // jobs; a one-shot fires now.
+                            let now = ka_agent_core::now_ms();
+                            let spec = task
+                                .payload
+                                .as_deref()
+                                .and_then(ka_agent_core::CronSpec::from_payload);
+                            let next = match (
+                                spec.as_ref().and_then(|s| s.recurrence_ms),
+                                task.scheduled_at_ms,
+                            ) {
+                                (Some(rec), Some(sched)) if rec > 0 => {
+                                    let mut n = sched;
+                                    while n <= now {
+                                        n += rec;
+                                    }
+                                    n
+                                }
+                                _ => now,
+                            };
+                            store
+                                .update_task_schedule(&task.id, Some(next), "queued")
+                                .map_err(|e| format!("resume: {e}"))?;
+                            Ok(format!("cron {short} resumed"))
+                        }
+                    }
+                }
+                other => Err(format!(
+                    "unknown action {other:?}; use schedule|list|pause|resume|remove|trigger"
+                )),
+            }
+        }
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -597,7 +736,7 @@ fn github_token() -> Result<String, String> {
 /// unique-local, private and unspecified targets — as IP literals in any
 /// form (v4/v6, bracketed) — unless the operator granted `http:get:private`.
 /// Redirects are followed manually and every hop re-checks the same guard.
-fn http_target_is_private(host: &str) -> bool {
+pub(crate) fn http_target_is_private(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return match ip {
@@ -654,7 +793,7 @@ fn github_api_post(token: &str, path: &str, body: &Value) -> Result<Value, Strin
 /// `http_get` with manual redirects: each hop's host must pass the same
 /// SSRF guard as the first (a public host redirecting to 169.254.169.254
 /// must not become a metadata read).
-fn http_get_no_redirect(
+pub(crate) fn http_get_no_redirect(
     url: &url::Url,
     timeout_secs: u64,
     grants: &grants::Grants,
