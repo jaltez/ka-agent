@@ -27,7 +27,7 @@ pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use queue::QueueItem;
 pub use session::{Session, SessionStatus};
 pub use task::{CronMode, CronSpec, Task, TaskStatus};
-pub use time::parse_duration;
+pub use time::{fmt_interval, parse_duration};
 pub use turn::{Turn, TurnStatus};
 
 /// Milliseconds since the Unix epoch (UTC). All timestamps in Ka Agent state

@@ -7,7 +7,7 @@ members = [
     "crates/ka-agent-runtime",
     "crates/ka-agent-channels",
     "crates/ka-agent-plugins",
-    "examples/plugins/probe",
+    "crates/ka-agent-web",
     "crates/ka-agent-memory",
     "apps/ka-agent",
 ]
@@ -20,14 +20,13 @@ license = "MIT"
 repository = "https://github.com/jaltez/ka-agent"
 
 [workspace.dependencies]
-# Ka engine crates, pinned to an exact revision (SEED.md §3.4: exact pin,
-# upgraded deliberately with the contract suite green). Local file:// mirror
-# of the upstream repository (github.com/jaltez/ka-harness); swap to the public
-# git URL + released crates
-# once ka 0.3.0 is published.
-ka-protocol = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
-ka-engine = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
-ka-dialect = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+# Ka engine crates, pinned to the exact released version (SEED.md §3.4:
+# exact pin, upgraded deliberately with the contract suite green). ka 0.3.0
+# ships on crates.io; content-identical to the old git pin a56aae2d.
+ka-protocol = { version = "=0.3.0" }
+ka-engine = { version = "=0.3.0" }
+ka-dialect = { version = "=0.3.0" }
+ka-strand = { version = "=0.3.0" }
 
 ka-agent-core = { path = "crates/ka-agent-core" }
 ka-agent-port = { path = "crates/ka-agent-port" }
@@ -48,10 +47,9 @@ tempfile = "3"
 toml = "0.9"
 thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-ureq = { version = "2", default-features = false, features = ["tls"] }
 url = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "net"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]

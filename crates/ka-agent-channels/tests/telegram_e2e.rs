@@ -177,6 +177,105 @@ async fn commands_route_locally() {
     stop(&mut stack).await;
 }
 
+/// File inbox (SEED.md §5.4): a photo is downloaded into the workspace's
+/// attachments dir and answered with a usable `@attachments/…` reference;
+/// the bytes on disk are exactly what the fake served.
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_lands_in_attachments_with_ref() {
+    let mut stack = spawn_channel(vec![42], "tok-file").await;
+    let payload = b"JPEGBYTES-etc".to_vec();
+    stack
+        .server
+        .push_file("f-photo-1", "photos/f-photo-1.jpg", &payload);
+    stack.server.push_photo_message(1, 5, 42, "f-photo-1");
+    let reply = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("@attachments/")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("attachment ack with @ref");
+    let text = reply.body["text"].as_str().unwrap_or("");
+    assert!(text.contains("saved attachments/"), "reply: {text}");
+    let dir = stack.runtime.workspace().join("attachments");
+    let saved = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "jpg"))
+        .expect("one jpg on disk");
+    assert_eq!(std::fs::read(&saved).unwrap(), payload, "bytes verbatim");
+    stop(&mut stack).await;
+}
+
+/// A document with a hostile name is sanitized; a download failure is
+/// reported to the operator instead of silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn document_name_sanitized_and_missing_file_reported() {
+    let mut stack = spawn_channel(vec![42], "tok-doc").await;
+    stack
+        .server
+        .push_file("f-doc-1", "docs/notes.txt", b"notes payload\n");
+    stack
+        .server
+        .push_document_message(1, 5, 42, "f-doc-1", "../../my notes!!.txt");
+    let reply = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("saved attachments/")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("document ack");
+    let text = reply.body["text"].as_str().unwrap_or("");
+    assert!(!text.contains(".."), "sanitized: {text}");
+    let dir = stack.runtime.workspace().join("attachments");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["_._my_notes__.txt".to_string()], "{names:?}");
+
+    // A file_id the server cannot resolve surfaces as an error reply.
+    stack
+        .server
+        .push_document_message(2, 5, 42, "f-ghost", "gone.txt");
+    let err = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("! [attachment]")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("download failure reported");
+    assert!(
+        err.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no file_path"),
+        "visible failure: {}",
+        err.body["text"]
+    );
+    stop(&mut stack).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn offset_persists_and_dedupes() {
     let mut stack = spawn_channel(vec![42], "tok-off").await;

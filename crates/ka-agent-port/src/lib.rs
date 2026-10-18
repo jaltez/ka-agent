@@ -25,7 +25,7 @@ pub use proto::{ImagePayload, StrandSel, WorkerCommand, WorkerEvent};
 pub use scenario::{Scenario, ScenarioSpeaker, Step};
 pub use worker::{WorkerRun, run_worker};
 
-/// The exact ka-harness git revision this build is pinned to
-/// (`Cargo.toml`, rewritten by CI to the public URL). `doctor` reports it
-/// and `scripts/check-ka-deps.sh` verifies it matches the manifest.
-pub const KA_PIN_REV: &str = "a56aae2d1b3a4c31c4910979e1033002eacc53a0";
+/// The exact released ka-harness version this build is pinned to
+/// (`Cargo.toml`, `=0.3.0`). `doctor` reports it and backups record it;
+/// `scripts/check-ka-deps.sh` verifies it matches the manifest.
+pub const KA_PIN: &str = "0.3.0";

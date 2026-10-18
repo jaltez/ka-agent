@@ -42,6 +42,17 @@ Field notes:
   worker's security overlay is applied **after** it and always wins.
 - `Open.scenario`: reserved for the scripted-speaker test scenario (contract
   tests, `spawn_with_speaker`); `null` in production.
+
+## 1.1 Worker lifetime and the idle reap
+
+The daemon keeps at most one worker per session and stops it when
+`worker_idle_timeout_secs` (default 900; `0` = keep forever) of session
+inactivity pass **and** the session is fully settled — idle status, no
+open turn, no pending ask, nothing queued. The stop is a `Close`-grade
+kill flagged `deliberate_close`: it books **no crash**, no backoff, no
+degradation. The next message starts a fresh worker that resumes the
+strand by path (the §3.6 resume path, replay noted, nothing re-delivered).
+Verified by `idle_worker_is_stopped_then_restarted_on_demand` (chat e2e).
 - `Submit.images`: image inputs for multimodal prompts; `Submit.skills`:
   skill names to enable for this turn.
 - `Answer.choice`: a **numeric index into the ask's `options`** in request

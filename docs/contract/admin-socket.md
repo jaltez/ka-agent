@@ -9,7 +9,8 @@ policy changes are CLI-only).
 - Path: `<KA_AGENT_DATA_DIR-or-default>/admin.sock`
 - Permissions: `0600`, owner = the daemon user. A stale socket file is removed
   at startup.
-- One request per connection; newline-delimited JSON; connection: close.
+- One request per connection; newline-delimited JSON (the line is capped at
+  8 KiB — an oversized request closes the connection); connection: close.
 
 ## Authentication
 

@@ -519,12 +519,14 @@ fn handle_tool_call(
             let root = data_root()?;
             let store = ka_agent_store::Store::open(&root.join("state.db"))
                 .map_err(|e| format!("store: {e}"))?;
+            let hash = call_hash("github_issue_comment", args);
+            ensure_not_duplicate(&store, "github_issue_comment", &hash)?;
             let now = ka_agent_core::now_ms();
             let intent_id = ka_agent_core::IntentId::generate();
             let intent = ka_agent_store::IntentRow {
                 id: intent_id.to_string(),
                 tool: "github_issue_comment".to_string(),
-                args_hash: format!("{:x}", ka_agent_core::now_ms() as u64 * 31),
+                args_hash: hash,
                 status: "executing".to_string(),
                 external_ref: None,
                 summary: Some(format!("comment on #{number} in {repo}")),
@@ -558,12 +560,14 @@ fn handle_tool_call(
             let root = data_root()?;
             let store = ka_agent_store::Store::open(&root.join("state.db"))
                 .map_err(|e| format!("store: {e}"))?;
+            let hash = call_hash("github_pull_review", args);
+            ensure_not_duplicate(&store, "github_pull_review", &hash)?;
             let now = ka_agent_core::now_ms();
             let intent_id = ka_agent_core::IntentId::generate();
             let intent = ka_agent_store::IntentRow {
                 id: intent_id.to_string(),
                 tool: "github_pull_review".to_string(),
-                args_hash: format!("{:x}", ka_agent_core::now_ms() as u64 * 37),
+                args_hash: hash,
                 status: "executing".to_string(),
                 external_ref: None,
                 summary: Some(format!("review on PR #{number} in {repo}")),
@@ -713,6 +717,39 @@ fn handle_tool_call(
     }
 }
 
+/// Content hash of one tool call: sha256 over the tool name and the
+/// serialized arguments. The intent log's idempotency key (SEED.md §7.3).
+fn call_hash(tool: &str, args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(tool.as_bytes());
+    h.update(b"\0");
+    h.update(args.to_string().as_bytes());
+    let d = h.finalize();
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Refuse a duplicate external write: an executing or succeeded intent
+/// with the same tool + args hash means the effect already happened (or is
+/// in flight). Fail closed instead of writing twice; failed attempts stay
+/// retryable (`active_intent_by_hash` skips them).
+fn ensure_not_duplicate(
+    store: &ka_agent_store::Store,
+    tool: &str,
+    hash: &str,
+) -> Result<(), String> {
+    match store.active_intent_by_hash(tool, hash) {
+        Ok(Some(prev)) => Err(format!(
+            "duplicate external write refused: {tool} with identical arguments is already \
+             {status} (intent {id}) — change the arguments if you meant a new effect",
+            status = prev.status,
+            id = prev.id
+        )),
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("intent log: {e}")),
+    }
+}
+
 /// Resolve the GitHub token: env first (the worker injects it), then the
 /// secret-store file tier (`<data>/secrets/github.token`). The worker's env
 /// sanitizer strips credential-shaped variables, so the file tier is the
@@ -730,7 +767,7 @@ fn github_token() -> Result<String, String> {
         .ok()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
-            "no GitHub token: set KA_AGENT_GITHUB_TOKEN or place one at              <data>/secrets/github.token"
+            "no GitHub token: set KA_AGENT_GITHUB_TOKEN or place one at <data>/secrets/github.token"
                 .to_string()
         })
 }
@@ -770,90 +807,109 @@ pub(crate) fn http_target_is_private(host: &str) -> bool {
         || bare.ends_with(".internal")
 }
 
+/// A blocking HTTP client for tool calls: per-call (they are rare), no
+/// redirects (the SSRF guard walks each hop itself), 15 s ceiling, and the
+/// product User-Agent. Runs in the `__mcp` bridge process or on
+/// `spawn_blocking` threads — never inside the async reactor.
+fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent("ka-agent")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
 /// GitHub API POST helper (write operations).
 fn github_api_post(token: &str, path: &str, body: &Value) -> Result<Value, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
+    let client = http_client(15)?;
     let url = format!("https://api.github.com{path}");
-    let body_text = serde_json::to_string(body).map_err(|e| format!("serialize: {e}"))?;
-    let response = agent
+    let response = client
         .post(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "ka-agent")
-        .send_string(&body_text)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .json(body)
+        .send()
         .map_err(|e| format!("github: {e}"))?;
-    let text = response
-        .into_string()
-        .map_err(|e| format!("github body: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("github: status {}", response.status()));
+    }
+    let text = response.text().map_err(|e| format!("github body: {e}"))?;
     let result: Value = serde_json::from_str(&text).map_err(|e| format!("github json: {e}"))?;
     Ok(result)
 }
 
-/// Blocking HTTP GET with a 15 s timeout, returns the response body as text.
-/// `http_get` with manual redirects: each hop's host must pass the same
-/// SSRF guard as the first (a public host redirecting to 169.254.169.254
-/// must not become a metadata read).
+/// Blocking HTTP GET, returns the response body as text. The `http_get`
+/// tool with manual redirects: each hop's host must pass the same SSRF
+/// guard as the first (a public host redirecting to 169.254.169.254 must
+/// not become a metadata read).
 pub(crate) fn http_get_no_redirect(
     url: &url::Url,
     timeout_secs: u64,
     grants: &grants::Grants,
 ) -> Result<String, String> {
     let allow_private = grants.check("http:get:private");
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .redirects(0)
-        .build();
+    let client = http_client(timeout_secs)?;
     let mut current = url.clone();
     for _ in 0..5 {
-        let resp = match agent.get(current.as_str()).call() {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, resp)) if (301..=308).contains(&code) => {
-                let location = resp.header("location").unwrap_or("").to_string();
-                let next = url::Url::parse(&location)
-                    .or_else(|_| current.join(&location))
-                    .map_err(|e| format!("redirect target: {e}"))?;
-                if !allow_private && http_target_is_private(next.host_str().unwrap_or("")) {
-                    return Err(format!(
-                        "redirect to private target {} refused (grant http:get:private to allow)",
-                        next.host_str().unwrap_or("?")
-                    ));
-                }
-                current = next;
-                continue;
+        let resp = client
+            .get(current.as_str())
+            .send()
+            .map_err(|e| format!("http: {e}"))?;
+        let status = resp.status().as_u16();
+        if (301..=308).contains(&status) {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let next = url::Url::parse(&location)
+                .or_else(|_| current.join(&location))
+                .map_err(|e| format!("redirect target: {e}"))?;
+            if !allow_private && http_target_is_private(next.host_str().unwrap_or("")) {
+                return Err(format!(
+                    "redirect to private target {} refused (grant http:get:private to allow)",
+                    next.host_str().unwrap_or("?")
+                ));
             }
-            Err(e) => return Err(format!("http: {e}")),
-        };
-        let content_type = resp.header("content-type").unwrap_or("").to_string();
+            current = next;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("http status {}", resp.status()));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         if !content_type.starts_with("text/")
             && !content_type.starts_with("application/json")
             && !content_type.starts_with("application/xml")
         {
             return Err(format!("unsupported content-type: {content_type}"));
         }
-        return resp.into_string().map_err(|e| format!("read body: {e}"));
+        return resp.text().map_err(|e| format!("read body: {e}"));
     }
     Err("too many redirects".into())
 }
 
-/// Simple GitHub API GET using ureq.
+/// Simple GitHub API GET.
 fn github_api(token: &str, path: &str) -> Result<Value, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
+    let client = http_client(15)?;
     let url = format!("https://api.github.com{path}");
-    let response = agent
+    let response = client
         .get(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "ka-agent")
-        .call()
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
         .map_err(|e| format!("github: {e}"))?;
-    let text = response
-        .into_string()
-        .map_err(|e| format!("github body: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("github: status {}", response.status()));
+    }
+    let text = response.text().map_err(|e| format!("github body: {e}"))?;
     let body: Value = serde_json::from_str(&text).map_err(|e| format!("github json: {e}"))?;
     Ok(body)
 }

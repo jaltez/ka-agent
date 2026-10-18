@@ -39,11 +39,22 @@ if [[ $fail -ne 0 ]]; then
 fi
 echo "ok: no ka-* dependencies outside ka-agent-port and ka-agent"
 
-# The pin constant the binary reports must match the manifest's git rev.
-manifest_rev="$(grep -o 'rev = "[0-9a-f]\{40\}"' Cargo.toml | head -1 | cut -d'"' -f2)"
-const_rev="$(grep -o 'KA_PIN_REV: &str = "[0-9a-f]\{40\}"' crates/ka-agent-port/src/lib.rs | cut -d'"' -f2)"
-if [ "$manifest_rev" != "$const_rev" ]; then
-  echo "error: ka-agent-port KA_PIN_REV ($const_rev) != Cargo.toml rev ($manifest_rev)"
+# The pin constant the binary reports must match the manifest's version pin.
+manifest_pin="$(grep -oE 'ka-protocol = \{ version = "=[^"]+"' Cargo.toml | grep -oE '"=[^"]+"' | tr -d '"=' | head -1)"
+const_pin="$(grep -o 'KA_PIN: &str = "[^"]*"' crates/ka-agent-port/src/lib.rs | cut -d'"' -f2)"
+if [ -z "$manifest_pin" ]; then
+  echo "error: no exact ka-protocol version pin found in Cargo.toml"
   exit 1
 fi
-echo "ok: pin constant matches the manifest ($const_rev)"
+if [ "$manifest_pin" != "$const_pin" ]; then
+  echo "error: ka-agent-port KA_PIN ($const_pin) != Cargo.toml ka-protocol pin ($manifest_pin)"
+  exit 1
+fi
+echo "ok: pin constant matches the manifest ($const_pin)"
+
+# No local file:// mirrors may survive in any manifest.
+if grep -rn 'file:///' Cargo.toml crates/*/Cargo.toml apps/*/Cargo.toml examples/plugins/probe/Cargo.toml 2>/dev/null; then
+  echo "error: file:// dependency mirror left in a manifest"
+  exit 1
+fi
+echo "ok: no file:// mirrors in manifests"

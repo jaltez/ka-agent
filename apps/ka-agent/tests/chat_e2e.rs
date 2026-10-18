@@ -23,14 +23,20 @@ impl Drop for Chat {
 }
 
 fn spawn_chat(root: &std::path::Path, scenario: &std::path::Path) -> Chat {
+    spawn_chat_cfg(root, scenario, "")
+}
+
+/// Same, with extra `ka-agent.toml` lines appended (feature tests).
+fn spawn_chat_cfg(root: &std::path::Path, scenario: &std::path::Path, extra: &str) -> Chat {
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let cfg = root.join("ka-agent.toml");
     std::fs::write(
         &cfg,
         format!(
-            "workspace = {:?}\nmode = \"guarded\"\napproval_ttl_secs = 300\nturn_grace_secs = 5\n",
-            ws.display().to_string()
+            "workspace = {:?}\nmode = \"guarded\"\napproval_ttl_secs = 300\nturn_grace_secs = 5\n{}",
+            ws.display().to_string(),
+            extra
         ),
     )
     .unwrap();
@@ -153,7 +159,40 @@ fn simple_turn_and_status() {
     chat.expect("turn done", Duration::from_secs(10));
     chat.send("/status");
     chat.expect("budget: $", Duration::from_secs(10));
-    chat.expect("tokens · recent worker crashes:", Duration::from_secs(10));
+    chat.expect("tokens · crashes:", Duration::from_secs(10));
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Idle reap (minimal-footprint contract): with `worker_idle_timeout_secs`
+/// set low, a settled session loses its worker after the timeout — noted
+/// as a deliberate stop, not a crash — and the next message restarts it
+/// (strand resumed by path) with zero crash bookkeeping.
+#[test]
+fn idle_worker_is_stopped_then_restarted_on_demand() {
+    let root = temp_root("idle-reap");
+    let sc = scenario_file(
+        &root,
+        "reap.json",
+        r#"{ "steps": [ {"text": "first-alive"}, {"text": "second-alive"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat_cfg(&root, &sc, "worker_idle_timeout_secs = 2\n");
+    chat.expect("commands:", Duration::from_secs(10));
+    chat.send("first message");
+    chat.expect("first-alive", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(10));
+    // Settled and idle: the maintenance loop reaps the worker within its
+    // 2 s timeout plus one loop interval, and books it as deliberate.
+    chat.expect("worker stopped", Duration::from_secs(20));
+    chat.expect("session Idle", Duration::from_secs(5));
+
+    // The next message works exactly as before: a fresh worker on the
+    // resumed strand, with zero crash bookkeeping.
+    chat.send("second message");
+    chat.expect("second-alive", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(10));
+    chat.send("/status");
+    chat.expect("tokens · crashes: 0", Duration::from_secs(10));
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
@@ -472,6 +511,61 @@ fn calendar_digest_on_demand() {
     chat.send("/calendar today");
     chat.expect("CTest-RRULE", Duration::from_secs(30));
     chat.expect("1 recurring event(s) not expanded", Duration::from_secs(10));
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Skills (SEED.md §9.1): enable provisions into the engine home, `/skills`
+/// lists it, `/skill <name> <text>` submits a turn through the worker
+/// protocol with that skill attached, and an unknown skill is refused
+/// before any engine work.
+#[test]
+fn skills_enable_list_invoke() {
+    let root = temp_root("skills");
+    let sc = scenario_file(
+        &root,
+        "skills.json",
+        r#"{ "steps": [ {"text": "skill-ack"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+
+    // The operator's skill library lives in the config dir (XDG-scoped).
+    let cfg_home = root.join("cfg-home");
+    let skill_dir = cfg_home.join("ka-agent/skills/review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname = \"review\"\ndescription = \"review a diff carefully\"\n---\n\nRead the diff twice.\n",
+    )
+    .unwrap();
+
+    // CLI: enable against the same data root.
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["skills", "enable", "review"])
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let provisioned = root.join("data/engine-home/.config/ka/skills/review/SKILL.md");
+    assert!(provisioned.is_file(), "skill provisioned into engine home");
+
+    // Chat: list, invoke, and a fail-closed unknown-skill case.
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("commands:", Duration::from_secs(10));
+    chat.send("/skills");
+    chat.expect("review — review a diff carefully", Duration::from_secs(10));
+    chat.send("/skill ghost do something");
+    chat.expect(
+        "! [skill] skill \"ghost\" is not enabled",
+        Duration::from_secs(10),
+    );
+    chat.send("/skill review check the attached diff");
+    chat.expect("skill-ack", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(10));
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }

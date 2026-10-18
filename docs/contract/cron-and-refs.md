@@ -2,7 +2,11 @@
 
 Four operator-facing features with one shared substrate: the tasks table
 carries a JSON `payload` (schema v4), and the runtime scheduler fires both
-reminders and generalized cron jobs.
+reminders and generalized cron jobs. Reminders (`kind = 'reminder'`) are
+notifications: on fire, the surface gets `⏰ <text>` and no engine turn is
+spent. The maintenance loop sleeps until the next due task (bounded by a
+15 s interval) and wakes immediately when the daemon itself schedules
+something (`scheduler_tick`).
 
 ## Cron
 
@@ -36,6 +40,16 @@ more; `now + ms` can never wrap i64). After a successful fire the next
 occurrence is computed by skipping missed occupations (`while next <= now`,
 overflow-checked), so a laptop that slept for three days fires once, not 72
 times; an unrepresentable schedule fails visibly instead of spinning.
+
+**Late and missed fires (SEED.md §7.2)**: a due fire that sat overdue still
+fires within the grace hour — with the lateness on the notification
+(`⏰ stretch (late by 5m)` / `cron: … (late by 40m)`); lateness under a
+minute goes unmarked. Overdue beyond that hour, one-shots are recorded
+`missed` (a terminal task status, off the live set) and reported
+(`⏰ missed: … (overdue by 2h)`); recurring jobs keep their schedule — the
+missed occupation is skipped with a note and the job re-arms strictly
+after now. Times render via `ka_agent_core::fmt_interval` (truncate to
+the largest unit).
 
 **Races and restarts**: firing claims the row `queued → running`
 conditionally — a cancel or pause that lands first or mid-flight wins and

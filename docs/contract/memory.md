@@ -26,14 +26,20 @@ operator accepts stable-memory writes.
   replaced by a one-line omission marker. The result is written to
   `<engine-home>/.config/ka/MEMORY.md` (ka's user-tier memory, re-read per
   prompt — validation §5: no worker restart needed).
-- **Commands** (console + Telegram):
+- **Commands** (shared router: console, Telegram, Matrix):
   - `/remember <fact>` — explicit operator acceptance, appends to facts.md,
     recompiles, commits.
   - `/forget <id>` — removes the entry, recompiles, commits.
   - `/memory` — report: files, bytes, budget %, truncated flag.
-  - `/memory review` — lists pending candidates (id, source, text).
+  - `/memory review` — lists pending candidates with **full ids**.
   - `/memory accept <id>` / `/memory reject <id>` — candidate → stable
-    memory (or rejected).
+    memory (or rejected). `<id>` may be the full id or any unique prefix
+    (`/cron rm` rule); an ambiguous prefix is refused, never guessed.
+- **CLI** (`ka-agent memory …`): `path` prints the memory directory,
+  `show [file]` prints one file, `edit [file]` opens `$EDITOR` on it and
+  recompiles + git-commits the result (SEED.md §9.1 `ka-agent memory
+  edit`). Files: facts (default) | profile | persona | preferences |
+  environment | conventions.
 
 ## Memory candidates
 

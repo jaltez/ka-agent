@@ -45,6 +45,8 @@ pub enum Error {
     UnknownApproval(String),
     #[error("{0}")]
     Refused(String),
+    #[error("skills: {0}")]
+    Skills(#[from] crate::skills::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -137,6 +139,9 @@ struct Live {
     /// We killed this worker on purpose (`/new`, the `/stop` escalation): its
     /// exit must not be booked as a crash.
     deliberate_close: bool,
+    /// Last time anything happened on this session (event, submit, ask) —
+    /// the idle reap's clock. `now_ms` while a turn is in flight.
+    last_activity_ms: i64,
 }
 
 struct Inner {
@@ -161,6 +166,8 @@ struct Shared {
     /// No-agent cron handlers, registered by kind (e.g. "calendar").
     /// Registered by the app binary; the runtime only dispatches (M11).
     no_agent: Mutex<HashMap<String, NoAgentFn>>,
+    /// Wakes the scheduler when a task is scheduled sooner than its sleep.
+    scheduler_tick: tokio::sync::Notify,
 }
 
 /// The runtime handle. Cheap to clone; the event loop and the expiry timer
@@ -274,6 +281,7 @@ impl Runtime {
                 port,
                 surface,
                 no_agent: Mutex::new(HashMap::new()),
+                scheduler_tick: tokio::sync::Notify::new(),
                 inner: Mutex::new(Inner {
                     session,
                     live: None,
@@ -404,7 +412,7 @@ impl Runtime {
                     };
                     if verdict == ka_agent_core::BudgetVerdict::Exceeded {
                         self.sh.surface.on_note(
-                            "paused: budget reached for this window; use /resume to                              override or wait for the window to roll",
+                            "paused: budget reached for this window; use /resume to override or wait for the window to roll",
                         );
                         false
                     } else {
@@ -459,6 +467,52 @@ impl Runtime {
                 Err(e)
             }
         }
+    }
+
+    /// `/skill <name> <text>`: submit one turn with that skill's full body
+    /// injected (SEED.md §2.6, §9.1). Fails closed: the skill must be
+    /// provisioned in the engine home, and the session must be idle — a
+    /// skill turn is never queued (the queue carries plain text only).
+    pub async fn handle_skill(&self, name: &str, text: &str) -> Result<(), Error> {
+        let skills = crate::skills::Skills::new(&self.sh.paths.engine_home());
+        if !skills.is_enabled(name)? {
+            return Err(Error::Refused(format!(
+                "skill {name:?} is not enabled — `ka-agent skills enable {name}`"
+            )));
+        }
+        if text.trim().is_empty() {
+            return Err(Error::Refused("usage: /skill <name> <text>".into()));
+        }
+        {
+            let mut g = self.lock();
+            if g.session.status != SessionStatus::Idle {
+                return Err(Error::Refused(
+                    "session busy — /skill runs when idle; nothing was queued".into(),
+                ));
+            }
+            let from = g.session.status;
+            g.session
+                .transition(SessionStatus::Running)
+                .map_err(|t| illegal_session(from, t))?;
+        }
+        self.persist_session_status(SessionStatus::Running);
+        match self.submit_text_with(text, vec![name.to_string()]).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let mut g = self.lock();
+                if g.session.status == SessionStatus::Running {
+                    g.session.transition(SessionStatus::Idle).ok();
+                }
+                drop(g);
+                self.persist_session_status(SessionStatus::Idle);
+                Err(e)
+            }
+        }
+    }
+
+    /// Skills the engine currently discovers (for `/skills` and doctor).
+    pub fn skills_enabled(&self) -> Vec<crate::skills::SkillInfo> {
+        crate::skills::Skills::new(&self.sh.paths.engine_home()).enabled()
     }
 
     fn persist_session_status(&self, status: SessionStatus) {
@@ -550,15 +604,23 @@ impl Runtime {
         Ok(self.sh.store.pending_candidates_full()?)
     }
 
-    /// `/memory accept <id>`: candidate → stable memory.
+    /// `/memory accept <id>`: candidate → stable memory. The id may be a
+    /// unique prefix (like `/cron rm`).
     pub fn accept_candidate(&self, id: &str) -> Result<bool, Error> {
-        let Some(row) = self
-            .sh
-            .store
-            .pending_candidates_full()?
-            .into_iter()
-            .find(|c| c.id.as_str() == id)
-        else {
+        let pending = self.sh.store.pending_candidates_full()?;
+        let matches: Vec<_> = pending
+            .iter()
+            .filter(|c| c.id.as_str() == id || c.id.as_str().starts_with(id))
+            .collect();
+        let Some(row) = (match matches.as_slice() {
+            [one] => Some((**one).clone()),
+            [] => None,
+            _ => {
+                return Err(Error::Refused(
+                    "ambiguous candidate id: type more of it".into(),
+                ));
+            }
+        }) else {
             return Ok(false);
         };
         let mem_id = self.sh.memory.add(
@@ -580,18 +642,28 @@ impl Runtime {
         Ok(true)
     }
 
-    /// `/memory reject <id>`.
+    /// `/memory reject <id>`: the same full-id-or-unique-prefix rule.
     pub fn reject_candidate(&self, id: &str) -> Result<bool, Error> {
-        let pending = self.sh.store.pending_candidates()?;
-        if !pending.iter().any(|c| c.as_str() == id) {
-            return Ok(false);
-        }
+        let pending = self.sh.store.pending_candidates_full()?;
+        let matches: Vec<_> = pending
+            .iter()
+            .filter(|c| c.id.as_str() == id || c.id.as_str().starts_with(id))
+            .collect();
+        let row = match matches.as_slice() {
+            [one] => (**one).clone(),
+            [] => return Ok(false),
+            _ => {
+                return Err(Error::Refused(
+                    "ambiguous candidate id: type more of it".into(),
+                ));
+            }
+        };
         self.sh
             .store
-            .set_candidate_status(&ka_agent_core::MemoryId(id.to_string()), "rejected")?;
+            .set_candidate_status(&row.id.clone(), "rejected")?;
         self.audit(
             audit_actions::MEMORY_EDIT,
-            id,
+            row.id.as_str(),
             Some("candidate rejected".into()),
         )?;
         Ok(true)
@@ -788,21 +860,6 @@ impl Runtime {
         Ok(expired)
     }
 
-    /// Periodic approval-expiry loop; run it next to the event loop.
-    pub async fn run_expiry_timer(&self, every: Duration) {
-        let mut tick = tokio::time::interval(every);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await; // first fires immediately
-        loop {
-            tick.tick().await;
-            if let Err(e) = self.expire_approvals().await {
-                self.sh
-                    .surface
-                    .on_error("internal", &format!("expiry sweep: {e}"));
-            }
-        }
-    }
-
     /// Decide the most recent pending approval (console `/y` and `/n`).
     /// Returns Ok(false) when nothing is pending.
     pub async fn decide_latest(&self, decision: ApprovalDecision) -> Result<bool, Error> {
@@ -834,9 +891,10 @@ impl Runtime {
         if reminder_text.is_empty() {
             return Ok(None);
         }
-        let mut task = ka_agent_core::Task::new(format!("⏰ {reminder_text}"), "reminder", false);
+        let mut task = ka_agent_core::Task::new(reminder_text.to_string(), "reminder", false);
         task.scheduled_at_ms = Some(ka_agent_core::now_ms() + ms as i64);
         self.sh.store.insert_task(&task)?;
+        self.sh.scheduler_tick.notify_one();
         Ok(Some(task.id))
     }
 
@@ -860,6 +918,51 @@ impl Runtime {
         }
     }
 
+    /// Stop a worker that has had nothing to do for
+    /// `worker_idle_timeout_secs`. Minimal-footprint rule: an idle resident
+    /// must not pay for a resident engine. The kill is `deliberate_close`
+    /// — not a crash, no backoff, no degradation — and the next message
+    /// restarts the worker, resuming the strand by path. Skipped unless
+    /// the session is fully settled: idle status, no open turn, no pending
+    /// ask, nothing queued.
+    async fn reap_idle_worker(&self) {
+        let timeout_secs = self.sh.cfg.worker_idle_timeout_secs;
+        if timeout_secs == 0 {
+            return;
+        }
+        let now = ka_agent_core::now_ms();
+        let port = {
+            let mut g = self.lock();
+            let (settled, idle_long_enough, port) = {
+                let Some(live) = g.live.as_ref() else {
+                    return;
+                };
+                let turn_open = live.current_turn.as_ref().is_some_and(|t| {
+                    self.sh
+                        .store
+                        .get_turn(t)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| !t.status.is_terminal())
+                });
+                let settled = g.session.status == SessionStatus::Idle
+                    && !turn_open
+                    && live.pending_asks.is_empty()
+                    && self.sh.store.queue_len(&g.session.id).unwrap_or(0) == 0;
+                let idle_long_enough = now - live.last_activity_ms >= (timeout_secs as i64) * 1000;
+                (settled, idle_long_enough, live.port.clone())
+            };
+            if !settled || !idle_long_enough {
+                return;
+            }
+            if let Some(live) = g.live.as_mut() {
+                live.deliberate_close = true;
+            }
+            port
+        };
+        port.kill().await;
+    }
+
     /// Schedule a cron job: a `kind = "cron"` task carrying its
     /// [`ka_agent_core::CronSpec`] as payload, first firing at
     /// `first_at_ms`.
@@ -872,6 +975,7 @@ impl Runtime {
         task.scheduled_at_ms = Some(first_at_ms);
         task.payload = Some(spec.to_payload());
         self.sh.store.insert_task(&task)?;
+        self.sh.scheduler_tick.notify_one();
         Ok(task.id)
     }
 
@@ -905,6 +1009,19 @@ impl Runtime {
         let now = ka_agent_core::now_ms();
         let due = self.sh.store.due_tasks(now)?;
         let mut fired = Vec::new();
+        // SEED.md §7.2: a fire that sat overdue fires late (and says so)
+        // within the grace hour; beyond it, one-shots are recorded `missed`
+        // and recurring jobs skip the missed occupation and re-arm.
+        const LATE_GRACE_MS: i64 = 3_600_000;
+        const LATE_MARK_MS: i64 = 60_000;
+        let late_by = |task: &ka_agent_core::Task| now - task.scheduled_at_ms.unwrap_or(now);
+        let late_suffix = |late_by: i64| {
+            if late_by > LATE_MARK_MS {
+                format!(" (late by {})", ka_agent_core::fmt_interval(late_by))
+            } else {
+                String::new()
+            }
+        };
         for task in due {
             // Claim: the snapshot is stale the moment another surface
             // (cancel, pause, remove) touched the row. Skip what we lost.
@@ -913,18 +1030,23 @@ impl Runtime {
             }
             match task.kind.as_str() {
                 "reminder" => {
+                    // A reminder is a notification, not a prompt: firing
+                    // it must not spend a model turn. Work that needs the
+                    // engine is a cron job with `mode = agent`, chosen
+                    // explicitly by the operator.
                     let title = task.title.clone();
-                    self.sh.surface.on_note(&format!("⏰ {title}"));
-                    if let Err(e) = self
-                        .handle_message(&format!("⏰ reminder: {title}"), "scheduler")
-                        .await
-                    {
-                        self.sh
-                            .surface
-                            .on_error("cron", &format!("reminder {}: {e}", task.id.as_str()));
-                        let _ = self.sh.store.settle_task(&task.id, "failed");
+                    let this_late_by = late_by(&task);
+                    if this_late_by > LATE_GRACE_MS {
+                        self.sh.surface.on_note(&format!(
+                            "⏰ missed: {title} (overdue by {})",
+                            ka_agent_core::fmt_interval(this_late_by)
+                        ));
+                        let _ = self.sh.store.settle_task(&task.id, "missed");
                         continue;
                     }
+                    self.sh
+                        .surface
+                        .on_note(&format!("⏰ {title}{}", late_suffix(this_late_by)));
                     let _ = self.sh.store.settle_task(&task.id, "succeeded");
                     fired.push(title);
                 }
@@ -935,9 +1057,48 @@ impl Runtime {
                         let _ = self.sh.store.settle_task(&task.id, "failed");
                         continue;
                     };
+                    let this_late_by = late_by(&task);
+                    let recurring = spec.recurrence_ms.is_some_and(|rec| rec > 0);
+                    if this_late_by > LATE_GRACE_MS {
+                        if recurring {
+                            // A recurring job outlives one missed occupation:
+                            // skip it and re-arm strictly after now.
+                            let note = match next_occurrence(
+                                task.scheduled_at_ms.unwrap_or(now),
+                                spec.recurrence_ms.unwrap_or(0),
+                                now,
+                            ) {
+                                Some(next) => {
+                                    let _ = self.sh.store.rearm_task(&task.id, next);
+                                    format!(
+                                        "cron '{}' skipped a missed occurrence (overdue by {}); re-armed",
+                                        spec.text,
+                                        ka_agent_core::fmt_interval(this_late_by)
+                                    )
+                                }
+                                None => {
+                                    let _ = self.sh.store.settle_task(&task.id, "failed");
+                                    "cron re-arm overflow".to_string()
+                                }
+                            };
+                            self.sh.surface.on_note(&note);
+                            continue;
+                        }
+                        self.sh.surface.on_note(&format!(
+                            "cron '{}' missed (overdue by {})",
+                            spec.text,
+                            ka_agent_core::fmt_interval(this_late_by)
+                        ));
+                        let _ = self.sh.store.settle_task(&task.id, "missed");
+                        continue;
+                    }
                     let ok = match &spec.mode {
                         ka_agent_core::CronMode::Agent => {
-                            self.sh.surface.on_note(&format!("cron: {}", spec.text));
+                            self.sh.surface.on_note(&format!(
+                                "cron: {}{}",
+                                spec.text,
+                                late_suffix(this_late_by)
+                            ));
                             match self.handle_message(&spec.text, "cron").await {
                                 Ok(()) => true,
                                 Err(e) => {
@@ -1009,20 +1170,47 @@ impl Runtime {
         Ok(fired)
     }
 
-    /// Scheduler loop; run it next to the expiry timer.
-    pub async fn run_scheduler(&self, every: Duration) {
-        let mut tick = tokio::time::interval(every);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await;
+    /// The maintenance loop: one wake for the approval-expiry sweep and
+    /// the scheduler. Sleeps until the next due task when one is queued
+    /// (bounded by `every`), otherwise a plain `every` interval — an idle
+    /// daemon ticks once per interval, not per concern. `scheduler_tick`
+    /// interrupts the sleep so an in-process `/remind` or `/cron add`
+    /// recomputes the deadline immediately; engine-side `cron_manage`
+    /// writes the store from another process and waits at most `every`.
+    pub async fn run_maintenance(&self, every: Duration) {
         loop {
-            tick.tick().await;
+            if let Err(e) = self.expire_approvals().await {
+                self.sh
+                    .surface
+                    .on_error("internal", &format!("expiry sweep: {e}"));
+            }
             if let Err(e) = self.fire_due_tasks().await {
                 self.sh
                     .surface
                     .on_error("internal", &format!("scheduler: {e}"));
             }
+            self.reap_idle_worker().await;
+            let wait = match self.sh.store.next_due_ms() {
+                Ok(Some(next)) => {
+                    let now = ka_agent_core::now_ms();
+                    if next <= now {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis((next - now) as u64 + 100)
+                    }
+                }
+                _ => every,
+            };
+            // Floor guards against a spin when a due task cannot be
+            // claimed; the cap bounds cross-process scheduling latency.
+            let wait = wait.min(every).max(Duration::from_millis(250));
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.sh.scheduler_tick.notified() => {}
+            }
         }
     }
+
     fn live_port(&self) -> Option<Arc<PortSession>> {
         self.lock().live.as_ref().map(|l| Arc::clone(&l.port))
     }
@@ -1035,6 +1223,12 @@ impl Runtime {
     // ---- submission ------------------------------------------------------
 
     async fn submit_text(&self, text: &str) -> Result<(), Error> {
+        self.submit_text_with(text, Vec::new()).await
+    }
+
+    /// Submit with per-turn skills (`Command::Prompt.skills`: the engine
+    /// injects the full SKILL.md bodies for these names into this turn).
+    async fn submit_text_with(&self, text: &str, skills: Vec<String>) -> Result<(), Error> {
         if let Err(e) = self.ensure_worker().await {
             // A dead worker at submit time behaves like an interruption:
             // surface it, never auto-retry (SEED.md §3.8).
@@ -1074,7 +1268,7 @@ impl Runtime {
                 live.live_text.clear();
             }
         }
-        match port.submit(text.to_string(), Vec::new(), Vec::new()).await {
+        match port.submit(text.to_string(), Vec::new(), skills).await {
             Ok(()) => {}
             Err(PortError::EngineClosed) => {
                 turn.transition(TurnStatus::Interrupted)
@@ -1172,6 +1366,7 @@ impl Runtime {
                 live_text: String::new(),
                 current_turn: None,
                 deliberate_close: false,
+                last_activity_ms: ka_agent_core::now_ms(),
             });
         }
         tokio::spawn(drive(Arc::clone(&self.sh), port, rx));
@@ -1184,6 +1379,13 @@ impl Runtime {
 /// delivery boundary is `idle`).
 async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<PortEvent>) {
     while let Some(ev) = rx.recv().await {
+        // Any event is activity: the idle reap's clock resets.
+        {
+            let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(live) = g.live.as_mut() {
+                live.last_activity_ms = ka_agent_core::now_ms();
+            }
+        }
         match ev {
             PortEvent::Bootstrap {
                 strand_id,
@@ -1661,6 +1863,9 @@ async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
         };
         let note = if degraded {
             "engine closed repeatedly — session degraded; /new to recover".to_string()
+        } else if deliberate {
+            // `/new`, a `/stop` escalation, or the idle reap: intentional.
+            "worker stopped; the next message restarts it".to_string()
         } else {
             "engine closed; the next message restarts the worker".to_string()
         };

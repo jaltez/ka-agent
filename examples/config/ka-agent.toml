@@ -3,9 +3,10 @@
 # unknown keys are hard errors. Secrets never live in this file — the
 # Telegram token is a name in the secret store (see [telegram] below).
 
-# The single workspace directory every engine runs in (MVP).
-# `~` expands against $HOME.
-workspace = "~/projects/ka-agent-workspace"
+# The single workspace directory every engine runs in. `~` expands against
+# $HOME; the default (what `ka-agent init` writes) is
+# ~/.local/share/ka-agent/workspace — keep instance-owned files together.
+workspace = "~/.local/share/ka-agent/workspace"
 
 # Default ka model selector for new sessions (e.g. "anthropic/claude-sonnet-4-5").
 # Omit to let the engine layer decide.
@@ -22,6 +23,11 @@ approval_ttl_secs = 900
 # Grace in seconds after /stop before escalating abort -> SIGTERM -> SIGKILL.
 # Range 1..=600.
 turn_grace_secs = 10
+
+# Stop an engine worker after this many idle seconds to release its
+# process; the next message restarts it and resumes the strand. 0 keeps
+# the worker forever (default: 900).
+worker_idle_timeout_secs = 900
 
 [worker_restart]
 # First backoff after a worker crash, in milliseconds.
@@ -47,13 +53,12 @@ crash_max = 5
 # engine_layer = "~/.config/ka-agent/engine.toml"
 
 [telegram]
-# The Telegram channel (M2). Enabling requires token_secret (a secret-store
-# name) and at least one allow_user_ids entry (numeric operator ids; private
-# chats only; usernames are never trusted).
-# The token resolves from $KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN or a 0600 file
-# under <data>/secrets/<token_secret>.
+# The Telegram channel. Enabling requires token_secret (a secret-store
+# name); set the token with `ka-agent secret set telegram.bot_token`, and
+# link your numeric Telegram user id with
+# `ka-agent identity link telegram <id>` (private chats only; usernames
+# are never trusted).
 enabled = false
 # Name of the bot token in the secret store.
 # token_secret = "telegram.bot_token"
 # api_base = "https://api.telegram.org"   # tests point this at a fake server
-allow_user_ids = []

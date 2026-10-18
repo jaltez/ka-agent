@@ -118,7 +118,7 @@ Transports between the operator and the instance: Telegram (first), the local ad
 
 ### 2.10 Tasks
 
-Units of work tracked by Ka Agent with a persisted state machine: a user request, a reminder, or a scheduled job. A task may run one or more prompt cycles. A task's side effects go through intents (§7.3).
+Units of work tracked by Ka Agent with a persisted state machine: a user request, a reminder, or a scheduled job. A task may run one or more prompt cycles. A task's side effects go through intents (§7.3). **Decision (2026-10-18): reminders are notifications — firing one never spends a model turn; engine-driven scheduled work is an explicit `mode = agent` cron job.**
 
 ### 2.11 Approvals
 
@@ -731,7 +731,7 @@ On startup, Ka Agent reconciles:
   - Read-only kinds (an RSS digest, a history summary) are re-queued automatically once.
   - Anything that may have side effects waits for the operator: **Re-run** or **Discard**.
 - **Approvals for intents survive restarts.** The action has not executed yet, so the card is re-sent with the remaining TTL.
-- **[Provisional]** Missed reminders and schedules fire late if they are less than 1 hour overdue, marked "late by Xm". Otherwise they are recorded as `missed` and reported.
+- **[Provisional]** Missed reminders and schedules fire late if they are less than 1 hour overdue, marked "late by Xm". Otherwise they are recorded as `missed` and reported. **Implemented (2026-10-18, schema v5 `missed` status): grace window 1 h; ≤1 h overdue fires with `late by` on the note; >1 h one-shots settle `missed` and recurring jobs skip the occupation and re-arm. Semantics: docs/contract/cron-and-refs.md.**
 
 ### 7.3 Never repeating destructive actions after a failure
 
@@ -897,9 +897,9 @@ The workspace is the only default write root, and execution happens only inside 
 - **One channel: Telegram.** Private chat, long polling, approvals through inline buttons, `/stop`, `/new`, `/status`.
 - **One local workspace.** A single configured directory; all engines run there.
 - **Resumable sessions through Ka.** Strands resume by path after any restart; policy is re-asserted on resume.
-- **Editable stable memory.** Markdown files, `/remember`, `/memory` (show), `/forget`, `ka-agent memory edit`, compiled into `MEMORY.md`. Model-proposed candidates and their review arrive in Phase 2.
+- **Editable stable memory.** Markdown files, `/remember`, `/memory` (show), `/forget`, `ka-agent memory edit`, compiled into `MEMORY.md`. Model-proposed candidates and their review arrive in Phase 2. **Shipped: all of it, including the CLI editor (`memory path|show|edit`) and candidate prefix matching (2026-10-18).**
 - **Searchable history.** FTS5 over prompt cycles, `/history`.
-- **A minimal skills mechanism.** `SKILL.md` directories in `~/.config/ka-agent/skills/`, enabled with `ka-agent skills enable`, provisioned into the engine home, invoked with `/skill`.
+- **A minimal skills mechanism.** `SKILL.md` directories in `~/.config/ka-agent/skills/`, enabled with `ka-agent skills enable`, provisioned into the engine home, invoked with `/skill`. **Shipped (2026-10-18): `ka-agent skills list|enable|disable`, engine-home provisioning, `/skills` listing, and `/skill <name> <text>` per-turn invocation through the worker protocol (contract: docs/contract/skills.md).**
 - **Approvals for sensitive actions.** Ka asks become cards with a TTL and deny-on-expiry; the audit is complete.
 - **A process supervisor with controlled restart.**
   - A systemd user unit for the daemon (`Restart=on-failure`, start-rate limiting).

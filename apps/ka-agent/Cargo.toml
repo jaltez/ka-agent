@@ -15,6 +15,7 @@ ka-agent-core = { workspace = true }
 ka-agent-port = { workspace = true }
 ka-agent-store = { workspace = true }
 ka-agent-runtime = { workspace = true }
+ka-agent-memory = { workspace = true }
 ka-agent-channels = { workspace = true }
 ka-agent-plugins = { workspace = true }
 ka-agent-web = { workspace = true }

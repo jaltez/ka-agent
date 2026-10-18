@@ -15,11 +15,12 @@ pub enum Outcome {
     NotACommand,
 }
 
-const HELP: &str = "commands: /help /status /new /stop /resume\n\
+pub const HELP: &str = "commands: /help /status /new /stop /resume\n\
                     /remember <fact> · /forget <id> · /memory [review|accept <id>|reject <id>]\n\
                     /history <query> · /history show <turn_id> · /remind <Nd> <text>\n\
                     /cron [list] · /cron add (in|every) <Nd> <text> · /cron rm <id>\n\
-                    /calendar add <url-or-path> · /calendar today · /y /n";
+                    /calendar add <url-or-path> · /calendar today · /skills · /skill <name> <text>\n\
+                    /y /n";
 
 fn short_id(id: &str, n: usize) -> String {
     id.chars().take(n).collect()
@@ -45,14 +46,10 @@ pub fn utc_compact(ms: i64) -> String {
     format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}Z")
 }
 
-/// Render an interval compactly (`1h`, `30m`, `2d`, `45s`).
+/// Render an interval compactly (`1h`, `30m`, `2d`, `45s`) — re-exported
+/// from core so surfaces and the runtime share one formatter.
 pub fn fmt_interval(ms: i64) -> String {
-    for (unit, mult) in [("d", 86_400_000i64), ("h", 3_600_000), ("m", 60_000)] {
-        if ms % mult == 0 {
-            return format!("{}{unit}", ms / mult);
-        }
-    }
-    format!("{}s", ms / 1000)
+    ka_agent_core::fmt_interval(ms)
 }
 
 /// One line per live cron: `id every|once next-UTC text [paused]`.
@@ -172,9 +169,7 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
                     Ok(rows) if rows.is_empty() => "no pending candidates".to_string(),
                     Ok(rows) => rows
                         .into_iter()
-                        .map(|c| {
-                            format!("{} ({}): {}", short_id(c.id.as_str(), 10), c.source, c.text)
-                        })
+                        .map(|c| format!("{} ({}): {}", c.id.as_str(), c.source, c.text))
                         .collect::<Vec<_>>()
                         .join("\n"),
                     Err(e) => format!("! [memory] {e}"),
@@ -274,7 +269,36 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
             Err(e) => Outcome::Reply(format!("! [resume] {e}")),
         },
         "/skills" => {
-            Outcome::Reply("skills live in <data>/engine-home/.config/ka/skills/ (SKILL.md)".into())
+            let enabled = runtime.skills_enabled();
+            let reply = if enabled.is_empty() {
+                "no skills enabled — `ka-agent skills enable <name>` provisions one".to_string()
+            } else {
+                enabled
+                    .into_iter()
+                    .map(|s| {
+                        if s.description.is_empty() {
+                            s.name
+                        } else {
+                            format!("{} — {}", s.name, s.description)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Outcome::Reply(reply)
+        }
+        "/skill" => {
+            let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+            match rest.split_once(' ') {
+                Some((name, prompt)) if !name.is_empty() && !prompt.is_empty() => {
+                    match runtime.handle_skill(name, prompt).await {
+                        // The turn itself streams back through the surface.
+                        Ok(()) => Outcome::Silent,
+                        Err(e) => Outcome::Reply(format!("! [skill] {e}")),
+                    }
+                }
+                _ => Outcome::Reply("usage: /skill <name> <text>".into()),
+            }
         }
         "/history" => {
             let rest = text.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");

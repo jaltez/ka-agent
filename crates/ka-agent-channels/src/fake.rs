@@ -21,6 +21,9 @@ struct State {
     captured: Vec<CapturedRequest>,
     next_message_id: i64,
     last_offset: Option<i64>,
+    /// Downloadable files: (file_id, file_path, bytes) — what `getFile`
+    /// resolves and `/file/bot<token>/<file_path>` serves.
+    files: Vec<(String, String, Vec<u8>)>,
 }
 
 /// A fake `api.telegram.org`. Spawn on an ephemeral local port and point
@@ -68,16 +71,39 @@ impl FakeBotServer {
                 let state = Arc::clone(&rt_state);
                 tokio::spawn(async move {
                     if let Some((path, body)) = read_request(&mut socket).await {
-                        let response = handle(&state, &path, &body);
-                        let _ = socket
-                            .write_all(
-                                format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                                    response.len()
+                        // File downloads bypass the JSON method table.
+                        let (status, content_type, response): (&str, &str, Vec<u8>) =
+                            if let Some(rest) = path.strip_prefix("/file/") {
+                                // /file/bot<token>/<file_path> — match the
+                                // full API-relative file_path, not a basename.
+                                let file_path = rest.split_once('/').map_or("", |x| x.1);
+                                let bytes = {
+                                    let st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.files
+                                        .iter()
+                                        .find(|(_, p, _)| p == file_path)
+                                        .map(|(_, _, b)| b.clone())
+                                        .unwrap_or_default()
+                                };
+                                let status = if bytes.is_empty() {
+                                    "404 Not Found"
+                                } else {
+                                    "200 OK"
+                                };
+                                (status, "application/octet-stream", bytes)
+                            } else {
+                                (
+                                    "200 OK",
+                                    "application/json",
+                                    handle(&state, &path, &body).into_bytes(),
                                 )
-                                .as_bytes(),
-                            )
-                            .await;
+                            };
+                        let head = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            response.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(&response).await;
                     }
                 });
             }
@@ -128,6 +154,56 @@ impl FakeBotServer {
             .unwrap_or_else(|e| e.into_inner())
             .captured
             .clone()
+    }
+
+    /// Serve a downloadable file: `getFile` resolves `file_id` to
+    /// `file_path`, and `GET <base>/file/bot<token>/<file_path>` returns
+    /// `bytes`.
+    pub fn push_file(&self, file_id: &str, file_path: &str, bytes: &[u8]) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .push((file_id.to_string(), file_path.to_string(), bytes.to_vec()));
+    }
+
+    /// Queue a private-chat photo message (size-ascending variants, as the
+    /// Bot API sends them).
+    pub fn push_photo_message(&self, update_id: i64, chat_id: i64, user_id: i64, file_id: &str) {
+        self.push_update(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 1,
+                "from": { "id": user_id, "is_bot": false },
+                "chat": { "id": chat_id, "type": "private" },
+                "date": 0,
+                "photo": [
+                    { "file_id": format!("{file_id}-small"), "width": 90, "height": 90 },
+                    { "file_id": file_id, "width": 1280, "height": 720 },
+                ],
+            }
+        }));
+    }
+
+    /// Queue a private-chat document message.
+    pub fn push_document_message(
+        &self,
+        update_id: i64,
+        chat_id: i64,
+        user_id: i64,
+        file_id: &str,
+        file_name: &str,
+    ) {
+        self.push_update(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 1,
+                "from": { "id": user_id, "is_bot": false },
+                "chat": { "id": chat_id, "type": "private" },
+                "date": 0,
+                "document": { "file_id": file_id, "file_name": file_name },
+            }
+        }));
     }
 
     /// Poll (50 ms) until a capture matching `pred` lands, or `timeout`.
@@ -244,6 +320,14 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
         "answerCallbackQuery" => Value::Bool(true),
         "sendChatAction" => Value::Bool(true),
         "getMe" => json!({ "id": 1, "is_bot": true, "first_name": "fake" }),
+        "getFile" => {
+            let file_id = body["file_id"].as_str().unwrap_or("");
+            st.files
+                .iter()
+                .find(|(id, _, _)| id == file_id)
+                .map(|(_, path, _)| json!({ "file_id": file_id, "file_path": path }))
+                .unwrap_or(Value::Null)
+        }
         _ => Value::Bool(true),
     };
     st.captured.push(CapturedRequest {

@@ -102,6 +102,42 @@ async fn one_shot_cron_fires_once_and_succeeds() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A reminder scheduled while the maintenance loop sleeps must fire at its
+/// due time, not at the next interval: `add_reminder` notifies the loop,
+/// which recomputes its sleep from the next due time.
+#[tokio::test]
+async fn reminder_added_while_sleeping_fires_on_time() {
+    let root = root("reminder-prompt");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+
+    let driver = rt.clone();
+    tokio::spawn(async move {
+        driver
+            .run_maintenance(std::time::Duration::from_secs(15))
+            .await;
+    });
+    // Let the loop finish its boot pass (which would consume any immediate
+    // wake) and settle into its idle sleep.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    rt.add_reminder("1s prompt-check").unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let seen = notes.0.lock().unwrap().join("\n");
+        if seen.contains("prompt-check") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reminder did not fire within 5s; notes: {seen}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A recurring cron skips missed occupations: armed strictly after now,
 /// back to `queued`, exactly one fire per sweep.
 #[tokio::test]
@@ -270,5 +306,100 @@ async fn overflowing_recurrence_fails_visibly() {
     assert_eq!(row.status, ka_agent_core::TaskStatus::Failed);
     let seen = notes.0.lock().unwrap().join("\n");
     assert!(seen.contains("recurrence overflow"), "surface saw: {seen}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A reminder overdue beyond the grace hour is recorded `missed` and
+/// reported — never fired silently hours later (SEED.md §7.2).
+#[tokio::test]
+async fn reminder_beyond_grace_is_missed() {
+    let root = root("reminder-missed");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+
+    let mut task = ka_agent_core::Task::new("water the plants".into(), "reminder", false);
+    task.scheduled_at_ms = Some(ka_agent_core::now_ms() - 2 * 3_600_000);
+    store.insert_task(&task).unwrap();
+
+    rt.fire_due_tasks().await.unwrap();
+    let row = store.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(row.status, ka_agent_core::TaskStatus::Missed);
+    let seen = notes.0.lock().unwrap().join("\n");
+    assert!(
+        seen.contains("⏰ missed: water the plants"),
+        "surface saw: {seen}"
+    );
+    assert!(seen.contains("overdue by 2h"), "surface saw: {seen}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A reminder within the grace window still fires — with the lateness on
+/// the notification instead of hidden.
+#[tokio::test]
+async fn reminder_within_grace_fires_with_late_marker() {
+    let root = root("reminder-late");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+
+    let mut task = ka_agent_core::Task::new("stretch".into(), "reminder", false);
+    task.scheduled_at_ms = Some(ka_agent_core::now_ms() - 5 * 60_000);
+    store.insert_task(&task).unwrap();
+
+    rt.fire_due_tasks().await.unwrap();
+    let row = store.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(row.status, ka_agent_core::TaskStatus::Succeeded);
+    let seen = notes.0.lock().unwrap().join("\n");
+    assert!(
+        seen.contains("⏰ stretch (late by 5m)"),
+        "surface saw: {seen}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A recurring cron whose due time passed while the machine slept skips
+/// the missed occupation and re-arms; a one-shot beyond grace is missed.
+#[tokio::test]
+async fn recurring_beyond_grace_skips_and_rearms_oneshot_is_missed() {
+    let root = root("cron-overdue");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+    rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
+
+    let now = ka_agent_core::now_ms();
+    // Recurring, overdue by 2h: no fire, re-armed strictly after now.
+    let tick_id = rt
+        .add_cron(spec("tick", Some(60_000)), now - 2 * 3_600_000)
+        .unwrap();
+    // One-shot, overdue by 2h: recorded missed (terminal — off the live set).
+    let once_id = rt
+        .add_cron(spec("once", None), now - 2 * 3_600_000)
+        .unwrap();
+
+    rt.fire_due_tasks().await.unwrap();
+
+    let tick = store.get_task(&tick_id).unwrap().unwrap();
+    assert_eq!(tick.status, ka_agent_core::TaskStatus::Queued);
+    let next = tick.scheduled_at_ms.unwrap();
+    assert!(
+        next > now && next <= now + 60_000 + 1_000,
+        "re-armed after now: {next}"
+    );
+    let once = store.get_task(&once_id).unwrap().unwrap();
+    assert_eq!(once.status, ka_agent_core::TaskStatus::Missed);
+    assert!(
+        !store.cron_tasks().unwrap().iter().any(|t| t.id == once_id),
+        "a missed one-shot is terminal: off the live set"
+    );
+
+    let seen = notes.0.lock().unwrap().join("\n");
+    assert!(
+        seen.contains("skipped a missed occurrence (overdue by 2h); re-armed"),
+        "surface saw: {seen}"
+    );
+    assert!(seen.contains("'once' missed (overdue by 2h)"), "{seen}");
+    assert!(!seen.contains("echo[tick]"), "must not fire: {seen}");
     let _ = std::fs::remove_dir_all(&root);
 }

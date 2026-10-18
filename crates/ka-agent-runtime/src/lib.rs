@@ -4,6 +4,7 @@
 
 pub mod paths;
 pub mod runtime;
+pub mod skills;
 pub mod surface;
 
 pub use paths::Paths;

@@ -41,7 +41,18 @@ daemon).
 
 ## Scheduler
 
-`/remind <Ns|Nm|Nh|Nd> <text>` creates a task in the store. A timer
-(15 s tick in the daemon) fires due reminders as `⏰ <text>` messages
-through the runtime's normal submission path (single-flight, queue,
-approvals all apply).
+`/remind <Ns|Nm|Nh|Nd> <text>` creates a task in the store. When it fires,
+the surface gets `⏰ <text>` and nothing else: a reminder is a
+notification, not a prompt — firing it never spends a model turn. Work
+that needs the engine is a cron job with `mode = agent`
+(`docs/contract/cron-and-refs.md`), chosen explicitly.
+
+## External writes and idempotency
+
+GitHub write tools (`github_issue_comment`, `github_pull_review`) log an
+intent **before** the API call whose `args_hash` is the sha256 of the tool
+name + serialized arguments. A retried call with identical arguments finds
+the earlier `executing`/`succeeded` intent and is refused (`duplicate
+external write refused`); failed attempts keep their row but stay
+retryable. The HTTP clients (`http_get`, GitHub, `@url` references) share
+one stack (`reqwest`, no redirects — the SSRF guard walks each hop).

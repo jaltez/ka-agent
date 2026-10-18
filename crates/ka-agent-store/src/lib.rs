@@ -65,6 +65,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v2.sql"),
     include_str!("schema_v3.sql"),
     include_str!("schema_v4.sql"),
+    include_str!("schema_v5.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -1047,6 +1048,20 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// The earliest queued scheduled time, if any: the maintenance loop
+    /// sleeps until it (bounded), instead of waking on a fixed interval.
+    pub fn next_due_ms(&self) -> Result<Option<i64>> {
+        let conn = self.lock();
+        // MIN() always yields a row; NULL means nothing is scheduled.
+        conn.query_row(
+            "SELECT MIN(scheduled_at_ms) FROM tasks
+             WHERE status = 'queued' AND scheduled_at_ms IS NOT NULL",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// Insert a task row.
     pub fn insert_task(&self, t: &ka_agent_core::Task) -> Result<()> {
         let conn = self.lock();
@@ -1238,6 +1253,35 @@ impl Store {
             return Err(StoreError::NotFound(format!("intent {id}")));
         }
         Ok(())
+    }
+
+    /// The most recent non-failed intent for a tool + args hash. This is
+    /// the idempotency check for external writes (SEED.md §7.3): a retried
+    /// call with identical arguments must find the earlier effect here and
+    /// refuse to write again. Failed attempts stay retryable.
+    pub fn active_intent_by_hash(&self, tool: &str, args_hash: &str) -> Result<Option<IntentRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, tool, args_hash, status, external_ref, summary, created_ms, updated_ms
+             FROM intents
+             WHERE tool = ?1 AND args_hash = ?2 AND status != 'failed'
+             ORDER BY created_ms DESC LIMIT 1",
+            params![tool, args_hash],
+            |r| {
+                Ok(IntentRow {
+                    id: r.get(0)?,
+                    tool: r.get(1)?,
+                    args_hash: r.get(2)?,
+                    status: r.get(3)?,
+                    external_ref: r.get(4)?,
+                    summary: r.get(5)?,
+                    created_ms: r.get(6)?,
+                    updated_ms: r.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.into())
     }
 
     /// Recent intents (for reporting).
@@ -1538,6 +1582,7 @@ fn task_status_str(s: &ka_agent_core::TaskStatus) -> &'static str {
         ka_agent_core::TaskStatus::Cancelled => "cancelled",
         ka_agent_core::TaskStatus::Interrupted => "interrupted",
         ka_agent_core::TaskStatus::Unknown => "unknown",
+        ka_agent_core::TaskStatus::Missed => "missed",
     }
 }
 
@@ -1553,6 +1598,7 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<ka_agent_core::Task> {
         "failed" => ka_agent_core::TaskStatus::Failed,
         "cancelled" => ka_agent_core::TaskStatus::Cancelled,
         "interrupted" => ka_agent_core::TaskStatus::Interrupted,
+        "missed" => ka_agent_core::TaskStatus::Missed,
         _ => ka_agent_core::TaskStatus::Unknown,
     };
     Ok(ka_agent_core::Task {
@@ -1974,7 +2020,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 3).unwrap();
         }
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.user_version().unwrap(), 4);
+        assert_eq!(store.user_version().unwrap(), MIGRATIONS.len());
         let spec = ka_agent_core::CronSpec {
             text: "daily digest".into(),
             source: "operator".into(),
@@ -1999,6 +2045,36 @@ mod tests {
         assert!(store.due_tasks(now + 30_000).unwrap().is_empty());
         assert_eq!(store.due_tasks(now + 61_000).unwrap().len(), 1);
         assert!(store.due_tasks(now + 61_000).unwrap()[0].payload.is_some());
+    }
+
+    #[test]
+    fn schema_v5_migration_from_v4() {
+        // Build a real v4 database, then reopen: the tasks table accepts
+        // 'missed' (the SEED.md §7.2 late-grace state) and a missed task
+        // round-trips and stays out of the live/due sets.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(include_str!("schema_v1.sql")).unwrap();
+            conn.execute_batch(include_str!("schema_v2.sql")).unwrap();
+            conn.execute_batch(include_str!("schema_v3.sql")).unwrap();
+            conn.execute_batch(include_str!("schema_v4.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.user_version().unwrap(), MIGRATIONS.len());
+
+        let mut task = ka_agent_core::Task::new("water the plants".into(), "reminder", false);
+        task.scheduled_at_ms = Some(ka_agent_core::now_ms() - 2 * 3_600_000);
+        store.insert_task(&task).unwrap();
+        store.set_task_status(&task.id, "missed").unwrap();
+        let row = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(row.status, ka_agent_core::TaskStatus::Missed);
+        assert!(row.status.is_terminal());
+        let now = ka_agent_core::now_ms();
+        assert!(store.due_tasks(now).unwrap().is_empty());
     }
 
     #[test]
@@ -2065,6 +2141,52 @@ mod tests {
         let intents = store.recent_intents(10).unwrap();
         assert_eq!(intents.len(), 2);
         assert!(intents.iter().any(|i| i.status == "failed"));
+    }
+
+    #[test]
+    fn active_intent_by_hash_is_the_idempotency_key() {
+        let store = Store::open_in_memory().unwrap();
+        let now = ka_agent_core::now_ms();
+        let row = IntentRow {
+            id: "int_dup".to_string(),
+            tool: "github_issue_comment".to_string(),
+            args_hash: "cafe01".to_string(),
+            status: "executing".to_string(),
+            external_ref: None,
+            summary: None,
+            created_ms: now,
+            updated_ms: now,
+        };
+        store.insert_intent(&row).unwrap();
+        // Same tool+hash while executing/succeeded: found (refuse retry).
+        let hit = store
+            .active_intent_by_hash("github_issue_comment", "cafe01")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, "int_dup");
+        // Different tool or hash: not found.
+        assert!(
+            store
+                .active_intent_by_hash("github_pull_review", "cafe01")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .active_intent_by_hash("github_issue_comment", "other")
+                .unwrap()
+                .is_none()
+        );
+        // Failed attempts stay retryable.
+        store
+            .update_intent_status("int_dup", "failed", None)
+            .unwrap();
+        assert!(
+            store
+                .active_intent_by_hash("github_issue_comment", "cafe01")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

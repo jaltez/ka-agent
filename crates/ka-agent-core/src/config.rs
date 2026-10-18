@@ -101,7 +101,10 @@ impl Telegram {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonConfig {
-    /// The single workspace directory every engine runs in (MVP).
+    /// The single workspace directory every engine runs in (MVP). The
+    /// default lives under the default data root — a relative default
+    /// would silently create `ka-agent-workspace/` wherever the operator
+    /// happened to stand.
     pub workspace: PathBuf,
     /// Default ka model selector for new sessions.
     pub model: Option<String>,
@@ -111,6 +114,11 @@ pub struct DaemonConfig {
     pub approval_ttl_secs: u64,
     /// Grace after `/stop` before SIGTERM/SIGKILL escalation.
     pub turn_grace_secs: u64,
+    /// Stop an engine worker after this many idle seconds (no live turn,
+    /// no pending ask) to release its process; the next message restarts
+    /// it and resumes the strand. `0` keeps the worker forever. A resident
+    /// daemon that answers once a day should not pay 24/7 for it.
+    pub worker_idle_timeout_secs: u64,
     #[serde(rename = "worker_restart")]
     pub worker_restart: WorkerRestart,
     pub budgets: Budgets,
@@ -124,11 +132,12 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            workspace: PathBuf::from("ka-agent-workspace"),
+            workspace: PathBuf::from("~/.local/share/ka-agent/workspace"),
             model: None,
             mode: "guarded".to_string(),
             approval_ttl_secs: 900,
             turn_grace_secs: 10,
+            worker_idle_timeout_secs: 900,
             worker_restart: WorkerRestart::default(),
             budgets: Budgets::default(),
             ka: Ka::default(),
@@ -167,6 +176,13 @@ impl DaemonConfig {
         }
         if self.turn_grace_secs == 0 || self.turn_grace_secs > 600 {
             return Err(Error::Validate("turn_grace_secs must be in 1..=600".into()));
+        }
+        // 0 disables the idle reap; anything set is capped at a week so a
+        // typo cannot silently disable it forever.
+        if self.worker_idle_timeout_secs > 7 * 86_400 {
+            return Err(Error::Validate(
+                "worker_idle_timeout_secs must be 0 (off) or at most one week".into(),
+            ));
         }
         if self.workspace.as_os_str().is_empty() {
             return Err(Error::Validate("workspace must not be empty".into()));
@@ -307,5 +323,20 @@ allow_user_ids = [12345]
         assert_eq!(cfg.budgets.daily_usd, Some(5.0));
         assert_eq!(cfg.telegram.allow_user_ids, vec![12345]);
         assert!(cfg.workspace_path().ends_with("ws"));
+    }
+
+    #[test]
+    fn default_workspace_is_absolute_under_the_data_root() {
+        // A relative default would create the workspace wherever the
+        // operator happened to stand (`ka-agent-workspace/` litter).
+        let ws = DaemonConfig::default().workspace_path();
+        assert!(
+            ws.is_absolute(),
+            "default workspace must be absolute: {ws:?}"
+        );
+        assert!(
+            ws.ends_with("ka-agent/workspace"),
+            "default workspace lives under the data root: {ws:?}"
+        );
     }
 }

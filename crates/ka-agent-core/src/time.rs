@@ -25,6 +25,23 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     (ms <= MAX_DURATION_MS).then_some(ms)
 }
 
+/// Render a duration compactly (`1h`, `30m`, `2d`, `45s`) — the operator
+/// format for lateness and TTLs. Truncates to the largest unit that fits
+/// (a 2h-and-3ms lateness still reads `2h`); never negative.
+pub fn fmt_interval(ms: i64) -> String {
+    let ms = ms.max(0);
+    if ms >= 86_400_000 {
+        return format!("{}d", ms / 86_400_000);
+    }
+    if ms >= 3_600_000 {
+        return format!("{}h", ms / 3_600_000);
+    }
+    if ms >= 60_000 {
+        return format!("{}m", ms / 60_000);
+    }
+    format!("{}s", ms / 1000)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -53,5 +70,15 @@ mod tests {
         assert_eq!(parse_duration("367d"), None);
         assert_eq!(parse_duration("9223372036854775s"), None);
         assert_eq!(parse_duration("366d"), Some(MAX_DURATION_MS));
+    }
+
+    #[test]
+    fn intervals_render_compactly() {
+        assert_eq!(fmt_interval(3_600_000), "1h");
+        assert_eq!(fmt_interval(1_800_000), "30m");
+        assert_eq!(fmt_interval(45_000), "45s");
+        assert_eq!(fmt_interval(86_400_000), "1d");
+        // Non-multiples fall to the smaller unit, truncated.
+        assert_eq!(fmt_interval(90_000), "1m");
     }
 }

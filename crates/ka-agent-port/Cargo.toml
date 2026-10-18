@@ -12,9 +12,9 @@ ka-protocol = { workspace = true }
 ka-engine = { workspace = true }
 ka-dialect = { workspace = true }
 # Strand-path resolution for the resume records (docs/contract/worker-protocol.md
-# `Strand.path`). Same exact revision pin as the other Ka crates — see the
+# `Strand.path`). Same exact-version pin as the other Ka crates — see the
 # workspace manifest note.
-ka-strand = { git = "file:///home/javier/projects/ka-harness", rev = "a56aae2d1b3a4c31c4910979e1033002eacc53a0" }
+ka-strand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

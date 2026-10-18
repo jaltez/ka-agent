@@ -94,6 +94,7 @@ fn short_id(id: &str, n: usize) -> String {
 pub(crate) struct TelegramClient {
     http: reqwest::Client,
     base: String,
+    download_base: String,
 }
 
 impl TelegramClient {
@@ -101,6 +102,7 @@ impl TelegramClient {
         Self {
             http: reqwest::Client::new(),
             base: format!("{api_base}/bot{token}"),
+            download_base: format!("{api_base}/file/bot{token}"),
         }
     }
 
@@ -192,6 +194,59 @@ impl TelegramClient {
         )
         .await
         .map(|_| ())
+    }
+
+    pub(crate) async fn set_my_commands(&self) -> Result<Value, ChannelError> {
+        self.call(
+            "setMyCommands",
+            json!({
+                "commands": [
+                    {"command": "help",    "description": "what the assistant can do"},
+                    {"command": "status",  "description": "session, strand, budget"},
+                    {"command": "new",     "description": "start a fresh session"},
+                    {"command": "stop",    "description": "abort the running turn"},
+                    {"command": "resume",  "description": "lift a pause (budget, auth)"},
+                    {"command": "remember","description": "save a fact to memory"},
+                    {"command": "forget",  "description": "remove a memory entry"},
+                    {"command": "memory",  "description": "memory report / review"},
+                    {"command": "history", "description": "search past turns"},
+                    {"command": "remind",  "description": "schedule a reminder"},
+                    {"command": "cron",    "description": "list / add scheduled jobs"},
+                    {"command": "calendar","description": "daily calendar digest"},
+                    {"command": "y",       "description": "approve the pending approval"},
+                    {"command": "n",       "description": "deny the pending approval"},
+                ]
+            }),
+        )
+        .await
+    }
+    /// `getFile`: resolve a file_id to the API-relative `file_path`.
+    pub(crate) async fn get_file(&self, file_id: &str) -> Result<String, ChannelError> {
+        let result = self.call("getFile", json!({ "file_id": file_id })).await?;
+        result["file_path"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| ChannelError::api("getFile: no file_path"))
+    }
+
+    /// Download one file by its API-relative path. Bot API downloads cap
+    /// at 20 MB; anything bigger is refused before it is written anywhere.
+    pub(crate) async fn download_file(&self, file_path: &str) -> Result<Vec<u8>, ChannelError> {
+        const MAX: usize = 20 * 1024 * 1024;
+        let resp = self
+            .http
+            .get(format!("{}/{file_path}", self.download_base))
+            .timeout(POLL_HTTP_TIMEOUT)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(ChannelError::api("download failed"));
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() > MAX {
+            return Err(ChannelError::api("file exceeds the 20 MB download cap"));
+        }
+        Ok(bytes.to_vec())
     }
 }
 
@@ -460,9 +515,10 @@ impl Surface for TelegramSurface {
                 text.push_str(&head.join("\n"));
             }
         }
-        let mins = card.expires_at_ms / 60_000;
-        let local = mins.rem_euclid(24 * 60);
-        text.push_str(&format!("\n\nexpires {:02}:{:02}", local / 60, local % 60));
+        text.push_str(&format!(
+            "\n\nexpires in {}",
+            crate::commands::fmt_interval(card.expires_at_ms - now_ms())
+        ));
         let first_line = card.question.lines().next().unwrap_or("").to_string();
         let markup = json!({
             "inline_keyboard": [
@@ -597,6 +653,12 @@ impl TelegramChannel {
             }
             eprintln!("telegram: getMe: {e}");
         }
+        // Register the command list so Telegram clients autocomplete the
+        // router's vocabulary. Best-effort: a fake or restricted API that
+        // refuses it must not disable the channel.
+        if let Err(e) = client.set_my_commands().await {
+            eprintln!("telegram: setMyCommands: {e} (continuing)");
+        }
 
         let mut backoff_secs = 1u64;
         loop {
@@ -726,9 +788,11 @@ impl TelegramChannel {
         let client = surface.client.clone();
 
         if message.get("photo").is_some() || message.get("document").is_some() {
-            let _ = client
-                .send_message(chat_id, "file uploads arrive in the next milestone", None)
-                .await;
+            let reply = match self.save_attachment(&client, message).await {
+                Ok(rel) => format!("saved {rel} — reference it with @{rel} in your next message"),
+                Err(e) => format!("! [attachment] {e}"),
+            };
+            let _ = client.send_message(chat_id, &reply, None).await;
             return;
         }
 
@@ -847,6 +911,90 @@ impl TelegramChannel {
             }
         }
     }
+
+    /// File inbox (SEED.md §5.4): download the message's largest photo or
+    /// its document into `<workspace>/attachments/` and return the
+    /// workspace-relative path. `@reference` expansion resolves against
+    /// the workspace, so the operator's next message can use the file by
+    /// pasting the returned `@attachments/…` token.
+    async fn save_attachment(
+        &self,
+        client: &TelegramClient,
+        message: &Value,
+    ) -> Result<String, String> {
+        // Photos arrive as size-ascending variants; the last is the best.
+        let (file_id, name): (String, String) = if let Some(sizes) = message["photo"].as_array() {
+            let best = sizes
+                .iter()
+                .filter_map(|p| p["file_id"].as_str())
+                .next_back()
+                .unwrap_or("");
+            if best.is_empty() {
+                return Err("photo without a file_id".into());
+            }
+            (best.to_string(), format!("photo-{}.jpg", short_id(best, 8)))
+        } else if let Some(doc) = message["document"].as_object() {
+            let file_id = doc
+                .get("file_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if file_id.is_empty() {
+                return Err("document without a file_id".into());
+            }
+            let raw = doc.get("file_name").and_then(Value::as_str).unwrap_or("");
+            let name = sanitize_attachment_name(raw)
+                .unwrap_or_else(|| format!("doc-{}.bin", short_id(&file_id, 8)));
+            (file_id, name)
+        } else {
+            return Err("message carries no photo or document".into());
+        };
+        let file_path = client.get_file(&file_id).await.map_err(|e| e.to_string())?;
+        let bytes = client
+            .download_file(&file_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        let dir = self.runtime.workspace().join("attachments");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Collisions never overwrite: first free `-N` suffix wins.
+        let mut path = dir.join(&name);
+        let mut n = 1;
+        while path.exists() {
+            n += 1;
+            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+            let ext = name.rsplit_once('.').map_or("", |(_, e)| e);
+            let candidate = if ext.is_empty() {
+                format!("{stem}-{n}")
+            } else {
+                format!("{stem}-{n}.{ext}")
+            };
+            path = dir.join(candidate);
+        }
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        path.strip_prefix(self.runtime.workspace())
+            .map(|p| p.display().to_string())
+            .map_err(|_| "attachment escaped the workspace".to_string())
+    }
+}
+
+/// `[A-Za-z0-9._-]` only, no leading dot, ≤ 64 chars, never empty.
+fn sanitize_attachment_name(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    while out.contains("..") {
+        out = out.replace("..", ".");
+    }
+    let trimmed: String = out.chars().take(64).collect();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 #[cfg(test)]

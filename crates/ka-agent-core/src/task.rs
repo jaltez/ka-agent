@@ -20,6 +20,9 @@ pub enum TaskStatus {
     /// A side effect may or may not have happened; never auto-retried
     /// (SEED.md §7.3).
     Unknown,
+    /// A scheduled fire that sat overdue beyond the late-grace window
+    /// (SEED.md §7.2): recorded, reported, never fired.
+    Missed,
 }
 
 impl TaskStatus {
@@ -31,6 +34,7 @@ impl TaskStatus {
                 | TaskStatus::Cancelled
                 | TaskStatus::Interrupted
                 | TaskStatus::Unknown
+                | TaskStatus::Missed
         )
     }
 
@@ -55,7 +59,8 @@ impl TaskStatus {
                 | (Unknown, Queued)
                 | (Interrupted, Cancelled)
                 | (Unknown, Cancelled)
-                | (Failed, Queued)
+            | (Failed, Queued)
+            | (Running, Missed)
         )
     }
 

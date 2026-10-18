@@ -83,9 +83,9 @@ fn doctor_reports_pin_contract_state_and_backup() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("ka pin : rev a56aae2"), "pin line: {text}");
+    assert!(text.contains("ka pin : 0.3.0"), "pin line: {text}");
     assert!(
-        text.contains("contract suite: ") && text.contains("(10 documents)"),
+        text.contains("contract suite: ") && text.contains("(13 documents)"),
         "contract hash: {text}"
     );
     assert!(text.contains("identities: 1 linked"), "{text}");
@@ -153,12 +153,7 @@ fn restart_stops_the_daemon_gracefully() {
     };
     wait_admin_socket(&data, Duration::from_secs(15));
 
-    let out = ka(&data)
-        .arg("restart")
-        .arg("--config")
-        .arg(&cfg)
-        .output()
-        .unwrap();
+    let out = ka(&data).arg("restart").output().unwrap();
     assert!(
         out.status.success(),
         "restart: {}",
@@ -508,12 +503,7 @@ fn restore_works_after_a_clean_stop() {
     wait_admin_socket(&data, Duration::from_secs(15));
     let sock = data.join("admin.sock");
     assert!(sock.exists(), "socket should exist while running");
-    let out = ka(&data)
-        .arg("restart")
-        .arg("--config")
-        .arg(&cfg)
-        .output()
-        .unwrap();
+    let out = ka(&data).arg("restart").output().unwrap();
     assert!(out.status.success());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
