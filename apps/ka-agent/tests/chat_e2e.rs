@@ -615,21 +615,33 @@ fn no_model_preflight_refuses_with_the_fix() {
         .env_remove("KA_MODEL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"hi\n/quit\n")
-        .unwrap();
+    // No /quit: it would race the refusal out of the event stream. EOF
+    // makes the client wait for the (already idle) session, draining the
+    // refusal first — the same ordering piped scripts rely on.
+    child.stdin.take().unwrap().write_all(b"hi\n").unwrap();
     let mut out = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
-    let _ = child.wait();
+    let mut err = String::new();
+    let (mut so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let (t1, t2) = (
+        std::thread::spawn(move || {
+            std::io::Read::read_to_string(&mut so, &mut out).unwrap();
+            out
+        }),
+        std::thread::spawn(move || {
+            std::io::Read::read_to_string(&mut se, &mut err).unwrap();
+            err
+        }),
+    );
+    let out = t1.join().unwrap();
+    let err = t2.join().unwrap();
+    let status = child.wait().unwrap();
+    eprintln!("chat exit: {status:?}");
     assert!(
         out.contains("no model configured — run"),
-        "preflight refusal missing:\n{out}"
+        "preflight refusal missing (exit {status:?}, stderr:\n{err})\nstdout:\n{out}"
     );
     assert!(
         !out.contains("no model configured)"),

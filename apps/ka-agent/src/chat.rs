@@ -133,6 +133,17 @@ impl Backend {
     async fn next(&mut self) -> Incoming {
         match self {
             Self::Local { rx, pending, .. } => {
+                // Real events first: a synthesized reply must never jump
+                // ahead of bus events broadcast before it (an EOF-time
+                // status answer, in particular).
+                match rx.try_recv() {
+                    Ok(ev) => return Incoming::Event(Box::new(ev)),
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        return Incoming::Lagged(n);
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => return Incoming::Closed,
+                    Err(broadcast::error::TryRecvError::Empty) => {}
+                }
                 if let Some(ev) = pending.pop_front() {
                     return Incoming::Event(Box::new(ev));
                 }

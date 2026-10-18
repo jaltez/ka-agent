@@ -169,6 +169,8 @@ struct Ctx {
     exe: PathBuf,
     root: PathBuf,
     config: PathBuf,
+    /// systemd only: `ReadWritePaths`. launchd needs no sandbox exceptions.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     workspace: PathBuf,
 }
 
