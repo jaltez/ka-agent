@@ -71,22 +71,33 @@ impl Drop for Daemon {
 }
 
 fn spawn_daemon(root: &std::path::Path) -> Daemon {
+    spawn_daemon_with(root, None)
+}
+
+fn write_config(root: &std::path::Path) -> std::path::PathBuf {
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let cfg = root.join("ka-agent.toml");
     std::fs::write(
         &cfg,
         format!(
-            "workspace = {:?}\nmode = \"guarded\"\nturn_grace_secs = 5\n",
+            "workspace = {:?}\nmode = \"guarded\"\nturn_grace_secs = 5\n[web]\nenabled = false\n",
             ws.display().to_string()
         ),
     )
     .unwrap();
+    cfg
+}
+
+fn spawn_daemon_with(root: &std::path::Path, scenario: Option<&std::path::Path>) -> Daemon {
+    let cfg = write_config(root);
     let data = root.join("data");
-    let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
-        .arg("run")
-        .arg("--config")
-        .arg(&cfg)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ka-agent"));
+    cmd.arg("run").arg("--config").arg(&cfg);
+    if let Some(sc) = scenario {
+        cmd.arg("--scenario").arg(sc);
+    }
+    let child = cmd
         .env("KA_AGENT_DATA_DIR", &data)
         .env_remove("KA_MODEL")
         .stdout(Stdio::null())
@@ -122,10 +133,11 @@ fn admin_socket_status_and_clean_sigterm() {
 
     let v = status_over(&daemon.sock());
     assert_eq!(v["ok"], serde_json::json!(true));
-    assert!(v["session"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(v["status"].as_str().is_some_and(|s| !s.is_empty()));
-    assert!(v["queue"].is_u64());
-    assert!(v["crashes"].is_u64());
+    let report = &v["report"];
+    assert!(report["session_id"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(report["status"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(report["queue"].is_u64());
+    assert!(report["crashes"].is_u64());
 
     // Unknown op → error.
     let mut stream = std::os::unix::net::UnixStream::connect(daemon.sock()).unwrap();
@@ -136,6 +148,107 @@ fn admin_socket_status_and_clean_sigterm() {
     assert_eq!(v["error"], serde_json::json!("unknown op"));
 
     // SIGTERM → exit 0.
+    daemon.sigterm_wait(Duration::from_secs(10));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// One runtime per data root: a second `ka-agent run` on the same root is
+/// refused (exit 1) and the first daemon keeps its admin socket.
+#[test]
+fn second_daemon_on_the_same_root_is_refused() {
+    let root = temp_root("single");
+    let mut daemon = spawn_daemon(&root);
+    daemon.wait_sock(Duration::from_secs(10));
+    let cfg = root.join("ka-agent.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("run")
+        .arg("--config")
+        .arg(&cfg)
+        .env("KA_AGENT_DATA_DIR", &daemon.data)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "second daemon must exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("another Ka Agent is already running"),
+        "stderr: {stderr}"
+    );
+    let v = status_over(&daemon.sock());
+    assert_eq!(
+        v["ok"],
+        serde_json::json!(true),
+        "first daemon still answers"
+    );
+    daemon.sigterm_wait(Duration::from_secs(10));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `ka-agent chat` while the daemon runs attaches to it: piped input is
+/// answered by the daemon's session, the client leaves by itself once the
+/// session is idle, and nothing is reconciled as interrupted.
+#[test]
+fn chat_attaches_to_the_running_daemon() {
+    let root = temp_root("attach");
+    let sc = root.join("attach.json");
+    std::fs::write(
+        &sc,
+        r#"{ "steps": [ {"text": "attach-ok"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 7 }"#,
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon_with(&root, Some(&sc));
+    daemon.wait_sock(Duration::from_secs(10));
+    let cfg = root.join("ka-agent.toml");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("chat")
+        .arg("--config")
+        .arg(&cfg)
+        .env("KA_AGENT_DATA_DIR", &daemon.data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\n/status\n")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attached chat did not exit by itself"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+    assert!(status.success(), "exit {status:?}; output:\n{out}");
+    for needle in [
+        "connected to the background service",
+        "attach-ok",
+        "queue 0",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+    }
+    let v = status_over(&daemon.sock());
+    assert_eq!(v["report"]["status"], serde_json::json!("Idle"), "{v}");
+    let db = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
+    let interrupted: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE status = 'interrupted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        interrupted, 0,
+        "the daemon's turn must not be reconciled away"
+    );
     daemon.sigterm_wait(Duration::from_secs(10));
     std::fs::remove_dir_all(&root).ok();
 }

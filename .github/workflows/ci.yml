@@ -34,3 +34,41 @@ jobs:
         run: cargo build --workspace --quiet
       - name: Tests
         run: cargo test --workspace --quiet
+
+  ci-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Ka dependency boundary gate
+        run: ./scripts/check-ka-deps.sh
+
+      # bubblewrap is Linux-only: plugin e2e and /proc probes are gated out.
+      - name: Tests
+        run: cargo test --workspace --quiet
+
+  # Windows is a goal, not a supported platform yet: the library crates
+  # build, but the binary still needs a named-pipe admin transport (the
+  # daemon/chat/status path is Unix-socket based). Keep the state visible
+  # without failing CI.
+  windows-check:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - name: Library crates compile for Windows
+        run: cargo check --workspace --exclude ka-agent --target x86_64-pc-windows-msvc

@@ -8,9 +8,11 @@
 //! - Tampered installed files disable the plugin; an unsigned archive is
 //!   refused.
 //!
-//! Requires bubblewrap (`apt install bubblewrap`); CI installs it.
+//! Requires bubblewrap (`apt install bubblewrap`); CI installs it. The
+//! whole module is Linux-only: the sandbox has no other implementation yet.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};

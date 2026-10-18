@@ -271,13 +271,14 @@ fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "cron_manage".into(),
-            description: "Manage ka-agent cron jobs: schedule prompts to run later (one-shot 'in') or on a fixed interval ('every'), and list/pause/resume/remove/trigger existing jobs. A scheduled prompt runs as a normal operator turn through the approval flow.".into(),
+            description: "Manage ka-agent cron jobs: schedule prompts to run later (one-shot 'in' or 'at') or on a fixed interval ('every'), and list/pause/resume/remove/trigger existing jobs. A scheduled prompt runs as a normal operator turn through the approval flow. Use 'at' with the operator's UTC offset for clock times.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["schedule", "list", "pause", "resume", "remove", "trigger"]},
                     "text": {"type": "string", "description": "schedule: the prompt to run"},
                     "in": {"type": "string", "description": "schedule: one-shot delay, Ns/Nm/Nh/Nd"},
+                    "at": {"type": "string", "description": "schedule: one-shot absolute time, RFC 3339 with offset (e.g. 2026-10-20T09:00:00+02:00)"},
                     "every": {"type": "string", "description": "schedule: recurring interval, Ns/Nm/Nh/Nd"},
                     "id": {"type": "string", "description": "pause/resume/remove/trigger: job id or id prefix"}
                 },
@@ -366,16 +367,16 @@ fn handle_tool_call(
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "md") {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            for (i, line) in content.lines().enumerate() {
-                                if line.to_lowercase().contains(&lower) {
-                                    let fname =
-                                        path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                                    hits.push(format!("{fname}:{i}: {line}"));
-                                    if hits.len() >= 20 {
-                                        break;
-                                    }
+                    if path.extension().is_some_and(|e| e == "md")
+                        && let Ok(content) = std::fs::read_to_string(&path)
+                    {
+                        for (i, line) in content.lines().enumerate() {
+                            if line.to_lowercase().contains(&lower) {
+                                let fname =
+                                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                                hits.push(format!("{fname}:{i}: {line}"));
+                                if hits.len() >= 20 {
+                                    break;
                                 }
                             }
                         }
@@ -602,16 +603,31 @@ fn handle_tool_call(
                     }
                     let every = args["every"].as_str();
                     let once = args["in"].as_str();
-                    let (recurrence_ms, delay) = match (every, once) {
-                        (Some(d), None) | (None, Some(d)) => {
+                    let at = args["at"].as_str();
+                    let (recurrence_ms, first_at_ms) = match (every, once, at) {
+                        (Some(d), None, None) => {
                             let ms = ka_agent_core::parse_duration(d).ok_or_else(|| {
                                 format!("bad duration {d:?}; use Ns, Nm, Nh or Nd")
                             })?;
-                            (every.map(|_| ms as i64), ms as i64)
+                            (Some(ms as i64), ka_agent_core::now_ms() + ms as i64)
+                        }
+                        (None, Some(d), None) => {
+                            let ms = ka_agent_core::parse_duration(d).ok_or_else(|| {
+                                format!("bad duration {d:?}; use Ns, Nm, Nh or Nd")
+                            })?;
+                            (None, ka_agent_core::now_ms() + ms as i64)
+                        }
+                        (None, None, Some(rfc3339)) => {
+                            let ts: jiff::Timestamp = rfc3339.parse()
+                                .map_err(|e| format!("bad 'at' {rfc3339:?}: {e} (use RFC 3339 with offset, e.g. 2026-10-20T09:00:00+02:00)"))?;
+                            if ts.as_millisecond() <= ka_agent_core::now_ms() {
+                                return Err("'at' is in the past".into());
+                            }
+                            (None, ts.as_millisecond())
                         }
                         _ => {
                             return Err(
-                                "give exactly one of 'in' (one-shot) or 'every' (recurring)".into(),
+                                "give exactly one of 'in' (one-shot), 'every' (recurring) or 'at' (absolute RFC 3339)".into(),
                             );
                         }
                     };
@@ -620,9 +636,11 @@ fn handle_tool_call(
                         source: "kagent".into(),
                         recurrence_ms,
                         mode: ka_agent_core::CronMode::Agent,
+                        at_local: None,
+                        weekday: None,
                     };
                     let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
-                    task.scheduled_at_ms = Some(ka_agent_core::now_ms() + delay);
+                    task.scheduled_at_ms = Some(first_at_ms);
                     task.payload = Some(spec.to_payload());
                     store
                         .insert_task(&task)
@@ -641,7 +659,8 @@ fn handle_tool_call(
                     Ok(if crons.is_empty() {
                         "no crons".to_string()
                     } else {
-                        crate::commands::cron_list_text(&crons)
+                        let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system());
+                        crate::commands::cron_list_text(&crons, &now)
                     })
                 }
                 "pause" | "resume" | "remove" | "trigger" => {
@@ -755,10 +774,10 @@ fn ensure_not_duplicate(
 /// sanitizer strips credential-shaped variables, so the file tier is the
 /// durable path (F13).
 fn github_token() -> Result<String, String> {
-    if let Ok(t) = std::env::var("KA_AGENT_GITHUB_TOKEN") {
-        if !t.trim().is_empty() {
-            return Ok(t);
-        }
+    if let Ok(t) = std::env::var("KA_AGENT_GITHUB_TOKEN")
+        && !t.trim().is_empty()
+    {
+        return Ok(t);
     }
     let root = data_root().map_err(|e| e.to_string())?;
     let path = root.join("secrets/github.token");

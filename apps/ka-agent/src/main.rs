@@ -2,15 +2,23 @@
 //! socket, the local chat surface, first-run setup, ops commands, and the
 //! hidden `__worker` / `__mcp` subcommands the runtime and engine supervise.
 
+mod admin;
 mod chat;
+mod config_cli;
 mod daemon;
+mod dashboard;
 mod doctor;
 mod grant;
 mod identity;
 mod memory_cli;
+mod model_cli;
 mod ops;
+mod pair;
 mod plugin_cli;
+mod prompt;
+mod service;
 mod setup;
+use service::ServiceAction;
 mod skills_cli;
 
 use std::path::PathBuf;
@@ -24,20 +32,43 @@ use clap::{Parser, Subcommand};
     about = "Ka Agent — resident assistant on the Ka engine"
 )]
 struct Cli {
+    /// No subcommand: open the chat (or first-run setup on a fresh install).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// First-run setup: write a starter config and prepare the data root.
-    Init {
+    /// First-run wizard: provider, live key check, model, timezone,
+    /// channels, service, and a verified first reply.
+    #[command(visible_alias = "init")]
+    Setup {
+        /// Section: all | model | telegram | matrix | service.
+        section: Option<String>,
         /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
         #[arg(short, long)]
         config: Option<PathBuf>,
-        /// Workspace directory for engines (default: <data>/workspace).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Exact model selector (provider/model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Read the API key from stdin's first line.
+        #[arg(long)]
+        key_stdin: bool,
+        #[arg(long)]
+        timezone: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Non-interactive: every prompt takes its default.
+        #[arg(long)]
+        yes: bool,
+        /// Skip the live credential check.
+        #[arg(long)]
+        no_verify: bool,
+        /// Do not offer the background service.
+        #[arg(long)]
+        no_service: bool,
     },
     /// Local chat surface over the runtime.
     Chat {
@@ -62,10 +93,56 @@ enum Command {
         #[arg(long)]
         web_port: Option<u16>,
     },
-    /// Ask a running daemon to exit gracefully (the systemd unit restarts it).
+    /// Ask a running daemon to exit gracefully (the background service
+    /// restarts it).
     Restart,
     /// Query a running daemon over its admin socket.
     Status,
+    /// Issue a one-time pairing code for a channel (`ka-agent pair telegram`).
+    Pair {
+        /// telegram | matrix
+        channel: String,
+        /// Config path.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Show or switch the model (`ka-agent model provider/model`).
+    Model {
+        /// Omit to show the current model and its key state.
+        selector: Option<String>,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// List models per provider.
+    Models {
+        /// Omit for every provider.
+        provider: Option<String>,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Inspect or change the config (format-preserving, live reload).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Install, start, stop or remove the background service; `ka-agent logs`.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Show the daemon log (`-f` to follow).
+    Logs {
+        /// Follow the log like `tail -f`.
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
     /// Link channel identities to this instance's operator (SEED.md §8.1).
     Identity {
         #[command(subcommand)]
@@ -96,16 +173,21 @@ enum Command {
         #[command(subcommand)]
         action: SkillsAction,
     },
-    /// Generate a one-shot auth URL for the web UI (M7).
-    WebToken {
-        /// Port the web server listens on (must match `run --web-port`).
-        #[arg(long, default_value_t = 8480)]
-        port: u16,
+    /// Open the web control panel in your browser (one-shot login link).
+    Dashboard {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Print the login URL without opening a browser.
+        #[arg(long)]
+        no_open: bool,
     },
     /// Instance health report.
     Doctor {
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Also check the provider key and channel tokens live.
+        #[arg(long)]
+        online: bool,
     },
     /// Hidden: the supervised worker process (spawned by the runtime).
     #[command(name = "__worker", hide = true)]
@@ -124,8 +206,11 @@ enum Command {
     },
     /// Write a restorable backup (state + memory + notes + config).
     Backup {
-        /// Output directory (created; must not already exist).
-        out: PathBuf,
+        /// Output directory (default: <data>/backups/<timestamp>, pruned).
+        out: Option<PathBuf>,
+        /// Backups to keep when pruning the default directory.
+        #[arg(long, default_value_t = 7)]
+        keep: usize,
         /// Config path (copied into the backup).
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -148,6 +233,25 @@ enum Command {
         /// Skip confirmation prompt.
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ConfigAction {
+    /// Print the config file's absolute path.
+    Path,
+    /// Print the config file verbatim.
+    Show,
+    /// Print one value (`ka-agent config get budgets.daily_usd`).
+    Get { key: String },
+    /// Set one value (dotted key; arrays are edited with `config edit`).
+    Set { key: String, value: String },
+    /// Remove one value (default applies again).
+    Unset { key: String },
+    /// Open $EDITOR on a validated copy.
+    Edit {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -216,6 +320,8 @@ enum IdentityAction {
         /// The address to unlink.
         address: String,
     },
+    /// Unknown contacts that messaged the bot, with the link command.
+    Pending,
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -277,6 +383,8 @@ enum SkillsAction {
     },
 }
 
+use clap::CommandFactory as _;
+
 fn config_path(flag: &Option<PathBuf>) -> PathBuf {
     flag.clone().unwrap_or_else(|| {
         if let Some(p) = std::env::var_os("KA_AGENT_CONFIG") {
@@ -294,7 +402,37 @@ fn config_path(flag: &Option<PathBuf>) -> PathBuf {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    let command = match cli.command {
+        // Plain `ka-agent`: chat when configured; first-run setup otherwise
+        // (interactive terminals only — a pipe gets help, not a wizard).
+        None => {
+            let config = config_path(&None);
+            if config.exists() {
+                Command::Chat {
+                    config: None,
+                    scenario: None,
+                }
+            } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                Command::Setup {
+                    section: None,
+                    config: None,
+                    provider: None,
+                    model: None,
+                    key_stdin: false,
+                    timezone: None,
+                    workspace: None,
+                    yes: false,
+                    no_verify: false,
+                    no_service: false,
+                }
+            } else {
+                Cli::command().print_help().ok();
+                return std::process::ExitCode::from(2);
+            }
+        }
+        Some(c) => c,
+    };
+    match command {
         // The worker builds its own current-thread runtime inside
         // `run_worker`; it must not run inside another tokio runtime.
         Command::Worker { scenario } => {
@@ -313,7 +451,54 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         },
-        Command::Init { config, workspace } => setup::init(config, workspace),
+        Command::Setup {
+            section,
+            config,
+            provider,
+            model,
+            key_stdin,
+            timezone,
+            workspace,
+            yes,
+            no_verify,
+            no_service,
+        } => {
+            let section = match section.as_deref() {
+                None | Some("all") => setup::Section::All,
+                Some("model") => setup::Section::Model,
+                Some("telegram") => setup::Section::Telegram,
+                Some("matrix") => setup::Section::Matrix,
+                Some("service") => setup::Section::Service,
+                Some(other) => {
+                    eprintln!(
+                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            // Prompts block on stdin; a current-thread runtime is enough and
+            // keeps the key check (async) simple.
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("ka-agent: cannot build async runtime");
+                return std::process::ExitCode::FAILURE;
+            };
+            let args = setup::SetupArgs {
+                section,
+                provider,
+                model,
+                key_stdin,
+                timezone,
+                workspace,
+                yes,
+                no_verify,
+                no_service,
+                config: config_path(&config),
+            };
+            rt.block_on(setup::run(args))
+        }
         Command::Chat { config, scenario } => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -340,18 +525,74 @@ fn main() -> std::process::ExitCode {
         }
         Command::Restart => daemon::restart_client(),
         Command::Status => daemon::status_client(),
+        Command::Pair { channel, config } => pair::pair(channel, config_path(&config)),
+        Command::Model { selector, config } => {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("ka-agent: cannot build async runtime");
+                return std::process::ExitCode::FAILURE;
+            };
+            rt.block_on(model_cli::model(model_cli::ModelArgs {
+                selector,
+                config: config_path(&config),
+            }))
+        }
+        Command::Models {
+            provider,
+            config: _,
+        } => model_cli::models(provider),
+        Command::Config { action, config } => match action {
+            ConfigAction::Path => {
+                config_cli::config(config_cli::ConfigCommand::Path, config_path(&config))
+            }
+            ConfigAction::Show => {
+                config_cli::config(config_cli::ConfigCommand::Show, config_path(&config))
+            }
+            ConfigAction::Get { key } => {
+                config_cli::config(config_cli::ConfigCommand::Get { key }, config_path(&config))
+            }
+            ConfigAction::Set { key, value } => config_cli::config(
+                config_cli::ConfigCommand::Set { key, value },
+                config_path(&config),
+            ),
+            ConfigAction::Unset { key } => config_cli::config(
+                config_cli::ConfigCommand::Unset { key },
+                config_path(&config),
+            ),
+            ConfigAction::Edit { config: cfg2 } => config_cli::config(
+                config_cli::ConfigCommand::Edit,
+                config_path(&cfg2.or(config)),
+            ),
+        },
+        Command::Service { action, config } => {
+            service::service_action(action, config_path(&config))
+        }
+        Command::Logs { follow, lines } => service::logs(follow, lines),
         Command::Grant { action } => grant::grant_action(action),
-        Command::Backup { out, config } => ops::backup_to(out, config_path(&config)),
+        Command::Backup { out, keep, config } => ops::backup_to(out, keep, config_path(&config)),
         Command::Restore { dir, force } => ops::restore_from(dir, force),
         Command::Export { out } => ops::export(&out),
         Command::Purge { confirm } => ops::purge(confirm),
         Command::Identity { action } => identity::identity_action(action),
         Command::Plugin { action } => plugin_cli::plugin_action(action),
-        Command::Key { action } => setup::key_action(action),
+        Command::Key { action } => {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("ka-agent: cannot build async runtime");
+                return std::process::ExitCode::FAILURE;
+            };
+            rt.block_on(setup::key_action(action))
+        }
         Command::Secret { action } => setup::secret_action(action),
         Command::Memory { action } => memory_cli::memory_action(action),
         Command::Skills { action } => skills_cli::skills_action(action),
-        Command::WebToken { port } => ops::web_token(port),
-        Command::Doctor { config } => doctor::doctor(config_path(&config)),
+        Command::Dashboard { config, no_open } => {
+            dashboard::dashboard(config_path(&config), no_open)
+        }
+        Command::Doctor { config, online } => doctor::doctor(config_path(&config), online),
     }
 }

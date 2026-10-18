@@ -178,15 +178,15 @@ impl MemoryStore {
         source: &str,
         valid_until: Option<String>,
     ) -> Result<String, Error> {
-        if let MemoryFile::Project(slug) = &file {
-            if !valid_slug(slug) {
-                return Err(Error::BadSlug(slug.clone()));
-            }
+        if let MemoryFile::Project(slug) = &file
+            && !valid_slug(slug)
+        {
+            return Err(Error::BadSlug(slug.clone()));
         }
-        if let Some(v) = &valid_until {
-            if !valid_date(v) {
-                return Err(Error::BadValidUntil(v.clone()));
-            }
+        if let Some(v) = &valid_until
+            && !valid_date(v)
+        {
+            return Err(Error::BadValidUntil(v.clone()));
         }
         let id = ka_agent_core::MemoryId::generate().0;
         let path = self.root.join(file.path());
@@ -223,12 +223,12 @@ impl MemoryStore {
                     pending_bullet = Some(line.to_string());
                     continue;
                 }
-                if let Some(fields) = parse_comment(line) {
-                    if fields.0 == id {
-                        removed = true;
-                        pending_bullet = None; // drop the paired bullet
-                        continue;
-                    }
+                if let Some(fields) = parse_comment(line)
+                    && fields.0 == id
+                {
+                    removed = true;
+                    pending_bullet = None; // drop the paired bullet
+                    continue;
                 }
                 if let Some(b) = pending_bullet.take() {
                     out.push_str(&b);
@@ -272,23 +272,26 @@ impl MemoryStore {
 
     /// Compile and mirror to `<root>/MEMORY.md`.
     pub fn compile(&self, budget_bytes: usize) -> Result<CompileReport, Error> {
-        let (report, text) = self.compile_inner(budget_bytes)?;
+        let (report, text) = self.compile_inner(budget_bytes, "")?;
         std::fs::write(self.root.join("MEMORY.md"), &text)?;
         Ok(report)
     }
 
     /// Compile without writing anything (tests, dry runs).
     pub fn compiled_text(&self, budget_bytes: usize) -> Result<String, Error> {
-        Ok(self.compile_inner(budget_bytes)?.1)
+        Ok(self.compile_inner(budget_bytes, "")?.1)
     }
 
     /// Compile and install to `<engine_config_ka_dir>/MEMORY.md`, creating the dir.
+    /// `preamble` (e.g. the operator's timezone) goes right after the header
+    /// line and counts against the budget; empty means none.
     pub fn install_compiled(
         &self,
         engine_config_ka_dir: &Path,
         budget_bytes: usize,
+        preamble: &str,
     ) -> Result<CompileReport, Error> {
-        let (report, text) = self.compile_inner(budget_bytes)?;
+        let (report, text) = self.compile_inner(budget_bytes, preamble)?;
         std::fs::create_dir_all(engine_config_ka_dir)?;
         std::fs::write(engine_config_ka_dir.join("MEMORY.md"), &text)?;
         Ok(report)
@@ -320,7 +323,17 @@ impl MemoryStore {
     }
 
     // -- internals ---------------------------------------------------------
-    fn compile_inner(&self, budget_bytes: usize) -> Result<(CompileReport, String), Error> {
+    fn compile_inner(
+        &self,
+        budget_bytes: usize,
+        preamble: &str,
+    ) -> Result<(CompileReport, String), Error> {
+        let preamble = preamble.trim();
+        let head = if preamble.is_empty() {
+            format!("{HEADER_LINE}\n")
+        } else {
+            format!("{HEADER_LINE}\n{preamble}\n")
+        };
         struct Sec {
             rel: String,
             bytes: usize,
@@ -348,7 +361,7 @@ impl MemoryStore {
         // Greedy fill in priority order. Returns (text, files, stop index);
         // `stop` is Some at the first file that did not fully fit.
         let build = |budget: usize| -> (String, Vec<FileReport>, Option<usize>) {
-            let mut text = format!("{HEADER_LINE}\n");
+            let mut text = head.clone();
             let mut files = Vec::new();
             for (i, s) in secs.iter().enumerate() {
                 let report = FileReport {
@@ -724,13 +737,22 @@ mod tests {
         let target = root.join("engine-config/ka");
         assert!(!target.exists());
         store
-            .install_compiled(&target, DEFAULT_BUDGET_BYTES)
+            .install_compiled(&target, DEFAULT_BUDGET_BYTES, "")
             .unwrap();
         let installed = std::fs::read_to_string(target.join("MEMORY.md")).unwrap();
         assert_eq!(
             installed,
             store.compiled_text(DEFAULT_BUDGET_BYTES).unwrap()
         );
+
+        // A preamble lands right after the header line and fits the budget.
+        let pre = "Operator timezone: Europe/Madrid (UTC+02:00 now).";
+        let report = store.install_compiled(&target, 200, pre).unwrap();
+        let installed = std::fs::read_to_string(target.join("MEMORY.md")).unwrap();
+        let mut lines = installed.lines();
+        assert_eq!(lines.nth(1), Some(pre));
+        assert!(installed.contains("prefers concise answers"));
+        assert!(report.total_bytes <= 200, "{installed}");
     }
 
     #[test]

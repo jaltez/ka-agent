@@ -54,6 +54,33 @@ string_id!(RunId, "run");
 string_id!(IntentId, "int");
 string_id!(MemoryId, "mem");
 
+/// The operator-facing handle of an id: its last 8 characters. The head of
+/// an id is time-ordered (ids minted seconds apart share it); the tail is
+/// the per-id entropy, so 8 characters of it are unique in practice.
+pub fn short_id(id: &str) -> &str {
+    let start = id.char_indices().rev().nth(7).map(|(i, _)| i).unwrap_or(0);
+    &id[start..]
+}
+
+/// Whether `query` names `id`: the full id, a prefix (with or without the
+/// family prefix such as `mem_`), or a suffix of at least 4 characters —
+/// which is what [`short_id`] shows.
+pub fn id_matches(id: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return false;
+    }
+    if id == q || id.starts_with(q) {
+        return true;
+    }
+    if let Some((_, body)) = id.split_once('_')
+        && body.starts_with(q)
+    {
+        return true;
+    }
+    q.len() >= 4 && id.ends_with(q)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -75,5 +102,17 @@ mod tests {
     fn different_families_never_collide_lexically() {
         assert!(SessionId::generate().0.starts_with("sess_"));
         assert!(ApprovalId::generate().0.starts_with("appr_"));
+    }
+
+    #[test]
+    fn short_ids_are_tails_and_match_back() {
+        let id = "mem_19a3f2b4c1d-03-8f2c11aa4b7e90d1";
+        assert_eq!(short_id(id), "4b7e90d1");
+        assert!(id_matches(id, "4b7e90d1"));
+        assert!(id_matches(id, "mem_19a3"));
+        assert!(id_matches(id, "19a3f2"));
+        assert!(!id_matches(id, "90d"));
+        assert!(!id_matches(id, ""));
+        assert_eq!(short_id("abc"), "abc");
     }
 }

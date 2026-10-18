@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use ka_agent_runtime::paths::Paths;
+use ka_agent_runtime::paths::{InstanceLock, Paths};
 use ka_agent_store::Store;
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for backup manifests (dependency-free).
@@ -30,12 +30,20 @@ fn backup_ts(ms: i64) -> String {
 /// `VACUUM INTO` (consistent even while the daemon writes), the memory repo
 /// (git history included), notes, and the config. Written to a staging dir
 /// and renamed, so a half-written backup is never visible.
-pub fn backup_to(out: PathBuf, config: PathBuf) -> std::process::ExitCode {
+/// `ka-agent backup [OUT] [--keep N]`. No `OUT`: `<root>/backups/<ts>`,
+/// pruned to the newest `keep` (default 7). An explicit `OUT` is never
+/// pruned and must not exist.
+pub fn backup_to(out: Option<PathBuf>, keep: usize, config: PathBuf) -> std::process::ExitCode {
+    let paths = Paths::new(Paths::default_root());
+    let pruned = out.is_none();
+    let out = out.unwrap_or_else(|| {
+        let stamp = backup_ts(ka_agent_core::now_ms()).replace(':', "-");
+        paths.backups().join(stamp)
+    });
     if out.exists() {
         eprintln!("ka-agent: {} already exists", out.display());
         return std::process::ExitCode::FAILURE;
     }
-    let paths = Paths::new(Paths::default_root());
     let store = match Store::open(&paths.state_db()) {
         Ok(s) => s,
         Err(e) => {
@@ -62,11 +70,11 @@ pub fn backup_to(out: PathBuf, config: PathBuf) -> std::process::ExitCode {
             copy_tree(&src, &staging.join(dir), &mut files);
         }
     }
-    if config.exists() {
-        if let Err(e) = std::fs::copy(&config, staging.join("config.toml")) {
-            eprintln!("ka-agent: copy config: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
+    if config.exists()
+        && let Err(e) = std::fs::copy(&config, staging.join("config.toml"))
+    {
+        eprintln!("ka-agent: copy config: {e}");
+        return std::process::ExitCode::FAILURE;
     }
     let manifest = serde_json::json!({
         "version": 1,
@@ -93,6 +101,7 @@ pub fn backup_to(out: PathBuf, config: PathBuf) -> std::process::ExitCode {
         serde_json::to_string(&serde_json::json!({
             "path": out.display().to_string(),
             "at": manifest["at"],
+            "at_ms": ka_agent_core::now_ms(),
         }))
         .unwrap_or_default(),
     );
@@ -101,7 +110,35 @@ pub fn backup_to(out: PathBuf, config: PathBuf) -> std::process::ExitCode {
         out.display(),
         manifest["at"].as_str().unwrap_or("?")
     );
+    if pruned {
+        prune_backups(&paths.backups(), keep.max(1));
+    }
     std::process::ExitCode::SUCCESS
+}
+
+/// Keep the newest `keep` timestamped backup directories. Only names that
+/// look like our `<date>T<time>Z` stamps are pruned; explicit user-chosen
+/// paths elsewhere are untouched.
+fn prune_backups(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut stamps: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.len() == "2026-10-30T18-30-00Z".len()
+                && n.as_bytes()[4] == b'-'
+                && n.as_bytes()[10] == b'T'
+        })
+        .collect();
+    stamps.sort();
+    if stamps.len() > keep {
+        for name in &stamps[..stamps.len() - keep] {
+            let _ = std::fs::remove_dir_all(dir.join(name));
+        }
+    }
 }
 
 /// `ka-agent restore <dir>`: unpack a backup into the data root. Refuses a
@@ -133,21 +170,16 @@ pub fn restore_from(dir: PathBuf, force: bool) -> std::process::ExitCode {
         eprintln!("ka-agent: {}: {e}", root.display());
         return std::process::ExitCode::FAILURE;
     }
-    // A live daemon holds SQLite locks; refuse rather than fight it. Probe
-    // the socket instead of testing existence: a stale file left by a crash
-    // or an unclean stop is not a running daemon.
+    // A live daemon (or local chat) holds SQLite locks; refuse rather than
+    // fight it. The instance lock is the proof; a leftover socket is not.
+    if InstanceLock::is_held(&paths) {
+        eprintln!("ka-agent: a daemon or chat is running — stop it first");
+        return std::process::ExitCode::FAILURE;
+    }
     let sock = root.join("admin.sock");
     if sock.exists() {
-        match std::os::unix::net::UnixStream::connect(&sock) {
-            Ok(_) => {
-                eprintln!("ka-agent: daemon is running (admin.sock answers) — stop it first");
-                return std::process::ExitCode::FAILURE;
-            }
-            Err(_) => {
-                println!("removing stale admin socket (no daemon answers)");
-                let _ = std::fs::remove_file(&sock);
-            }
-        }
+        println!("removing stale admin socket (no daemon holds the data root)");
+        let _ = std::fs::remove_file(&sock);
     }
     if let Err(e) = std::fs::copy(dir.join("state.db"), root.join("state.db")) {
         eprintln!("ka-agent: state: {e}");
@@ -218,34 +250,33 @@ pub fn export(out: &std::path::Path) -> std::process::ExitCode {
             ("tasks", "tasks.jsonl"),
         ] {
             let sql = format!("SELECT * FROM {table}");
-            if let Ok(conn) = rusqlite::Connection::open(paths.state_db()) {
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let cols: Vec<String> =
-                        stmt.column_names().into_iter().map(String::from).collect();
-                    let path = out.join(file);
-                    if let Ok(f) = std::fs::File::create(&path) {
-                        let mut w = std::io::BufWriter::new(f);
-                        if let Ok(mut rows) = stmt.query([]) {
-                            while let Ok(Some(row)) = rows.next() {
-                                let obj: std::collections::BTreeMap<String, serde_json::Value> =
-                                    cols.iter()
-                                        .map(|c| {
-                                            (
-                                                c.clone(),
-                                                row.get_ref(c.as_str())
-                                                    .map(cell_to_json)
-                                                    .unwrap_or(serde_json::Value::Null),
-                                            )
-                                        })
-                                        .collect();
-                                if let Ok(line) = serde_json::to_string(&obj) {
-                                    writeln!(w, "{line}").ok();
-                                }
+            if let Ok(conn) = rusqlite::Connection::open(paths.state_db())
+                && let Ok(mut stmt) = conn.prepare(&sql)
+            {
+                let cols: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+                let path = out.join(file);
+                if let Ok(f) = std::fs::File::create(&path) {
+                    let mut w = std::io::BufWriter::new(f);
+                    if let Ok(mut rows) = stmt.query([]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let obj: std::collections::BTreeMap<String, serde_json::Value> = cols
+                                .iter()
+                                .map(|c| {
+                                    (
+                                        c.clone(),
+                                        row.get_ref(c.as_str())
+                                            .map(cell_to_json)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    )
+                                })
+                                .collect();
+                            if let Ok(line) = serde_json::to_string(&obj) {
+                                writeln!(w, "{line}").ok();
                             }
                         }
                     }
-                    manifest.push(file.to_string());
                 }
+                manifest.push(file.to_string());
             }
         }
     }
@@ -303,6 +334,10 @@ pub fn purge(confirm: bool) -> std::process::ExitCode {
         );
         return std::process::ExitCode::FAILURE;
     }
+    if InstanceLock::is_held(&paths) {
+        eprintln!("ka-agent: a daemon or chat is running — stop it first");
+        return std::process::ExitCode::FAILURE;
+    }
     match std::fs::remove_dir_all(paths.root()) {
         Ok(()) => {
             println!("purged {}", paths.root().display());
@@ -310,31 +345,6 @@ pub fn purge(confirm: bool) -> std::process::ExitCode {
         }
         Err(e) => {
             eprintln!("ka-agent: purge: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-pub fn web_token(port: u16) -> std::process::ExitCode {
-    let paths = Paths::new(Paths::default_root());
-    if let Err(e) = paths.ensure_dirs() {
-        eprintln!("ka-agent: cannot create {}: {e}", paths.root().display());
-        return std::process::ExitCode::FAILURE;
-    }
-    let store = match Store::open(&paths.state_db()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ka-agent: cannot open {}: {e}", paths.state_db().display());
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    match ka_agent_web::issue_auth_url(&store, port) {
-        Ok(url) => {
-            println!("open within 10 minutes: {url}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("ka-agent: web-token: {e}");
             std::process::ExitCode::FAILURE
         }
     }

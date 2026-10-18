@@ -44,6 +44,18 @@ impl Surface for MultiSurface {
         }
     }
 
+    fn on_notice(&self, text: &str) {
+        for s in &self.inner {
+            s.on_notice(text);
+        }
+    }
+
+    fn on_inbound(&self, source: &str, text: &str) {
+        for s in &self.inner {
+            s.on_inbound(source, text);
+        }
+    }
+
     fn on_approval(&self, card: &ApprovalCard) {
         for s in &self.inner {
             s.on_approval(card);

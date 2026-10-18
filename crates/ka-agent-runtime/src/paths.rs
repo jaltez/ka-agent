@@ -12,10 +12,10 @@ pub struct Paths {
 impl Paths {
     /// `$KA_AGENT_DATA_DIR` or `~/.local/share/ka-agent`.
     pub fn default_root() -> PathBuf {
-        if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR") {
-            if !dir.is_empty() {
-                return PathBuf::from(dir);
-            }
+        if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir);
         }
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -66,6 +66,11 @@ impl Paths {
         self.root.join("backups")
     }
 
+    /// The single-instance lock file (daemon or local chat).
+    pub fn instance_lock(&self) -> PathBuf {
+        self.root.join("instance.lock")
+    }
+
     pub fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }
@@ -85,6 +90,49 @@ impl Paths {
             std::fs::create_dir_all(dir)?;
         }
         Ok(())
+    }
+}
+
+/// Exclusive hold on one data root: the daemon and a local chat both build a
+/// `Runtime` over the same `state.db`, session and strand, so only one of
+/// them may run at a time. Released when dropped (or the process dies).
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LockError {
+    #[error("another Ka Agent is running on {0}")]
+    Held(PathBuf),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl InstanceLock {
+    /// Take the lock, creating the root and the lock file when missing.
+    pub fn acquire(paths: &Paths) -> Result<Self, LockError> {
+        std::fs::create_dir_all(paths.root())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.instance_lock())?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(LockError::Held(paths.root().to_path_buf()))
+            }
+            Err(std::fs::TryLockError::Error(e)) => Err(LockError::Io(e)),
+        }
+    }
+
+    /// Whether another process holds the lock (acquire-and-drop probe).
+    /// I/O failures (no root yet, unreadable) count as not held.
+    pub fn is_held(paths: &Paths) -> bool {
+        if !paths.instance_lock().exists() {
+            return false;
+        }
+        matches!(Self::acquire(paths), Err(LockError::Held(_)))
     }
 }
 
@@ -114,5 +162,18 @@ mod tests {
         assert!(p.engine_home().join(".config/ka").is_dir());
         assert!(p.engine_state().is_dir());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn instance_lock_is_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::new(dir.path());
+        assert!(!InstanceLock::is_held(&p));
+        let held = InstanceLock::acquire(&p).unwrap();
+        assert!(InstanceLock::is_held(&p));
+        assert!(matches!(InstanceLock::acquire(&p), Err(LockError::Held(_))));
+        drop(held);
+        assert!(!InstanceLock::is_held(&p));
+        InstanceLock::acquire(&p).unwrap();
     }
 }

@@ -65,7 +65,6 @@ fn resolve_with(
 
 /// Store a secret as a `0600` single-line file (admin CLI / setup).
 pub fn store(name: &str, value: &str, secrets_dir: &Path) -> Result<PathBuf, SecretError> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(secrets_dir).map_err(|source| SecretError::Io {
         name: name.to_string(),
         path: secrets_dir.to_path_buf(),
@@ -77,13 +76,17 @@ pub fn store(name: &str, value: &str, secrets_dir: &Path) -> Result<PathBuf, Sec
         path: path.clone(),
         source,
     })?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
-        SecretError::Io {
-            name: name.to_string(),
-            path: path.clone(),
-            source,
-        }
-    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| SecretError::Io {
+                name: name.to_string(),
+                path: path.clone(),
+                source,
+            },
+        )?;
+    }
     Ok(path)
 }
 

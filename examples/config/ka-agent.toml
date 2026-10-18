@@ -4,7 +4,7 @@
 # Telegram token is a name in the secret store (see [telegram] below).
 
 # The single workspace directory every engine runs in. `~` expands against
-# $HOME; the default (what `ka-agent init` writes) is
+# $HOME; the default (what `ka-agent setup` writes) is
 # ~/.local/share/ka-agent/workspace — keep instance-owned files together.
 workspace = "~/.local/share/ka-agent/workspace"
 
@@ -62,3 +62,18 @@ enabled = false
 # Name of the bot token in the secret store.
 # token_secret = "telegram.bot_token"
 # api_base = "https://api.telegram.org"   # tests point this at a fake server
+
+# Loopback web control panel (`ka-agent dashboard`). Enabled by default on
+# port 8480; set enabled = false to run headless.
+# [web]
+# enabled = true
+# port = 8480
+
+# Daily calendar digest time, local wall clock (what `/calendar add`
+# schedules). Defaults to "08:00".
+# [calendar]
+# digest_time = "08:00"
+
+# Operator timezone (IANA name). Default: the system zone. Every reminder
+# and cron time is interpreted here.
+# timezone = "Europe/Madrid"

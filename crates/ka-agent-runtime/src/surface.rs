@@ -56,8 +56,20 @@ pub trait Surface: Send + Sync {
     /// it into the final answer.
     fn on_delta_thought(&self, _text: &str) {}
 
-    /// Informational note (compaction, recovery, queue state, ...).
+    /// In-turn progress or diagnostics (tool calls, replay notes). A surface
+    /// may fold or drop these; anything the operator must receive goes
+    /// through [`Surface::on_notice`].
     fn on_note(&self, text: &str);
+
+    /// A message the operator must receive as its own message (reminders,
+    /// cron output, pauses, recovery, queue state).
+    fn on_notice(&self, text: &str) {
+        self.on_note(text)
+    }
+
+    /// An inbound message accepted from any channel (for cross-channel
+    /// transcripts).
+    fn on_inbound(&self, _source: &str, _text: &str) {}
 
     /// A new approval is pending; render the card.
     fn on_approval(&self, card: &ApprovalCard);

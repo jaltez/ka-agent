@@ -158,8 +158,10 @@ fn simple_turn_and_status() {
     chat.expect("Hello from scripted", Duration::from_secs(30));
     chat.expect("turn done", Duration::from_secs(10));
     chat.send("/status");
-    chat.expect("budget: $", Duration::from_secs(10));
-    chat.expect("tokens · crashes:", Duration::from_secs(10));
+    chat.expect("today: $", Duration::from_secs(10));
+    chat.expect("queue 0", Duration::from_secs(10));
+    chat.expect("worker:", Duration::from_secs(10));
+    chat.expect("crashes ", Duration::from_secs(10));
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
@@ -177,7 +179,7 @@ fn idle_worker_is_stopped_then_restarted_on_demand() {
         r#"{ "steps": [ {"text": "first-alive"}, {"text": "second-alive"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
     );
     let mut chat = spawn_chat_cfg(&root, &sc, "worker_idle_timeout_secs = 2\n");
-    chat.expect("commands:", Duration::from_secs(10));
+    chat.expect("local session", Duration::from_secs(10));
     chat.send("first message");
     chat.expect("first-alive", Duration::from_secs(30));
     chat.expect("turn done", Duration::from_secs(10));
@@ -192,7 +194,7 @@ fn idle_worker_is_stopped_then_restarted_on_demand() {
     chat.expect("second-alive", Duration::from_secs(30));
     chat.expect("turn done", Duration::from_secs(10));
     chat.send("/status");
-    chat.expect("tokens · crashes: 0", Duration::from_secs(10));
+    chat.expect("crashes 0", Duration::from_secs(10));
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
@@ -387,7 +389,7 @@ fn cron_end_to_end_and_agents_md_seeded_once() {
     let data = root.join("data");
     let recurring_id = cron_id_from_store(&data);
     chat.send(&format!("/cron rm {recurring_id}"));
-    chat.expect("cron removed", Duration::from_secs(10));
+    chat.expect("cancelled:", Duration::from_secs(10));
     chat.send("/cron list");
     chat.expect("no crons", Duration::from_secs(10));
     chat.send("/quit");
@@ -399,7 +401,7 @@ fn cron_end_to_end_and_agents_md_seeded_once() {
         r#"{ "steps": [ {"text": "x"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
     );
     let mut chat2 = spawn_chat(&root, &sc2);
-    chat2.expect("ka-agent chat", Duration::from_secs(15));
+    chat2.expect("local session", Duration::from_secs(15));
     assert_eq!(
         std::fs::read_to_string(&agents_md).unwrap_or_default(),
         "OPERATOR-MARKER-XYZ\n",
@@ -481,30 +483,46 @@ fn calendar_digest_on_demand() {
         .unwrap()
         .as_millis() as i64;
     std::fs::create_dir_all(root.join("ws")).unwrap();
+    // The digest window is the local day [today 00:00, tomorrow 00:00), so
+    // the event must land inside TODAY even when the test runs near
+    // midnight: half an hour from now, clamped into the day.
+    let now = jiff::Timestamp::from_millisecond(now_ms)
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::system());
+    let today_end = now
+        .with()
+        .time(jiff::civil::time(23, 58, 0, 0))
+        .build()
+        .unwrap();
+    let in_half_an_hour = now + jiff::Span::new().minutes(30);
+    let event_at = if in_half_an_hour <= today_end {
+        in_half_an_hour
+    } else {
+        today_end
+    };
+    let event_ms = event_at.timestamp().as_millisecond();
     let ics_path = root.join("ws/cal.ics");
     std::fs::write(
         &ics_path,
         format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:CTest-XYZ\nDTSTART:{}\nEND:VEVENT\nEND:VCALENDAR\n",
-            ics_stamp(now_ms + 2 * 3_600_000)
+            ics_stamp(event_ms)
         ),
     )
     .unwrap();
     let mut chat = spawn_chat(&root, &sc);
     chat.send(&format!("/calendar add {}", ics_path.display()));
-    chat.expect(
-        "calendar digest daily at 08:00 UTC",
-        Duration::from_secs(10),
-    );
+    chat.expect("calendar digest daily at 08:00", Duration::from_secs(10));
     chat.send("/calendar today");
     chat.expect("CTest-XYZ", Duration::from_secs(30));
 
-    // Same source, now with a recurring event: counted, not expanded.
+    // Same source, now with a recurring event: counted, not expanded. Same
+    // local-day clamping as above.
     std::fs::write(
         &ics_path,
         format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:CTest-RRULE\nDTSTART:{}\nRRULE:FREQ=DAILY\nEND:VEVENT\nEND:VCALENDAR\n",
-            ics_stamp(now_ms + 3 * 3_600_000)
+            ics_stamp(event_ms)
         ),
     )
     .unwrap();
@@ -555,7 +573,7 @@ fn skills_enable_list_invoke() {
 
     // Chat: list, invoke, and a fail-closed unknown-skill case.
     let mut chat = spawn_chat(&root, &sc);
-    chat.expect("commands:", Duration::from_secs(10));
+    chat.expect("local session", Duration::from_secs(10));
     chat.send("/skills");
     chat.expect("review — review a diff carefully", Duration::from_secs(10));
     chat.send("/skill ghost do something");
@@ -567,5 +585,55 @@ fn skills_enable_list_invoke() {
     chat.expect("skill-ack", Duration::from_secs(30));
     chat.expect("turn done", Duration::from_secs(10));
     chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A message the agent cannot possibly run (no model configured, no engine
+/// layer) is refused BEFORE any state moves: the refusal names the fix, the
+/// session returns to idle, and the engine never sees a canned fallback.
+#[test]
+fn no_model_preflight_refuses_with_the_fix() {
+    let root = temp_root("preflight");
+    // No `--scenario` on purpose? The scenario only matters for the worker,
+    // which is never started here; spawn WITHOUT it so the preflight bites.
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let cfg = root.join("ka-agent.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "workspace = {:?}\nmode = \"guarded\"\n",
+            ws.display().to_string()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("chat")
+        .arg("--config")
+        .arg(&cfg)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .env_remove("KA_MODEL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hi\n/quit\n")
+        .unwrap();
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+    let _ = child.wait();
+    assert!(
+        out.contains("no model configured — run"),
+        "preflight refusal missing:\n{out}"
+    );
+    assert!(
+        !out.contains("no model configured)"),
+        "the canned no-model speaker leaked:\n{out}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }

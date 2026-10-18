@@ -24,6 +24,9 @@ struct State {
     /// Downloadable files: (file_id, file_path, bytes) — what `getFile`
     /// resolves and `/file/bot<token>/<file_path>` serves.
     files: Vec<(String, String, Vec<u8>)>,
+    /// When set, any request carrying `parse_mode` is refused the way
+    /// Telegram refuses malformed HTML.
+    reject_html: bool,
 }
 
 /// A fake `api.telegram.org`. Spawn on an ephemeral local port and point
@@ -126,7 +129,7 @@ impl FakeBotServer {
             "update_id": update_id,
             "message": {
                 "message_id": 1,
-                "from": { "id": user_id, "is_bot": false },
+                "from": { "id": user_id, "is_bot": false, "first_name": "Tester" },
                 "chat": { "id": chat_id, "type": "private" },
                 "date": 0,
                 "text": text,
@@ -239,6 +242,15 @@ impl FakeBotServer {
             .unwrap_or_else(|e| e.into_inner())
             .last_offset
     }
+
+    /// Refuse every request that sets `parse_mode` with
+    /// `Bad Request: can't parse entities` (the request is still captured).
+    pub fn set_reject_html(&self, on: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reject_html = on;
+    }
 }
 
 /// Read one request: request line + headers, then Content-Length body.
@@ -299,6 +311,14 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
     // path: /bot<token>/<method>
     let method = path.rsplit('/').next().unwrap_or("").to_string();
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    if st.reject_html && body.get("parse_mode").is_some() {
+        st.captured.push(CapturedRequest {
+            method,
+            body: body.clone(),
+        });
+        return json!({ "ok": false, "description": "Bad Request: can't parse entities" })
+            .to_string();
+    }
     let result = match method.as_str() {
         "getUpdates" => {
             let offset = body["offset"].as_i64().unwrap_or(0);
@@ -319,7 +339,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
         "editMessageText" => Value::Bool(true),
         "answerCallbackQuery" => Value::Bool(true),
         "sendChatAction" => Value::Bool(true),
-        "getMe" => json!({ "id": 1, "is_bot": true, "first_name": "fake" }),
+        "getMe" => json!({ "id": 1, "is_bot": true, "first_name": "fake", "username": "fake_bot" }),
         "getFile" => {
             let file_id = body["file_id"].as_str().unwrap_or("");
             st.files
@@ -352,6 +372,108 @@ struct MatrixState {
     next_batch: u64,
     since_seen: Vec<Option<String>>,
     sent: Vec<CapturedRequest>,
+    /// Pending invites `(room, sender)`, emitted under `rooms.invite`.
+    invites: Vec<(String, String)>,
+    /// Rooms joined via `POST …/rooms/{room}/join` (decoded ids).
+    joins: Vec<String>,
+    /// `/sync` requests currently held open (long-poll).
+    syncs_pending: usize,
+}
+
+/// The bot account invites are addressed to (`state_key`); configure the
+/// channel's `user_id` with it.
+pub const FAKE_MATRIX_BOT: &str = "@ka-agent:example.org";
+
+/// Longest the fake holds an empty `/sync` open (the client asks for more).
+const FAKE_SYNC_HOLD_MS: u64 = 5_000;
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_param(path: &str, key: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+/// Serve one `/sync`: long-poll until something is queued or the hold ends.
+async fn matrix_sync(state: &Arc<Mutex<MatrixState>>, path: &str) -> String {
+    let wait_ms = query_param(path, "timeout")
+        .and_then(|t| t.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(FAKE_SYNC_HOLD_MS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    {
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.since_seen.push(query_param(path, "since"));
+        st.syncs_pending += 1;
+    }
+    loop {
+        {
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.timeline.is_empty() || !st.invites.is_empty() {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    st.syncs_pending = st.syncs_pending.saturating_sub(1);
+    // Deliver everything that arrived since the last sync served
+    // (server-side FIFO timeline; tokens do not attach to events).
+    let events: Vec<(String, Value)> = std::mem::take(&mut st.timeline);
+    let invites: Vec<(String, String)> = std::mem::take(&mut st.invites);
+    st.next_batch += 1;
+    let next = format!("s{}", st.next_batch);
+    let mut rooms = serde_json::Map::new();
+    for (room, event) in events {
+        if let Some(arr) = rooms
+            .entry(room)
+            .or_insert_with(|| serde_json::json!({"timeline": {"events": []}}))["timeline"]
+            ["events"]
+            .as_array_mut()
+        {
+            arr.push(event);
+        }
+    }
+    let mut invite = serde_json::Map::new();
+    for (room, sender) in invites {
+        invite.insert(
+            room,
+            serde_json::json!({"invite_state": {"events": [{
+                "type": "m.room.member",
+                "sender": sender,
+                "state_key": FAKE_MATRIX_BOT,
+                "content": {"membership": "invite"},
+            }]}}),
+        );
+    }
+    serde_json::json!({
+        "next_batch": next,
+        "rooms": {"join": rooms, "invite": invite, "leave": {}},
+    })
+    .to_string()
 }
 
 pub struct FakeHomeserver {
@@ -385,7 +507,11 @@ impl FakeHomeserver {
                 let state = Arc::clone(&rt_state);
                 tokio::spawn(async move {
                     if let Some((path, body)) = read_request(&mut socket).await {
-                        let response = matrix_handle(&state, &path, &body);
+                        let response = if path.starts_with("/_matrix/client/v3/sync") {
+                            matrix_sync(&state, &path).await
+                        } else {
+                            matrix_handle(&state, &path, &body)
+                        };
                         let _ = socket
                             .write_all(
                                 format!(
@@ -416,6 +542,44 @@ impl FakeHomeserver {
             .unwrap_or_else(|e| e.into_inner())
             .timeline
             .push((room.to_string(), event));
+    }
+
+    /// Queue a raw timeline event (e.g. with `origin_server_ts`, or an
+    /// `m.room.encrypted` event).
+    pub fn push_room_event(&self, room: &str, event: Value) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .timeline
+            .push((room.to_string(), event));
+    }
+
+    /// Queue an invite of the bot to `room` from `sender`, emitted under
+    /// `rooms.invite` on the next sync.
+    pub fn push_invite(&self, room: &str, sender: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invites
+            .push((room.to_string(), sender.to_string()));
+    }
+
+    /// Rooms the client joined, in order (decoded room ids).
+    pub fn joins(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .joins
+            .clone()
+    }
+
+    /// Whether a `/sync` long-poll is currently held open.
+    pub fn sync_pending(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .syncs_pending
+            > 0
     }
 
     /// Wait until the homeserver saw a send with this text fragment.
@@ -476,41 +640,18 @@ impl FakeHomeserver {
 
 fn matrix_handle(state: &Arc<Mutex<MatrixState>>, path: &str, body: &Value) -> String {
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-    if path.starts_with("/_matrix/client/v3/sync") {
-        let since = path
-            .split("since=")
-            .nth(1)
-            .and_then(|s| s.split('&').next())
-            .map(str::to_string);
-        st.since_seen.push(since.clone());
-        // Deliver everything that arrived since the last sync served
-        // (server-side FIFO timeline; tokens do not attach to events).
-        let events: Vec<(String, Value)> = std::mem::take(&mut st.timeline);
-        st.next_batch += 1;
-        let next = format!("s{}", st.next_batch);
-        let mut rooms = serde_json::Map::new();
-        for (room, event) in events {
-            if let Some(arr) =
-                rooms
-                    .entry(room)
-                    .or_insert_with(|| serde_json::json!({"timeline": {"events": []}}))["timeline"]
-                    ["events"]
-                    .as_array_mut()
-            {
-                arr.push(event);
-            }
-        }
-        serde_json::json!({
-            "next_batch": next,
-            "rooms": {"join": rooms, "invite": {}, "leave": {}},
-        })
-        .to_string()
-    } else if path.contains("/send/m.room.message/") {
+    if path.contains("/send/m.room.message/") {
         st.sent.push(CapturedRequest {
             method: "PUT".into(),
             body: body.clone(),
         });
         serde_json::json!({"event_id": format!("$k{}", st.sent.len())}).to_string()
+    } else if let Some(room) = path
+        .strip_prefix("/_matrix/client/v3/rooms/")
+        .and_then(|r| r.strip_suffix("/join"))
+    {
+        st.joins.push(percent_decode(room));
+        serde_json::json!({"room_id": percent_decode(room)}).to_string()
     } else {
         serde_json::json!({}).to_string()
     }

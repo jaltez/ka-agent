@@ -1,58 +1,71 @@
 //! The resident daemon: `ka-agent run` (runtime + channels + admin socket
-//! + optional web UI) and the local admin clients (`status`, `restart`).
+//! + web UI) and the local admin clients (`status`, `restart`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ka_agent_core::{ApprovalStatus, DaemonConfig, SessionStatus};
 use ka_agent_runtime::surface::ApprovalCard;
-use ka_agent_runtime::{Runtime, Surface, paths::Paths};
+use ka_agent_runtime::{
+    EventBus, InstanceLock, LockError, Runtime, Surface, SurfaceEvent, paths::Paths,
+};
 use ka_agent_store::Store;
 
+use crate::admin;
 use crate::identity::migrate_config_identities;
 
-/// The no-channel surface: local observability only. Telegram, when enabled,
-/// is the real surface; this keeps a daemon without channels from being mute.
-struct NullSurface;
+/// The journal surface: every runtime event as one stderr line, so the
+/// service log (`ka-agent logs`) is a complete trail of what happened.
+pub struct LogSurface;
 
-impl Surface for NullSurface {
+impl Surface for LogSurface {
     fn on_note(&self, text: &str) {
-        println!("· {text}");
+        eprintln!("· {text}");
+    }
+
+    fn on_notice(&self, text: &str) {
+        eprintln!("» {text}");
+    }
+
+    fn on_inbound(&self, source: &str, text: &str) {
+        eprintln!("» you ({source}): {text}");
     }
 
     fn on_approval(&self, card: &ApprovalCard) {
-        println!(
+        eprintln!(
             "┌ approval {} (expires in {})\n│ {}",
             card.approval_id,
-            ka_agent_channels::commands::fmt_interval(card.expires_at_ms - ka_agent_core::now_ms()),
+            ka_agent_core::fmt_interval(card.expires_at_ms - ka_agent_core::now_ms()),
             card.question
         );
     }
 
     fn on_approval_settled(&self, approval_id: &str, status: ApprovalStatus) {
-        println!("· approval {approval_id} → {status:?}");
+        eprintln!("· approval {approval_id} → {status:?}");
     }
 
     fn on_turn_finished(&self, stop: &str, cost_usd: f64, tokens: u64) {
-        println!("· turn {stop} · ${cost_usd:.4} · {tokens} tokens");
+        eprintln!("· turn {stop} · ${cost_usd:.4} · {tokens} tokens");
     }
 
     fn on_session_status(&self, status: SessionStatus) {
-        println!("· session {status:?}");
+        eprintln!("· session {status:?}");
     }
 
     fn on_error(&self, class: &str, message: &str) {
-        println!("! [{class}] {message}");
+        eprintln!("! [{class}] {message}");
     }
 }
 
-/// Current process uid without libc: `/proc/self` is a symlink to
-/// `/proc/<pid>`, owned by the process's real uid.
-fn current_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self")
-        .map(|m| m.uid())
-        .unwrap_or(u32::MAX)
+/// The exact refusal when another runtime holds the data root.
+pub fn print_lock_held(root: &Path) {
+    eprintln!(
+        "ka-agent: another Ka Agent is already running on {} (the daemon or a local chat).",
+        root.display()
+    );
+    eprintln!(
+        "check it with `ka-agent status`; stop the daemon with `ka-agent restart` or `ka-agent service stop`"
+    );
 }
 
 pub async fn run_daemon(
@@ -63,9 +76,13 @@ pub async fn run_daemon(
     // Signals first: from the first line of startup, SIGINT/SIGTERM must be
     // graceful — a kill arriving during init would otherwise terminate the
     // process by default (verified by the matrix e2e restart race).
+    // SIGTERM watching is Unix-only; Windows relies on Ctrl-C.
+    #[cfg(unix)]
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| eprintln!("ka-agent: cannot watch SIGTERM: {e}"))
         .ok();
+    #[cfg(not(unix))]
+    let term: Option<()> = None;
     let ctrl_c = tokio::signal::ctrl_c();
 
     // Strict, like every long-running path: a daemon with a broken config
@@ -74,7 +91,7 @@ pub async fn run_daemon(
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "ka-agent: config ({}) invalid: {e}\nrun `ka-agent init` to create one",
+                "ka-agent: config ({}) invalid: {e}\nrun `ka-agent setup` to create one",
                 config.display()
             );
             return std::process::ExitCode::FAILURE;
@@ -85,6 +102,22 @@ pub async fn run_daemon(
         eprintln!("ka-agent: cannot create {}: {e}", paths.root().display());
         return std::process::ExitCode::FAILURE;
     }
+    // One runtime per data root: held for the whole function. Only after
+    // acquiring it is a leftover admin socket provably stale.
+    let _lock = match InstanceLock::acquire(&paths) {
+        Ok(l) => l,
+        Err(LockError::Held(root)) => {
+            print_lock_held(&root);
+            return std::process::ExitCode::FAILURE;
+        }
+        Err(LockError::Io(e)) => {
+            eprintln!(
+                "ka-agent: cannot lock {}: {e}",
+                paths.instance_lock().display()
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let store = match Store::open(&paths.state_db()) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -144,33 +177,45 @@ pub async fn run_daemon(
     } else {
         None
     };
-    // Surfaces fan out to every enabled channel (Phase 6); a channel-less
-    // daemon keeps the local NullSurface so it stays observable.
-    let mut surfaces: Vec<Arc<dyn Surface>> = Vec::new();
+    // Surfaces fan out: the journal, the event bus (attached terminals and
+    // the web chat), and every enabled channel.
+    let bus = Arc::new(EventBus::new());
+    let mut surfaces: Vec<Arc<dyn Surface>> = vec![Arc::new(LogSurface), bus.clone()];
     let _telegram_surface = token.as_ref().map(|t| {
-        let s: Arc<ka_agent_channels::TelegramSurface> = Arc::new(
-            ka_agent_channels::TelegramSurface::new(cfg.telegram.api_base().to_string(), t.clone()),
-        );
+        // The operator's last chat survives restarts, so reminders and
+        // cron output arrive before anyone writes again.
+        let initial_chat = store
+            .meta_get("telegram.chat_id")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok());
+        let s: Arc<ka_agent_channels::TelegramSurface> =
+            Arc::new(ka_agent_channels::TelegramSurface::new(
+                cfg.telegram.api_base().to_string(),
+                t.clone(),
+                initial_chat,
+            ));
         surfaces.push(s.clone());
         s
     });
     let matrix_surface = matrix_token.as_ref().map(|t| {
         let homeserver = cfg.matrix.homeserver.clone().unwrap_or_default();
-        let s: Arc<ka_agent_channels::MatrixSurface> = Arc::new(
-            ka_agent_channels::MatrixSurface::new(ka_agent_channels::MatrixConfig {
-                homeserver,
-                user_id: cfg.matrix.user_id.clone(),
-                token: t.clone(),
-            }),
-        );
+        // The last room the operator wrote from survives restarts, so
+        // proactive notices are delivered before anyone writes again.
+        let initial_room = store.meta_get("matrix.room_id").ok().flatten();
+        let s: Arc<ka_agent_channels::MatrixSurface> =
+            Arc::new(ka_agent_channels::MatrixSurface::new(
+                ka_agent_channels::MatrixConfig {
+                    homeserver,
+                    user_id: cfg.matrix.user_id.clone(),
+                    token: t.clone(),
+                },
+                initial_room,
+            ));
         surfaces.push(s.clone());
         s
     });
-    let surface: Arc<dyn Surface> = if surfaces.is_empty() {
-        Arc::new(NullSurface)
-    } else {
-        Arc::new(ka_agent_channels::MultiSurface::new(surfaces))
-    };
+    let surface: Arc<dyn Surface> = Arc::new(ka_agent_channels::MultiSurface::new(surfaces));
 
     let mut port = ka_agent_port::WorkerPort::with_current_exe();
     if let Some(sc) = scenario {
@@ -189,13 +234,15 @@ pub async fn run_daemon(
             return std::process::ExitCode::FAILURE;
         }
     };
+    runtime.set_config_path(config.clone());
     // No-agent cron handlers (M11): the calendar digest runs without the
     // engine. Registered right after the runtime exists, before any tick.
     {
         let st = Arc::clone(&store);
+        let tz = cfg.time_zone();
         runtime.set_no_agent_handler(
             "calendar",
-            Arc::new(move |src| ka_agent_channels::calendar::digest(src, &st)),
+            Arc::new(move |src| ka_agent_channels::calendar::digest_in(src, &st, &tz)),
         );
     }
     println!(
@@ -240,7 +287,8 @@ pub async fn run_daemon(
         );
     }
 
-    // Admin socket: one newline-delimited JSON request per connection.
+    // Admin socket: newline-delimited JSON. The lock above proves a leftover
+    // socket is stale.
     let sock_path = paths.root().join("admin.sock");
     let _ = std::fs::remove_file(&sock_path);
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
@@ -258,36 +306,58 @@ pub async fn run_daemon(
             return std::process::ExitCode::FAILURE;
         }
     }
+    // Peers must be the socket's owner: the uid comes from the file we just
+    // created (portable; `/proc` does not exist on macOS).
+    #[cfg(unix)]
+    let own_uid = {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(&sock_path) {
+            Ok(m) => m.uid(),
+            Err(e) => {
+                eprintln!("ka-agent: cannot stat {}: {e}", sock_path.display());
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let own_uid = 0u32;
     println!("admin socket {}", sock_path.display());
 
-    // Web UI (M7): loopback-only, session auth; enabled with --web-port.
+    // Web UI (M7): loopback-only, session auth; `[web]` in the config, or
+    // `--web-port` as an override.
+    let web_port = web_port.or_else(|| cfg.web.enabled.then_some(cfg.web.port));
     if let Some(web_port) = web_port {
-        let web = ka_agent_web::WebServer::new(web_port, runtime.clone(), Arc::clone(&store));
+        let web = ka_agent_web::WebServer::new(
+            web_port,
+            runtime.clone(),
+            Arc::clone(&store),
+            Arc::clone(&bus),
+        );
         let web_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = web.run(web_rx).await {
-                eprintln!("ka-agent: web server: {e}");
+                eprintln!("ka-agent: web UI disabled: {e}");
             }
         });
-        println!(
-            "web UI http://127.0.0.1:{web_port} (login: ka-agent web-token --port {web_port})"
-        );
+        println!("web UI http://127.0.0.1:{web_port} (open it with: ka-agent dashboard)");
     }
 
-    let admin_runtime = runtime.clone();
-    let admin_store = Arc::clone(&store);
-    let admin_shutdown = shutdown_tx.clone();
+    let ctx = AdminCtx {
+        runtime: runtime.clone(),
+        store: Arc::clone(&store),
+        bus: Arc::clone(&bus),
+        shutdown: shutdown_tx.clone(),
+        own_uid,
+        config: config.clone(),
+    };
     let admin = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
-            eprintln!("ka-agent: admin connection");
-            let rt = admin_runtime.clone();
-            let st = Arc::clone(&admin_store);
-            let tx = admin_shutdown.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_admin(stream, rt, st, tx).await {
+                if let Err(e) = serve_admin(stream, ctx).await {
                     eprintln!("ka-agent: admin request: {e}");
                 }
             });
@@ -322,160 +392,256 @@ pub async fn run_daemon(
     std::process::ExitCode::SUCCESS
 }
 
-async fn serve_admin(
-    mut stream: tokio::net::UnixStream,
+/// Everything an admin connection needs.
+#[derive(Clone)]
+struct AdminCtx {
     runtime: Runtime,
     store: Arc<Store>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let peer_uid = stream.peer_cred().map(|c| c.uid()).unwrap_or(u32::MAX);
-    // One bounded line: a request bigger than this is not one of ours, and
-    // an unbounded read hands any local peer an unbounded buffer.
-    const MAX_REQUEST: usize = 8 * 1024;
-    let mut line = Vec::new();
-    let mut buf = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        line.extend_from_slice(&buf[..n]);
-        if line.len() > MAX_REQUEST {
-            return Ok(());
-        }
-        if line.contains(&b'\n') {
-            break;
-        }
+    bus: Arc<EventBus>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// Owner of the socket file; only this uid may talk to the daemon.
+    own_uid: u32,
+    /// The config file the daemon loaded (re-read by `reload`).
+    config: PathBuf,
+}
+
+/// First request line ceiling: anything bigger is not one of ours, and an
+/// unbounded read hands any local peer an unbounded buffer.
+const MAX_REQUEST: u64 = 8 * 1024;
+/// Per-line ceiling on an attach stream (a pasted message fits).
+const MAX_ATTACH_LINE: u64 = 64 * 1024;
+
+/// Read one `\n`-terminated line of at most `max` bytes. `Ok(None)` on EOF
+/// or an over-long line (the caller closes the connection).
+async fn read_bounded_line<R>(r: &mut R, max: u64) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut buf = Vec::new();
+    let n = (&mut *r).take(max + 1).read_until(b'\n', &mut buf).await?;
+    if n == 0 || (buf.len() as u64) > max || !buf.ends_with(b"\n") {
+        return Ok(None);
     }
+    Ok(Some(String::from_utf8_lossy(&buf).trim().to_string()))
+}
+
+async fn serve_admin(stream: tokio::net::UnixStream, ctx: AdminCtx) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let peer_uid = stream.peer_cred().map(|c| c.uid()).unwrap_or(u32::MAX);
+    let (r, mut w) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(r);
+    let Some(line) = read_bounded_line(&mut reader, MAX_REQUEST).await? else {
+        return Ok(());
+    };
     if line.is_empty() {
         return Ok(());
     }
-    let reply: serde_json::Value = if peer_uid != current_uid() {
+    let reply: serde_json::Value = if peer_uid != ctx.own_uid {
         serde_json::json!({"error": "forbidden"})
     } else {
-        match std::str::from_utf8(&line)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim()).ok())
-        {
-            Some(req) if req.get("op").and_then(|o| o.as_str()) == Some("status") => {
-                let (status, strand, usd, tokens, crashes) = runtime.status();
-                let queue = store.queue_len(&runtime.session_id()).unwrap_or(0);
-                serde_json::json!({
-                    "ok": true,
-                    "session": runtime.session_id().to_string(),
-                    "status": format!("{status:?}"),
-                    "strand": strand,
-                    "budget_usd": usd,
-                    "budget_tokens": tokens,
-                    "crashes": crashes,
-                    "queue": queue,
-                })
-            }
+        let req = serde_json::from_str::<serde_json::Value>(&line).ok();
+        let op = req
+            .as_ref()
+            .and_then(|r| r.get("op"))
+            .and_then(|o| o.as_str())
+            .map(str::to_string);
+        match (req, op.as_deref()) {
+            (Some(_), Some("status")) => match ctx.runtime.status_report() {
+                Ok(report) => serde_json::json!({"ok": true, "report": report}),
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            },
             // Graceful stop (CLI-only policy, §5): the process exits 0 and
-            // the supervisor (systemd unit) brings it back — this is what
+            // the service manager brings it back — this is what
             // `ka-agent restart` drives.
-            Some(req) if req.get("op").and_then(|o| o.as_str()) == Some("shutdown") => {
-                let _ = shutdown_tx.send(true);
+            (Some(_), Some("shutdown")) => {
+                let _ = ctx.shutdown.send(true);
                 serde_json::json!({"ok": true, "shutting_down": true})
             }
-            Some(_) => serde_json::json!({"error": "unknown op"}),
-            None => serde_json::json!({"error": "bad json"}),
+            (Some(req), Some("reload")) => {
+                let restart_worker = req
+                    .get("restart_worker")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match DaemonConfig::load(&ctx.config) {
+                    Ok(cfg) => {
+                        let report = ctx.runtime.reload_config(cfg, restart_worker).await;
+                        serde_json::json!({"ok": true, "report": report})
+                    }
+                    Err(e) => serde_json::json!({"error": e.to_string()}),
+                }
+            }
+            (Some(_), Some("attach")) => return serve_attach(reader, w, ctx).await,
+            (Some(_), _) => serde_json::json!({"error": "unknown op"}),
+            (None, _) => serde_json::json!({"error": "bad json"}),
         }
     };
-    let (r, mut w) = stream.into_split();
-    drop(r);
     w.write_all(format!("{reply}\n").as_bytes()).await?;
     w.flush().await
 }
 
-/// `ka-agent restart`: graceful stop over the admin socket. Without a
-/// supervisor the daemon simply stops; with the systemd unit
-/// (`Restart=always`) it comes straight back — that pairing is the restart.
-pub fn restart_client() -> std::process::ExitCode {
-    let sock = Paths::new(Paths::default_root()).root().join("admin.sock");
-    let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "ka-agent: cannot connect {}: {e} (is the daemon running?)",
-                sock.display()
-            );
-            return std::process::ExitCode::FAILURE;
+/// `{"op":"attach"}`: a live terminal on the daemon's session. The server
+/// sends `hello` then every bus event; the client sends `say` lines that go
+/// through the shared command router exactly like a channel message.
+async fn serve_attach(
+    mut reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut w: tokio::net::unix::OwnedWriteHalf,
+    ctx: AdminCtx,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::broadcast::error::RecvError;
+    // Subscribe before the hello so nothing between them is lost.
+    let mut sub = ctx.bus.subscribe();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if w.write_all(line.as_bytes()).await.is_err() || w.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let send = |tx: &tokio::sync::mpsc::UnboundedSender<String>, ev: &SurfaceEvent| -> bool {
+        match serde_json::to_string(ev) {
+            Ok(json) => tx.send(format!("{json}\n")).is_ok(),
+            Err(_) => true,
         }
     };
-    use std::io::{BufRead, BufReader, Write};
-    if let Err(e) = stream.write_all(b"{\"op\":\"shutdown\"}\n") {
-        eprintln!("ka-agent: send: {e}");
-        return std::process::ExitCode::FAILURE;
+    match ctx.runtime.status_report() {
+        Ok(report) => {
+            send(&tx, &SurfaceEvent::Hello { report });
+        }
+        Err(e) => {
+            send(
+                &tx,
+                &SurfaceEvent::Error {
+                    class: "internal".into(),
+                    message: format!("status: {e}"),
+                },
+            );
+        }
     }
-    let _ = stream.flush();
-    let reply: Option<String> = BufReader::new(stream).lines().next().and_then(|l| l.ok());
-    match reply {
-        Some(line) => println!("{line}"),
-        None => println!("\"no reply\""),
+    let fwd_tx = tx.clone();
+    let forwarder = tokio::spawn(async move {
+        loop {
+            let ev = match sub.recv().await {
+                Ok(ev) => ev,
+                Err(RecvError::Lagged(n)) => SurfaceEvent::Notice {
+                    text: format!("(missed {n} events)"),
+                },
+                Err(RecvError::Closed) => break,
+            };
+            if !send(&fwd_tx, &ev) {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_ATTACH_LINE).await {
+            Ok(Some(l)) => l,
+            Ok(None) | Err(_) => break,
+        };
+        let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        // `status` answers this client with a fresh `hello`, ordered after
+        // everything it said before (a piped chat waits for idle with it).
+        if req.get("op").and_then(|o| o.as_str()) == Some("status") {
+            if let Ok(report) = ctx.runtime.status_report() {
+                send(&tx, &SurfaceEvent::Hello { report });
+            }
+            continue;
+        }
+        let Some(text) = Some(req)
+            .filter(|v| v.get("op").and_then(|o| o.as_str()) == Some("say"))
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+        else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match ka_agent_channels::commands::route(&ctx.runtime, "console", text).await {
+            ka_agent_channels::commands::Outcome::Reply(r) => {
+                send(&tx, &SurfaceEvent::Reply { text: r });
+            }
+            ka_agent_channels::commands::Outcome::Silent => {}
+            ka_agent_channels::commands::Outcome::NotACommand => {
+                let expanded =
+                    ka_agent_channels::refs::expand(&ctx.store, &ctx.runtime.workspace(), text)
+                        .await;
+                if let Err(e) = ctx.runtime.handle_message(&expanded, "console").await {
+                    send(
+                        &tx,
+                        &SurfaceEvent::Error {
+                            class: "internal".into(),
+                            message: e.to_string(),
+                        },
+                    );
+                }
+            }
+        }
     }
-    println!("daemon stopping (systemd restarts it if the unit is installed)");
-    std::process::ExitCode::SUCCESS
+    forwarder.abort();
+    drop(tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// `ka-agent restart`: graceful stop over the admin socket. Under the
+/// background service (`Restart=always` / `KeepAlive`) that is a restart.
+pub fn restart_client() -> std::process::ExitCode {
+    let paths = Paths::new(Paths::default_root());
+    match admin::request(&paths, &serde_json::json!({"op": "shutdown"})) {
+        Ok(_) => {
+            println!(
+                "Ka Agent is stopping — the background service starts it again \
+                 (without one, start it with `ka-agent run`)"
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Err(admin::AdminError::NotRunning(_)) => {
+            eprintln!("{}", not_running_text());
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("ka-agent: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+pub fn not_running_text() -> &'static str {
+    "Ka Agent is not running — start it with `ka-agent service install` (background) or `ka-agent run`"
+}
+
+/// The operator's "now", in the zone a status report names.
+pub fn zoned_now(tz_name: &str) -> jiff::Zoned {
+    let tz = jiff::tz::TimeZone::get(tz_name).unwrap_or(jiff::tz::TimeZone::UTC);
+    jiff::Timestamp::now().to_zoned(tz)
 }
 
 pub fn status_client() -> std::process::ExitCode {
-    // The socket path depends only on the data root; no config is needed.
-    let sock = Paths::new(Paths::default_root()).root().join("admin.sock");
-    if !sock.exists() {
-        eprintln!(
-            "ka-agent: no admin socket at {}\nis the daemon running? start it with `ka-agent run`",
-            sock.display()
-        );
-        return std::process::ExitCode::FAILURE;
-    }
-    let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ka-agent: cannot connect {}: {e}", sock.display());
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(3)));
-    use std::io::{BufRead, BufReader, Write};
-    if let Err(e) = stream.write_all(b"{\"op\":\"status\"}\n") {
-        eprintln!("ka-agent: send: {e}");
-        return std::process::ExitCode::FAILURE;
-    }
-    let _ = stream.flush();
-    let mut line = String::new();
-    match BufReader::new(stream).read_line(&mut line) {
-        Ok(0) | Err(_) => {
-            eprintln!("ka-agent: daemon closed the connection without a reply");
-            return std::process::ExitCode::FAILURE;
-        }
-        Ok(_) => {}
-    }
-    let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+    let paths = Paths::new(Paths::default_root());
+    let v = match admin::request(&paths, &serde_json::json!({"op": "status"})) {
         Ok(v) => v,
+        Err(admin::AdminError::NotRunning(_)) => {
+            println!("{}", not_running_text());
+            return std::process::ExitCode::FAILURE;
+        }
         Err(e) => {
-            eprintln!("ka-agent: bad reply: {e}");
+            eprintln!("ka-agent: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    if v.get("error").is_some() {
-        eprintln!("ka-agent: {}", v["error"].as_str().unwrap_or("error"));
-        return std::process::ExitCode::FAILURE;
+    match serde_json::from_value::<ka_agent_runtime::StatusReport>(v["report"].clone()) {
+        Ok(report) => {
+            println!("{}", report.render(&zoned_now(&report.timezone)));
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ka-agent: bad status reply: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
-    let strand = v["strand"].as_str().unwrap_or("(new)");
-    println!(
-        "session {} · {}",
-        v["session"].as_str().unwrap_or("?"),
-        v["status"].as_str().unwrap_or("?")
-    );
-    println!("strand: {strand}");
-    println!(
-        "budget: ${:.4} + {} tokens",
-        v["budget_usd"].as_f64().unwrap_or(0.0),
-        v["budget_tokens"].as_u64().unwrap_or(0)
-    );
-    println!("queue: {}", v["queue"].as_u64().unwrap_or(0));
-    println!("crashes: {}", v["crashes"].as_u64().unwrap_or(0));
-    std::process::ExitCode::SUCCESS
 }

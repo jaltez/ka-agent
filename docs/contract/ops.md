@@ -43,7 +43,7 @@ ka pin (the exact crates.io version, verified against the manifest by
 `check-ka-deps.sh`), the contract-suite hash (sha256 of the thirteen
 embedded `docs/contract/*.md` — the behavioral contract this binary
 shipped with), config presence and validity (a missing config says
-`ka-agent init`, a broken one says why), data/state/workspace state, the
+`ka-agent setup`, a broken one says why), data/state/workspace state, the
 engine provider-key count (ka's `.env` tier — `ka-agent key set`), git
 presence (memory is git-backed; a missing git is a FAIL), bubblewrap
 version (the plugin sandbox prerequisite), enabled skills, linked
@@ -52,7 +52,7 @@ every check names what to do about it.
 
 ## First-run setup
 
-`ka-agent init` writes a starter config (workspace under the data root),
+`ka-agent setup` writes the config (workspace under the data root),
 creates the data directories, the state store and the git-backed memory
 tree, and prints the next steps. `ka-agent key set <NAME>` writes the
 engine provider key (0600, upsert); `ka-agent secret set <name>` writes

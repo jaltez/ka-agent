@@ -412,7 +412,9 @@ impl PortSession {
                 },
             );
         // Own process group: the whole worker tree (engine tool children
-        // included) is killable as one unit (ka-port.md §8).
+        // included) is killable as one unit (ka-port.md §8). Windows has
+        // no process groups; the kill there targets the process itself.
+        #[cfg(unix)]
         cmd.process_group(0);
         // Safety net: a dropped session must not leak a live worker.
         cmd.kill_on_drop(true);
@@ -680,10 +682,9 @@ async fn reader_task(
             WorkerEvent::Ka { event } => {
                 let (strand_id, strand_path) = state.snapshot_strand();
                 if let Some(pe) = map_ka_event(event, strand_id.as_deref(), strand_path.as_deref())
+                    && tx.send(pe).await.is_err()
                 {
-                    if tx.send(pe).await.is_err() {
-                        break; // consumer gone
-                    }
+                    break; // consumer gone
                 }
             }
             WorkerEvent::EngineClosed { .. } => {

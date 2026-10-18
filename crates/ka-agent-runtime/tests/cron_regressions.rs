@@ -68,6 +68,8 @@ fn spec(text: &str, recurrence_ms: Option<i64>) -> CronSpec {
         source: "operator".into(),
         recurrence_ms,
         mode: CronMode::NoAgent("echo".into()),
+        at_local: None,
+        weekday: None,
     }
 }
 
@@ -121,7 +123,8 @@ async fn reminder_added_while_sleeping_fires_on_time() {
     // Let the loop finish its boot pass (which would consume any immediate
     // wake) and settle into its idle sleep.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    rt.add_reminder("1s prompt-check").unwrap();
+    rt.add_reminder_at(ka_agent_core::now_ms() + 1_000, "prompt-check")
+        .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -250,7 +253,10 @@ async fn concurrent_cancel_wins_over_rearm() {
     assert!(store.claim_task(&id).unwrap(), "first claim takes the row");
     assert!(!store.claim_task(&id).unwrap(), "double claim is refused");
     // …the operator cancelling mid-flight…
-    assert!(rt.cancel_cron(&id.as_str()[..8]).unwrap());
+    assert!(matches!(
+        rt.cancel_scheduled(&id.as_str()[..8]).unwrap(),
+        ka_agent_runtime::CancelOutcome::Cancelled(_)
+    ));
     // …and the loop finishing: settle and re-arm must both be no-ops.
     assert!(!store.settle_task(&id, "succeeded").unwrap());
     assert!(!store.rearm_task(&id, now + 60_000).unwrap());

@@ -1,15 +1,16 @@
 //! The Telegram channel (SEED.md §5): Bot API long polling in, throttled
-//! messages + approval keyboards out. Plain text only — `parse_mode` is
-//! never set, so model output is never interpreted as markup.
+//! messages + approval keyboards out. Final answers and notices render a
+//! safe HTML subset (`tg_format`, everything escaped first) with a
+//! plain-text fallback; router replies and approval cards stay plain.
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use ka_agent_core::audit::AuditRecord;
-use ka_agent_core::{ApprovalDecision, ApprovalStatus, DaemonConfig, SessionStatus};
+use ka_agent_core::{ApprovalDecision, ApprovalStatus, DaemonConfig, OutboxChunk, SessionStatus};
 use ka_agent_runtime::surface::{ApprovalCard, Surface};
 use ka_agent_runtime::{Error as RtError, Runtime};
 use ka_agent_store::Store;
@@ -17,12 +18,18 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
+use crate::pairing::{self, Redeem};
+use crate::tg_format::to_telegram_html;
+
 const POLL_TIMEOUT_SECS: u64 = 25;
 const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(40);
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 const NOTE_EDIT_INTERVAL_MS: i64 = 3_000;
 const SEND_SPACING_MS: i64 = 1_000;
 const UNAUTHORIZED_NOTE_SECS: i64 = 60;
+const START_REPLY_INTERVAL_MS: i64 = 60 * 60 * 1000;
+const MAX_MESSAGE_CHARS: usize = 4096;
+const START_REPLY: &str = "This is a private assistant. If you are its owner, run `ka-agent pair telegram` on your computer and send the code here.";
 
 #[derive(Debug, Error)]
 pub(crate) enum ChannelError {
@@ -40,7 +47,7 @@ impl ChannelError {
     }
 
     /// Bad-token failures: Telegram answers 401/404 with these descriptions.
-    fn is_auth_failure(&self) -> bool {
+    pub(crate) fn is_auth_failure(&self) -> bool {
         match self {
             Self::Api { description } => {
                 description.contains("Unauthorized")
@@ -65,7 +72,7 @@ fn now_ms() -> i64 {
 /// fence) append a closer; if it continues a block opened in an earlier
 /// chunk, prepend the opener.
 pub(crate) fn balance_fences(text: &str) -> String {
-    if text.matches("```").count() % 2 == 0 {
+    if text.matches("```").count().is_multiple_of(2) {
         return text.to_string();
     }
     if text.trim_start().starts_with("```") {
@@ -160,6 +167,35 @@ impl TelegramClient {
         Ok(result["message_id"].as_i64().unwrap_or(0))
     }
 
+    /// `sendMessage` with `parse_mode: HTML`; the caller supplies markup
+    /// built by `tg_format` (input already escaped).
+    pub(crate) async fn send_message_html(
+        &self,
+        chat_id: i64,
+        html: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<i64, ChannelError> {
+        let mut body = json!({ "chat_id": chat_id, "text": html, "parse_mode": "HTML" });
+        if let Some(markup) = reply_markup {
+            body["reply_markup"] = markup;
+        }
+        let result = self.call("sendMessage", body).await?;
+        Ok(result["message_id"].as_i64().unwrap_or(0))
+    }
+
+    pub(crate) async fn delete_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<(), ChannelError> {
+        self.call(
+            "deleteMessage",
+            json!({ "chat_id": chat_id, "message_id": message_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn edit_message_text(
         &self,
         chat_id: i64,
@@ -197,25 +233,22 @@ impl TelegramClient {
     }
 
     pub(crate) async fn set_my_commands(&self) -> Result<Value, ChannelError> {
+        // Built from the shared command table so the menu can never drift
+        // from what `/help` says (fixes /skills and /skill missing here).
+        let commands: Vec<serde_json::Value> = crate::commands::COMMANDS
+            .iter()
+            .filter(|c| c.telegram)
+            .map(|c| {
+                json!({
+                    "command": c.name,
+                    "description": c.summary.chars().take(256).collect::<String>(),
+                })
+            })
+            .collect();
         self.call(
             "setMyCommands",
             json!({
-                "commands": [
-                    {"command": "help",    "description": "what the assistant can do"},
-                    {"command": "status",  "description": "session, strand, budget"},
-                    {"command": "new",     "description": "start a fresh session"},
-                    {"command": "stop",    "description": "abort the running turn"},
-                    {"command": "resume",  "description": "lift a pause (budget, auth)"},
-                    {"command": "remember","description": "save a fact to memory"},
-                    {"command": "forget",  "description": "remove a memory entry"},
-                    {"command": "memory",  "description": "memory report / review"},
-                    {"command": "history", "description": "search past turns"},
-                    {"command": "remind",  "description": "schedule a reminder"},
-                    {"command": "cron",    "description": "list / add scheduled jobs"},
-                    {"command": "calendar","description": "daily calendar digest"},
-                    {"command": "y",       "description": "approve the pending approval"},
-                    {"command": "n",       "description": "deny the pending approval"},
-                ]
+                "commands": commands
             }),
         )
         .await
@@ -250,6 +283,18 @@ impl TelegramClient {
     }
 }
 
+/// Validate a bot token with `getMe`; returns the bot's username.
+pub async fn telegram_get_me(api_base: &str, token: &str) -> Result<String, String> {
+    let me = TelegramClient::new(api_base, token)
+        .get_me()
+        .await
+        .map_err(|e| e.to_string())?;
+    me["username"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "telegram getMe: no username in the answer".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Surface (outbound, throttled)
 // ---------------------------------------------------------------------------
@@ -269,10 +314,21 @@ fn take_surface_state(client: TelegramClient, token: &str) -> Arc<SurfaceInner> 
         .unwrap_or_else(|| Arc::new(SurfaceInner::new(client)))
 }
 
+/// The in-turn progress message: none yet, being sent, or on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    None,
+    Sending,
+    Shown(i64),
+}
+
 struct SurfaceInner {
     client: TelegramClient,
     chat_id: AtomicI64,
-    progress_message_id: Mutex<Option<i64>>,
+    /// Set between `on_turn_started` and `on_turn_finished`; notes outside
+    /// a turn are dropped (the journal surface keeps them).
+    turn_active: AtomicBool,
+    progress: Mutex<Progress>,
     last_progress_edit_ms: AtomicI64,
     pending_notes: Mutex<Vec<String>>,
     /// short approval id → (full id, message id, question first line)
@@ -286,7 +342,8 @@ impl SurfaceInner {
         Self {
             client,
             chat_id: AtomicI64::new(0),
-            progress_message_id: Mutex::new(None),
+            turn_active: AtomicBool::new(false),
+            progress: Mutex::new(Progress::None),
             last_progress_edit_ms: AtomicI64::new(0),
             pending_notes: Mutex::new(Vec::new()),
             cards: Mutex::new(HashMap::new()),
@@ -302,10 +359,10 @@ impl SurfaceInner {
         }
     }
 
-    fn set_chat(&self, chat_id: i64) {
-        self.chat_id
-            .compare_exchange(0, chat_id, Ordering::AcqRel, Ordering::Acquire)
-            .ok();
+    /// Remember the operator's chat (the last private chat of a linked
+    /// user wins); `true` when it changed.
+    fn set_chat(&self, chat_id: i64) -> bool {
+        chat_id != 0 && self.chat_id.swap(chat_id, Ordering::AcqRel) != chat_id
     }
 
     fn spawn_send(&self, text: String) {
@@ -314,6 +371,43 @@ impl SurfaceInner {
             tokio::spawn(async move {
                 let _ = client.send_message(chat, &text, None).await;
             });
+        }
+    }
+
+    /// Send one message as rendered HTML, keeping ≥1 s between sends.
+    /// Falls back to plain text when the HTML is too long or Telegram
+    /// refuses it (`can't parse entities`).
+    async fn send_rich(&self, text: &str) {
+        let mut last = self.last_send_ms.lock().await;
+        let wait = SEND_SPACING_MS - (now_ms() - *last);
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+        }
+        let Some(chat) = self.chat() else { return };
+        let plain = balance_fences(text);
+        let html = to_telegram_html(&plain);
+        let mut fallback = true;
+        if html.chars().count() <= MAX_MESSAGE_CHARS {
+            match self.client.send_message_html(chat, &html, None).await {
+                Ok(_) => fallback = false,
+                Err(ChannelError::Api { description }) => {
+                    eprintln!("telegram: HTML refused ({description}); sending plain text");
+                }
+                Err(e) => {
+                    eprintln!("telegram: send: {e}");
+                    fallback = false;
+                }
+            }
+        }
+        if fallback && let Err(e) = self.client.send_message(chat, &plain, None).await {
+            eprintln!("telegram: send: {e}");
+        }
+        *last = now_ms();
+    }
+
+    fn stop_typing(&self) {
+        if let Some(handle) = self.typing.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            handle.abort();
         }
     }
 
@@ -344,10 +438,15 @@ pub struct TelegramSurface {
 }
 
 impl TelegramSurface {
-    /// No chat yet — the surface no-ops until the poller learns the chat id
-    /// from the first allowed inbound message (`set_chat`).
-    pub fn new(api_base: String, token: String) -> Self {
+    /// `initial_chat` is the persisted `telegram.chat_id` meta value, so
+    /// proactive notices reach the operator right after a restart. Without
+    /// it the surface no-ops until the poller learns the chat id from an
+    /// allowed inbound message (`set_chat`).
+    pub fn new(api_base: String, token: String, initial_chat: Option<i64>) -> Self {
         let inner = Arc::new(SurfaceInner::new(TelegramClient::new(&api_base, &token)));
+        if let Some(chat) = initial_chat {
+            inner.set_chat(chat);
+        }
         surfaces()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -355,95 +454,125 @@ impl TelegramSurface {
         Self { inner }
     }
 
-    /// Called by the poller on the first allowed inbound message.
+    /// Called by the poller on allowed inbound messages.
     pub fn set_chat(&self, chat_id: i64) {
         self.inner.set_chat(chat_id);
     }
 }
 
 impl Surface for TelegramSurface {
+    /// Typing indicator only; a progress message appears with the first note.
     fn on_turn_started(&self) {
+        self.inner.turn_active.store(true, Ordering::Release);
+        *self
+            .inner
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Progress::None;
+        self.inner
+            .pending_notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let Some(chat) = self.inner.chat() else {
             return;
         };
-        self.inner
-            .last_progress_edit_ms
-            .store(now_ms(), Ordering::Release);
-        // typing indicator until the turn ends
-        {
-            let mut typing = self.inner.typing.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(old) = typing.take() {
-                old.abort();
-            }
-            let client = self.inner.client.clone();
-            *typing = Some(tokio::spawn(async move {
-                loop {
-                    let _ = client.send_chat_action(chat).await;
-                    tokio::time::sleep(TYPING_INTERVAL).await;
-                }
-            }));
+        let mut typing = self.inner.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = typing.take() {
+            old.abort();
         }
-        // progress message
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            if let Ok(message_id) = inner.client.send_message(chat, "…", None).await {
-                *inner
-                    .progress_message_id
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(message_id);
+        let client = self.inner.client.clone();
+        *typing = Some(tokio::spawn(async move {
+            loop {
+                let _ = client.send_chat_action(chat).await;
+                tokio::time::sleep(TYPING_INTERVAL).await;
             }
-        });
+        }));
     }
 
-    /// Notes are folded into the progress message at most every 3 s; the
-    /// last 3 buffered notes are shown on the next edit.
+    /// In-turn progress: the first note sends `⏳ {note}`; later notes edit
+    /// that message (last 3 shown) at most every 3 s. Outside a turn notes
+    /// are dropped here.
     fn on_note(&self, text: &str) {
+        if !self.inner.turn_active.load(Ordering::Acquire) {
+            return;
+        }
         let Some(chat) = self.inner.chat() else {
             return;
         };
-        {
+        let shown = {
             let mut notes = self
                 .inner
                 .pending_notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             notes.push(text.to_string());
-        }
-        let last = self.inner.last_progress_edit_ms.load(Ordering::Acquire);
-        let now = now_ms();
-        if now - last < NOTE_EDIT_INTERVAL_MS {
-            return;
-        }
-        self.inner
-            .last_progress_edit_ms
-            .store(now, Ordering::Release);
-        let notes: Vec<String> = {
-            let mut notes = self
-                .inner
-                .pending_notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let keep = notes.len().saturating_sub(3);
-            let shown = notes.split_off(keep);
-            *notes = Vec::new();
-            shown
+            let drop_n = notes.len().saturating_sub(3);
+            notes.drain(..drop_n);
+            notes.join("\n")
         };
-        if notes.is_empty() {
-            return;
-        }
-        let message_id = *self
+        let now = now_ms();
+        let mut progress = self
             .inner
-            .progress_message_id
+            .progress
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let Some(message_id) = message_id else { return };
-        let text = format!("…\n{}", notes.join("\n"));
-        let client = self.inner.client.clone();
-        tokio::spawn(async move {
-            let _ = client
-                .edit_message_text(chat, message_id, &text, None)
-                .await;
-        });
+        match *progress {
+            Progress::None => {
+                *progress = Progress::Sending;
+                self.inner
+                    .last_progress_edit_ms
+                    .store(now, Ordering::Release);
+                let inner = Arc::clone(&self.inner);
+                let body = format!("⏳ {text}");
+                tokio::spawn(async move {
+                    let sent = inner.client.send_message(chat, &body, None).await.ok();
+                    let orphan = {
+                        let mut p = inner.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        match (sent, *p) {
+                            (Some(id), Progress::Sending) => {
+                                *p = Progress::Shown(id);
+                                None
+                            }
+                            (None, Progress::Sending) => {
+                                *p = Progress::None;
+                                None
+                            }
+                            // the turn ended while the send was in flight
+                            (sent, _) => sent,
+                        }
+                    };
+                    if let Some(id) = orphan {
+                        let _ = inner.client.delete_message(chat, id).await;
+                    }
+                });
+            }
+            Progress::Sending => {}
+            Progress::Shown(message_id) => {
+                let last = self.inner.last_progress_edit_ms.load(Ordering::Acquire);
+                if now - last < NOTE_EDIT_INTERVAL_MS {
+                    return;
+                }
+                self.inner
+                    .last_progress_edit_ms
+                    .store(now, Ordering::Release);
+                let client = self.inner.client.clone();
+                let body = format!("⏳ {shown}");
+                tokio::spawn(async move {
+                    let _ = client
+                        .edit_message_text(chat, message_id, &body, None)
+                        .await;
+                });
+            }
+        }
+    }
+
+    /// Operator-must-receive messages (reminders, cron output, pauses):
+    /// always their own message.
+    fn on_notice(&self, text: &str) {
+        let inner = Arc::clone(&self.inner);
+        let text = text.to_string();
+        tokio::spawn(async move { inner.send_rich(&text).await });
     }
 
     /// No per-delta edits: streaming text over Bot API edits would be a
@@ -453,52 +582,37 @@ impl Surface for TelegramSurface {
     fn on_delta_thought(&self, _text: &str) {}
 
     fn on_final_chunk(&self, _index: u32, text: &str) {
-        let Some(_chat) = self.inner.chat() else {
+        if self.inner.chat().is_none() {
             return;
-        };
+        }
         let inner = Arc::clone(&self.inner);
-        let text = balance_fences(text);
-        tokio::spawn(async move {
-            // ≥1 s spacing between sends
-            let mut last = inner.last_send_ms.lock().await;
-            let wait = SEND_SPACING_MS - (now_ms() - *last);
-            if wait > 0 {
-                tokio::time::sleep(Duration::from_millis(wait as u64)).await;
-            }
-            if let Some(chat) = inner.chat() {
-                if inner.client.send_message(chat, &text, None).await.is_ok() {
-                    *last = now_ms();
-                }
-            }
-        });
+        let text = text.to_string();
+        tokio::spawn(async move { inner.send_rich(&text).await });
     }
 
-    fn on_turn_finished(&self, stop: &str, cost_usd: f64, tokens: u64) {
-        if let Some(handle) = self
-            .inner
-            .typing
+    /// Stops typing and deletes the progress message; cost lives in /status.
+    fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {
+        self.inner.stop_typing();
+        self.inner.turn_active.store(false, Ordering::Release);
+        self.inner
+            .pending_notes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            handle.abort();
+            .clear();
+        let previous = std::mem::replace(
+            &mut *self
+                .inner
+                .progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            Progress::None,
+        );
+        if let (Progress::Shown(message_id), Some(chat)) = (previous, self.inner.chat()) {
+            let client = self.inner.client.clone();
+            tokio::spawn(async move {
+                let _ = client.delete_message(chat, message_id).await;
+            });
         }
-        let Some(chat) = self.inner.chat() else {
-            return;
-        };
-        let message_id = *self
-            .inner
-            .progress_message_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(message_id) = message_id else { return };
-        let text = format!("· turn {stop} · ${cost_usd:.4} · {tokens} tk");
-        let client = self.inner.client.clone();
-        tokio::spawn(async move {
-            let _ = client
-                .edit_message_text(chat, message_id, &text, None)
-                .await;
-        });
     }
 
     fn on_approval(&self, card: &ApprovalCard) {
@@ -573,6 +687,11 @@ pub struct TelegramChannel {
     cfg: TelegramConfig,
     runtime: Runtime,
     store: Arc<Store>,
+    /// uid → last `/start` reply (ms); strangers get at most one an hour.
+    start_replied: Mutex<HashMap<i64, i64>>,
+    /// Chunks recovered at startup while no chat was known; delivered on
+    /// the first `set_chat`.
+    undelivered: Mutex<Vec<OutboxChunk>>,
 }
 
 impl crate::channel::Channel for TelegramChannel {
@@ -591,6 +710,8 @@ impl TelegramChannel {
             cfg,
             runtime,
             store,
+            start_replied: Mutex::new(HashMap::new()),
+            undelivered: Mutex::new(Vec::new()),
         }
     }
 
@@ -602,6 +723,16 @@ impl TelegramChannel {
     pub async fn run(self, shutdown: watch::Receiver<bool>) {
         let client = TelegramClient::new(&self.cfg.api_base, &self.cfg.token);
         let surface = take_surface_state(client.clone(), &self.cfg.token);
+        if surface.chat().is_none()
+            && let Some(chat) = self
+                .store
+                .meta_get("telegram.chat_id")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<i64>().ok())
+        {
+            surface.set_chat(chat);
+        }
         let allow = self.cfg.allow_user_ids.clone();
         let mut unauthorized_last: HashMap<i64, i64> = HashMap::new();
 
@@ -614,29 +745,21 @@ impl TelegramChannel {
             .unwrap_or(0);
 
         // Crash recovery (SEED §3.7): chunks queued but never delivered go
-        // out first, oldest first, before any new traffic.
+        // out first, oldest first, before any new traffic. Without a known
+        // chat they wait for the operator's first message.
         let recover = self
             .store
             .pending_chunks_for_session(&self.runtime.session_id())
             .unwrap_or_default();
-        for chunk in &recover {
-            if let Some(chat) = surface.chat() {
-                if client.send_message(chat, &chunk.text, None).await.is_ok() {
-                    self.store
-                        .mark_sent(&chunk.turn, chunk.chunk_index, chunk.chunk_index as i64)
-                        .ok();
-                }
-            } else {
-                eprintln!(
-                    "telegram: {} undelivered chunk(s) from before the crash, \
-                     but no chat to send them to; they stay queued",
-                    recover.len()
-                );
-                break;
-            }
-        }
         if !recover.is_empty() {
             eprintln!("telegram: recovered {} queued chunk(s)", recover.len());
+            match surface.chat() {
+                Some(chat) => self.deliver_recovered(&client, chat, recover).await,
+                None => {
+                    eprintln!("telegram: no chat known yet; they go out after your next message");
+                    *self.undelivered.lock().unwrap_or_else(|e| e.into_inner()) = recover;
+                }
+            }
         }
 
         // Startup token check: fail fast on a bad token instead of
@@ -769,6 +892,87 @@ impl TelegramChannel {
         false
     }
 
+    /// Adopt `chat_id` as the operator's chat: persist it when it changed
+    /// and flush chunks recovered while no chat was known.
+    async fn adopt_chat(&self, surface: &Arc<SurfaceInner>, chat_id: i64) {
+        if surface.set_chat(chat_id)
+            && let Err(e) = self
+                .store
+                .meta_set("telegram.chat_id", &chat_id.to_string())
+        {
+            eprintln!("telegram: persist chat id: {e}");
+        }
+        let pending =
+            std::mem::take(&mut *self.undelivered.lock().unwrap_or_else(|e| e.into_inner()));
+        if !pending.is_empty() {
+            self.deliver_recovered(&surface.client, chat_id, pending)
+                .await;
+        }
+    }
+
+    async fn deliver_recovered(
+        &self,
+        client: &TelegramClient,
+        chat: i64,
+        chunks: Vec<OutboxChunk>,
+    ) {
+        for chunk in &chunks {
+            match client.send_message(chat, &chunk.text, None).await {
+                Ok(message_id) => {
+                    self.store
+                        .mark_sent(&chunk.turn, chunk.chunk_index, message_id)
+                        .ok();
+                }
+                Err(e) => eprintln!("telegram: recovered chunk: {e}"),
+            }
+        }
+    }
+
+    /// Unlinked private messages that may still get an answer: a correct
+    /// `/pair <code>` links the sender; `/start` gets the one-line owner
+    /// hint at most once an hour per uid. `true` = handled (linked).
+    async fn unlinked_private(
+        &self,
+        message: &Value,
+        uid: i64,
+        text: &str,
+        surface: &Arc<SurfaceInner>,
+    ) -> bool {
+        let chat_id = message["chat"]["id"].as_i64().unwrap_or(uid);
+        if pairing::is_pair_command(text) {
+            if pairing::redeem(&self.store, "telegram", &uid.to_string(), text) == Redeem::Linked {
+                self.adopt_chat(surface, chat_id).await;
+                let _ = surface
+                    .client
+                    .send_message(chat_id, pairing::TELEGRAM_WELCOME, None)
+                    .await;
+                return true;
+            }
+            return false;
+        }
+        let first = text.split_whitespace().next().unwrap_or("");
+        if first.split('@').next() == Some("/start") {
+            let now = now_ms();
+            let reply = {
+                let mut replied = self.start_replied.lock().unwrap_or_else(|e| e.into_inner());
+                let due = replied
+                    .get(&uid)
+                    .is_none_or(|last| now - *last >= START_REPLY_INTERVAL_MS);
+                if due {
+                    replied.insert(uid, now);
+                }
+                due
+            };
+            if reply {
+                let _ = surface
+                    .client
+                    .send_message(chat_id, START_REPLY, None)
+                    .await;
+            }
+        }
+        false
+    }
+
     async fn dispatch_message(
         &self,
         message: &Value,
@@ -780,11 +984,21 @@ impl TelegramChannel {
         let Some(uid) = message["from"]["id"].as_i64() else {
             return;
         };
+        if chat_type == "private"
+            && let Some(text) = message["text"].as_str()
+            && !self
+                .store
+                .is_linked("telegram", &uid.to_string())
+                .unwrap_or(false)
+            && self.unlinked_private(message, uid, text, surface).await
+        {
+            return;
+        }
         if !self.gate(uid, chat_type, unauthorized_last).await {
             return;
         }
         let chat_id = message["chat"]["id"].as_i64().unwrap_or(0);
-        surface.set_chat(chat_id);
+        self.adopt_chat(surface, chat_id).await;
         let client = surface.client.clone();
 
         if message.get("photo").is_some() || message.get("document").is_some() {
@@ -839,7 +1053,7 @@ impl TelegramChannel {
             return;
         }
         let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
-        surface.set_chat(chat_id);
+        self.adopt_chat(surface, chat_id).await;
         let client = surface.client.clone();
         let Some(data) = cb["data"].as_str() else {
             return;

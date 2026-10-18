@@ -78,7 +78,7 @@ fn adopted_busy_session_returns_to_idle_on_startup() {
     // Restart the runtime over the same store.
     let rt = runtime_with(&root, Arc::clone(&store), config(&root));
     assert_eq!(
-        rt.status().0,
+        rt.session_status(),
         ka_agent_core::SessionStatus::Idle,
         "an adopted busy session must not stay busy"
     );
@@ -132,7 +132,7 @@ async fn expired_ask_is_dropped_from_the_pending_map() {
 
     // The invariant that matters: nothing is left claiming a live ask, so the
     // next message is submitted (or queued for drain), never wedged.
-    let (status, _, _, _, _) = rt.status();
+    let status = rt.session_status();
     assert_ne!(
         status,
         ka_agent_core::SessionStatus::AwaitingApproval,
@@ -239,7 +239,10 @@ fn resume_lifts_a_pause_and_refuses_on_budget() {
         .unwrap();
     let after_roll = runtime_with(&root, Arc::clone(&store), cfg);
     assert!(after_roll.resume().unwrap());
-    assert_eq!(after_roll.status().0, ka_agent_core::SessionStatus::Idle);
+    assert_eq!(
+        after_roll.session_status(),
+        ka_agent_core::SessionStatus::Idle
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -257,7 +260,7 @@ fn stop_escalates_on_the_turn_not_the_process() {
 
     // No live worker: a no-op, not an error.
     futures_lite_block(rt.stop_turn()).unwrap();
-    assert_eq!(rt.status().0, ka_agent_core::SessionStatus::Idle);
+    assert_eq!(rt.session_status(), ka_agent_core::SessionStatus::Idle);
 
     let _ = std::fs::remove_dir_all(&root);
 }

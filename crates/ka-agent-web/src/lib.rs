@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ka_agent_runtime::Runtime;
+use ka_agent_runtime::{EventBus, Runtime, SurfaceEvent};
 use ka_agent_store::Store;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,7 +30,17 @@ pub struct Request {
     path: String,
     query: HashMap<String, String>,
     cookies: HashMap<String, String>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl Request {
+    fn headers_get(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 pub struct Response {
@@ -39,47 +49,64 @@ pub struct Response {
     pub body: String,
     pub set_cookies: Vec<String>,
     pub redirect: Option<String>,
+    /// Extra headers on this response only (CSP is added automatically on
+    /// every HTML response).
+    pub extra_headers: Vec<(&'static str, String)>,
 }
 
+/// The default security policy: only this origin, no third-party anything,
+/// frames denied, no JS except our own static file.
+pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
 impl Response {
-    pub fn html(body: String) -> Self {
+    fn base(status: u16, content_type: &'static str, body: String) -> Self {
         Self {
-            status: 200,
-            content_type: "text/html; charset=utf-8",
+            status,
+            content_type,
             body,
             set_cookies: Vec::new(),
             redirect: None,
+            extra_headers: Vec::new(),
         }
+    }
+
+    pub fn html(body: String) -> Self {
+        Self::base(200, "text/html; charset=utf-8", body)
+    }
+
+    pub fn json(body: String) -> Self {
+        Self::base(200, "application/json", body)
+    }
+
+    /// POST replies use 303 so a browser reload does not re-submit.
+    pub fn see_other(location: &str) -> Self {
+        let mut r = Self::base(303, "text/plain", String::new());
+        r.redirect = Some(location.to_string());
+        r
     }
 
     pub fn redirect(location: &str) -> Self {
-        Self {
-            status: 302,
-            content_type: "text/plain",
-            body: String::new(),
-            set_cookies: Vec::new(),
-            redirect: Some(location.to_string()),
-        }
+        Self::see_other(location)
     }
 
     pub fn unauthorized() -> Self {
-        Self {
-            status: 401,
-            content_type: "text/plain",
-            body: "unauthorized\n".into(),
-            set_cookies: Vec::new(),
-            redirect: None,
-        }
+        Self::base(
+            401,
+            "text/html; charset=utf-8",
+            "<!DOCTYPE html><html><body><p>Session expired. On your computer run <code>ka-agent dashboard</code>.</p></body></html>".into(),
+        )
     }
 
     pub fn not_found() -> Self {
-        Self {
-            status: 404,
-            content_type: "text/plain",
-            body: "not found\n".into(),
-            set_cookies: Vec::new(),
-            redirect: None,
-        }
+        Self::base(404, "text/plain", "not found\n".into())
+    }
+
+    pub fn bad_request(message: &str) -> Self {
+        Self::base(400, "text/plain", format!("{message}\n"))
+    }
+
+    pub fn forbidden(message: &str) -> Self {
+        Self::base(403, "text/plain", format!("{message}\n"))
     }
 }
 
@@ -119,6 +146,7 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
             let method = parts.next()?.to_string();
             let target = parts.next()?.to_string();
             let mut cookies = HashMap::new();
+            let mut headers: Vec<(String, String)> = Vec::new();
             let mut content_length: Option<u64> = None;
             for line in lines {
                 if let Some(v) = line
@@ -130,6 +158,9 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
                             cookies.insert(k.trim().to_string(), val.trim().to_string());
                         }
                     }
+                }
+                if let Some((name, value)) = line.split_once(": ") {
+                    headers.push((name.trim().to_string(), value.trim().to_string()));
                 }
                 if let Some(v) = line
                     .strip_prefix("Content-Length: ")
@@ -176,6 +207,7 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
                 path: path.to_string(),
                 query,
                 cookies,
+                headers,
                 body,
             });
         }
@@ -183,21 +215,37 @@ pub async fn parse_request(socket: &mut tokio::net::TcpStream) -> Option<Request
 }
 
 pub fn url_decode(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '%' => {
-                let hex: String = chars.by_ref().take(2).collect();
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    out.push(byte as char);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Both hex digits must be present; a truncated escape stays a
+            // literal `%` (lossless, never a control byte).
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
                 }
             }
-            '+' => out.push(' '),
-            _ => out.push(c),
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub async fn write_response(socket: &mut tokio::net::TcpStream, resp: Response) {
@@ -213,6 +261,14 @@ pub async fn write_response(socket: &mut tokio::net::TcpStream, resp: Response) 
     }
     if let Some(loc) = &resp.redirect {
         head.push_str(&format!("Location: {loc}\r\n"));
+    }
+    if resp.content_type.starts_with("text/html") {
+        head.push_str(&format!(
+            "Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\n"
+        ));
+    }
+    for (name, value) in &resp.extra_headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
     let _ = socket.write_all(head.as_bytes()).await;
@@ -296,35 +352,16 @@ pub fn issue_auth_url(store: &Store, port: u16) -> Result<String, WebError> {
     Ok(format!("http://127.0.0.1:{port}/auth?token={token}"))
 }
 
-/// 32 bytes of OS entropy, hex-encoded. Falls back to per-thread hasher
-/// output (seeded from the OS by `RandomState`) if `/dev/urandom` is absent.
+/// 32 bytes of OS entropy, hex-encoded.
 fn random_hex(bytes: usize) -> String {
-    use std::io::Read;
+    use rand_core::RngCore;
     let mut buf = vec![0u8; bytes];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok()
-    {
-        let mut out = String::with_capacity(bytes * 2);
-        for b in buf {
-            out.push_str(&format!("{b:02x}"));
-        }
-        return out;
+    rand_core::OsRng.fill_bytes(&mut buf);
+    let mut out = String::with_capacity(bytes * 2);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
     }
-    let mut out = String::with_capacity(bytes * 2 + 16);
-    while out.len() < bytes * 2 {
-        out.push_str(&format!("{:016x}", random_u64()));
-    }
-    out.truncate(bytes * 2);
     out
-}
-
-fn random_u64() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u64(ka_agent_core::now_ms() as u64);
-    h.write_u64(std::process::id() as u64);
-    h.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -335,14 +372,16 @@ pub struct WebServer {
     pub port: u16,
     pub runtime: Runtime,
     pub store: Arc<Store>,
+    pub bus: Arc<EventBus>,
 }
 
 impl WebServer {
-    pub fn new(port: u16, runtime: Runtime, store: Arc<Store>) -> Self {
+    pub fn new(port: u16, runtime: Runtime, store: Arc<Store>, bus: Arc<EventBus>) -> Self {
         Self {
             port,
             runtime,
             store,
+            bus,
         }
     }
 
@@ -351,6 +390,7 @@ impl WebServer {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| WebError::Bind(format!("bind {addr}: {e}")))?;
+        let _ = self.store.meta_set("web.url", &format!("http://{addr}"));
         eprintln!("ka-agent web: listening on {addr}");
         let auth = Arc::new(Auth::new());
         // Bounded concurrency: a local process must not exhaust the shared
@@ -362,6 +402,7 @@ impl WebServer {
             tokio::select! {
                 _ = shutdown.changed() => {
                     eprintln!("ka-agent web: shutting down");
+                    let _ = self.store.meta_set("web.url", "");
                     return Ok(());
                 }
                 accepted = listener.accept() => {
@@ -373,10 +414,12 @@ impl WebServer {
                     let auth = Arc::clone(&auth);
                     let runtime = self.runtime.clone();
                     let store = Arc::clone(&self.store);
+                    let bus = Arc::clone(&self.bus);
                     tokio::spawn(async move {
                         let _slot = slot;
                         // One deadline for head and body alike: a dribbling
-                        // connection cannot reset it byte by byte.
+                        // connection cannot reset it byte by byte. The SSE
+                        // stream is exempt by design (see its own branch).
                         let req = tokio::time::timeout(
                             Duration::from_secs(30),
                             parse_request(&mut socket),
@@ -385,6 +428,10 @@ impl WebServer {
                         .ok()
                         .flatten();
                         if let Some(req) = req {
+                            if req.path == "/events" {
+                                serve_events(&req, &auth, &runtime, &store, bus, socket).await;
+                                return;
+                            }
                             let resp = route(&req, &auth, &runtime, &store).await;
                             write_response(&mut socket, resp).await;
                         }
@@ -414,7 +461,40 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
         return Response::unauthorized();
     }
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => pages::dashboard(runtime, store),
+        ("GET", "/") => pages::chat_page(runtime, store),
+        ("GET", "/static/chat.js") => {
+            let mut r = Response::base(
+                200,
+                "application/javascript",
+                include_str!("chat.js").to_string(),
+            );
+            r.extra_headers
+                .push(("Cache-Control", "no-store".to_string()));
+            r
+        }
+        ("POST", "/chat/send") => {
+            if req.headers_get("x-ka-agent") != Some("1") {
+                return Response::forbidden("missing X-Ka-Agent header");
+            }
+            let body = String::from_utf8_lossy(&req.body);
+            pages::chat_send(runtime, store, &body).await
+        }
+        ("GET", "/status") => pages::status(runtime),
+        ("GET", "/tasks") => pages::tasks(runtime),
+        ("POST", "/tasks/cancel") => {
+            let body = String::from_utf8_lossy(&req.body);
+            pages::tasks_cancel(runtime, &body).await
+        }
+        ("GET", "/skills") => pages::skills(runtime),
+        ("POST", "/skills/toggle") => {
+            let body = String::from_utf8_lossy(&req.body);
+            pages::skills_toggle(runtime, &body)
+        }
+        ("GET", "/contacts") => pages::contacts(runtime, store),
+        ("POST", "/memory/forget") => {
+            let body = String::from_utf8_lossy(&req.body);
+            pages::memory_forget(runtime, &body).await
+        }
         ("GET", "/history") => pages::history(runtime, req.query.get("q").map(String::as_str)),
         ("GET", p) if p.starts_with("/history/show/") => {
             let turn_id = p.strip_prefix("/history/show/").unwrap_or("");
@@ -432,20 +512,73 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
         ("GET", "/approvals") => pages::approvals(runtime, store),
         ("POST", "/approvals/decide") => {
             let body = String::from_utf8_lossy(&req.body);
-            pages::approvals_decide(runtime, &body).await
+            if req.headers_get("x-ka-agent") == Some("1") {
+                pages::approvals_decide_json(runtime, &body).await
+            } else {
+                pages::approvals_decide(runtime, &body).await
+            }
         }
-        ("GET", "/audit") => pages::audit(store),
+        ("GET", "/audit") => pages::audit(runtime, store),
         ("GET", "/intents") => pages::intents(store),
         _ => Response::not_found(),
     }
 }
 
-/// Local wall-clock `HH:MM` for a millisecond timestamp (dependency-free:
-/// minutes resolution is enough for an audit row).
-pub fn fmt_ms(ms: i64) -> String {
-    let mins = ms.div_euclid(60_000);
-    let (h, m) = (mins.div_euclid(60) % 24, mins % 60);
-    format!("{h:02}:{m:02}")
+/// `GET /events`: server-sent events from the bus. Authenticated like any
+/// page; the connection lives until the client or the daemon goes away.
+async fn serve_events(
+    req: &Request,
+    auth: &Auth,
+    _runtime: &Runtime,
+    _store: &Arc<Store>,
+    bus: Arc<EventBus>,
+    mut socket: tokio::net::TcpStream,
+) {
+    if !auth.is_valid(&req.cookies) {
+        write_response(&mut socket, Response::unauthorized()).await;
+        return;
+    }
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
+    if socket.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    let mut rx = bus.subscribe();
+    let mut ping = tokio::time::interval(Duration::from_secs(25));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => SurfaceEvent::Notice {
+                        text: format!("(missed {n} events)"),
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                if matches!(ev, SurfaceEvent::Hello { .. } | SurfaceEvent::Reply { .. }) {
+                    continue;
+                }
+                match serde_json::to_string(&ev) {
+                    Ok(json) => {
+                        if socket
+                            .write_all(format!("data: {json}\n\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            _ = ping.tick() => {
+                if socket.write_all(b": ping\n\n").await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = socket.flush().await;
+    }
 }
 
 /// Escape user-derived text for safe HTML rendering.

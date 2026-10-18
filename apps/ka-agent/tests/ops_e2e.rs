@@ -83,19 +83,23 @@ fn doctor_reports_pin_contract_state_and_backup() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("ka pin : 0.3.0"), "pin line: {text}");
+    assert!(text.contains("ka 0.3.0"), "pin line: {text}");
     assert!(
-        text.contains("contract suite: ") && text.contains("(13 documents)"),
+        text.contains("contracts ") && text.contains("(13 documents)"),
         "contract hash: {text}"
     );
-    assert!(text.contains("identities: 1 linked"), "{text}");
-    assert!(text.contains("backup : none yet"), "{text}");
+    // A valid config without a model is the one hard failure.
+    assert_eq!(out.status.code(), Some(1), "doctor exit: {text}");
+    assert!(text.contains("no model — run `ka-agent setup`"), "{text}");
+    assert!(text.contains("identities 1 linked"), "{text}");
+    assert!(text.contains("no backup yet"), "{text}");
     let hash1: String = text
         .lines()
-        .find(|l| l.starts_with("contract suite: "))
+        .find(|l| l.contains("contracts "))
         .unwrap()
         .chars()
-        .skip("contract suite: ".len())
+        .skip_while(|c| *c != '(')
+        .skip(1)
         .take(16)
         .collect();
 
@@ -122,14 +126,18 @@ fn doctor_reports_pin_contract_state_and_backup() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("backup : latest"), "{text}");
+    assert!(
+        !text.contains("no backup yet"),
+        "backup must be visible after one runs: {text}"
+    );
     // The hash is stable across runs (same embedded contract).
     let hash2: String = text
         .lines()
-        .find(|l| l.starts_with("contract suite: "))
+        .find(|l| l.contains("contracts "))
         .unwrap()
         .chars()
-        .skip("contract suite: ".len())
+        .skip_while(|c| *c != '(')
+        .skip(1)
         .take(16)
         .collect();
     assert_eq!(hash1, hash2, "contract hash must be deterministic");
@@ -160,7 +168,10 @@ fn restart_stops_the_daemon_gracefully() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("shutting_down"), "{stdout}");
+    assert!(
+        stdout.contains("Ka Agent is stopping"),
+        "restart reply: {stdout}"
+    );
 
     // The daemon exits 0 (graceful), promptly.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -557,5 +568,43 @@ fn restore_works_after_a_clean_stop() {
         "a stale socket must not block restore: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The default backup path rotates: two runs with `--keep 1` leave exactly
+/// one timestamped directory (Verification 15).
+#[test]
+fn backup_default_path_prunes_to_keep() {
+    let root = temp_root("rotate");
+    let cfg = write_config(&root);
+    let data = root.join("data");
+    for _ in 0..2 {
+        let out = ka(&data)
+            .args(["backup", "--keep", "1", "--config"])
+            .arg(&cfg)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "backup: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    let backups = data.join("backups");
+    let mut stamps: Vec<_> = std::fs::read_dir(&backups)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    stamps.sort();
+    assert!(
+        !stamps.is_empty(),
+        "a backup directory exists: {:?}",
+        stamps
+    );
+    let dirs = stamps.len();
+    assert_eq!(dirs, 1, "keep=1 must prune to one: {stamps:?}");
     let _ = std::fs::remove_dir_all(&root);
 }

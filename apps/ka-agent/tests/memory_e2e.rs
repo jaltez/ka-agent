@@ -132,7 +132,7 @@ fn history_remember_forget_flow() {
     chat.send("/remember I prefer concise answers");
     chat.expect("remembered mem_", Duration::from_secs(10));
     chat.send("/memory");
-    chat.expect("facts.md", Duration::from_secs(10));
+    chat.expect("concise answers", Duration::from_secs(10));
     let mem_id = {
         let out = chat.seen();
         out.lines()

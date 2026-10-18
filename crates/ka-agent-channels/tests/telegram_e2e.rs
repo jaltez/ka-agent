@@ -50,7 +50,22 @@ async fn spawn_channel(allow: Vec<i64>, token: &str) -> Stack {
             .link_identity("telegram", &uid.to_string(), "test")
             .unwrap();
     }
-    let surface = TelegramSurface::new(base.clone(), token.to_string());
+    spawn_on(server, base, db_path, store, allow, token, None)
+}
+
+/// Channel + runtime over an existing store and fake server; the surface
+/// starts from `initial_chat` exactly as the daemon passes the meta value.
+fn spawn_on(
+    server: FakeBotServer,
+    base: String,
+    db_path: std::path::PathBuf,
+    store: Arc<Store>,
+    allow: Vec<i64>,
+    token: &str,
+    initial_chat: Option<i64>,
+) -> Stack {
+    let dir = db_path.parent().unwrap().to_path_buf();
+    let surface = TelegramSurface::new(base.clone(), token.to_string(), initial_chat);
     let cfg = DaemonConfig {
         workspace: dir.clone(),
         telegram: TelegramSettings {
@@ -158,7 +173,10 @@ async fn commands_route_locally() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().unwrap_or("") == "unknown command: /frobnicate"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("unknown command /frobnicate")
             },
             Duration::from_secs(5),
         )
@@ -314,7 +332,7 @@ async fn offset_persists_and_dedupes() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().unwrap_or("").contains("memory")
+                    && c.body["text"].as_str().unwrap_or("").contains("remembered")
             },
             Duration::from_secs(5),
         )
@@ -337,7 +355,7 @@ async fn offset_persists_and_dedupes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_card_and_callback_settle() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base.clone(), "tok-appr".to_string());
+    let surface = TelegramSurface::new(base.clone(), "tok-appr".to_string(), None);
     let full_id = "appr_0123456789abcdef";
     let card = ApprovalCard {
         approval_id: full_id.to_string(),
@@ -399,6 +417,7 @@ async fn approval_card_and_callback_settle() {
         Arc::new(TelegramSurface::new(
             String::new(),
             "unused-token".to_string(),
+            None,
         )) as Arc<dyn Surface>,
     )
     .unwrap();
@@ -447,7 +466,7 @@ async fn approval_card_and_callback_settle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn surface_noops_until_chat_is_known() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-nochat".to_string());
+    let surface = TelegramSurface::new(base, "tok-nochat".to_string(), None);
     surface.on_final_chunk(0, "chunk");
     surface.on_error("test", "boom");
     surface.on_turn_finished("done", 0.0, 0);

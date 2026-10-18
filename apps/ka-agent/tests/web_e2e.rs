@@ -40,21 +40,29 @@ impl Daemon {
         [("KA_AGENT_DATA_DIR".to_string(), self.data.clone())]
     }
 
-    /// `ka-agent web-token --port <port>` → the login URL it prints.
+    /// `ka-agent dashboard --no-open` → the one-shot login URL.
     fn web_token(&self) -> String {
+        // The dashboard needs the daemon's admin socket; wait for it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if !self.data.join("admin.sock").exists() {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            break;
+        }
         let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
-            .args(["web-token", "--port", &self.port.to_string()])
+            .args(["dashboard", "--no-open"])
             .envs(self.env())
             .output()
             .unwrap();
-        assert!(out.status.success(), "web-token exited {:?}", out.status);
+        assert!(out.status.success(), "dashboard exited {:?}", out.status);
         let stdout = String::from_utf8_lossy(&out.stdout);
-        stdout
-            .trim()
-            .rsplit(' ')
-            .next()
-            .expect("login URL on stdout")
-            .to_string()
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("open: "))
+            .expect("login URL on stdout");
+        line["open: ".len()..].trim().to_string()
     }
 }
 
@@ -71,12 +79,21 @@ fn spawn_daemon(root: &std::path::Path, port: u16) -> Daemon {
     )
     .unwrap();
     let data = root.join("data");
+    // A scripted speaker: web chat turns must stream answers without keys.
+    let sc = root.join("web.json");
+    std::fs::write(
+        &sc,
+        r#"{ "steps": [ {"text": "web-hello"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 3 }"#,
+    )
+    .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
         .arg("run")
         .arg("--config")
         .arg(&cfg)
         .arg("--web-port")
         .arg(port.to_string())
+        .arg("--scenario")
+        .arg(&sc)
         .env("KA_AGENT_DATA_DIR", &data)
         .env_remove("KA_MODEL")
         .stdout(Stdio::null())
@@ -112,10 +129,24 @@ impl Http {
 }
 
 fn request(port: u16, method: &str, path: &str, cookie: Option<&str>, body: &str) -> Http {
+    request_h(port, method, path, cookie, body, &[])
+}
+
+fn request_h(
+    port: u16,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> Http {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
     if let Some(c) = cookie {
         req.push_str(&format!("Cookie: {c}\r\n"));
+    }
+    for (name, value) in extra {
+        req.push_str(&format!("{name}: {value}\r\n"));
     }
     if !body.is_empty() {
         req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
@@ -178,7 +209,7 @@ fn login(daemon: &Daemon) -> String {
     let path = url.split("127.0.0.1").nth(1).expect("URL host");
     let path = path.trim_start_matches(|c: char| c.is_ascii_digit() || c == ':');
     let resp = request(daemon.port, "GET", path, None, "");
-    assert_eq!(resp.status, 302, "login should redirect: {url}");
+    assert_eq!(resp.status, 303, "login should redirect: {url}");
     assert_eq!(resp.header("location"), Some("/"));
     let set = resp.header("set-cookie").expect("Set-Cookie on login");
     assert!(set.contains("HttpOnly"), "cookie not HttpOnly: {set}");
@@ -188,6 +219,7 @@ fn login(daemon: &Daemon) -> String {
 
 /// The listening socket for `port` in `/proc/net/tcp`, as (address, port).
 /// Linux-specific: proves the bind address, which a connect test cannot.
+#[cfg(target_os = "linux")]
 fn listening_addr(port: u16) -> Option<String> {
     let table = std::fs::read_to_string("/proc/net/tcp").ok()?;
     for line in table.lines().skip(1) {
@@ -249,22 +281,40 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     let path = url.split("127.0.0.1").nth(1).unwrap();
     let path = path.trim_start_matches(|c: char| c.is_ascii_digit() || c == ':');
     let replay = request(port, "GET", path, None, "");
-    assert_eq!(replay.status, 302, "fresh token should log in");
+    assert_eq!(replay.status, 303, "fresh token should log in");
     let replay = request(port, "GET", path, None, "");
     assert_eq!(
         replay.status, 401,
         "consumed token must not authenticate again"
     );
 
-    // A session reaches every page.
-    let dashboard = request(port, "GET", "/", Some(&cookie), "");
-    assert_eq!(dashboard.status, 200);
-    assert!(dashboard.body.contains("Dashboard"), "dashboard body");
+    // A session reaches every page. The chat page loads our one JS file
+    // under a strict CSP.
+    let chat = request(port, "GET", "/", Some(&cookie), "");
+    assert_eq!(chat.status, 200);
     assert!(
-        dashboard.body.contains("session"),
-        "dashboard shows session id"
+        chat.body.contains("script src=\"/static/chat.js\""),
+        "chat page body: {}",
+        chat.body
     );
-    assert!(dashboard.body.contains("budget"), "dashboard shows budget");
+    let csp = chat
+        .header("content-security-policy")
+        .expect("CSP on HTML responses");
+    assert!(csp.contains("script-src 'self'"), "CSP: {csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "CSP: {csp}");
+    let js = request(port, "GET", "/static/chat.js", Some(&cookie), "");
+    assert_eq!(js.status, 200);
+    assert!(js.body.contains("EventSource"), "chat.js served");
+
+    // The status page (the old dashboard) renders the operator report.
+    let dashboard = request(port, "GET", "/status", Some(&cookie), "");
+    assert_eq!(dashboard.status, 200);
+    assert!(
+        dashboard.body.contains("today: $"),
+        "status shows spend: {}",
+        dashboard.body
+    );
+    assert!(dashboard.body.contains("worker:"), "status shows worker");
 
     for (path, needle) in [
         ("/memory", "Memory"),
@@ -272,6 +322,9 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
         ("/approvals", "Approvals"),
         ("/audit", "Audit"),
         ("/intents", "Intents"),
+        ("/tasks", "Tasks"),
+        ("/contacts", "Contacts"),
+        ("/skills", "Skills"),
         ("/history?q=anything", "History"),
     ] {
         let resp = request(port, "GET", path, Some(&cookie), "");
@@ -323,6 +376,88 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
         request(port, "GET", "/../etc/passwd", Some(&cookie), "").status,
         404
     );
+
+    // The chat-send endpoint is CSRF-guarded: no header, no service.
+    let no_header = request(port, "POST", "/chat/send", Some(&cookie), "text=hi");
+    assert_eq!(no_header.status, 403, "missing X-Ka-Agent must be refused");
+    assert!(no_header.body.contains("X-Ka-Agent"));
+
+    // A command through the router replies as JSON.
+    let cmd = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%2Fstatus",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(cmd.status, 200);
+    cmd.header("content-type").expect("json content type");
+    assert!(
+        cmd.header("content-type")
+            .unwrap()
+            .starts_with("application/json"),
+        "chat/send replies JSON"
+    );
+    // (The reply body carries the rendered status; the queue line proves it.)
+    assert!(cmd.body.contains("queue"), "status JSON: {}", cmd.body);
+
+    // Non-ASCII form input arrives intact (percent-decoded as UTF-8).
+    let accented = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%C3%A9",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(accented.status, 200, "accented send: {}", accented.body);
+
+    // Live stream: an open /events socket sees the inbound echo and the
+    // scripted answer's delta for a message sent while it is open.
+    let events = open_events(port, &cookie);
+    let sent = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=hello+stream",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(sent.status, 200);
+    let stream = read_events(events, Duration::from_secs(10));
+    assert!(stream.contains("\"ev\":\"inbound\""), "stream: {stream}");
+    assert!(stream.contains("\"ev\":\"delta\""), "stream: {stream}");
+}
+
+/// Open a raw SSE connection (blocking socket, read timeout 60 s).
+fn open_events(port: u16, cookie: &str) -> std::net::TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let req = format!(
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream
+}
+
+/// Read the SSE stream until `timeout` passes; returns everything received.
+fn read_events(mut stream: std::net::TcpStream, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[test]
@@ -604,19 +739,17 @@ fn approvals_card_renders_escaped_and_only_live_asks_decide() {
     let cookie = login(&daemon);
 
     // The approvals inbox lists the live session's asks, so seed into the
-    // session the daemon actually runs (its id is on the dashboard).
-    let dashboard = request(port, "GET", "/", Some(&cookie), "");
-    let marker = "<td>session</td><td>";
-    let start = dashboard.body.find(marker).expect("session row") + marker.len();
-    let session_id = dashboard.body[start..]
-        .split("</td>")
-        .next()
+    // session the daemon actually runs (adopted = newest row in the store).
+    let session_id: String = {
+        let db = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
+        db.query_row(
+            "SELECT id FROM sessions ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap()
-        .to_string();
-    assert!(
-        !session_id.is_empty(),
-        "session id parsed from the dashboard"
-    );
+    };
+    assert!(!session_id.is_empty(), "session id read from the store");
 
     let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
     let session = ka_agent_core::SessionId(session_id);

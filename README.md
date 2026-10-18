@@ -8,34 +8,43 @@ and stops.
 
 ## Quickstart
 
+Linux and macOS (Windows: see the note at the end):
+
 ```sh
-cargo install --path apps/ka-agent    # or: cargo build --release -p ka-agent
+curl -fsSL https://raw.githubusercontent.com/jaltez/ka-agent/main/scripts/install.sh | sh
+# or build from source: cargo install --path apps/ka-agent
 
-ka-agent init                         # writes ~/.config/ka-agent/ka-agent.toml + data root
-ka-agent key set ANTHROPIC_API_KEY    # paste the provider key (stdin; 0600, never printed)
-ka-agent doctor                       # verify: config, key, git, sandbox, contract hash
-
-ka-agent chat                         # talk to it in the terminal
-ka-agent run                          # resident daemon (channels, scheduler, approvals)
+ka-agent                              # first run: a 3-minute setup wizard
 ```
 
-From Telegram: `ka-agent secret set telegram.bot_token`, then set
-`[telegram] enabled = true` and `token_secret = "telegram.bot_token"` in the
-config, `ka-agent identity link telegram <your-numeric-id>`, and
-`ka-agent run`. From Matrix, the same shape under `[matrix]`
-(`docs/contract/matrix.md`).
+`ka-agent setup` picks a provider, verifies the key live, picks a model,
+detects your timezone, optionally pairs Telegram or Matrix by one-time code,
+installs the background service, and proves everything with a first reply.
+Nothing is written until you confirm. Later:
+
+```sh
+ka-agent                              # chat (attaches to the background service)
+ka-agent dashboard                    # open the web control panel in your browser
+ka-agent status                       # one-glance report
+ka-agent doctor                       # full health check
+ka-agent logs -f                      # the daemon's log
+
+ka-agent model provider/model         # switch models, applied live
+ka-agent pair telegram                # pair your phone by one-time code
+ka-agent service status               # background service state
+```
 
 Two rules of the house, both enforced by code:
 
 - **Every config is explicit.** Missing or invalid config is an error, never
-  a silent default (`init` writes the first one).
+  a silent default (`ka-agent setup` writes the first one).
 - **Nothing external happens unapproved.** External writes need a grant, are
   logged as intents (deduplicated by content hash), and approvals deny on
   expiry.
 
 ## What's in
 
-**Status: working and verified.** `cargo test --workspace`: 186 tests green,
+**Status: working and verified.** `cargo test --workspace`: green,
 including e2e over the real binary (scripted engine, fake Bot API, fault
 injection). Telegram + Matrix + memory + history + MCP bridge + scheduler +
 loopback web UI + sandboxed third-party plugins + cron/`@refs`/AGENTS.md +
@@ -73,10 +82,11 @@ calendar digest + first-run setup.
 - **`ka-agent-web`** — the loopback-only web UI: server-rendered HTML, no
   JS, one-shot CLI-issued login link, every user-derived string escaped.
   Dashboard, history, memory editor, approvals, audit, intents.
-- **`ka-agent` (the binary)** — `init` · `key set|list` · `secret set|list`
+- **`ka-agent` (the binary)** — `setup` · `key set|list` · `secret set|list`
   · `chat` · `run` · `status` · `restart` · `doctor` · `memory path|show|edit`
-  · `skills list|enable|disable` · `identity` · `grant` · `plugin`
-  · `backup|restore` · `export` · `purge` · `web-token` · hidden `__worker` / `__mcp`.
+  · `skills list|enable|disable` · `identity` (incl. `pending`) · `grant` · `plugin`
+  · `model`/`models` · `config` · `pair` · `service install|…` · `logs` · `dashboard`
+  · `backup|restore` · `export` · `purge` · hidden `__worker` / `__mcp`.
 
 The engine gets `kagent.*` tools (memory_propose, notes_search/append/read,
 http_get, GitHub, cron_manage) through the `[[mcp]]` overlay — model-proposed
@@ -127,8 +137,9 @@ no local mirrors, no vendored repos.
 ## Configuration
 
 `ka-agent.toml` (default `~/.config/ka-agent/ka-agent.toml`, or
-`$KA_AGENT_CONFIG`), strict — unknown keys are errors. `ka-agent init`
-writes a commented starter; the full schema lives in
+`$KA_AGENT_CONFIG`), strict — unknown keys are errors. `ka-agent config`
+edits it format-preservingly and applies safe changes live; `ka-agent setup`
+(alias `init`) writes the first one; the full schema lives in
 `crates/ka-agent-core/src/config.rs`, a fully commented copy in
 `examples/config/ka-agent.toml`.
 
@@ -165,12 +176,20 @@ Loopback-only, off by default:
 
 ```sh
 ka-agent run --web-port 8480     # daemon + web UI
-ka-agent web-token --port 8480   # prints a one-shot login URL (10 min TTL)
+ka-agent dashboard               # prints + opens a one-shot login URL (10 min TTL)
 ```
 
 The URL sets an `HttpOnly; SameSite=Strict` session cookie and redirects to
 the dashboard. Mutations are POST-only. Details and the security checklist:
 `docs/contract/web-ui.md`.
+
+## Platforms
+
+Linux (first-class: plugins use bubblewrap; services use systemd user units)
+and macOS (launchd; plugins need Linux). **Windows is a goal, not there yet:**
+the library crates compile for Windows, but the binary still needs a
+named-pipe admin transport — `ka-agent run`/`chat`/`status` are
+Unix/macOS-only today (CI keeps the Windows build state visible).
 
 ## The ka pin
 

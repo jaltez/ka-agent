@@ -9,12 +9,14 @@ pub mod grants;
 pub mod matrix;
 pub mod mcp;
 pub mod multi;
+pub mod pairing;
 pub mod refs;
 pub mod secret;
 pub mod telegram;
+pub mod tg_format;
 
 pub use channel::Channel;
-pub use commands::{cron_add, cron_list_text, fmt_interval, utc_compact};
+pub use commands::{cron_add, cron_list_text, fmt_interval, help_for, help_text};
 pub use matrix::{MatrixChannel, MatrixConfig, MatrixSurface};
 pub use mcp::run_mcp;
 pub use multi::MultiSurface;

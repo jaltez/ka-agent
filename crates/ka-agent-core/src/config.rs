@@ -17,6 +17,10 @@ pub enum Error {
     Parse { path: PathBuf, message: String },
     #[error("invalid config: {0}")]
     Validate(String),
+    /// A `config_file` edit that cannot be expressed (array/table targets,
+    /// write failures).
+    #[error("{0}")]
+    Edit(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +102,40 @@ impl Telegram {
     }
 }
 
+/// The local web control panel: strict `[web]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Web {
+    /// Serve the web UI on `127.0.0.1:{port}`.
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 8480,
+        }
+    }
+}
+
+/// The calendar digest: strict `[calendar]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Calendar {
+    /// Local clock time (operator zone) of the daily digest, `HH:MM`.
+    pub digest_time: String,
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Self {
+            digest_time: "08:00".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonConfig {
@@ -127,6 +165,11 @@ pub struct DaemonConfig {
     /// The Matrix channel (Phase 6).
     #[serde(default)]
     pub matrix: MatrixSettings,
+    /// Operator timezone (IANA name, e.g. `Europe/Madrid`). `None` uses the
+    /// system zone (UTC when it cannot be determined).
+    pub timezone: Option<String>,
+    pub web: Web,
+    pub calendar: Calendar,
 }
 
 impl Default for DaemonConfig {
@@ -143,6 +186,9 @@ impl Default for DaemonConfig {
             ka: Ka::default(),
             telegram: Telegram::default(),
             matrix: MatrixSettings::default(),
+            timezone: None,
+            web: Web::default(),
+            calendar: Calendar::default(),
         }
     }
 }
@@ -187,10 +233,10 @@ impl DaemonConfig {
         if self.workspace.as_os_str().is_empty() {
             return Err(Error::Validate("workspace must not be empty".into()));
         }
-        if let Some(usd) = self.budgets.daily_usd {
-            if usd <= 0.0 {
-                return Err(Error::Validate("budgets.daily_usd must be positive".into()));
-            }
+        if let Some(usd) = self.budgets.daily_usd
+            && usd <= 0.0
+        {
+            return Err(Error::Validate("budgets.daily_usd must be positive".into()));
         }
         if self.telegram.enabled && self.telegram.token_secret.is_none() {
             return Err(Error::Validate(
@@ -214,7 +260,31 @@ impl DaemonConfig {
                 ));
             }
         }
+        if let Some(name) = &self.timezone
+            && jiff::tz::TimeZone::get(name).is_err()
+        {
+            return Err(Error::Validate(format!(
+                "timezone {name:?} is not a known IANA zone (e.g. \"Europe/Madrid\")"
+            )));
+        }
+        if self.web.port == 0 {
+            return Err(Error::Validate("web.port must not be 0".into()));
+        }
+        if crate::when::parse_hhmm(&self.calendar.digest_time).is_none() {
+            return Err(Error::Validate(
+                "calendar.digest_time must be HH:MM (24h)".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// The operator's zone: the configured IANA zone, else the system zone
+    /// (jiff falls back to UTC when the system zone is unknown).
+    pub fn time_zone(&self) -> jiff::tz::TimeZone {
+        self.timezone
+            .as_deref()
+            .and_then(|name| jiff::tz::TimeZone::get(name).ok())
+            .unwrap_or_else(jiff::tz::TimeZone::system)
     }
 
     /// Workspace path with `~` expanded.
@@ -297,6 +367,7 @@ model = "zai/glm-5.3-flash"
 mode = "plan"
 approval_ttl_secs = 300
 turn_grace_secs = 5
+timezone = "Europe/Madrid"
 
 [worker_restart]
 backoff_start_ms = 500
@@ -315,6 +386,13 @@ engine_layer = "~/engine.toml"
 enabled = false
 token_secret = "telegram.bot_token"
 allow_user_ids = [12345]
+
+[web]
+enabled = false
+port = 9000
+
+[calendar]
+digest_time = "07:30"
 "#;
         let p = write_tmp("full", toml_src);
         let cfg = DaemonConfig::load(&p).unwrap();
@@ -323,6 +401,52 @@ allow_user_ids = [12345]
         assert_eq!(cfg.budgets.daily_usd, Some(5.0));
         assert_eq!(cfg.telegram.allow_user_ids, vec![12345]);
         assert!(cfg.workspace_path().ends_with("ws"));
+        assert_eq!(cfg.timezone.as_deref(), Some("Europe/Madrid"));
+        assert_eq!(cfg.time_zone().iana_name(), Some("Europe/Madrid"));
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.port, 9000);
+        assert_eq!(cfg.calendar.digest_time, "07:30");
+    }
+
+    #[test]
+    fn web_and_calendar_defaults() {
+        let cfg = DaemonConfig::default();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.port, 8480);
+        assert_eq!(cfg.calendar.digest_time, "08:00");
+        assert!(cfg.timezone.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn bad_timezone_rejected() {
+        let cfg = DaemonConfig {
+            timezone: Some("Mars/Olympus".into()),
+            ..DaemonConfig::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "invalid config: timezone \"Mars/Olympus\" is not a known IANA zone (e.g. \"Europe/Madrid\")"
+        );
+    }
+
+    #[test]
+    fn web_port_zero_rejected() {
+        let mut cfg = DaemonConfig::default();
+        cfg.web.port = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("web.port"));
+    }
+
+    #[test]
+    fn bad_digest_time_rejected() {
+        let mut cfg = DaemonConfig::default();
+        cfg.calendar.digest_time = "25:00".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("calendar.digest_time must be HH:MM (24h)"),
+            "{err}"
+        );
     }
 
     #[test]

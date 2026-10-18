@@ -9,10 +9,10 @@ fn main() {
     let mut scenario = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--scenario" {
-            if let Some(path) = args.next() {
-                scenario = Some(path.into());
-            }
+        if arg == "--scenario"
+            && let Some(path) = args.next()
+        {
+            scenario = Some(path.into());
         }
     }
     if let Err(e) = ka_agent_port::run_worker(ka_agent_port::WorkerRun { scenario }) {

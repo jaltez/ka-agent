@@ -156,7 +156,10 @@ struct Inner {
 pub type NoAgentFn = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
 struct Shared {
-    cfg: DaemonConfig,
+    /// The live configuration; swapped whole by [`Runtime::reload_config`].
+    cfg: std::sync::RwLock<Arc<DaemonConfig>>,
+    /// The file the configuration came from (for `/model` and reloads).
+    config_path: Mutex<Option<std::path::PathBuf>>,
     paths: Paths,
     store: Arc<Store>,
     memory: ka_agent_memory::MemoryStore,
@@ -170,11 +173,56 @@ struct Shared {
     scheduler_tick: tokio::sync::Notify,
 }
 
+fn cfg_of(sh: &Shared) -> Arc<DaemonConfig> {
+    Arc::clone(&sh.cfg.read().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Field comparison for config sections that only derive `Debug`.
+fn differs<T: std::fmt::Debug>(a: &T, b: &T) -> bool {
+    format!("{a:?}") != format!("{b:?}")
+}
+
+/// What a config reload changed: applied to the running agent, or waiting
+/// for a restart.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReloadReport {
+    pub applied: Vec<String>,
+    pub restart_required: Vec<String>,
+}
+
+/// Whether the engine can resolve the configured model's provider key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelKeyState {
+    Present,
+    Missing(String),
+    Keyless,
+}
+
+/// What `/remind rm` or `/cron rm` cancelled.
+#[derive(Debug, Clone)]
+pub enum CancelOutcome {
+    Cancelled(String),
+    NotFound,
+    Ambiguous(Vec<String>),
+}
+
 /// The runtime handle. Cheap to clone; the event loop and the expiry timer
 /// share the same state.
 #[derive(Clone)]
 pub struct Runtime {
     sh: Arc<Shared>,
+}
+
+/// The memory preamble tells the model which zone to schedule in: every
+/// clock time the operator writes is local, never UTC.
+pub fn memory_preamble(cfg: &DaemonConfig) -> String {
+    let tz = cfg.time_zone();
+    let offset = jiff::Timestamp::now().to_zoned(tz.clone()).offset();
+    format!(
+        "Operator timezone: {} (UTC{} now). Schedule clock times in this zone.",
+        tz.iana_name().unwrap_or("UTC"),
+        offset
+    )
 }
 
 impl Runtime {
@@ -190,7 +238,7 @@ impl Runtime {
         paths.ensure_dirs()?;
         let interrupted = store.reconcile_running_turns(ka_agent_core::now_ms())?;
         if !interrupted.is_empty() {
-            surface.on_note(&format!(
+            surface.on_notice(&format!(
                 "recovered after restart: {} interrupted turn(s) marked; nothing was re-submitted",
                 interrupted.len()
             ));
@@ -200,7 +248,7 @@ impl Runtime {
         // still shows them. Marked `interrupted` (= paused, resumable).
         let stuck_tasks = store.reconcile_running_tasks(ka_agent_core::now_ms())?;
         if !stuck_tasks.is_empty() {
-            surface.on_note(&format!(
+            surface.on_notice(&format!(
                 "recovered after restart: {} scheduled task(s) interrupted mid-fire marked paused",
                 stuck_tasks.len()
             ));
@@ -245,19 +293,22 @@ impl Runtime {
                 .is_ok()
             {
                 store.update_session_status(&session.id, session.status)?;
-                surface.on_note(&format!(
+                surface.on_notice(&format!(
                     "recovered session status {from:?} → idle (its turn died with the previous process)"
                 ));
             }
         }
         let session = session;
         let mut budget = BudgetState::new(cfg.budgets.daily_usd, cfg.budgets.daily_tokens);
-        if let Some(saved) = store.meta_get("budget")? {
-            if let Ok(b) = serde_json::from_str::<BudgetState>(&saved) {
-                if b.day == ka_agent_core::day_key(ka_agent_core::now_ms()) {
-                    budget = b;
-                }
-            }
+        if let Some(saved) = store.meta_get("budget")?
+            && let Ok(b) = serde_json::from_str::<BudgetState>(&saved)
+            && b.day == ka_agent_core::day_key(ka_agent_core::now_ms())
+        {
+            budget = b;
+            // The saved window keeps today's spend; the caps always
+            // come from the current config.
+            budget.daily_usd_cap = cfg.budgets.daily_usd;
+            budget.daily_token_cap = cfg.budgets.daily_tokens;
         }
         let memory = ka_agent_memory::MemoryStore::open(&paths.root().join("memory"))?;
         // Compile stable memory into the engine's user-tier MEMORY.md; ka
@@ -266,6 +317,7 @@ impl Runtime {
         memory.install_compiled(
             &paths.engine_home().join(".config/ka"),
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
+            &memory_preamble(&cfg),
         )?;
         // Operator-facing workspace context (M11): never overwrite an
         // existing AGENTS.md; a read-only workspace must not fail startup.
@@ -274,7 +326,8 @@ impl Runtime {
         }
         Ok(Self {
             sh: Arc::new(Shared {
-                cfg,
+                cfg: std::sync::RwLock::new(Arc::new(cfg)),
+                config_path: Mutex::new(None),
                 paths,
                 store,
                 memory,
@@ -299,25 +352,153 @@ impl Runtime {
         self.lock().session.id.clone()
     }
 
-    pub fn cfg(&self) -> &DaemonConfig {
-        &self.sh.cfg
+    /// A snapshot of the live configuration.
+    pub fn config(&self) -> Arc<DaemonConfig> {
+        cfg_of(&self.sh)
+    }
+
+    /// Remember the config file this runtime was built from.
+    pub fn set_config_path(&self, path: std::path::PathBuf) {
+        *self
+            .sh
+            .config_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
+
+    pub fn config_path(&self) -> Option<std::path::PathBuf> {
+        self.sh
+            .config_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn cfg(&self) -> Arc<DaemonConfig> {
+        cfg_of(&self.sh)
     }
 
     /// The operator's workspace: where `@` file references resolve.
     pub fn workspace(&self) -> std::path::PathBuf {
-        self.sh.cfg.workspace_path()
+        self.cfg().workspace_path()
     }
 
-    /// (session status, strand id, spent USD, spent tokens, recent crashes)
-    pub fn status(&self) -> (SessionStatus, Option<String>, f64, u64, usize) {
-        let g = self.lock();
-        (
-            g.session.status,
-            g.session.strand_id.clone(),
-            g.budget.spent_usd,
-            g.budget.spent_tokens,
-            g.crashes.len(),
-        )
+    /// Now, in the operator's zone (configured, else the system zone).
+    pub fn now_zoned(&self) -> jiff::Zoned {
+        jiff::Timestamp::now().to_zoned(self.cfg().time_zone())
+    }
+
+    /// The current session status.
+    pub fn session_status(&self) -> SessionStatus {
+        self.lock().session.status
+    }
+
+    /// Everything `/status` shows, in one struct.
+    pub fn status_report(&self) -> Result<crate::status::StatusReport, Error> {
+        let cfg = self.cfg();
+        let (sid, status, strand, worker_running, budget, crashes) = {
+            let g = self.lock();
+            (
+                g.session.id.clone(),
+                g.session.status,
+                g.session.strand_id.clone(),
+                g.live.is_some(),
+                g.budget.clone(),
+                g.crashes.len(),
+            )
+        };
+        let queue = self.sh.store.queue_len(&sid)?;
+        let pending_approvals = self.sh.store.pending_approvals(&sid)?.len();
+        let next_task = self
+            .sh
+            .store
+            .scheduled_tasks()?
+            .into_iter()
+            .find(|t| t.status == ka_agent_core::TaskStatus::Queued)
+            .and_then(|t| t.scheduled_at_ms.map(|at| (t.title, at)));
+        let tz = cfg.time_zone();
+        Ok(crate::status::StatusReport {
+            session_id: sid.to_string(),
+            status: format!("{status:?}"),
+            strand_id: strand,
+            model: cfg.model.clone(),
+            mode: cfg.mode.clone(),
+            worker_running,
+            idle_timeout_secs: cfg.worker_idle_timeout_secs,
+            spent_usd: budget.spent_usd,
+            spent_tokens: budget.spent_tokens,
+            limit_usd: cfg.budgets.daily_usd,
+            limit_tokens: cfg.budgets.daily_tokens,
+            queue,
+            pending_approvals,
+            crashes,
+            next_task,
+            timezone: tz.iana_name().unwrap_or("UTC").to_string(),
+        })
+    }
+
+    /// Swap in a new configuration. Settings the runtime reads per use apply
+    /// immediately; channel, workspace and web settings need a restart. A
+    /// changed model/mode/engine layer (or `restart_worker`, after a key
+    /// change) stops an idle worker so the next message starts a fresh one
+    /// with the new settings; a running turn finishes on the old ones.
+    pub async fn reload_config(&self, new: DaemonConfig, restart_worker: bool) -> ReloadReport {
+        let old = self.cfg();
+        let live_fields = [
+            ("model", differs(&old.model, &new.model)),
+            ("mode", differs(&old.mode, &new.mode)),
+            (
+                "ka.engine_layer",
+                differs(&old.ka.engine_layer, &new.ka.engine_layer),
+            ),
+            (
+                "approval_ttl_secs",
+                differs(&old.approval_ttl_secs, &new.approval_ttl_secs),
+            ),
+            (
+                "turn_grace_secs",
+                differs(&old.turn_grace_secs, &new.turn_grace_secs),
+            ),
+            (
+                "worker_idle_timeout_secs",
+                differs(&old.worker_idle_timeout_secs, &new.worker_idle_timeout_secs),
+            ),
+            (
+                "worker_restart",
+                differs(&old.worker_restart, &new.worker_restart),
+            ),
+            ("budgets", differs(&old.budgets, &new.budgets)),
+            ("timezone", differs(&old.timezone, &new.timezone)),
+            ("calendar", differs(&old.calendar, &new.calendar)),
+        ];
+        let restart_fields = [
+            ("workspace", differs(&old.workspace, &new.workspace)),
+            ("telegram", differs(&old.telegram, &new.telegram)),
+            ("matrix", differs(&old.matrix, &new.matrix)),
+            ("web", differs(&old.web, &new.web)),
+        ];
+        let names = |fields: &[(&str, bool)]| -> Vec<String> {
+            fields
+                .iter()
+                .filter(|(_, c)| *c)
+                .map(|(n, _)| n.to_string())
+                .collect()
+        };
+        let report = ReloadReport {
+            applied: names(&live_fields),
+            restart_required: names(&restart_fields),
+        };
+        let engine_changed = live_fields[..3].iter().any(|(_, c)| *c);
+        {
+            let mut g = self.lock();
+            g.budget.daily_usd_cap = new.budgets.daily_usd;
+            g.budget.daily_token_cap = new.budgets.daily_tokens;
+        }
+        *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
+        if restart_worker || engine_changed {
+            self.stop_idle_worker().await;
+        }
+        report
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -347,7 +528,7 @@ impl Runtime {
         }
         let session = {
             let mut g = self.lock();
-            g.session = Session::new(self.sh.cfg.workspace_path());
+            g.session = Session::new(self.cfg().workspace_path());
             g.restart_attempt = 0;
             g.session.clone()
         };
@@ -388,6 +569,7 @@ impl Runtime {
     /// Inbound message: submit now when idle, otherwise enqueue durably
     /// (gap G4 — ka drops mid-cycle prompts, HTTP 200 notwithstanding).
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
+        self.sh.surface.on_inbound(source, text);
         let submit_now = {
             let mut g = self.lock();
             match g.session.status {
@@ -411,7 +593,7 @@ impl Runtime {
                         g.budget.verdict()
                     };
                     if verdict == ka_agent_core::BudgetVerdict::Exceeded {
-                        self.sh.surface.on_note(
+                        self.sh.surface.on_notice(
                             "paused: budget reached for this window; use /resume to override or wait for the window to roll",
                         );
                         false
@@ -426,9 +608,9 @@ impl Runtime {
                     }
                 }
                 SessionStatus::Degraded => {
-                    self.sh
-                        .surface
-                        .on_note("worker crash loop: use /new to start a fresh session");
+                    self.sh.surface.on_notice(
+                        "⚠ degraded — the worker keeps crashing; /new starts a fresh session",
+                    );
                     false
                 }
             }
@@ -440,14 +622,14 @@ impl Runtime {
             self.persist_session_status(SessionStatus::Running);
         }
         if !submit_now {
-            match self.status().0 {
+            match self.session_status() {
                 SessionStatus::Running
                 | SessionStatus::AwaitingApproval
                 | SessionStatus::Stopping => {
                     let item = QueueItem::new(self.session_id(), text.to_string(), source);
                     self.sh.store.enqueue(&item)?;
                     let n = self.sh.store.queue_len(&self.session_id())?;
-                    self.sh.surface.on_note(&format!("queued (#{n})"));
+                    self.sh.surface.on_notice(&format!("queued (#{n})"));
                 }
                 _ => {}
             }
@@ -678,14 +860,19 @@ impl Runtime {
         Ok(self.sh.store.search_episodes(query, limit)?)
     }
 
-    /// `/history show <turn>`: the stored exchange.
+    /// `/history show <turn|prefix>`: the stored exchange. The id may be
+    /// the full id or a prefix (with or without the `turn_` family).
     pub fn history_show(&self, turn_id: &str) -> Result<Option<(String, String)>, Error> {
-        let Some(turn) = self
+        let turn = match self
             .sh
             .store
             .get_turn(&ka_agent_core::TurnId(turn_id.to_string()))?
-        else {
-            return Ok(None);
+        {
+            Some(t) => t,
+            None => match self.sh.store.find_turn_by_prefix(turn_id.trim())? {
+                Some(t) => t,
+                None => return Ok(None),
+            },
         };
         let answer = self
             .sh
@@ -702,6 +889,7 @@ impl Runtime {
         self.sh.memory.install_compiled(
             &self.sh.paths.engine_home().join(".config/ka"),
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
+            &memory_preamble(&self.cfg()),
         )?;
         Ok(())
     }
@@ -724,12 +912,12 @@ impl Runtime {
             }
         };
         let Some(port) = port else {
-            self.sh.surface.on_note("nothing to stop");
+            self.sh.surface.on_notice("nothing to stop");
             return Ok(());
         };
-        self.sh.surface.on_note("stopping…");
+        self.sh.surface.on_notice("stopping…");
         port.abort().await.ok();
-        let grace = Duration::from_secs(self.sh.cfg.turn_grace_secs);
+        let grace = Duration::from_secs(self.cfg().turn_grace_secs);
         // Escalate on the *turn*, not the process: a successful abort leaves
         // the worker attached (it is reused for the next turn), and the old
         // `is_closed()` test therefore always killed it — SIGKILLing a turn
@@ -777,12 +965,11 @@ impl Runtime {
         };
         // Deny-on-expiry is an invariant, not a schedule: a decision that
         // arrives between the TTL and the next sweep must not allow the ask.
-        if let Ok(row) = self.sh.store.get_approval(&id) {
-            if row.status == ka_agent_core::ApprovalStatus::Pending
-                && ka_agent_core::now_ms() >= row.expires_at_ms
-            {
-                return Err(Error::UnknownApproval(approval_id.to_string()));
-            }
+        if let Ok(row) = self.sh.store.get_approval(&id)
+            && row.status == ka_agent_core::ApprovalStatus::Pending
+            && ka_agent_core::now_ms() >= row.expires_at_ms
+        {
+            return Err(Error::UnknownApproval(approval_id.to_string()));
         }
         let status = match decision {
             ApprovalDecision::Allow | ApprovalDecision::Always => {
@@ -881,21 +1068,79 @@ impl Runtime {
 
     // ---- scheduler (SEED.md §7.2; generalized cron M11) -----------------
 
-    /// `/remind <N(s|m|h|d)> <text>`: create a reminder.
-    pub fn add_reminder(&self, text: &str) -> Result<Option<ka_agent_core::TaskId>, Error> {
-        let (duration_str, reminder_text) = text.split_once(' ').unwrap_or(("", ""));
-        let ms = ka_agent_core::parse_duration(duration_str).ok_or_else(|| Error::Illegal {
-            from: "remind".into(),
-            to: format!("bad duration {duration_str:?}; use Ns, Nm, Nh or Nd"),
-        })?;
-        if reminder_text.is_empty() {
-            return Ok(None);
+    /// Schedule a reminder at an absolute time (parsing is the router's
+    /// job: every surface shares one grammar).
+    pub fn add_reminder_at(&self, at_ms: i64, text: &str) -> Result<ka_agent_core::TaskId, Error> {
+        if text.trim().is_empty() {
+            return Err(Error::Refused("a reminder needs a text".into()));
         }
-        let mut task = ka_agent_core::Task::new(reminder_text.to_string(), "reminder", false);
-        task.scheduled_at_ms = Some(ka_agent_core::now_ms() + ms as i64);
+        let mut task = ka_agent_core::Task::new(text.trim().to_string(), "reminder", false);
+        task.scheduled_at_ms = Some(at_ms);
         self.sh.store.insert_task(&task)?;
         self.sh.scheduler_tick.notify_one();
-        Ok(Some(task.id))
+        Ok(task.id)
+    }
+
+    /// The model's provider key state against the engine `.env` (the
+    /// same file the worker reads): `None` when no model is configured.
+    pub fn model_key_state(&self) -> Result<Option<(String, ModelKeyState)>, Error> {
+        let Some(model) = self.cfg().model.clone() else {
+            return Ok(None);
+        };
+        let sel = ka_agent_port::catalog::validate_selector(&model).map_err(Error::Refused)?;
+        let env = ka_agent_port::catalog::read_env_file(&ka_agent_port::catalog::engine_env_path(
+            &self.sh.paths.engine_home(),
+        ));
+        let state = match ka_agent_port::catalog::key_state(&sel, &env) {
+            ka_agent_port::catalog::KeyState::Present => ModelKeyState::Present,
+            ka_agent_port::catalog::KeyState::Missing(name) => ModelKeyState::Missing(name),
+            ka_agent_port::catalog::KeyState::Keyless => ModelKeyState::Keyless,
+        };
+        Ok(Some((sel.id, state)))
+    }
+
+    /// `/model <provider/model>`: validate, save to the config file, apply
+    /// live. Returns the normalized selector for the reply.
+    pub async fn set_model(&self, sel: &str) -> Result<String, Error> {
+        let info = ka_agent_port::catalog::validate_selector(sel).map_err(Error::Refused)?;
+        let path = self
+            .config_path()
+            .ok_or_else(|| Error::Refused("no config file — run ka-agent setup".into()))?;
+        ka_agent_core::config_file::set(&path, "model", &info.id).map_err(Error::Config)?;
+        let new = DaemonConfig::load(&path)?;
+        self.reload_config(new, false).await;
+        Ok(info.id)
+    }
+
+    /// The `id8` history line listing: the session's last `limit` prompt
+    /// cycles with their answers.
+    pub fn recent_turns(&self, limit: usize) -> Result<Vec<(ka_agent_core::Turn, String)>, Error> {
+        let sid = self.session_id();
+        let turns = self.sh.store.latest_turns_for_session(&sid, limit)?;
+        let mut out = Vec::new();
+        for t in turns {
+            let answer: String = self
+                .sh
+                .store
+                .chunks_for_turn(&t.id)?
+                .into_iter()
+                .map(|c| c.text)
+                .collect();
+            out.push((t, answer));
+        }
+        Ok(out)
+    }
+
+    /// Pending approval cards of the live session (`/approvals`, `/y <id8>`).
+    pub fn pending_approval_cards(&self) -> Result<Vec<crate::surface::ApprovalCard>, Error> {
+        let sid = self.session_id();
+        Ok(self
+            .sh
+            .store
+            .pending_approvals(&sid)?
+            .iter()
+            .filter_map(crate::surface::ApprovalCard::from_approval)
+            .collect())
     }
 
     /// Register a no-agent cron handler by kind (e.g. "calendar"). The app
@@ -926,16 +1171,29 @@ impl Runtime {
     /// the session is fully settled: idle status, no open turn, no pending
     /// ask, nothing queued.
     async fn reap_idle_worker(&self) {
-        let timeout_secs = self.sh.cfg.worker_idle_timeout_secs;
+        let timeout_secs = self.cfg().worker_idle_timeout_secs;
         if timeout_secs == 0 {
             return;
         }
+        self.stop_settled_worker((timeout_secs as i64) * 1000).await;
+    }
+
+    /// Stop the worker now if the session is settled (config reload, key
+    /// change): the next message starts a fresh worker with new settings.
+    /// Returns whether a worker was stopped.
+    pub async fn stop_idle_worker(&self) -> bool {
+        self.stop_settled_worker(0).await
+    }
+
+    /// Deliberately kill a settled worker that has been inactive for at
+    /// least `min_idle_ms`.
+    async fn stop_settled_worker(&self, min_idle_ms: i64) -> bool {
         let now = ka_agent_core::now_ms();
         let port = {
             let mut g = self.lock();
             let (settled, idle_long_enough, port) = {
                 let Some(live) = g.live.as_ref() else {
-                    return;
+                    return false;
                 };
                 let turn_open = live.current_turn.as_ref().is_some_and(|t| {
                     self.sh
@@ -949,11 +1207,11 @@ impl Runtime {
                     && !turn_open
                     && live.pending_asks.is_empty()
                     && self.sh.store.queue_len(&g.session.id).unwrap_or(0) == 0;
-                let idle_long_enough = now - live.last_activity_ms >= (timeout_secs as i64) * 1000;
+                let idle_long_enough = now - live.last_activity_ms >= min_idle_ms;
                 (settled, idle_long_enough, live.port.clone())
             };
             if !settled || !idle_long_enough {
-                return;
+                return false;
             }
             if let Some(live) = g.live.as_mut() {
                 live.deliberate_close = true;
@@ -961,6 +1219,7 @@ impl Runtime {
             port
         };
         port.kill().await;
+        true
     }
 
     /// Schedule a cron job: a `kind = "cron"` task carrying its
@@ -984,21 +1243,45 @@ impl Runtime {
         Ok(self.sh.store.cron_tasks()?)
     }
 
-    /// Cancel a live cron by id prefix; `Ok(false)` when nothing matches.
-    pub fn cancel_cron(&self, id_prefix: &str) -> Result<bool, Error> {
+    /// The engine home (skills, compiled memory).
+    pub fn engine_home(&self) -> std::path::PathBuf {
+        self.sh.paths.engine_home()
+    }
+
+    /// The instance store (read/write by routers and the web layer).
+    pub fn store(&self) -> &Arc<Store> {
+        &self.sh.store
+    }
+
+    /// Live reminders and crons, next fire first (`/reminders`).
+    pub fn scheduled_tasks(&self) -> Result<Vec<ka_agent_core::Task>, Error> {
+        Ok(self.sh.store.scheduled_tasks()?)
+    }
+
+    /// Cancel any scheduled task (reminder or cron) by id prefix.
+    pub fn cancel_scheduled(&self, id_prefix: &str) -> Result<CancelOutcome, Error> {
         if id_prefix.trim().is_empty() {
-            return Ok(false);
+            return Ok(CancelOutcome::NotFound);
         }
-        let crons = self.list_crons()?;
-        let Some(task) = crons
-            .iter()
-            .find(|t| t.id.as_str().starts_with(id_prefix))
-            .cloned()
-        else {
-            return Ok(false);
-        };
-        self.sh.store.set_task_status(&task.id, "cancelled")?;
-        Ok(true)
+        let matches: Vec<_> = self
+            .sh
+            .store
+            .scheduled_tasks()?
+            .into_iter()
+            .filter(|t| ka_agent_core::ids::id_matches(t.id.as_str(), id_prefix.trim()))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(CancelOutcome::NotFound),
+            [one] => {
+                self.sh.store.set_task_status(&one.id, "cancelled")?;
+                Ok(CancelOutcome::Cancelled(one.title.clone()))
+            }
+            many => Ok(CancelOutcome::Ambiguous(
+                many.iter()
+                    .map(|t| ka_agent_core::ids::short_id(t.id.as_str()).to_string())
+                    .collect(),
+            )),
+        }
     }
 
     /// Fire due tasks (reminders and crons); called from the scheduler
@@ -1014,6 +1297,24 @@ impl Runtime {
         // and recurring jobs skip the missed occupation and re-arm.
         const LATE_GRACE_MS: i64 = 3_600_000;
         const LATE_MARK_MS: i64 = 60_000;
+        let now_zoned = jiff::Timestamp::now().to_zoned(self.cfg().time_zone());
+        // Anchored recurrence (`at_local`): the next occurrence is the next
+        // local wall-clock hit (weekday-optional), DST-correct — not a
+        // fixed-interval hop from the previous fire.
+        let next_for = |spec: &ka_agent_core::CronSpec, now: i64| -> Option<i64> {
+            let Some(at) = spec.at_local.as_deref() else {
+                return next_occurrence(
+                    now,
+                    spec.recurrence_ms.unwrap_or(0),
+                    ka_agent_core::now_ms(),
+                );
+            };
+            let (hh, mm) = ka_agent_core::when::parse_hhmm(at)?;
+            let weekday = spec
+                .weekday
+                .and_then(|w| jiff::civil::Weekday::from_monday_zero_offset(w as i8).ok());
+            Some(ka_agent_core::when::next_local(hh, mm, weekday, &now_zoned))
+        };
         let late_by = |task: &ka_agent_core::Task| now - task.scheduled_at_ms.unwrap_or(now);
         let late_suffix = |late_by: i64| {
             if late_by > LATE_MARK_MS {
@@ -1037,7 +1338,7 @@ impl Runtime {
                     let title = task.title.clone();
                     let this_late_by = late_by(&task);
                     if this_late_by > LATE_GRACE_MS {
-                        self.sh.surface.on_note(&format!(
+                        self.sh.surface.on_notice(&format!(
                             "⏰ missed: {title} (overdue by {})",
                             ka_agent_core::fmt_interval(this_late_by)
                         ));
@@ -1046,7 +1347,7 @@ impl Runtime {
                     }
                     self.sh
                         .surface
-                        .on_note(&format!("⏰ {title}{}", late_suffix(this_late_by)));
+                        .on_notice(&format!("⏰ {title}{}", late_suffix(this_late_by)));
                     let _ = self.sh.store.settle_task(&task.id, "succeeded");
                     fired.push(title);
                 }
@@ -1063,11 +1364,7 @@ impl Runtime {
                         if recurring {
                             // A recurring job outlives one missed occupation:
                             // skip it and re-arm strictly after now.
-                            let note = match next_occurrence(
-                                task.scheduled_at_ms.unwrap_or(now),
-                                spec.recurrence_ms.unwrap_or(0),
-                                now,
-                            ) {
+                            let note = match next_for(&spec, task.scheduled_at_ms.unwrap_or(now)) {
                                 Some(next) => {
                                     let _ = self.sh.store.rearm_task(&task.id, next);
                                     format!(
@@ -1081,10 +1378,10 @@ impl Runtime {
                                     "cron re-arm overflow".to_string()
                                 }
                             };
-                            self.sh.surface.on_note(&note);
+                            self.sh.surface.on_notice(&note);
                             continue;
                         }
-                        self.sh.surface.on_note(&format!(
+                        self.sh.surface.on_notice(&format!(
                             "cron '{}' missed (overdue by {})",
                             spec.text,
                             ka_agent_core::fmt_interval(this_late_by)
@@ -1094,7 +1391,7 @@ impl Runtime {
                     }
                     let ok = match &spec.mode {
                         ka_agent_core::CronMode::Agent => {
-                            self.sh.surface.on_note(&format!(
+                            self.sh.surface.on_notice(&format!(
                                 "cron: {}{}",
                                 spec.text,
                                 late_suffix(this_late_by)
@@ -1112,7 +1409,7 @@ impl Runtime {
                         ka_agent_core::CronMode::NoAgent(kind) => {
                             match self.run_no_agent(kind, &spec.text) {
                                 Ok(out) => {
-                                    self.sh.surface.on_note(&out);
+                                    self.sh.surface.on_notice(&out);
                                     true
                                 }
                                 Err(e) => {
@@ -1132,7 +1429,7 @@ impl Runtime {
                     }
                     match spec.recurrence_ms {
                         Some(rec) if rec > 0 => {
-                            match next_occurrence(task.scheduled_at_ms.unwrap_or(now), rec, now) {
+                            match next_for(&spec, task.scheduled_at_ms.unwrap_or(now)) {
                                 // Re-arm only if the row is still `running` (a
                                 // cancel mid-flight wins).
                                 Some(next) => {
@@ -1226,9 +1523,50 @@ impl Runtime {
         self.submit_text_with(text, Vec::new()).await
     }
 
+    /// Refuse a message that cannot possibly work, before any state moves:
+    /// no model configured, or the model's provider key missing. The
+    /// refusal is the operator's answer; the session returns to idle and
+    /// nothing is submitted or recorded.
+    fn preflight(&self) -> Result<(), String> {
+        // Scripted speakers (e2e) legitimately run without model or keys.
+        if self.sh.port.scenario_override.is_some() {
+            return Ok(());
+        }
+        let cfg = self.cfg();
+        if cfg.model.is_none() && cfg.ka.engine_layer.is_none() {
+            return Err(
+                "no model configured — run `ka-agent setup` (or /model provider/model)".into(),
+            );
+        }
+        if let Some(model) = &cfg.model {
+            let sel = ka_agent_port::catalog::validate_selector(model)?;
+            let env = ka_agent_port::catalog::read_env_file(
+                &ka_agent_port::catalog::engine_env_path(&self.sh.paths.engine_home()),
+            );
+            if let ka_agent_port::catalog::KeyState::Missing(name) =
+                ka_agent_port::catalog::key_state(&sel, &env)
+            {
+                return Err(format!(
+                    "{model} needs {name} — on your computer run: ka-agent key set {name}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Submit with per-turn skills (`Command::Prompt.skills`: the engine
     /// injects the full SKILL.md bodies for these names into this turn).
     async fn submit_text_with(&self, text: &str, skills: Vec<String>) -> Result<(), Error> {
+        if let Err(msg) = self.preflight() {
+            self.sh.surface.on_notice(&msg);
+            let mut g = self.lock();
+            if g.session.status == SessionStatus::Running {
+                g.session.transition(SessionStatus::Idle).ok();
+            }
+            drop(g);
+            self.persist_session_status(SessionStatus::Idle);
+            return Ok(());
+        }
         if let Err(e) = self.ensure_worker().await {
             // A dead worker at submit time behaves like an interruption:
             // surface it, never auto-retry (SEED.md §3.8).
@@ -1306,9 +1644,10 @@ impl Runtime {
         if self.lock().live.is_some() {
             return Ok(());
         }
+        let cfg = self.cfg();
         let wait = Backoff::new(
-            self.sh.cfg.worker_restart.backoff_start_ms,
-            self.sh.cfg.worker_restart.backoff_max_ms,
+            cfg.worker_restart.backoff_start_ms,
+            cfg.worker_restart.backoff_max_ms,
         )
         .delay(self.lock().restart_attempt);
         if !wait.is_zero() {
@@ -1323,9 +1662,7 @@ impl Runtime {
                 cache_dir: self.sh.paths.engine_cache(),
                 agent_data_root: self.sh.paths.root().to_path_buf(),
             };
-            let layer = self
-                .sh
-                .cfg
+            let layer = cfg
                 .engine_layer_path()
                 .and_then(|p| std::fs::read_to_string(p).ok());
             (g.session.clone(), env, layer)
@@ -1337,8 +1674,8 @@ impl Runtime {
         let req = OpenRequest {
             workspace: session.workspace.clone(),
             strand: selector,
-            model: self.sh.cfg.model.clone(),
-            mode: Some(self.sh.cfg.mode.clone()),
+            model: cfg.model.clone(),
+            mode: Some(cfg.mode.clone()),
             engine_layer_toml,
             env,
             binary: self.sh.port.binary.clone(),
@@ -1404,11 +1741,10 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                 drop(g);
                 if let (Some(sid_ref), Some(path_ref)) =
                     (&snapshot.strand_id, &snapshot.strand_path)
+                    && let Err(e) = sh.store.set_strand(&snapshot.id, sid_ref, path_ref)
                 {
-                    if let Err(e) = sh.store.set_strand(&snapshot.id, sid_ref, path_ref) {
-                        sh.surface
-                            .on_error("internal", &format!("strand persist: {e}"));
-                    }
+                    sh.surface
+                        .on_error("internal", &format!("strand persist: {e}"));
                 }
                 if replay_messages > 0 {
                     sh.surface.on_note(&format!(
@@ -1460,7 +1796,7 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                             .as_ref()
                             .and_then(|l| l.current_turn.clone())
                             .unwrap_or_else(TurnId::generate),
-                        sh.cfg.approval_ttl_secs,
+                        cfg_of(&sh).approval_ttl_secs,
                     )
                 };
                 let kind = ApprovalKind::KaAsk {
@@ -1489,11 +1825,9 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                         .transition(SessionStatus::AwaitingApproval)
                         .map_err(|t| illegal_session(from, t))
                         .is_ok();
-                    if awaiting {
-                        if let Some(live) = g.live.as_mut() {
-                            live.pending_asks
-                                .insert(approval.id.clone(), ask_id.clone());
-                        }
+                    if awaiting && let Some(live) = g.live.as_mut() {
+                        live.pending_asks
+                            .insert(approval.id.clone(), ask_id.clone());
                     }
                     let port = g.live.as_ref().map(|l| Arc::clone(&l.port));
                     let status = g.session.status;
@@ -1528,7 +1862,7 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                 );
                 let _ = sh.store.append_audit(&mut rec);
                 sh.surface
-                    .on_note("ask auto-denied: its turn already finished (nothing to approve)");
+                    .on_notice("ask auto-denied: its turn already finished (nothing to approve)");
             }
             PortEvent::TurnFinished {
                 stop,
@@ -1539,33 +1873,33 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     g.live.as_ref().and_then(|l| l.current_turn.clone())
                 };
-                if let Some(tid) = turn_result {
-                    if let Some(mut t) = sh.store.get_turn(&tid).ok().flatten() {
-                        t.stop = Some(stop.clone());
-                        t.cost_usd = cost_usd;
-                        t.tokens = tokens;
-                        // The engine can finish a turn before the submit
-                        // handshake recorded it as running: walk the record
-                        // up so the finish always lands on a legal edge.
-                        if t.status == TurnStatus::Submitted {
-                            t.transition(TurnStatus::Running).ok();
-                            sh.store.update_turn(&t).ok();
-                        }
-                        let next = match stop.as_str() {
-                            "done" | "length" => Some(TurnStatus::Done),
-                            "error" => Some(TurnStatus::Error),
-                            "aborted" => Some(TurnStatus::Aborted),
-                            _ => None,
-                        };
-                        if let Some(next) = next {
-                            t.transition(next)
-                                .map_err(|x| illegal_turn(t.status, x))
-                                .ok();
-                        }
-                        if let Err(e) = sh.store.update_turn(&t) {
-                            sh.surface
-                                .on_error("internal", &format!("turn persist: {e}"));
-                        }
+                if let Some(tid) = turn_result
+                    && let Some(mut t) = sh.store.get_turn(&tid).ok().flatten()
+                {
+                    t.stop = Some(stop.clone());
+                    t.cost_usd = cost_usd;
+                    t.tokens = tokens;
+                    // The engine can finish a turn before the submit
+                    // handshake recorded it as running: walk the record
+                    // up so the finish always lands on a legal edge.
+                    if t.status == TurnStatus::Submitted {
+                        t.transition(TurnStatus::Running).ok();
+                        sh.store.update_turn(&t).ok();
+                    }
+                    let next = match stop.as_str() {
+                        "done" | "length" => Some(TurnStatus::Done),
+                        "error" => Some(TurnStatus::Error),
+                        "aborted" => Some(TurnStatus::Aborted),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        t.transition(next)
+                            .map_err(|x| illegal_turn(t.status, x))
+                            .ok();
+                    }
+                    if let Err(e) = sh.store.update_turn(&t) {
+                        sh.surface
+                            .on_error("internal", &format!("turn persist: {e}"));
                     }
                 }
                 let (verdict, budget) = {
@@ -1590,12 +1924,13 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     let status = g.session.status;
                     drop(g);
                     rt_persist_status(&sh, status);
-                    sh.surface
-                        .on_note("daily budget reached — paused until tomorrow (override via CLI)");
+                    sh.surface.on_notice(
+                        "daily budget reached — paused until tomorrow (override via CLI)",
+                    );
                 }
                 if stop == "error" {
                     sh.surface
-                        .on_note("turn ended in error; see /status — nothing was re-submitted");
+                        .on_notice("turn ended in error; see /status — nothing was re-submitted");
                 }
                 // A cycle can emit several `turn_finished` events (auto-poke,
                 // verify): the first settles the status, the later ones only
@@ -1697,8 +2032,22 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     let status = g.session.status;
                     drop(g);
                     rt_persist_status(&sh, status);
-                    sh.surface
-                        .on_note("auth failure — paused; fix the provider key and /resume");
+                    let remedy = cfg_of(&sh)
+                        .model
+                        .as_deref()
+                        .and_then(|m| ka_agent_port::catalog::validate_selector(m).ok())
+                        .and_then(|s| s.key_env);
+                    let text = match remedy {
+                        Some(env) => {
+                            format!(
+                                "the provider rejected the key — run `ka-agent key set {env}`, then /resume"
+                            )
+                        }
+                        None => {
+                            "auth failure — paused; fix the provider key and /resume".to_string()
+                        }
+                    };
+                    sh.surface.on_notice(&text);
                 }
             }
             PortEvent::EngineClosed => {
@@ -1706,15 +2055,14 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     g.live.as_ref().and_then(|l| l.current_turn.clone())
                 };
-                if let Some(tid) = interrupted {
-                    if let Some(mut t) = sh.store.get_turn(&tid).ok().flatten() {
-                        if !t.status.is_terminal() {
-                            t.transition(TurnStatus::Interrupted)
-                                .map_err(|x| illegal_turn(t.status, x))
-                                .ok();
-                            sh.store.update_turn(&t).ok();
-                        }
-                    }
+                if let Some(tid) = interrupted
+                    && let Some(mut t) = sh.store.get_turn(&tid).ok().flatten()
+                    && !t.status.is_terminal()
+                {
+                    t.transition(TurnStatus::Interrupted)
+                        .map_err(|x| illegal_turn(t.status, x))
+                        .ok();
+                    sh.store.update_turn(&t).ok();
                 }
                 rt_on_engine_closed(&sh, port.clone()).await;
             }
@@ -1841,7 +2189,8 @@ fn rt_persist_status(sh: &Arc<Shared>, status: SessionStatus) {
 async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
     port.kill().await;
     let now = ka_agent_core::now_ms();
-    let window_ms = (sh.cfg.worker_restart.crash_window_secs as i64) * 1000;
+    let cfg = cfg_of(sh);
+    let window_ms = (cfg.worker_restart.crash_window_secs as i64) * 1000;
     let deliberate = {
         let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.live.as_ref().is_some_and(|l| l.deliberate_close)
@@ -1854,7 +2203,7 @@ async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
             g.crashes.push(now);
             g.restart_attempt = g.restart_attempt.saturating_add(1);
         }
-        let degraded = !deliberate && g.crashes.len() >= sh.cfg.worker_restart.crash_max as usize;
+        let degraded = !deliberate && g.crashes.len() >= cfg.worker_restart.crash_max as usize;
         let from = g.session.status;
         let target = if degraded {
             SessionStatus::Degraded
@@ -1881,7 +2230,11 @@ async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
     }
     rt_persist_status(sh, status);
     sh.surface.on_session_status(status);
-    sh.surface.on_note(&note);
+    if deliberate {
+        sh.surface.on_note(&note);
+    } else {
+        sh.surface.on_notice(&note);
+    }
 }
 
 /// Seed the workspace with an `AGENTS.md` context file (M11). Written only
@@ -1904,11 +2257,16 @@ on the Ka engine. One operator per instance; everything is auditable.
 - Memory: durable facts live under `<data>/memory/` and are compiled into the
   engine's MEMORY.md. Propose new facts with the `memory_propose` tool for
   operator review; never store them yourself.
-- Operator commands: /status /new /stop /resume /remember /memory /history
-  /remind /cron /calendar /y /n.
-- Scheduling: `/cron add in 10m <text>` (one-shot) or
-  `/cron add every 1h <text>` (recurring) run prompts on a schedule; the
-  `cron_manage` tool does the same from the engine.
+- Operator commands: /help lists them all (/status /new /stop /resume
+  /model /remember /memory /history /remind /reminders /cron /calendar
+  /approvals /skills /y /n).
+- Scheduling: reminders and crons use the operator's local time. One-shot
+  `/cron add in 10m <text>`; recurring `/cron add every 1h <text>`,
+  `/cron add every day at 08:00 <text>` or
+  `/cron add every mon at 09:00 <text>`. Reminders accept `in 2h30m`,
+  `at 18:30`, `tomorrow 9am`, `fri 17:00` or `2026-11-03 10:00`. The
+  `cron_manage` tool does the same from the engine ('at' takes RFC 3339
+  with the operator's UTC offset).
 - References: `@<file>`, `@<dir>/`, `@turn:<id-prefix>`, `@https://…` inline
   in a message inject that context into the turn.
 - External effects (HTTP writes, GitHub) require operator grants and
@@ -1916,18 +2274,6 @@ on the Ka engine. One operator per instance; everything is auditable.
 - Health and audit: `ka-agent doctor`, `ka-agent history`; backups under
   `<data>/backups/`.
 "#;
-
-/// Next `hour:00` UTC strictly after now (fixed-hour scheduling: the
-/// calendar digest fires at 08:00 UTC).
-pub fn next_daily_utc(hour: u8) -> i64 {
-    let now = ka_agent_core::now_ms();
-    let today = now.div_euclid(86_400_000) * 86_400_000 + (hour as i64) * 3_600_000;
-    if today > now {
-        today
-    } else {
-        today + 86_400_000
-    }
-}
 
 /// Next occurrence strictly after `now`, skipping missed occupations.
 /// `None` on i64 overflow (an unarmable schedule, e.g. a hand-crafted

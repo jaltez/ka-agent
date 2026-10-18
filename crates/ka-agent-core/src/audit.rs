@@ -51,6 +51,7 @@ pub mod actions {
     pub const BUDGET_PAUSE: &str = "budget.pause";
     pub const IDENTITY_LINK: &str = "identity.link";
     pub const IDENTITY_UNLINK: &str = "identity.unlink";
+    pub const IDENTITY_PAIR: &str = "identity.pair";
 }
 
 #[cfg(test)]

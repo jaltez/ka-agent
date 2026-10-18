@@ -165,7 +165,7 @@ async fn simple_turn_and_offset_persistence_across_restart() {
     // would be satisfied instantly by it).
     fake.push_text_message(5, 42, 42, "/memory");
     fake.await_capture(
-        |c| send_message_text(c).is_some_and(|t| t.contains("memory:")),
+        |c| send_message_text(c).is_some_and(|t| t.contains("remembered yet")),
         Duration::from_secs(30),
     )
     .expect("no /memory reply after restart");

@@ -91,6 +91,8 @@ pub struct EpisodeHit {
     pub turn: String,
     pub role: String,
     pub snippet: String,
+    /// When the episode happened (the turn's creation, ms epoch).
+    pub at_ms: i64,
 }
 
 /// One pending memory candidate (`/memory review`).
@@ -142,10 +144,10 @@ impl Store {
     /// Open (or create) the database at `path`, apply pragmas and migrations.
     /// Parent directories are created as needed.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         Self::init(Connection::open(path)?)
     }
@@ -997,6 +999,24 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Unknown contacts that tried to reach a channel, newest first:
+    /// `(actor, last_ms, count)` grouped over the `*.unauthorized` audit
+    /// rows (actor is `<channel>:<address>`).
+    pub fn unauthorized_contacts(&self, limit: usize) -> Result<Vec<(String, i64, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT actor, MAX(at_ms), COUNT(*) FROM audit
+             WHERE action IN ('telegram.unauthorized','matrix.unauthorized')
+             GROUP BY actor ORDER BY 2 DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------
     // memory candidates
     // ------------------------------------------------------------------
@@ -1179,6 +1199,20 @@ impl Store {
             "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
              FROM tasks
              WHERE kind = 'cron' AND status IN ('queued','running','interrupted')
+             ORDER BY scheduled_at_ms",
+        )?;
+        let rows = stmt.query_map([], row_to_task)?;
+        collect_rows(rows)
+    }
+
+    /// Live reminders and crons (queued, running or operator-paused), next
+    /// fire first.
+    pub fn scheduled_tasks(&self) -> Result<Vec<ka_agent_core::Task>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
+             FROM tasks
+             WHERE kind IN ('reminder','cron') AND status IN ('queued','running','interrupted')
              ORDER BY scheduled_at_ms",
         )?;
         let rows = stmt.query_map([], row_to_task)?;
@@ -1433,8 +1467,11 @@ impl Store {
     pub fn search_episodes(&self, query: &str, limit: usize) -> Result<Vec<EpisodeHit>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT session, turn, role, snippet(episodes_fts, 3, '[', ']', '…', 12)
-             FROM episodes_fts WHERE episodes_fts MATCH ?1
+            "SELECT f.session, f.turn, f.role,
+                    snippet(episodes_fts, 3, '[', ']', '…', 12), t.created_ms
+             FROM episodes_fts f
+             LEFT JOIN turns t ON t.id = f.turn
+             WHERE episodes_fts MATCH ?1
              ORDER BY rank LIMIT ?2",
         )?;
         let quoted = format!("\"{}\"", query.replace('"', "\"\""));
@@ -1444,6 +1481,7 @@ impl Store {
                 turn: r.get(1)?,
                 role: r.get(2)?,
                 snippet: r.get(3)?,
+                at_ms: r.get(4).unwrap_or(0),
             })
         })?;
         collect_rows(rows)
@@ -2026,6 +2064,8 @@ mod tests {
             source: "operator".into(),
             recurrence_ms: Some(86_400_000),
             mode: ka_agent_core::CronMode::NoAgent("calendar".into()),
+            at_local: None,
+            weekday: None,
         };
         let mut task = ka_agent_core::Task::new("cron".into(), "cron", false);
         task.scheduled_at_ms = Some(ka_agent_core::now_ms() + 60_000);

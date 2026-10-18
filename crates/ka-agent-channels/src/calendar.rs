@@ -16,20 +16,42 @@ use crate::mcp;
 /// presentable answer; `Err` is a visible failure (bad source, refused
 /// fetch).
 pub fn digest(source: &str, store: &Store) -> Result<String, String> {
-    let raw = load(source, store)?;
-    Ok(render(&raw, ka_agent_core::now_ms()))
+    digest_in(source, store, &jiff::tz::TimeZone::system())
 }
 
-/// ICS body → digest lines for the `[now, now+24h)` window.
-fn render(raw: &str, now: i64) -> String {
+/// Digest in the operator's zone: the window is the local day
+/// (`[today 00:00, tomorrow 00:00)`), and wall-clock times in the ICS that
+/// carry a `Z` are labelled with the operator's offset, not left as `Z`.
+pub fn digest_in(source: &str, store: &Store, tz: &jiff::tz::TimeZone) -> Result<String, String> {
+    let raw = load(source, store)?;
+    let now = jiff::Timestamp::now().to_zoned(tz.clone());
+    Ok(render(&raw, &now))
+}
+
+/// ICS body → digest lines for the local `[today 00:00, tomorrow 00:00)`
+/// window, times in `now`'s zone.
+fn render(raw: &str, now: &jiff::Zoned) -> String {
+    let day_start = now
+        .with()
+        .date(now.date())
+        .time(jiff::civil::time(0, 0, 0, 0))
+        .build()
+        .unwrap_or_else(|_| {
+            now.with()
+                .time(jiff::civil::time(0, 0, 0, 0))
+                .build()
+                .unwrap_or_else(|_| now.clone())
+        });
+    let window_start = day_start.timestamp().as_millisecond();
+    let window_end = window_start + 86_400_000;
     let (mut events, recurring) = parse_events(raw);
-    events.retain(|e| e.start_ms >= now && e.start_ms < now + 86_400_000);
+    events.retain(|e| e.start_ms >= window_start && e.start_ms < window_end);
     events.sort_by_key(|e| e.start_ms);
     let mut out: Vec<String> = events
         .iter()
         .map(|ev| match (&ev.start, &ev.end) {
-            (Some(s), Some(e)) => format!("{}-{} {}", label(s), label(e), ev.summary),
-            (Some(s), None) => format!("{} {}", label(s), ev.summary),
+            (Some(s), Some(e)) => format!("{}-{} {}", label(s, now), label(e, now), ev.summary),
+            (Some(s), None) => format!("{} {}", label(s, now), ev.summary),
             (None, _) => format!("(all day) {}", ev.summary),
         })
         .collect();
@@ -71,12 +93,25 @@ struct Time {
     zulu: bool,
 }
 
-fn label(t: &Time) -> String {
-    if t.zulu {
-        format!("{}Z", t.hhmm)
-    } else {
-        t.hhmm.clone()
+/// The event's wall-clock time. A `Z` time is converted into `now`'s zone
+/// (a local time keeps its zone's wall clock as stated).
+fn label(t: &Time, now: &jiff::Zoned) -> String {
+    if !t.zulu {
+        return t.hhmm.clone();
     }
+    let Some((h, m)) = t.hhmm.split_once(':') else {
+        return format!("{}Z", t.hhmm);
+    };
+    let (h, m): (i8, i8) = (h.parse().unwrap_or(0), m.parse().unwrap_or(0));
+    let Ok(at) = now
+        .with()
+        .hour(h.clamp(0, 23))
+        .minute(m.clamp(0, 59))
+        .build()
+    else {
+        return format!("{}Z", t.hhmm);
+    };
+    format!("{:02}:{:02}", at.hour(), at.minute())
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +261,26 @@ mod tests {
         Store::open(&dir.join("state.db")).unwrap()
     }
 
+    /// An event time inside the digest window (the local day): half an
+    /// hour out, clamped to 23:58 so a test running near midnight stays
+    /// inside today.
+    fn day_safe(now_ms: i64) -> i64 {
+        let now = jiff::Timestamp::from_millisecond(now_ms)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        let end = now
+            .with()
+            .time(jiff::civil::time(23, 58, 0, 0))
+            .build()
+            .unwrap();
+        let candidate = now + jiff::Span::new().minutes(30);
+        if candidate <= end {
+            candidate.timestamp().as_millisecond()
+        } else {
+            end.timestamp().as_millisecond()
+        }
+    }
+
     /// `YYYYMMDDTHHMMSSZ` for `now + offset_ms`, and its `HH:MM`.
     fn stamp(now: i64, offset_ms: i64) -> (String, String) {
         let t = now + offset_ms;
@@ -250,80 +305,102 @@ mod tests {
     }
 
     #[test]
-    fn event_inside_window_is_listed_with_zulu_time() {
-        let now = ka_agent_core::now_ms();
-        let (start, hhmm) = stamp(now, 2 * 3_600_000);
-        let (end, _) = stamp(now, 3 * 3_600_000);
+    fn event_inside_window_is_listed_in_operator_zone() {
+        let now_ms = ka_agent_core::now_ms();
+        let now = jiff::Timestamp::from_millisecond(now_ms)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        let (start, hhmm) = stamp(day_safe(now_ms), 0);
+        let (end, _) = stamp(day_safe(now_ms) + 1_800_000, 0);
         let ics = format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:CTest-XYZ\nDTSTART:{start}\nDTEND:{end}\nEND:VEVENT\nEND:VCALENDAR\n"
         );
-        let out = render(&ics, now);
-        assert!(out.contains(&format!("{hhmm}Z")), "{out}");
+        let out = render(&ics, &now);
+        // The ICS time is `Z`; the digest labels it in the operator zone.
+        assert!(!out.contains(&format!("{hhmm}Z")), "no zulu suffix: {out}");
+        assert!(out.contains(&hhmm), "{out}");
         assert!(out.contains("CTest-XYZ"), "{out}");
     }
 
     #[test]
     fn event_outside_window_is_not_listed() {
-        let now = ka_agent_core::now_ms();
-        let (start, _) = stamp(now, 3 * 86_400_000); // +3 days
+        let now_ms = ka_agent_core::now_ms();
+        let now = jiff::Timestamp::from_millisecond(now_ms)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        let (start, _) = stamp(now_ms + 3 * 86_400_000, 0); // +3 days: outside today
         let ics = format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Far\nDTSTART:{start}\nEND:VEVENT\nEND:VCALENDAR\n"
         );
-        let out = render(&ics, now);
+        let out = render(&ics, &now);
         assert!(out.contains("no events in the next 24h"), "{out}");
     }
 
     #[test]
     fn date_only_event_is_all_day() {
-        let now = ka_agent_core::now_ms();
+        let now_ms = ka_agent_core::now_ms();
+        let now = jiff::Timestamp::from_millisecond(now_ms)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
         // Next UTC midnight (or `now` itself at an exact boundary): always
-        // inside [now, now+24h).
-        let boundary = if now % 86_400_000 == 0 {
-            now
-        } else {
-            (now.div_euclid(86_400_000) + 1) * 86_400_000
-        };
-        let (stamp_str, _) = stamp(boundary + 3_600_000, 0); // same civil date
+        // inside the local day window.
+        // Noon of the local day: always inside [today 00:00, tomorrow 00:00).
+        let noon = now
+            .with()
+            .time(jiff::civil::time(12, 0, 0, 0))
+            .build()
+            .unwrap()
+            .timestamp()
+            .as_millisecond();
+        let (stamp_str, _) = stamp(noon, 0);
         let date_only = &stamp_str[..8];
         let ics = format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:WholeDay\nDTSTART;VALUE=DATE:{date_only}\nEND:VEVENT\nEND:VCALENDAR\n"
         );
-        let out = render(&ics, now);
+        let out = render(&ics, &now);
         assert!(out.contains("(all day) WholeDay"), "{out}");
     }
 
     #[test]
     fn folded_summary_lines_are_unfolded() {
-        let now = ka_agent_core::now_ms();
-        let (start, _) = stamp(now, 3_600_000);
+        let now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        let (start, _) = stamp(day_safe(ka_agent_core::now_ms()), 0);
         let ics = format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Folded\n PartTwo\nDTSTART:{start}\nEND:VEVENT\nEND:VCALENDAR\n"
         );
-        let out = render(&ics, now);
+        let out = render(&ics, &now);
         assert!(out.contains("FoldedPartTwo"), "{out}");
     }
 
     #[test]
     fn rrule_events_are_counted_not_expanded() {
-        let now = ka_agent_core::now_ms();
-        let (start, _) = stamp(now, 3_600_000);
+        let now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        let (start, _) = stamp(day_safe(ka_agent_core::now_ms()), 0);
         let ics = format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Daily\nDTSTART:{start}\nRRULE:FREQ=DAILY\nEND:VEVENT\nEND:VCALENDAR\n"
         );
-        let out = render(&ics, now);
+        let out = render(&ics, &now);
         assert!(out.contains("Daily"), "{out}");
         assert!(out.contains("1 recurring event(s) not expanded"), "{out}");
     }
 
     #[test]
     fn events_are_sorted_by_start() {
-        let now = ka_agent_core::now_ms();
-        let (late, _) = stamp(now, 5 * 3_600_000);
-        let (early, _) = stamp(now, 3_600_000);
+        let now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        // Both inside today: the clamped slot and half an hour before it.
+        let safe = day_safe(ka_agent_core::now_ms());
+        let (late, _) = stamp(safe, 0);
+        let (early, _) = stamp(safe - 1_800_000, 0);
         let ics = format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Late\nDTSTART:{late}\nEND:VEVENT\nBEGIN:VEVENT\nSUMMARY:Early\nDTSTART:{early}\nEND:VEVENT\nEND:VCALENDAR\n"
         );
-        let out = render(&ics, now);
+        let out = render(&ics, &now);
         let early_at = out.find("Early").expect("Early listed");
         let late_at = out.find("Late").expect("Late listed");
         assert!(early_at < late_at, "{out}");
@@ -333,8 +410,10 @@ mod tests {
     fn local_path_source_is_read() {
         let root = temp_root("path");
         let store = store_at(&root.join("data"));
-        let now = ka_agent_core::now_ms();
-        let (start, _) = stamp(now, 3_600_000);
+        let _now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system());
+        let (start, _) = stamp(day_safe(ka_agent_core::now_ms()), 0);
         let ics = root.join("cal.ics");
         std::fs::write(
             &ics,

@@ -9,9 +9,9 @@ pipeline: the pages are strings the runtime renders per request.
 | Step | Command |
 |---|---|
 | Start the daemon with the UI | `ka-agent run --web-port 8480` |
-| Mint a login link | `ka-agent web-token --port 8480` |
+| Mint a login link | `ka-agent dashboard` (one-shot URL; respects the configured port) |
 
-The port default is none (off). `ka-agent web-token` writes a token into the
+The port default is none (off). `ka-agent dashboard` mints a one-shot token in the
 daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 `http://127.0.0.1:<port>/auth?token=<token>`.
 

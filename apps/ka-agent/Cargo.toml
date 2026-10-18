@@ -27,6 +27,9 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
+jiff = { workspace = true }
+rpassword = { workspace = true }
+toml_edit = { workspace = true }
 
 [lints]
 workspace = true

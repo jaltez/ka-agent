@@ -194,6 +194,14 @@ pub struct CronSpec {
     /// Fixed interval between fires in ms; `None` = one-shot.
     pub recurrence_ms: Option<i64>,
     pub mode: CronMode,
+    /// Anchored recurrence: the local wall-clock time ("HH:MM") each
+    /// occurrence fires at, in the operator zone (DST-correct). When set,
+    /// the next fire is computed from it instead of `recurrence_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_local: Option<String>,
+    /// With `at_local`: only on this weekday (0 = Monday); `None` = daily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekday: Option<u8>,
 }
 
 impl CronSpec {
@@ -252,6 +260,8 @@ mod cron_tests {
             source: "kagent".into(),
             recurrence_ms: None,
             mode: CronMode::Agent,
+            at_local: None,
+            weekday: None,
         };
         assert_eq!(
             CronSpec::from_payload(&one_shot.to_payload()),
@@ -263,6 +273,8 @@ mod cron_tests {
             source: "operator".into(),
             recurrence_ms: Some(86_400_000),
             mode: CronMode::NoAgent("calendar".into()),
+            at_local: Some("08:00".into()),
+            weekday: None,
         };
         let payload = recurring.to_payload();
         assert!(payload.contains(r#""mode":"no_agent""#), "{payload}");

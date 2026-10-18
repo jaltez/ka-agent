@@ -12,6 +12,7 @@
 //! - [`scenario`] — the scripted speaker for deterministic, network-free
 //!   tests and e2e runs.
 
+pub mod catalog;
 pub mod port;
 pub mod proto;
 pub mod scenario;

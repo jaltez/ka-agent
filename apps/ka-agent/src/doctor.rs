@@ -1,11 +1,13 @@
-//! `ka-agent doctor`: the instance health report. Read-only; every check
-//! names what it looked at and what to do about it.
+//! `ka-agent doctor`: the instance health report. Read-only (it creates
+//! nothing), every check is one line: what it looked at, and the exact
+//! command that fixes it when it is wrong. Exit 1 when any check failed
+//! (`✗`); warnings (`!`) do not fail.
 
 use std::path::PathBuf;
 
 use ka_agent_core::DaemonConfig;
+use ka_agent_port::catalog::{self, CredentialCheck, KeyState};
 use ka_agent_runtime::paths::Paths;
-use ka_agent_store::Store;
 
 /// sha256 of the shipped contract suite (docs/contract/*.md, sorted by
 /// name, embedded at build time): the behavioral contract this binary was
@@ -24,6 +26,8 @@ fn contract_suite_hash() -> String {
 }
 
 /// The contract documents, embedded: (file name, bytes), sorted by name.
+/// A new document must be appended here AND its expected count updated in
+/// `ops_e2e.rs::doctor_reports_pin_contract_state_and_backup`.
 static CONTRACT_DOCS: &[(&str, &[u8])] = &[
     (
         "admin-socket.md",
@@ -76,136 +80,306 @@ static CONTRACT_DOCS: &[(&str, &[u8])] = &[
     ),
 ];
 
-pub fn doctor(config: PathBuf) -> std::process::ExitCode {
-    // doctor stays informative even with a missing/broken config: the
-    // report itself is the diagnostic.
-    let cfg = match DaemonConfig::load(&config) {
-        Ok(c) => c,
-        Err(e) => {
-            if !config.exists() {
-                println!(
-                    "config : MISSING at {} — run `ka-agent init`",
-                    config.display()
-                );
-            } else {
-                println!("config : INVALID: {e} (continuing with defaults)");
-            }
-            DaemonConfig::default()
-        }
-    };
+struct Report {
+    failed: bool,
+}
+
+impl Report {
+    fn new() -> Self {
+        Self { failed: false }
+    }
+
+    fn ok(&self, line: String) {
+        println!("✓ {line}");
+    }
+
+    fn info(&self, line: &str) {
+        println!("· {line}");
+    }
+
+    fn warn(&self, line: &str) {
+        println!("! {line}");
+    }
+
+    fn fail(&mut self, line: String) {
+        println!("✗ {line}");
+        self.failed = true;
+    }
+}
+
+pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
+    let rep = Report::new();
+    let mut rep = rep;
     let paths = Paths::new(Paths::default_root());
-    println!("ka-agent {}", env!("CARGO_PKG_VERSION"));
-    println!("ka pin : {} (crates.io, exact)", ka_agent_port::KA_PIN);
-    let hash = contract_suite_hash();
     println!(
-        "contract suite: {}… ({} documents)",
-        &hash[..16],
+        "ka-agent {} · ka {} · contracts {}… ({} documents)",
+        env!("CARGO_PKG_VERSION"),
+        ka_agent_port::KA_PIN,
+        &contract_suite_hash()[..16],
         CONTRACT_DOCS.len()
     );
-    println!(
-        "config : {} (workspace {})",
-        config.display(),
-        cfg.workspace_path().display()
-    );
-    println!("data   : {}", paths.root().display());
-    match paths.ensure_dirs() {
-        Ok(()) => println!("dirs   : ok"),
-        Err(e) => println!("dirs   : FAIL {e}"),
-    }
-    match Store::open(&paths.state_db()) {
-        Ok(s) => {
-            let v = s
-                .user_version()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|e| format!("? {e}"));
-            println!("state  : {} (schema v{v})", paths.state_db().display())
+
+    // Config: present, parseable, valid.
+    let cfg = if !config.exists() {
+        rep.fail(format!(
+            "no config at {} — run `ka-agent setup`",
+            config.display()
+        ));
+        None
+    } else {
+        match DaemonConfig::load(&config) {
+            Ok(c) => {
+                rep.ok(format!("config {}", config.display()));
+                Some(c)
+            }
+            Err(e) => {
+                rep.fail(format!(
+                    "config {} invalid: {e} — run `ka-agent setup` or `ka-agent config edit`",
+                    config.display()
+                ));
+                None
+            }
         }
-        Err(e) => println!("state  : FAIL {e}"),
+    };
+
+    // Model + its provider key (the whole point of setup).
+    let model = cfg.as_ref().and_then(|c| c.model.clone());
+    match &model {
+        Some(model) => {
+            rep.ok(format!("model {model}"));
+            if let Ok(sel) = catalog::validate_selector(model) {
+                let env = catalog::read_env_file(&catalog::engine_env_path(&paths.engine_home()));
+                match catalog::key_state(&sel, &env) {
+                    KeyState::Present => {
+                        if let Some(env) = sel.key_env {
+                            rep.ok(format!("provider key {env} set"));
+                        } else {
+                            rep.info("provider needs no key (local)");
+                        }
+                    }
+                    KeyState::Missing(env) => {
+                        rep.fail(format!("{env} missing — ka-agent key set {env}"))
+                    }
+                    KeyState::Keyless => rep.info("provider needs no key (local)"),
+                }
+            }
+        }
+        None => rep.fail("no model — run `ka-agent setup`".into()),
     }
-    let ws = cfg.workspace_path();
-    match std::fs::create_dir_all(&ws) {
-        Ok(()) => println!("workspace: {} ok", ws.display()),
-        Err(e) => println!("workspace: FAIL {e}"),
-    }
-    if let Err(e) = cfg.validate() {
-        println!("config validate: FAIL {e}");
-    } else {
-        println!("config validate: ok");
-    }
-    // Engine provider key (ka's .env tier — the file `ka-agent key set`
-    // writes and the worker's engine reads).
-    let engine_env = paths.engine_home().join(".config/ka/.env");
-    let key_count = std::fs::read_to_string(&engine_env)
-        .map(|t| {
-            t.lines()
-                .filter(|l| {
-                    l.split_once('=')
-                        .is_some_and(|(n, v)| !n.trim().is_empty() && !v.trim().is_empty())
-                })
-                .count()
-        })
-        .unwrap_or(0);
-    if key_count > 0 {
-        println!("provider key: {key_count} set ({})", engine_env.display());
-    } else {
-        println!("provider key: NONE — the engine cannot call a model until you run:");
-        println!("             ka-agent key set ANTHROPIC_API_KEY <key>");
-    }
-    // Memory backing: stable memory is git-backed, so the git binary is a
-    // hard prerequisite of the daemon's first start.
+
+    // git (memory backing is a git repo).
     match std::process::Command::new("git").arg("--version").output() {
         Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout).into_owned();
-            let v = raw.trim().strip_prefix("git version ").unwrap_or("?");
-            println!(
-                "memory : git {v} backing {}",
-                paths.root().join("memory").display()
-            );
+            let v = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .strip_prefix("git version ")
+                .unwrap_or("?")
+                .to_string();
+            rep.ok(format!("git {v}"));
         }
-        _ => println!("memory : FAIL git missing — the daemon cannot start (git-backed memory)"),
+        _ => rep.fail("git missing — memory needs it; install git".into()),
     }
-    // Provisioned skills (SEED.md §9.1): what the engine can be asked to
-    // apply with /skill.
-    let skills_count = ka_agent_runtime::skills::Skills::new(&paths.engine_home())
-        .enabled()
-        .len();
-    println!("skills : {skills_count} enabled (ka-agent skills list)");
-    // Sandbox prerequisite (M8): bubblewrap, present and runnable.
+
+    // Daemon.
+    let daemon_up = crate::admin::is_running(&paths);
+    if daemon_up {
+        rep.ok("daemon running".into());
+    } else {
+        rep.warn("not running — ka-agent service install (or ka-agent run)");
+    }
+
+    // Service definition installed?
+    if crate::service::supported() {
+        if crate::service::is_installed() {
+            rep.ok("background service installed".into());
+            if !daemon_up && crate::service::is_active() {
+                rep.warn(
+                    "service is active but the daemon does not answer — check `ka-agent logs`",
+                );
+            }
+        } else {
+            rep.warn("background service not installed — ka-agent service install");
+        }
+    }
+
+    // Channels: token resolvable + someone paired.
+    if let Some(cfg) = &cfg {
+        let secrets = paths.root().join("secrets");
+        if cfg.telegram.enabled {
+            let name = cfg
+                .telegram
+                .token_secret
+                .clone()
+                .unwrap_or_else(|| "telegram.bot_token".into());
+            match ka_agent_channels::secret::resolve(&name, &secrets) {
+                Ok(_) => rep.ok(format!("telegram token {name:?} resolves")),
+                Err(e) => rep.fail(format!(
+                    "telegram token {name:?} missing: {e} — ka-agent setup telegram"
+                )),
+            }
+            if paths.state_db().exists()
+                && let Ok(store) = ka_agent_store::Store::open(&paths.state_db())
+            {
+                let linked = store
+                    .list_identities()
+                    .map(|rows| rows.iter().any(|r| r.channel == "telegram"))
+                    .unwrap_or(false);
+                if linked {
+                    rep.ok("telegram: someone paired".into());
+                } else {
+                    rep.warn("telegram: no one paired — ka-agent pair telegram");
+                }
+            }
+        }
+        if cfg.matrix.enabled {
+            let name = cfg
+                .matrix
+                .token_secret
+                .clone()
+                .unwrap_or_else(|| "matrix.access_token".into());
+            match ka_agent_channels::secret::resolve(&name, &secrets) {
+                Ok(_) => rep.ok(format!("matrix token {name:?} resolves")),
+                Err(e) => rep.fail(format!(
+                    "matrix token {name:?} missing: {e} — ka-agent setup matrix"
+                )),
+            }
+        }
+        // Web.
+        if cfg.web.enabled {
+            let url_in_meta = paths
+                .state_db()
+                .exists()
+                .then(|| ka_agent_store::Store::open(&paths.state_db()).ok())
+                .flatten()
+                .and_then(|s| s.meta_get("web.url").ok().flatten())
+                .is_some_and(|u| !u.is_empty());
+            if daemon_up && !url_in_meta {
+                rep.warn("web UI not answering (port busy?) — check `ka-agent logs`");
+            } else {
+                rep.info(&format!(
+                    "web UI port {} (ka-agent dashboard)",
+                    cfg.web.port
+                ));
+            }
+        } else {
+            rep.warn("web UI disabled — ka-agent config set web.enabled true");
+        }
+        // Timezone.
+        if cfg.timezone.is_some() {
+            rep.ok(format!(
+                "timezone {}",
+                cfg.time_zone().iana_name().unwrap_or("UTC")
+            ));
+        } else {
+            let sys = jiff::tz::TimeZone::system()
+                .iana_name()
+                .unwrap_or("UTC")
+                .to_string();
+            rep.warn(&format!(
+                "using system zone {sys} — ka-agent config set timezone \"{sys}\""
+            ));
+        }
+    }
+
+    // Sandbox: plugins need bubblewrap, which is Linux-only today.
+    #[cfg(target_os = "linux")]
     match std::process::Command::new("bwrap")
         .arg("--version")
         .output()
     {
         Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout).into_owned();
-            let v = raw.trim().strip_prefix("bubblewrap ").unwrap_or("?");
-            println!("sandbox: bubblewrap {v}");
+            let v = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .strip_prefix("bubblewrap ")
+                .unwrap_or("?")
+                .to_string();
+            rep.ok(format!("sandbox bubblewrap {v}"));
         }
-        _ => println!("sandbox: FAIL bubblewrap missing (plugins cannot run)"),
+        _ => rep.warn("bubblewrap missing — plugins cannot run; install bubblewrap"),
     }
-    // Instance state a support conversation needs at a glance.
-    if let Ok(store) = Store::open(&paths.state_db()) {
+    #[cfg(not(target_os = "linux"))]
+    rep.info("plugins need Linux");
+
+    // Instance state (only when the store exists; doctor creates nothing).
+    if paths.state_db().exists()
+        && let Ok(store) = ka_agent_store::Store::open(&paths.state_db())
+    {
         let ids = store.list_identities().map(|v| v.len()).unwrap_or(0);
-        println!("identities: {ids} linked");
-        let lock = ka_agent_plugins::Lockfile::load(&paths.root().join("plugins/installed.json"));
-        match lock {
+        rep.ok(format!("identities {ids} linked"));
+        match ka_agent_plugins::Lockfile::load(&paths.root().join("plugins/installed.json")) {
             Ok(l) => {
                 let enabled = l.plugins.iter().filter(|p| p.enabled).count();
-                println!("plugins : {} installed, {enabled} enabled", l.plugins.len());
+                rep.info(&format!(
+                    "plugins: {} installed, {enabled} enabled",
+                    l.plugins.len()
+                ));
             }
-            Err(e) => println!("plugins : lockfile error: {e}"),
+            Err(_) => rep.info("plugins: none installed"),
+        }
+        let now = ka_agent_core::now_ms();
+        // Backup age comes from the pointer file `backup` writes.
+        match std::fs::read_to_string(paths.root().join("backups/latest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|m| m["at_ms"].as_i64().or(None))
+        {
+            Some(at) => {
+                let ago = now - at;
+                let zone = jiff::tz::TimeZone::system();
+                rep.ok(format!(
+                    "last backup {}",
+                    ka_agent_core::when::describe(at, &jiff::Timestamp::now().to_zoned(zone))
+                ));
+                if ago > 7 * 86_400_000 {
+                    rep.warn(
+                        "last backup more than a week old — `ka-agent backup` or check the timer",
+                    );
+                }
+            }
+            None => {
+                rep.warn("no backup yet — ka-agent backup (or install the service for the nightly timer)");
+            }
         }
     }
-    // Last backup: `backup` records a pointer at <data>/backups/latest.json.
-    let pointer = paths.root().join("backups/latest.json");
-    match std::fs::read_to_string(&pointer)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+
+    // --online: live credential + channel checks.
+    if online
+        && let Some(model) = &model
+        && let Some(p) = catalog::provider(model.split('/').next().unwrap_or(""))
     {
-        Some(m) => {
-            let at = m["at"].as_str().unwrap_or("?");
-            println!("backup : latest {at}");
+        let env = catalog::read_env_file(&catalog::engine_env_path(&paths.engine_home()));
+        let key = p
+            .key_env
+            .and_then(|e| env.get(e).cloned())
+            .or_else(|| p.key_env.and_then(|e| std::env::var(e).ok()));
+        let check = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .map(|rt| rt.block_on(catalog::check_credentials(&p, key.as_deref())));
+        match check {
+            Ok(CredentialCheck::Ok { models }) => rep.ok(format!(
+                "online: {} key works ({} models)",
+                p.name,
+                models.len()
+            )),
+            Ok(CredentialCheck::NoListing { .. }) => {
+                rep.ok(format!("online: reached {}", p.name));
+            }
+            Ok(CredentialCheck::Rejected { status, .. }) => rep.fail(format!(
+                "online: {} rejected the key (HTTP {status})",
+                p.name
+            )),
+            Ok(CredentialCheck::Unreachable { message }) => {
+                rep.warn(&format!("online: {message}"));
+            }
+            Err(e) => rep.warn(&format!("online checks unavailable: {e}")),
         }
-        None => println!("backup : none yet (run `ka-agent backup` or install the timer)"),
     }
-    std::process::ExitCode::SUCCESS
+
+    if rep.failed {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
 }

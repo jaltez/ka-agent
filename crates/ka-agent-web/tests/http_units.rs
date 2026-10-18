@@ -28,9 +28,12 @@ fn url_decode_handles_percent_plus_and_malformed_input() {
     assert_eq!(url_decode("%3Cscript%3E"), "<script>");
     assert_eq!(url_decode("plain"), "plain");
     assert_eq!(url_decode(""), "");
-    // Malformed escapes must never panic.
-    assert_eq!(url_decode("%zz"), "");
-    assert_eq!(url_decode("%"), "");
-    assert_eq!(url_decode("%2"), "\u{2}");
+    // Malformed escapes must never panic: the raw `%` survives.
+    assert_eq!(url_decode("%zz"), "%zz");
+    assert_eq!(url_decode("%"), "%");
+    assert_eq!(url_decode("%2"), "%2");
     assert_eq!(url_decode("id=1&decision=y"), "id=1&decision=y");
+    // Multi-byte UTF-8 survives the byte round-trip (the old
+    // char-by-char decoder mangled it).
+    assert_eq!(url_decode("%C3%A9"), "é");
 }

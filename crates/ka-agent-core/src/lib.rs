@@ -10,6 +10,7 @@ pub mod approval;
 pub mod audit;
 pub mod budget;
 pub mod config;
+pub mod config_file;
 pub mod ids;
 pub mod outbox;
 pub mod queue;
@@ -17,11 +18,12 @@ pub mod session;
 pub mod task;
 pub mod time;
 pub mod turn;
+pub mod when;
 
 pub use approval::{Approval, ApprovalDecision, ApprovalKind, ApprovalStatus};
 pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
-pub use config::{DaemonConfig, Error as ConfigError, MatrixSettings};
+pub use config::{Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, Web};
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use queue::QueueItem;
@@ -29,6 +31,7 @@ pub use session::{Session, SessionStatus};
 pub use task::{CronMode, CronSpec, Task, TaskStatus};
 pub use time::{fmt_interval, parse_duration};
 pub use turn::{Turn, TurnStatus};
+pub use when::When;
 
 /// Milliseconds since the Unix epoch (UTC). All timestamps in Ka Agent state
 /// are stored as this integer; rendering to a human format is a surface
@@ -48,10 +51,10 @@ pub fn day_key(now_ms: i64) -> i64 {
 /// Expand a leading `~` to `$HOME`. Untouched otherwise (relative paths stay
 /// relative to the daemon's working directory).
 pub fn expand_home(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::Path::new(&home).join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::Path::new(&home).join(rest);
     }
     std::path::PathBuf::from(path)
 }

@@ -104,7 +104,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, PackError> {
-    if s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(PackError::Other(format!("bad hex (len {})", s.len())));
     }
     (0..s.len())
@@ -354,13 +354,13 @@ pub fn install_archive(
     let lock_path = plugins_root.join("installed.json");
     let mut lock = Lockfile::load(&lock_path)?;
     // TOFU: updates of an installed id must come from the pinned key.
-    if let Some(existing) = lock.get(&manifest.plugin.id) {
-        if existing.signed_by != signed_by {
-            return Err(PackError::Other(format!(
-                "plugin {} is pinned to a different key; refusing this update",
-                manifest.plugin.id
-            )));
-        }
+    if let Some(existing) = lock.get(&manifest.plugin.id)
+        && existing.signed_by != signed_by
+    {
+        return Err(PackError::Other(format!(
+            "plugin {} is pinned to a different key; refusing this update",
+            manifest.plugin.id
+        )));
     }
     let target = plugins_root.join(&manifest.plugin.id);
     let staging = plugins_root.join(format!(".stage-{}", manifest.plugin.id));
@@ -402,14 +402,17 @@ pub fn install_archive(
 
 /// Persist a keypair on disk (0600 seed, 0644 public half).
 pub fn write_keypair(plugins_root: &Path, key: &SigningKey, label: &str) -> Result<(), PackError> {
-    use std::os::unix::fs::PermissionsExt;
     let dir = plugins_root.join("keys");
     std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
     let name = key.public_hex()[..16].to_string();
     let seed_path = dir.join(format!("{name}.seed"));
     std::fs::write(&seed_path, key.seed_hex()).map_err(|e| io(&seed_path, e))?;
-    std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| io(&seed_path, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| io(&seed_path, e))?;
+    }
     let pub_path = dir.join(format!("{name}.pub"));
     let pub_line = format!("{}\t{}\n", key.public_hex(), label);
     std::fs::write(&pub_path, pub_line).map_err(|e| io(&pub_path, e))?;
