@@ -3,11 +3,16 @@
 ## Install (user units)
 
 ```
-cp dist/systemd/ka-agent.service ~/.config/systemd/user/
-cp dist/systemd/ka-agent-backup.{service,timer} ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ka-agent ka-agent-backup.timer
+ka-agent service install
 ```
+
+The units are generated from the running binary (`ka-agent service print`
+shows them): `ka-agent.service`, `ka-agent-backup.service` and
+`ka-agent-backup.timer` under `$XDG_CONFIG_HOME/systemd/user/` (Linux) or
+`~/Library/LaunchAgents/` (macOS). Install is idempotent and upgrade-safe:
+it rewrites the definitions with the current binary and restarts the
+daemon. It refuses while a foreground `ka-agent run` or chat holds the data
+root.
 
 - `ka-agent.service` — `Restart=always` (a clean exit is also a restart;
   `ka-agent restart` drives exactly that), start-rate limited (5 in 10 min

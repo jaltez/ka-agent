@@ -2,36 +2,35 @@
 
 A resident assistant on the [Ka](https://github.com/jaltez/ka-harness) coding
 engine: one always-on daemon per operator that keeps working across sessions
-and channels — durable memory, tasks, approvals, Telegram — while all model
-reasoning and tool execution stay in Ka engines that Ka Agent starts, watches
-and stops.
+and channels — durable memory, scheduled tasks, approvals, Telegram, Matrix —
+while all model reasoning and tool execution stay in Ka engines that Ka Agent
+starts, watches and stops.
 
 ## Quickstart
 
-Linux and macOS (Windows: see the note at the end):
+Linux and macOS (Windows: see [Platforms](#platforms)):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jaltez/ka-agent/main/scripts/install.sh | sh
-# or build from source: cargo install --path apps/ka-agent
-
-ka-agent                              # first run: a 3-minute setup wizard
+ka-agent                              # first run: the setup wizard
 ```
 
-`ka-agent setup` picks a provider, verifies the key live, picks a model,
-detects your timezone, optionally pairs Telegram or Matrix by one-time code,
-installs the background service, and proves everything with a first reply.
-Nothing is written until you confirm. Later:
+The wizard takes about three minutes: it picks a provider, verifies the API
+key live, picks a model, detects your timezone, offers to pair Telegram or
+Matrix by one-time code, offers to install the background service, and ends
+with a real first reply. Nothing is written until you confirm. From source
+instead: `cargo install --path apps/ka-agent`.
+
+Installer knobs (all optional): `KA_AGENT_INSTALL_DIR` (default
+`~/.local/bin`), `KA_AGENT_NO_SETUP=1`, `KA_AGENT_INSTALL_FROM=<tarball>`.
+
+After setup, four things cover most days:
 
 ```sh
 ka-agent                              # chat (attaches to the background service)
-ka-agent dashboard                    # open the web control panel in your browser
+ka-agent dashboard                    # web control panel in your browser
 ka-agent status                       # one-glance report
-ka-agent doctor                       # full health check
-ka-agent logs -f                      # the daemon's log
-
-ka-agent model provider/model         # switch models, applied live
-ka-agent pair telegram                # pair your phone by one-time code
-ka-agent service status               # background service state
+ka-agent doctor                       # full health check; exit 1 = fix something
 ```
 
 Two rules of the house, both enforced by code:
@@ -42,171 +41,167 @@ Two rules of the house, both enforced by code:
   logged as intents (deduplicated by content hash), and approvals deny on
   expiry.
 
-## What's in
+## Talking to it
 
-**Status: working and verified.** `cargo test --workspace`: green,
-including e2e over the real binary (scripted engine, fake Bot API, fault
-injection). Telegram + Matrix + memory + history + MCP bridge + scheduler +
-loopback web UI + sandboxed third-party plugins + cron/`@refs`/AGENTS.md +
-calendar digest + first-run setup.
+Plain text is a prompt; `/commands` are optional (`/help` lists them, and
+`@file`, `@dir/`, `@turn:<id>` or `@https://…` injects context). The terminal
+and every paired phone share one session: an answer asked on Telegram shows
+in your terminal too.
 
-- **`ka-agent-core`** — domain types and state machines: ids, sessions/turns,
-  approvals, tasks, queue, outbox, budgets, audit, strict `ka-agent.toml`
-  config. No I/O.
-- **`ka-agent-store`** — SQLite persistence (WAL, schema v4, migrations,
-  audit chain, FTS5 history, intent log with content-hash idempotency).
-- **`ka-agent-port`** — the `KaPort` trait and the crate-backed worker
-  boundary (`docs/contract/ka-port.md`, `worker-protocol.md`). The only
-  crate that touches the `ka-*` engine crates.
-- **`ka-agent-runtime`** — session manager, durable queue, single-flight
-  submission, approvals with deny-on-expiry, budgets, worker supervisor with
-  backoff and a crash-loop breaker, and one maintenance loop (approval
-  expiry + scheduler + idle-worker reap) that sleeps until the next due
-  task instead of polling. An idle worker is stopped after
-  `worker_idle_timeout_secs` (default 15 min) so a resident daemon pays
-  for its engine only while it works.
-- **`ka-agent-memory`** — stable memory: Markdown with provenance comments,
-  git-backed (every accepted change is a commit), compiled into the engine's
-  `MEMORY.md` under a 6 KB budget (ka re-reads it per prompt). Candidates
-  from the model land in `/memory review`; `/memory accept` takes a full id
-  or any unique prefix.
-- **`ka-agent-channels`** — Telegram (long polling, identity gating, typing
-  indicator + progress edits, approval keyboards, command autocompletion via
-  `setMyCommands`) and Matrix behind one `Channel` trait with a shared
-  command router; `MultiSurface` fans runtime output to every enabled
-  channel. One HTTP stack (`reqwest`) with a manual-redirect SSRF guard.
-- **`ka-agent-plugins`** — signed (`ed25519`, TOFU-pinned) plugin archives
-  with an MCP-stdio runtime inside a bubblewrap sandbox (`--unshare-net`,
-  read-only system, 30 s wall clock, 64 KiB output cap).
-  Contract: `docs/contract/plugins.md`; example: `examples/plugins/probe`.
-- **`ka-agent-web`** — the loopback-only web UI: server-rendered HTML, no
-  JS, one-shot CLI-issued login link, every user-derived string escaped.
-  Dashboard, history, memory editor, approvals, audit, intents.
-- **`ka-agent` (the binary)** — `setup` · `key set|list` · `secret set|list`
-  · `chat` · `run` · `status` · `restart` · `doctor` · `memory path|show|edit`
-  · `skills list|enable|disable` · `identity` (incl. `pending`) · `grant` · `plugin`
-  · `model`/`models` · `config` · `pair` · `service install|…` · `logs` · `dashboard`
-  · `backup|restore` · `export` · `purge` · hidden `__worker` / `__mcp`.
+| | |
+|---|---|
+| `/status` | model, spend vs limits, queue, next task |
+| `/model provider/model` | switch model, applied live |
+| `/new` · `/stop` · `/resume` | fresh session · abort reply · lift a pause |
+| `/remember <fact>` · `/forget <id>` | durable memory (git-backed; `/memory` lists ids) |
+| `/history [query]` · `/history show <id>` | past turns |
+| `/remind <when> <text>` · `/reminders` | notifications, no model turn |
+| `/cron add …` · `/calendar add <url>` | scheduled prompts · daily digest |
+| `/approvals` · `/y [id]` · `/n [id]` | decide pending approvals |
+| `/skills` · `/skill <name> <text>` | one turn with a skill loaded |
 
-The engine gets `kagent.*` tools (memory_propose, notes_search/append/read,
-http_get, GitHub, cron_manage) through the `[[mcp]]` overlay — model-proposed
-memories flow into `/memory review`. `/remind` fires as a notification (no
-model turn); `/cron add every …` runs prompts on a schedule. Skills are the
-operator's `SKILL.md` library: `ka-agent skills enable <name>` provisions it
-for the engine and `/skill <name> <text>` runs one turn with it
-(`docs/contract/skills.md`). Send a photo or file on Telegram and it lands
-in `<workspace>/attachments/` with an `@reference` you can paste back.
-
-## Layout
+Scheduling times are always your local time:
 
 ```
-ka-agent/
-  Cargo.toml              # workspace; ka crates pinned to =0.3.0 on crates.io
-  apps/ka-agent/          # the binary (daemon, admin CLI, hidden worker)
-    src/{main,chat,daemon,doctor,setup,identity,plugin_cli,grant,ops,memory_cli}.rs
-  crates/
-    ka-agent-core/        # domain types & state machines; no I/O
-    ka-agent-port/        # KaPort trait + worker protocol; the ONLY crate
-                          # (besides apps/ka-agent) that may depend on ka-*
-    ka-agent-store/       # SQLite schema, migrations, backups, audit chain
-    ka-agent-memory/      # stable memory: git-backed Markdown + MEMORY.md
-    ka-agent-channels/    # Telegram + Matrix channels, shared router
-    ka-agent-web/         # loopback-only web UI (session auth, HTML pages)
-    ka-agent-plugins/     # signed archives + bubblewrap sandbox host
-  docs/
-    contract/             # the behavior contracts (hash-embedded in doctor)
-    ka-interface-validation.md
-  examples/config/        # ka-agent.toml, engine.toml
-  scripts/check-ka-deps.sh  # CI gate: ka-* deps stay inside the port
-  SEED.md
+/remind in 2h30m stretch
+/remind at 18:30 call the dentist
+/remind tomorrow 9am send the invoice
+/remind fri 17:00 week notes
+/cron add every 1h check the build
+/cron add every day at 08:00 summarize my inbox
+/cron add every mon at 09:00 plan the week
 ```
 
-## Build & test
+`Ctrl-C` stops a running reply, twice quits; `/quit` leaves the terminal chat.
+
+## Channels (phone)
 
 ```sh
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+ka-agent pair telegram        # prints /pair XXXX-XXXX to send your bot
+ka-agent pair matrix          # same idea for Matrix
 ```
 
-The workspace denies `unwrap`/`expect`/`todo`/`unimplemented`/`dbg` and
-forbids `unsafe_code`; CI (`.github/workflows/ci.yml`) runs fmt, clippy,
-tests and the dependency gate. Builds are plain crates.io dependencies —
-no local mirrors, no vendored repos.
+Pairing happens once; the bot then answers only you (unknown senders stay
+silent, and anything they tried shows in `ka-agent identity pending` with the
+exact `identity link` command). Telegram setup needs a bot token from
+@BotFather — the wizard asks for it and verifies it; Matrix asks for a bot
+account and logs in once. Photos and files sent on Telegram land in
+`<workspace>/attachments/` with an `@reference` you can paste back.
 
 ## Configuration
 
-`ka-agent.toml` (default `~/.config/ka-agent/ka-agent.toml`, or
-`$KA_AGENT_CONFIG`), strict — unknown keys are errors. `ka-agent config`
-edits it format-preservingly and applies safe changes live; `ka-agent setup`
-(alias `init`) writes the first one; the full schema lives in
-`crates/ka-agent-core/src/config.rs`, a fully commented copy in
-`examples/config/ka-agent.toml`.
+`ka-agent.toml` lives at `~/.config/ka-agent/ka-agent.toml` (override with
+`$KA_AGENT_CONFIG`); it is strict — unknown keys are errors. A fully
+commented copy of the schema is in
+[`examples/config/ka-agent.toml`](examples/config/ka-agent.toml). Edit it
+with `ka-agent config set <key> <value>` / `config edit` — comments and key
+order survive, safe changes apply to the running agent live, the rest tells
+you to `ka-agent restart`. Key settings: `model`, `mode` (`guarded` default),
+`timezone`, `budgets.daily_usd` / `daily_tokens`, `worker_idle_timeout_secs`,
+`[web]`, `[calendar]`.
 
 Secrets never go in the file:
 
-- Provider key: `ka-agent key set ANTHROPIC_API_KEY` (writes the engine's
-  `~<data>/engine-home/.config/ka/.env`, 0600 — exactly what ka's own key
-  prompt would write).
-- Channel/connector tokens: `ka-agent secret set <name>` (0600 file under
-  `<data>/secrets/`, referenced by name from the config).
+- Provider key: `ka-agent key set ANTHROPIC_API_KEY` (0600, in the engine's
+  `.env` — exactly what ka's own key prompt would write).
+- Channel tokens: `ka-agent secret set <name>` (0600 under `<data>/secrets/`,
+  referenced by name from the config).
 
-Data root: `~/.local/share/ka-agent` (or `$KA_AGENT_DATA_DIR`). Everything
-instance-owned lives there: state.db, memory/, notes/, secrets/, engine
-homes, workspace, backups.
+Data root: `~/.local/share/ka-agent` (or `$KA_AGENT_DATA_DIR`) — state.db,
+memory/, notes/, secrets/, engine homes, workspace, backups.
 
-## Ops
-
-Run it as a resident service (ADR-0001: one instance per operator):
+## Running it for real
 
 ```sh
-cp dist/systemd/ka-agent.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now ka-agent
+ka-agent service install      # units + start at login + nightly 03:30 backup timer
+ka-agent service status       # service-manager state + daemon answering?
+ka-agent logs -f              # the daemon's journal
+ka-agent restart              # graceful stop; the service brings it back
+ka-agent service uninstall    # stop and remove the units
 ```
 
-Nightly backups with the included timer (`ka-agent-backup.timer`,
-`Persistent=true`), restore with `ka-agent restore <dir>` (refuses a
-non-empty root; the drill is `ops_e2e.rs`). `ka-agent doctor` prints the ka
-pin, the contract-suite hash, provider-key and git state, sandbox
-prerequisites and instance state. Details: `docs/contract/ops.md`.
+`service install` is idempotent: run it again after upgrading and it rewrites
+the unit files with the new binary and restarts. It refuses while a
+foreground `ka-agent run` or chat holds the data root. On Linux it uses
+systemd user units (`sudo loginctl enable-linger $USER` keeps it alive after
+logout — the installer tells you if that is missing); on macOS, launchd.
+Without a service manager (containers, WSL without systemd) run
+`ka-agent run` inside a terminal multiplexer.
 
-## Web UI
+Backups land in `<data>/backups/<timestamp>` and rotate to the newest 7
+(`--keep N` overrides; a named output is never pruned). Restore with
+`ka-agent restore <dir>` — it refuses a non-empty data root unless `--force`.
 
-Loopback-only, off by default:
+## When something looks wrong
 
 ```sh
-ka-agent run --web-port 8480     # daemon + web UI
-ka-agent dashboard               # prints + opens a one-shot login URL (10 min TTL)
+ka-agent doctor               # one line per check, each with the fix; exit 1 = fix something
+ka-agent doctor --online      # also verify the provider key and channels live
+ka-agent logs -n 200          # what the daemon just did
 ```
 
-The URL sets an `HttpOnly; SameSite=Strict` session cookie and redirects to
-the dashboard. Mutations are POST-only. Details and the security checklist:
-`docs/contract/web-ui.md`.
+A chat that answers "no model configured" needs `ka-agent setup` (or
+`/model provider/model`); a key rejection names the exact
+`ka-agent key set …` to run. `ka-agent status` shows pauses, crashes and the
+next scheduled task.
+
+## Web control panel
+
+On by default at `http://127.0.0.1:8480` (loopback only, `[web]` in the
+config):
+
+```sh
+ka-agent dashboard            # prints + opens a one-shot login URL (10 min TTL)
+```
+
+Chat with the agent live (streaming over SSE), browse status, tasks, memory,
+skills, approvals, history and contacts. The URL sets an
+`HttpOnly; SameSite=Strict` session cookie; mutations are POST-only.
+Details: `docs/contract/web-ui.md`.
 
 ## Platforms
 
-Linux (first-class: plugins use bubblewrap; services use systemd user units)
+Linux first-class (plugins use bubblewrap; services use systemd user units)
 and macOS (launchd; plugins need Linux). **Windows is a goal, not there yet:**
 the library crates compile for Windows, but the binary still needs a
-named-pipe admin transport — `ka-agent run`/`chat`/`status` are
-Unix/macOS-only today (CI keeps the Windows build state visible).
+named-pipe admin transport — `run`/`chat`/`status` are Unix/macOS-only today
+(CI keeps the Windows build state visible).
 
-## The ka pin
+---
 
-The Ka crates (`ka-protocol`, `ka-engine`, `ka-dialect`, `ka-strand`) are
-pinned to the exact released version — `=0.3.0` from crates.io — declared in
-`[workspace.dependencies]` and reported by `doctor` (`KA_PIN` in
-`ka-agent-port`). `scripts/check-ka-deps.sh` fails CI if the constant and
-the manifest drift apart, or if any `ka-*` dependency escapes the port.
+## For contributors
 
-Upgrades are deliberate: bump the pin, keep the port contract suite green
-(SEED §11.3).
+**Layout.** `apps/ka-agent/` is the binary (daemon, chat, setup, admin CLI,
+hidden `__worker`/`__mcp`); `crates/` holds `ka-agent-core` (domain types,
+no I/O), `ka-agent-store` (SQLite, audit chain, FTS5), `ka-agent-port` (the
+`KaPort` trait — the only crate beside the binary that may touch `ka-*`),
+`ka-agent-runtime` (sessions, queue, approvals, budgets, worker supervisor,
+scheduler), `ka-agent-memory` (git-backed Markdown compiled into the
+engine's `MEMORY.md`), `ka-agent-channels` (Telegram + Matrix + shared
+router), `ka-agent-web`, `ka-agent-plugins` (signed archives, bubblewrap
+sandbox). `docs/contract/` is one behavior contract per subsystem; `doctor`
+embeds their hash so support can compare builds.
 
-## Further reading
+**The ka pin.** The `ka-*` engine crates are pinned to the exact released
+version (`=0.3.0`, crates.io) and reported by `doctor`. Upgrades are
+deliberate: bump the pin, keep the contract suite green (SEED §11.3);
+`scripts/check-ka-deps.sh` fails CI if the pin or the boundary drifts.
 
-- `SEED.md` — the product and architecture seed (§3.4 boundary, §3.8 errors,
-  §11 layout).
-- `docs/ka-interface-validation.md` — Phase 0 evidence: gap verdicts G1–G20,
-  runtime probes, findings F-1…F-8.
-- `docs/contract/` — one contract per subsystem; `doctor` embeds their
-  sha256 so support can compare behavior builds were built against.
+**Build & test.**
+
+```sh
+cargo build --workspace && cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+./scripts/check-ka-deps.sh
+```
+
+The workspace denies `unwrap`/`expect`/`todo`/`unimplemented`/`dbg` and
+forbids `unsafe`; CI runs fmt, clippy, tests and the dependency gate on
+Linux and macOS, plus a non-blocking Windows compile check
+(`.github/workflows/ci.yml`); `release.yml` cuts signed-checksum tarballs
+for four targets on `v*` tags.
+
+**Further reading.** `SEED.md` (architecture seed),
+`docs/contract/` (subsystem contracts), `docs/adr/0001-instance-per-user.md`,
+`docs/ka-interface-validation.md`, `examples/plugins/probe` (a plugin, end to
+end).
