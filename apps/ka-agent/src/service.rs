@@ -112,10 +112,50 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const DAEMON_LABEL: &str = "dev.ka-agent.daemon";
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const BACKUP_LABEL: &str = "dev.ka-agent.backup";
+/// Profile-scoped service names. The default profile keeps the historical
+/// unsuffixed names (existing installs are untouched); every other profile
+/// gets its own unit/plist set and can run beside the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceNames {
+    /// systemd unit stem: `ka-agent` or `ka-agent-<profile>`.
+    pub daemon: String,
+    pub daemon_unit: String,
+    pub backup_service: String,
+    pub backup_timer: String,
+    /// launchd labels: `dev.ka-agent.daemon` or `dev.ka-agent.<profile>.daemon`.
+    pub daemon_label: String,
+    pub backup_label: String,
+}
+
+/// Pure: the names for one profile.
+pub fn unit_names(profile: &str) -> ServiceNames {
+    let (stem, dot) = if profile == "default" {
+        (String::new(), String::new())
+    } else {
+        (format!("-{profile}"), format!(".{profile}"))
+    };
+    ServiceNames {
+        daemon: format!("ka-agent{stem}"),
+        daemon_unit: format!("ka-agent{stem}.service"),
+        backup_service: format!("ka-agent-backup{stem}.service"),
+        backup_timer: format!("ka-agent-backup{stem}.timer"),
+        daemon_label: format!("dev.ka-agent{dot}.daemon"),
+        backup_label: format!("dev.ka-agent{dot}.backup"),
+    }
+}
+
+fn names() -> ServiceNames {
+    unit_names(&ka_agent_core::layout::profile_name())
+}
+
+/// Profiles that may own a service: systemd unit names and launchd labels
+/// allow a limited alphabet.
+fn service_safe_profile(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 
 fn plist_head(label: &str, exe: &Path, arg: &str, root: &Path, config: &Path) -> String {
     format!(
@@ -137,6 +177,11 @@ fn plist_head(label: &str, exe: &Path, arg: &str, root: &Path, config: &Path) ->
 /// The launchd agent that keeps the daemon running.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn launchd_plist(exe: &Path, root: &Path, config: &Path) -> String {
+    launchd_plist_labeled(exe, root, config, &names().daemon_label)
+}
+
+/// Pure core of [`launchd_plist`] with an explicit label (tests).
+pub fn launchd_plist_labeled(exe: &Path, root: &Path, config: &Path, label: &str) -> String {
     let log = xml_escape(&root.join("logs/daemon.log").display().to_string());
     format!(
         "{head}\
@@ -145,13 +190,18 @@ pub fn launchd_plist(exe: &Path, root: &Path, config: &Path) -> String {
          \t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
          \t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n\
          </dict>\n</plist>\n",
-        head = plist_head(DAEMON_LABEL, exe, "run", root, config),
+        head = plist_head(label, exe, "run", root, config),
     )
 }
 
 /// The launchd agent that runs the nightly backup.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn launchd_backup_plist(exe: &Path, root: &Path, config: &Path) -> String {
+    launchd_backup_plist_labeled(exe, root, config, &names().backup_label)
+}
+
+/// Pure core of [`launchd_backup_plist`] with an explicit label (tests).
+pub fn launchd_backup_plist_labeled(exe: &Path, root: &Path, config: &Path, label: &str) -> String {
     format!(
         "{head}\
          \t<key>StartCalendarInterval</key>\n\t<dict>\n\
@@ -159,7 +209,7 @@ pub fn launchd_backup_plist(exe: &Path, root: &Path, config: &Path) -> String {
          \t\t<key>Minute</key>\n\t\t<integer>30</integer>\n\
          \t</dict>\n\
          </dict>\n</plist>\n",
-        head = plist_head(BACKUP_LABEL, exe, "backup", root, config),
+        head = plist_head(label, exe, "backup", root, config),
     )
 }
 
@@ -229,17 +279,18 @@ mod imp {
             .join("systemd/user")
     }
 
-    fn units(c: &Ctx) -> [(&'static str, String); 3] {
+    fn units(c: &Ctx) -> [(String, String); 3] {
+        let n = names();
         [
             (
-                "ka-agent.service",
+                n.daemon_unit,
                 systemd_unit(&c.exe, &c.root, &c.config, &c.workspace),
             ),
             (
-                "ka-agent-backup.service",
+                n.backup_service,
                 systemd_backup_service(&c.exe, &c.root, &c.config),
             ),
-            ("ka-agent-backup.timer", systemd_backup_timer()),
+            (n.backup_timer, systemd_backup_timer()),
         ]
     }
 
@@ -250,13 +301,13 @@ mod imp {
     }
 
     pub fn is_installed() -> bool {
-        unit_dir().join("ka-agent.service").exists()
+        unit_dir().join(names().daemon_unit).exists()
     }
 
     pub fn is_active() -> bool {
         // `is-active` exits non-zero when inactive; read stdout regardless.
         std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "ka-agent.service"])
+            .args(["--user", "is-active", &names().daemon_unit])
             .output()
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
     }
@@ -279,13 +330,9 @@ mod imp {
             lines.push(format!("wrote {}", path.display()));
         }
         systemctl(&["daemon-reload"])?;
-        systemctl(&[
-            "enable",
-            "--now",
-            "ka-agent.service",
-            "ka-agent-backup.timer",
-        ])?;
-        systemctl(&["restart", "ka-agent.service"])?;
+        let n = names();
+        systemctl(&["enable", "--now", &n.daemon_unit, &n.backup_timer])?;
+        systemctl(&["restart", &n.daemon_unit])?;
         lines.push("✓ Ka Agent runs in the background and starts at login".into());
         lines.push("  logs: ka-agent logs -f · status: ka-agent service status".into());
         let user = std::env::var("USER").unwrap_or_default();
@@ -301,19 +348,11 @@ mod imp {
     }
 
     pub fn uninstall() -> Result<Vec<String>, String> {
-        let _ = systemctl(&[
-            "disable",
-            "--now",
-            "ka-agent.service",
-            "ka-agent-backup.timer",
-        ]);
+        let n = names();
+        let _ = systemctl(&["disable", "--now", &n.daemon_unit, &n.backup_timer]);
         let dir = unit_dir();
         let mut lines = Vec::new();
-        for name in [
-            "ka-agent.service",
-            "ka-agent-backup.service",
-            "ka-agent-backup.timer",
-        ] {
+        for name in [n.daemon_unit, n.backup_service, n.backup_timer] {
             let p = dir.join(name);
             if p.exists() {
                 std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -326,11 +365,11 @@ mod imp {
     }
 
     pub fn start() -> Result<(), String> {
-        systemctl(&["start", "ka-agent.service"]).map(|_| ())
+        systemctl(&["start", &names().daemon_unit]).map(|_| ())
     }
 
     pub fn stop() -> Result<(), String> {
-        systemctl(&["stop", "ka-agent.service"]).map(|_| ())
+        systemctl(&["stop", &names().daemon_unit]).map(|_| ())
     }
 
     pub fn state() -> String {
@@ -338,7 +377,7 @@ mod imp {
             return "not installed".into();
         }
         let out = std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "ka-agent.service"])
+            .args(["--user", "is-active", &names().daemon_unit])
             .output();
         match out {
             Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -355,7 +394,8 @@ mod imp {
 
     pub fn logs(_root: &Path, follow: bool, n: usize) -> ExitCode {
         let n = n.to_string();
-        let mut args = vec!["--user", "-u", "ka-agent.service", "-n", &n, "-o", "cat"];
+        let unit = names().daemon_unit;
+        let mut args = vec!["--user", "-u", &unit, "-n", &n, "-o", "cat"];
         if follow {
             args.push("-f");
         }
@@ -383,11 +423,12 @@ mod imp {
         home().join("Library/LaunchAgents")
     }
 
-    fn plists(c: &Ctx) -> [(&'static str, String); 2] {
+    fn plists(c: &Ctx) -> [(String, String); 2] {
+        let n = names();
         [
-            (DAEMON_LABEL, launchd_plist(&c.exe, &c.root, &c.config)),
+            (n.daemon_label, launchd_plist(&c.exe, &c.root, &c.config)),
             (
-                BACKUP_LABEL,
+                n.backup_label,
                 launchd_backup_plist(&c.exe, &c.root, &c.config),
             ),
         ]
@@ -402,13 +443,12 @@ mod imp {
     }
 
     pub fn is_installed() -> bool {
-        plist_path(DAEMON_LABEL).exists()
+        plist_path(&names().daemon_label).exists()
     }
 
     pub fn is_active() -> bool {
-        uid().is_ok_and(|u| {
-            run_quiet("launchctl", &["print", &format!("gui/{u}/{DAEMON_LABEL}")]).is_ok()
-        })
+        let label = names().daemon_label;
+        uid().is_ok_and(|u| run_quiet("launchctl", &["print", &format!("gui/{u}/{label}")]).is_ok())
     }
 
     pub fn install(c: &Ctx) -> Result<Vec<String>, String> {
@@ -417,7 +457,7 @@ mod imp {
             .map_err(|e| format!("{}: {e}", c.root.display()))?;
         let mut lines = Vec::new();
         for (label, text) in plists(c) {
-            let path = plist_path(label);
+            let path = plist_path(&label);
             write_file(&path, &text)?;
             let _ = run_quiet("launchctl", &["bootout", &format!("gui/{u}/{label}")]);
             let p = path.display().to_string();
@@ -432,9 +472,10 @@ mod imp {
     pub fn uninstall() -> Result<Vec<String>, String> {
         let u = uid()?;
         let mut lines = Vec::new();
-        for label in [DAEMON_LABEL, BACKUP_LABEL] {
+        let n = names();
+        for label in [n.daemon_label, n.backup_label] {
             let _ = run_quiet("launchctl", &["bootout", &format!("gui/{u}/{label}")]);
-            let p = plist_path(label);
+            let p = plist_path(&label);
             if p.exists() {
                 std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
                 lines.push(format!("removed {}", p.display()));
@@ -448,7 +489,11 @@ mod imp {
         let u = uid()?;
         run_quiet(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{u}/{DAEMON_LABEL}")],
+            &[
+                "kickstart",
+                "-k",
+                &format!("gui/{u}/{}", names().daemon_label),
+            ],
         )
         .map(|_| ())
     }
@@ -457,7 +502,11 @@ mod imp {
         let u = uid()?;
         run_quiet(
             "launchctl",
-            &["kill", "SIGTERM", &format!("gui/{u}/{DAEMON_LABEL}")],
+            &[
+                "kill",
+                "SIGTERM",
+                &format!("gui/{u}/{}", names().daemon_label),
+            ],
         )
         .map(|_| ())
     }
@@ -575,6 +624,12 @@ pub fn is_active() -> bool {
 /// Write (or refresh) the service definitions, enable and (re)start them.
 /// Returns the lines to print.
 pub fn install(paths: &Paths, config: &Path) -> Result<Vec<String>, String> {
+    let profile = ka_agent_core::layout::profile_name();
+    if !service_safe_profile(&profile) {
+        return Err(format!(
+            "profile name {profile:?} cannot be used for a service unit — [a-z0-9-] only"
+        ));
+    }
     if InstanceLock::is_held(paths) && !is_active() {
         return Err(FOREGROUND_RUNNING.to_string());
     }
@@ -674,6 +729,20 @@ pub fn logs(follow: bool, n: usize) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_names_scope_per_profile() {
+        let d = unit_names("default");
+        assert_eq!(d.daemon_unit, "ka-agent.service");
+        assert_eq!(d.backup_timer, "ka-agent-backup.timer");
+        assert_eq!(d.daemon_label, "dev.ka-agent.daemon");
+        let w = unit_names("work");
+        assert_eq!(w.daemon_unit, "ka-agent-work.service");
+        assert_eq!(w.backup_service, "ka-agent-backup-work.service");
+        assert_eq!(w.backup_timer, "ka-agent-backup-work.timer");
+        assert_eq!(w.daemon_label, "dev.ka-agent.work.daemon");
+        assert_eq!(w.backup_label, "dev.ka-agent.work.backup");
+    }
 
     #[test]
     fn systemd_unit_runs_exe_and_opens_workspace() {

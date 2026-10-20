@@ -163,3 +163,33 @@ fn fresh_install_never_touches_legacy_locations() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn migration_never_lands_in_a_non_default_profile() {
+    let home = home();
+    let old_root = home.join(".local/share/ka-agent");
+    std::fs::create_dir_all(old_root.join("memory")).unwrap();
+    std::fs::write(old_root.join("memory/facts.md"), b"- keeps its place\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["identity", "list"])
+        .env("HOME", &home)
+        .env("KA_AGENT_PROFILE", "work")
+        .env_remove("KA_AGENT_DATA_DIR")
+        .env_remove("KA_AGENT_CONFIG")
+        .env_remove("KA_AGENT_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // The legacy tree stays exactly where it was …
+    assert!(old_root.join("memory/facts.md").is_file());
+    // … the work profile got its own fresh root …
+    assert!(home.join(".ka-agent/profiles/work").is_dir());
+    // … and nothing moved into it.
+    assert!(!home.join(".ka-agent/profiles/work/memory").exists());
+
+    let _ = std::fs::remove_dir_all(&home);
+}

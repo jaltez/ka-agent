@@ -204,6 +204,14 @@ impl DaemonConfig {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
+        // A config that pins nothing gets the ACTIVE profile's workspace —
+        // profiles must never share one by accident of the default value.
+        let has_workspace = toml::from_str::<toml::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("workspace").cloned())
+            .is_some();
+        let mut cfg = cfg;
+        cfg.set_default_workspace(has_workspace, &crate::layout::default_root());
         cfg.validate()?;
         Ok(cfg)
     }
@@ -287,6 +295,14 @@ impl DaemonConfig {
             .unwrap_or_else(jiff::tz::TimeZone::system)
     }
 
+    /// When the file pins no `workspace`, resolve it inside `root` (the
+    /// active data root) instead of the hardcoded default-profile path.
+    fn set_default_workspace(&mut self, has_key: bool, root: &Path) {
+        if !has_key {
+            self.workspace = root.join("workspace");
+        }
+    }
+
     /// Workspace path with `~` expanded.
     pub fn workspace_path(&self) -> PathBuf {
         crate::expand_home(&self.workspace.display().to_string())
@@ -314,6 +330,26 @@ mod tests {
         let p = dir.join("ka-agent.toml");
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn workspace_default_follows_the_active_root_when_absent() {
+        let mut cfg = DaemonConfig::default();
+        cfg.set_default_workspace(false, std::path::Path::new("/data/pinned"));
+        assert_eq!(
+            cfg.workspace_path(),
+            std::path::PathBuf::from("/data/pinned/workspace")
+        );
+        // An explicit key is untouched.
+        let mut explicit = DaemonConfig {
+            workspace: std::path::PathBuf::from("/explicit/ws"),
+            ..DaemonConfig::default()
+        };
+        explicit.set_default_workspace(true, std::path::Path::new("/data/pinned"));
+        assert_eq!(
+            explicit.workspace_path(),
+            std::path::PathBuf::from("/explicit/ws")
+        );
     }
 
     #[test]

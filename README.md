@@ -102,7 +102,16 @@ Ka Agent keeps everything under `~/.ka-agent` (override with
 ```
 
 `$KA_AGENT_DATA_DIR` replaces the data root wholesale (tests, service
-units). The config is strict — unknown keys are errors. A fully
+units). The config is strict — unknown keys are errors.
+
+**Profiles** are structural: `KA_AGENT_PROFILE=work` gives the command its
+own complete data root (`~/.ka-agent/profiles/work/…` — state, memory,
+secrets, workspace, socket, lock, backups), and `ka-agent service install`
+under a non-default profile installs its own units
+(`ka-agent-work.service`, `dev.ka-agent.work.daemon`) so two profiles can
+run side by side. The config file and web port stay shared today — pin
+`web.port` (or `KA_AGENT_CONFIG`) per profile to differ them; a config with
+no `workspace` key resolves inside the active profile, never another. A fully
 commented copy of the schema is in
 [`examples/config/ka-agent.toml`](examples/config/ka-agent.toml). Edit it
 with `ka-agent config set <key> <value>` / `config edit` — comments and key

@@ -19,6 +19,11 @@ pub fn migrate() -> Result<(), String> {
     {
         return Ok(());
     }
+    // The legacy tree belongs to the default profile; running under another
+    // profile must not swallow it.
+    if layout::profile_name() != "default" {
+        return Ok(());
+    }
     let base = layout::base_dir();
     if base.exists() {
         return Ok(());
