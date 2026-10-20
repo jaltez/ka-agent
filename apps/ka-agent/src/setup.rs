@@ -944,7 +944,19 @@ pub async fn run(args: SetupArgs) -> std::process::ExitCode {
     }
     let fresh = !args.config.exists();
     let doc = match ka_agent_core::config_file::read_doc(&args.config) {
-        Ok(d) => d,
+        Ok(mut d) => {
+            // A new non-default profile must not fight the default one for
+            // the web panel's port.
+            let profile = ka_agent_core::layout::profile_name();
+            if fresh
+                && profile != "default"
+                && args.config == ka_agent_core::layout::config_path_for(&profile)
+            {
+                d["web"]["port"] =
+                    toml_edit::value(i64::from(crate::profile_cli::unclaimed_web_port()));
+            }
+            d
+        }
         Err(e) => {
             eprintln!("ka-agent: {e}");
             return std::process::ExitCode::FAILURE;

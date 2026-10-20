@@ -134,9 +134,9 @@ fn fresh_install_never_touches_legacy_locations() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    // The config is base-level (not per profile) …
+    // The config is the profile's own …
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains(".ka-agent/config.toml"),
+        String::from_utf8_lossy(&out.stdout).contains(".ka-agent/profiles/work/config.toml"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -203,4 +203,64 @@ fn migration_never_lands_in_a_non_default_profile() {
     assert!(!home.join(".ka-agent/profiles/work/memory").exists());
 
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn profiles_get_their_own_config_and_the_active_one_sticks() {
+    let home = home();
+    let base = home.join(".ka-agent");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("config.toml"),
+        "model = \"x/y\"\n[telegram]\nenabled = true\ntoken_secret = \"tg\"\n",
+    )
+    .unwrap();
+
+    let out = ka(&home, &["profile", "create", "work"]);
+    assert!(out.status.success(), "{out:?}");
+    let work_cfg = base.join("profiles/work/config.toml");
+    let text = std::fs::read_to_string(&work_cfg).unwrap();
+    assert!(text.contains("model = \"x/y\""), "{text}");
+    assert!(
+        !text.contains("telegram"),
+        "bot token must not be shared: {text}"
+    );
+    assert!(text.contains("port = 8481"), "{text}");
+
+    let path = |args: &[&str]| {
+        let o = ka(&home, args);
+        assert!(o.status.success(), "{o:?}");
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    assert_eq!(
+        path(&["config", "path"]),
+        base.join("config.toml").display().to_string()
+    );
+    assert_eq!(
+        path(&["-p", "work", "config", "path"]),
+        work_cfg.display().to_string()
+    );
+
+    assert!(ka(&home, &["profile", "use", "work"]).status.success());
+    assert_eq!(path(&["config", "path"]), work_cfg.display().to_string());
+    assert_eq!(
+        path(&["-p", "default", "config", "path"]),
+        base.join("config.toml").display().to_string()
+    );
+
+    assert!(
+        !ka(&home, &["profile", "remove", "default", "--yes"])
+            .status
+            .success()
+    );
+    assert!(
+        ka(&home, &["profile", "remove", "work", "--yes"])
+            .status
+            .success()
+    );
+    assert!(!base.join("profiles/work").exists());
+    assert_eq!(
+        path(&["config", "path"]),
+        base.join("config.toml").display().to_string()
+    );
 }

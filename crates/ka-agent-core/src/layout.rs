@@ -7,8 +7,10 @@
 //! |             | tests, service units) else `<base>/profiles/<profile>`
 //! | Base        | `KA_AGENT_HOME` else `~/.ka-agent`
 //! | Profile     | `KA_AGENT_PROFILE` else `default`
+//! | Profile     | `-p/--profile`, `KA_AGENT_PROFILE`, `profile use`, `default`
 //! | Config      | `KA_AGENT_CONFIG` else `<data root>/config.toml` when
-//! |             | `KA_AGENT_DATA_DIR` is set, else `<base>/config.toml`
+//! |             | `KA_AGENT_DATA_DIR` is set, else `<base>/config.toml` for
+//! |             | the default profile, `<base>/profiles/<p>/config.toml` else
 //!
 //! The pre-0.3 locations (`~/.local/share/ka-agent`, `~/.config/ka-agent/`)
 //! are migrated on first run by the binary (`apps/ka-agent/src/layout.rs`).
@@ -26,12 +28,92 @@ pub fn base_dir() -> PathBuf {
     Path::new(&home).join(".ka-agent")
 }
 
-/// The profile name in use (`$KA_AGENT_PROFILE`, else `default`).
+/// Process-wide profile chosen on the command line (`-p/--profile`).
+/// Set once by the binary before anything resolves a path.
+static PROFILE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Pin the profile for this process (`ka-agent -p work …`). First call wins.
+pub fn set_profile_override(name: &str) {
+    let _ = PROFILE_OVERRIDE.set(name.to_string());
+}
+
+/// A usable profile name: `[a-z0-9-]`, 1..=32 chars. The same alphabet
+/// works for directories, systemd unit names and launchd labels.
+pub fn valid_profile_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+}
+
+/// The file that remembers `ka-agent profile use <name>`.
+pub fn active_profile_file() -> PathBuf {
+    base_dir().join("active_profile")
+}
+
+/// The profile in use: `-p/--profile`, else `$KA_AGENT_PROFILE`, else the
+/// one chosen with `ka-agent profile use`, else `default`.
 pub fn profile_name() -> String {
-    std::env::var("KA_AGENT_PROFILE")
+    if let Some(p) = PROFILE_OVERRIDE.get() {
+        return p.clone();
+    }
+    if let Ok(p) = std::env::var("KA_AGENT_PROFILE")
+        && valid_profile_name(&p)
+    {
+        return p;
+    }
+    std::fs::read_to_string(active_profile_file())
         .ok()
-        .filter(|p| !p.is_empty() && p != "." && p != ".." && !p.contains('/'))
+        .map(|s| s.trim().to_string())
+        .filter(|p| valid_profile_name(p))
         .unwrap_or_else(|| "default".to_string())
+}
+
+/// Every profile directory under `<base>/profiles`, sorted (`default`
+/// included once it exists).
+pub fn list_profiles() -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(base_dir().join("profiles"))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| valid_profile_name(n))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// A profile's config file: the default profile's lives at the base
+/// (`~/.ka-agent/config.toml`), every other profile owns one inside its
+/// directory, so profiles never share channels, ports or models by
+/// accident.
+pub fn config_path_for(profile: &str) -> PathBuf {
+    if profile == "default" {
+        base_dir().join("config.toml")
+    } else {
+        compose_profile_root(&base_dir(), profile).join("config.toml")
+    }
+}
+
+/// The config file for the current process: `$KA_AGENT_CONFIG`, else
+/// `<data root>/config.toml` when the root is pinned with
+/// `$KA_AGENT_DATA_DIR` (a self-contained instance), else the active
+/// profile's ([`config_path_for`]).
+pub fn default_config_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("KA_AGENT_CONFIG")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("config.toml");
+    }
+    config_path_for(&profile_name())
 }
 
 /// `<base>/profiles/<profile>` (pure — testable without env games).
@@ -77,6 +159,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn profile_names_are_dir_and_unit_safe() {
+        for ok in ["default", "work", "home-2"] {
+            assert!(valid_profile_name(ok), "{ok}");
+        }
+        for bad in ["", "Work", "a/b", "..", "-x", "a b", &"x".repeat(33)] {
+            assert!(!valid_profile_name(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn profile_roots_nest_under_base() {

@@ -212,7 +212,15 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
                 .clone()
                 .unwrap_or_else(|| "telegram.bot_token".into());
             match ka_agent_channels::secret::resolve(&name, &secrets) {
-                Ok(_) => rep.ok(format!("telegram token {name:?} resolves")),
+                Ok(token) => {
+                    rep.ok(format!("telegram token {name:?} resolves"));
+                    for p in crate::profile_cli::profiles_polling_token(&token) {
+                        rep.fail(format!(
+                            "profile {p} polls the same Telegram bot — two daemons on one token \
+                             steal each other's updates (409); give each profile its own bot"
+                        ));
+                    }
+                }
                 Err(e) => rep.fail(format!(
                     "telegram token {name:?} missing: {e} — ka-agent setup telegram"
                 )),
@@ -253,6 +261,13 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
                 .flatten()
                 .and_then(|s| s.meta_get("web.url").ok().flatten())
                 .is_some_and(|u| !u.is_empty());
+            for p in crate::profile_cli::profiles_on_web_port(cfg.web.port) {
+                rep.warn(&format!(
+                    "profile {p} also uses web port {} — only one daemon can serve it; \
+                     ka-agent config set web.port <n>",
+                    cfg.web.port
+                ));
+            }
             if daemon_up && !url_in_meta {
                 rep.warn("web UI not answering (port busy?) — check `ka-agent logs`");
             } else {

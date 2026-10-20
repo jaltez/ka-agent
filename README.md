@@ -95,23 +95,33 @@ Ka Agent keeps everything under `~/.ka-agent` (override with
 
 ```
 ~/.ka-agent/
-  config.toml                  # instance config ($KA_AGENT_CONFIG overrides)
-  skills/                      # your SKILL.md library
-  profiles/default/            # data for the active profile ($KA_AGENT_PROFILE)
+  config.toml                  # the default profile's config ($KA_AGENT_CONFIG overrides)
+  skills/                      # your SKILL.md library (shared by all profiles)
+  active_profile               # written by `ka-agent profile use`
+  profiles/default/            # data for the default profile
     workspace/  state.db  memory/  secrets/  backups/  logs/  …
+  profiles/work/               # another profile: same tree + its own config.toml
 ```
 
 `$KA_AGENT_DATA_DIR` replaces the data root wholesale (tests, service
 units). The config is strict — unknown keys are errors.
 
-**Profiles** are structural: `KA_AGENT_PROFILE=work` gives the command its
-own complete data root (`~/.ka-agent/profiles/work/…` — state, memory,
-secrets, workspace, socket, lock, backups), and `ka-agent service install`
-under a non-default profile installs its own units
-(`ka-agent-work.service`, `dev.ka-agent.work.daemon`) so two profiles can
-run side by side. The config file and web port stay shared today — pin
-`web.port` (or `KA_AGENT_CONFIG`) per profile to differ them; a config with
-no `workspace` key resolves inside the active profile, never another. A fully
+**Profiles** are independent instances — data, memory, secrets, workspace,
+config, web port, channels and service units:
+
+```sh
+ka-agent profile create work          # config from default, minus channels; next free web port
+ka-agent profile create work --copy-keys   # also copy the provider keys
+ka-agent -p work setup                # any command takes -p/--profile
+ka-agent profile use work             # make it the default for commands without -p
+ka-agent profile list | show [name] | remove <name> --yes
+```
+
+Precedence: `-p` > `$KA_AGENT_PROFILE` > `profile use` > `default`.
+`ka-agent -p work service install` installs `ka-agent-work.service` /
+`dev.ka-agent.work.daemon`, so profiles run side by side. A new profile
+starts without Telegram/Matrix — one bot token can only be polled by one
+daemon; give each profile its own bot. A fully
 commented copy of the schema is in
 [`examples/config/ka-agent.toml`](examples/config/ka-agent.toml). Edit it
 with `ka-agent config set <key> <value>` / `config edit` — comments and key

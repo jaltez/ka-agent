@@ -16,6 +16,7 @@ mod model_cli;
 mod ops;
 mod pair;
 mod plugin_cli;
+mod profile_cli;
 mod prompt;
 mod service;
 mod setup;
@@ -33,6 +34,9 @@ use clap::{Parser, Subcommand};
     about = "Ka Agent — resident assistant on the Ka engine"
 )]
 struct Cli {
+    /// Profile to act on (overrides $KA_AGENT_PROFILE and `profile use`).
+    #[arg(short = 'p', long, global = true, value_name = "NAME")]
+    profile: Option<String>,
     /// No subcommand: open the chat (or first-run setup on a fresh install).
     #[command(subcommand)]
     command: Option<Command>,
@@ -135,6 +139,11 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Manage profiles: independent instances (data, config, service).
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
     /// Show the daemon log (`-f` to follow).
     Logs {
         /// Follow the log like `tail -f`.
@@ -234,6 +243,33 @@ enum Command {
         /// Skip confirmation prompt.
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ProfileAction {
+    /// List profiles (active one marked, running ones flagged).
+    List,
+    /// Create a profile (config copied from another, minus channels).
+    Create {
+        name: String,
+        /// Profile whose config to start from.
+        #[arg(long, default_value = "default")]
+        from: String,
+        /// Also copy that profile's provider keys.
+        #[arg(long)]
+        copy_keys: bool,
+    },
+    /// Make a profile the default for commands without `-p`.
+    Use { name: String },
+    /// Print a profile's paths and state.
+    Show { name: Option<String> },
+    /// Delete a profile's data and config (not `default`).
+    Remove {
+        name: String,
+        /// Required: this deletes data.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -390,23 +426,25 @@ fn config_path(flag: &Option<PathBuf>) -> PathBuf {
     flag.clone().unwrap_or_else(default_config_path)
 }
 
-/// `$KA_AGENT_CONFIG`, else inside the data root when it is explicitly
-/// pinned (a self-contained instance), else `<base>/config.toml`
-/// (`~/.ka-agent/config.toml`).
 fn default_config_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("KA_AGENT_CONFIG") {
-        return PathBuf::from(p);
-    }
-    if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join("config.toml");
-    }
-    ka_agent_core::layout::base_dir().join("config.toml")
+    ka_agent_core::layout::default_config_path()
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    if let Some(p) = &cli.profile {
+        if !ka_agent_core::layout::valid_profile_name(p) {
+            eprintln!("ka-agent: profile name {p:?}: [a-z0-9-], up to 32 chars");
+            return std::process::ExitCode::FAILURE;
+        }
+        if std::env::var_os("KA_AGENT_DATA_DIR").is_some_and(|v| !v.is_empty()) {
+            eprintln!(
+                "ka-agent: --profile conflicts with KA_AGENT_DATA_DIR (it pins one instance)"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+        ka_agent_core::layout::set_profile_override(p);
+    }
     // One-time move to the ~/.ka-agent layout — never for the supervised
     // helper processes (they run inside an already-migrated environment).
     let helper = matches!(
@@ -585,6 +623,7 @@ fn main() -> std::process::ExitCode {
             service::service_action(action, config_path(&config))
         }
         Command::Logs { follow, lines } => service::logs(follow, lines),
+        Command::Profile { action } => profile_cli::profile_action(action),
         Command::Grant { action } => grant::grant_action(action),
         Command::Backup { out, keep, config } => ops::backup_to(out, keep, config_path(&config)),
         Command::Restore { dir, force } => ops::restore_from(dir, force),
