@@ -284,7 +284,7 @@ async fn waking_message_does_not_overtake_the_durable_queue() {
     let store = store_at(&root.join("data"));
 
     // A previous process left one message durably queued.
-    let mut session = Session::new(root.join("ws"));
+    let session = Session::new(root.join("ws"));
     store.insert_session(&session).unwrap();
     store
         .enqueue(&ka_agent_core::QueueItem::new(
