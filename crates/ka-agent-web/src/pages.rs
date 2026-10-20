@@ -388,7 +388,7 @@ pub async fn memory_forget(runtime: &Runtime, body: &str) -> crate::Response {
 pub async fn approvals_decide_json(runtime: &Runtime, body: &str) -> crate::Response {
     let id = form_field(body, "id");
     let decision = match form_field(body, "decision").as_str() {
-        "y" | "always" => ApprovalDecision::Allow,
+        "y" => ApprovalDecision::Allow,
         _ => ApprovalDecision::Deny,
     };
     match runtime.decide(&id, decision).await {
@@ -677,7 +677,7 @@ pub fn approvals(runtime: &Runtime, store: &Store) -> crate::Response {
 pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response {
     let id = form_field(body, "id");
     let decision = match form_field(body, "decision").as_str() {
-        "y" | "always" => ApprovalDecision::Allow,
+        "y" => ApprovalDecision::Allow,
         _ => ApprovalDecision::Deny,
     };
     match runtime.decide(&id, decision).await {

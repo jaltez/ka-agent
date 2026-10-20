@@ -12,6 +12,12 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+/// Shortest recurrence the model may schedule: every fire is a full agent
+/// turn, so a runaway `every 1s` would burn the budget in minutes.
+const MIN_MODEL_CRON_EVERY_MS: u64 = 60_000;
+/// Live crons the model may hold at once (operator crons don't count).
+const MAX_MODEL_CRONS: usize = 50;
+
 /// Tool definition: name, description, JSON schema, effect class.
 struct ToolDef {
     name: String,
@@ -279,7 +285,7 @@ fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
                     "text": {"type": "string", "description": "schedule: the prompt to run"},
                     "in": {"type": "string", "description": "schedule: one-shot delay, Ns/Nm/Nh/Nd"},
                     "at": {"type": "string", "description": "schedule: one-shot absolute time, RFC 3339 with offset (e.g. 2026-10-20T09:00:00+02:00)"},
-                    "every": {"type": "string", "description": "schedule: recurring interval, Ns/Nm/Nh/Nd"},
+                    "every": {"type": "string", "description": "schedule: recurring interval, Nm/Nh/Nd (minimum 60s)"},
                     "id": {"type": "string", "description": "pause/resume/remove/trigger: job id or id prefix"}
                 },
                 "required": ["action"]
@@ -609,6 +615,12 @@ fn handle_tool_call(
                             let ms = ka_agent_core::parse_duration(d).ok_or_else(|| {
                                 format!("bad duration {d:?}; use Ns, Nm, Nh or Nd")
                             })?;
+                            if ms < MIN_MODEL_CRON_EVERY_MS {
+                                return Err(format!(
+                                    "'every' must be at least {}s — each run is a full agent turn",
+                                    MIN_MODEL_CRON_EVERY_MS / 1000
+                                ));
+                            }
                             (Some(ms as i64), ka_agent_core::now_ms() + ms as i64)
                         }
                         (None, Some(d), None) => {
@@ -631,6 +643,22 @@ fn handle_tool_call(
                             );
                         }
                     };
+                    let live = store
+                        .cron_tasks()
+                        .map_err(|e| format!("store: {e}"))?
+                        .iter()
+                        .filter(|t| {
+                            t.payload
+                                .as_deref()
+                                .and_then(ka_agent_core::CronSpec::from_payload)
+                                .is_some_and(|c| c.source == "kagent")
+                        })
+                        .count();
+                    if live >= MAX_MODEL_CRONS {
+                        return Err(format!(
+                            "{live} model-scheduled crons are live (limit {MAX_MODEL_CRONS}) — remove some first"
+                        ));
+                    }
                     let spec = ka_agent_core::CronSpec {
                         text: text.to_string(),
                         source: "kagent".into(),
@@ -647,7 +675,7 @@ fn handle_tool_call(
                         .map_err(|e| format!("insert: {e}"))?;
                     Ok(format!(
                         "cron {} scheduled ({})",
-                        &task.id.as_str()[..8],
+                        ka_agent_core::ids::short_id(task.id.as_str()),
                         match recurrence_ms {
                             Some(ms) => format!("every {}", crate::commands::fmt_interval(ms)),
                             None => "once".to_string(),
@@ -669,11 +697,18 @@ fn handle_tool_call(
                         return Err("missing 'id'".into());
                     }
                     let crons = store.cron_tasks().map_err(|e| format!("store: {e}"))?;
-                    let task = crons
+                    let mut hits = crons
                         .iter()
-                        .find(|t| t.id.as_str().starts_with(id))
+                        .filter(|t| ka_agent_core::ids::id_matches(t.id.as_str(), id));
+                    let task = hits
+                        .next()
                         .ok_or_else(|| format!("no live cron id starts with {id:?}"))?;
-                    let short = &task.id.as_str()[..8];
+                    if hits.next().is_some() {
+                        return Err(format!(
+                            "id prefix {id:?} matches several crons — use more characters (see action \"list\")"
+                        ));
+                    }
+                    let short = ka_agent_core::ids::short_id(task.id.as_str());
                     match action {
                         "pause" => {
                             store

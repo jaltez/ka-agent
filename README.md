@@ -228,8 +228,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 The workspace denies `unwrap`/`expect`/`todo`/`unimplemented`/`dbg` and
 forbids `unsafe`; CI runs fmt, clippy, tests and the dependency gate on
 Linux and macOS, plus a non-blocking Windows compile check
-(`.github/workflows/ci.yml`); `release.yml` cuts signed-checksum tarballs
-for four targets on `v*` tags.
+(`.github/workflows/ci.yml`); `release.yml` cuts tarballs for four targets
+on `v*` tags, each with a SHA-256 file and a Sigstore build-provenance
+attestation (`gh attestation verify ka-agent-<target>.tar.gz --repo
+jaltez/ka-agent`).
 
 **Further reading.** `SEED.md` (architecture seed),
 `docs/contract/` (subsystem contracts), `docs/adr/0001-instance-per-user.md`,

@@ -118,6 +118,13 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
         &contract_suite_hash()[..16],
         CONTRACT_DOCS.len()
     );
+    if std::env::var_os("KA_AGENT_DATA_DIR").is_none() {
+        rep.info(&format!(
+            "profile {} · data {}",
+            ka_agent_core::layout::profile_name(),
+            paths.root().display()
+        ));
+    }
 
     // Config: present, parseable, valid.
     let cfg = if !config.exists() {

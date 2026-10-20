@@ -444,6 +444,10 @@ fn cron_manage_tool_schedules_and_lists() {
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"1h","text":"bridge smoke"}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":""}}}"#,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":"nosuchprefix"}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"5s","text":"too often"}}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"2h","text":"second"}}}"#,
+        // Every task id starts `task_`: ambiguous, refused.
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":"task_"}}}"#,
     ] {
         stdin.write_all(msg.as_bytes()).unwrap();
         stdin.write_all(b"\n").unwrap();
@@ -474,14 +478,38 @@ fn cron_manage_tool_schedules_and_lists() {
         .find(|l| l.contains("\"id\":5"))
         .expect("no-match remove answered");
     assert!(no_match.contains("isError"), "{no_match}");
+    let answer = |id: u32| {
+        text.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or_else(|| panic!("{id} answered: {text}"))
+            .to_string()
+    };
+    let too_often = answer(6);
+    assert!(
+        too_often.contains("isError") && too_often.contains("at least 60s"),
+        "{too_often}"
+    );
+    let ambiguous = answer(8);
+    assert!(
+        ambiguous.contains("isError") && ambiguous.contains("several"),
+        "{ambiguous}"
+    );
 
-    // The row is in the store with a valid payload (the daemon's scheduler
-    // will pick it up from here).
+    // Both valid rows are in the store with a valid payload (the daemon's
+    // scheduler will pick them up from here); nothing was removed.
     let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
     let crons = store.cron_tasks().unwrap();
-    assert_eq!(crons.len(), 1, "{crons:?}");
-    assert_eq!(crons[0].kind, "cron");
-    let spec = ka_agent_core::CronSpec::from_payload(crons[0].payload.as_deref().unwrap_or(""))
+    assert_eq!(crons.len(), 2, "{crons:?}");
+    let first = crons
+        .iter()
+        .find(|t| {
+            t.payload
+                .as_deref()
+                .is_some_and(|p| p.contains("bridge smoke"))
+        })
+        .unwrap();
+    assert_eq!(first.kind, "cron");
+    let spec = ka_agent_core::CronSpec::from_payload(first.payload.as_deref().unwrap_or(""))
         .expect("valid CronSpec payload");
     assert_eq!(spec.recurrence_ms, Some(3_600_000));
     assert_eq!(spec.mode, ka_agent_core::CronMode::Agent);

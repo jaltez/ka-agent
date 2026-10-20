@@ -34,8 +34,10 @@ A cron job is a `kind = 'cron'` task whose `payload` is a `CronSpec`:
   store directly (SQLite WAL); it only ever touches `kind='cron'` rows,
   never reminders.
 
-**Recurrence semantics**: fixed interval (`every N…`), not calendar
-expressions. Durations are capped at 366 days (`parse_duration` refuses
+**Recurrence semantics**: `every N…` interval (model jobs: ≥ 60 s), or
+operator `every day at HH:MM` / `every <weekday> at HH:MM` in the
+configured local timezone — no raw cron expressions. Durations are capped
+at 366 days (`parse_duration` refuses
 more; `now + ms` can never wrap i64). After a successful fire the next
 occurrence is computed by skipping missed occupations (`while next <= now`,
 overflow-checked), so a laptop that slept for three days fires once, not 72

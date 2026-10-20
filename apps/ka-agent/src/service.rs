@@ -300,8 +300,8 @@ mod imp {
         run_quiet("systemctl", &full)
     }
 
-    pub fn is_installed() -> bool {
-        unit_dir().join(names().daemon_unit).exists()
+    pub fn is_installed_for(profile: &str) -> bool {
+        unit_dir().join(unit_names(profile).daemon_unit).exists()
     }
 
     pub fn is_active() -> bool {
@@ -442,8 +442,8 @@ mod imp {
         run_quiet("id", &["-u"])
     }
 
-    pub fn is_installed() -> bool {
-        plist_path(&names().daemon_label).exists()
+    pub fn is_installed_for(profile: &str) -> bool {
+        plist_path(&unit_names(profile).daemon_label).exists()
     }
 
     pub fn is_active() -> bool {
@@ -579,7 +579,7 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub fn is_installed() -> bool {
+    pub fn is_installed_for(_profile: &str) -> bool {
         false
     }
     pub fn is_active() -> bool {
@@ -613,7 +613,12 @@ mod imp {
 
 /// Whether the service definition is installed for this user.
 pub fn is_installed() -> bool {
-    imp::is_installed()
+    imp::is_installed_for(&ka_agent_core::layout::profile_name())
+}
+
+/// Whether `profile`'s daemon unit/plist is installed.
+pub fn is_installed_for(profile: &str) -> bool {
+    imp::is_installed_for(profile)
 }
 
 /// Whether the service manager reports the daemon service running.

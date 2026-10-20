@@ -792,7 +792,7 @@ impl Runtime {
         let pending = self.sh.store.pending_candidates_full()?;
         let matches: Vec<_> = pending
             .iter()
-            .filter(|c| c.id.as_str() == id || c.id.as_str().starts_with(id))
+            .filter(|c| ka_agent_core::ids::id_matches(c.id.as_str(), id))
             .collect();
         let Some(row) = (match matches.as_slice() {
             [one] => Some((**one).clone()),
@@ -829,7 +829,7 @@ impl Runtime {
         let pending = self.sh.store.pending_candidates_full()?;
         let matches: Vec<_> = pending
             .iter()
-            .filter(|c| c.id.as_str() == id || c.id.as_str().starts_with(id))
+            .filter(|c| ka_agent_core::ids::id_matches(c.id.as_str(), id))
             .collect();
         let row = match matches.as_slice() {
             [one] => (**one).clone(),

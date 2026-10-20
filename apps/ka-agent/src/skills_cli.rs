@@ -1,5 +1,5 @@
 //! `ka-agent skills …` (SEED.md §9.1): the operator's skill library is
-//! `~/.config/ka-agent/skills/<name>/SKILL.md`; `enable` provisions (copies)
+//! `~/.ka-agent/skills/<name>/SKILL.md` (a shared library; `enable` provisions it into the active profile); `enable` provisions (copies)
 //! it into the engine home where ka discovers it, `disable` removes it.
 //! A skill is text, not code — it never changes what the engine may do.
 

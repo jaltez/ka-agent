@@ -636,6 +636,10 @@ pub fn status_client() -> std::process::ExitCode {
     };
     match serde_json::from_value::<ka_agent_runtime::StatusReport>(v["report"].clone()) {
         Ok(report) => {
+            let profile = ka_agent_core::layout::profile_name();
+            if profile != "default" && std::env::var_os("KA_AGENT_DATA_DIR").is_none() {
+                println!("profile {profile}");
+            }
             println!("{}", report.render(&zoned_now(&report.timezone)));
             std::process::ExitCode::SUCCESS
         }

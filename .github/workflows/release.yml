@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -46,6 +48,12 @@ jobs:
           T=${{ matrix.target }}
           tar czf "ka-agent-$T.tar.gz" -C "target/$T/release" ka-agent
           shasum -a 256 "ka-agent-$T.tar.gz" > "ka-agent-$T.tar.gz.sha256"
+
+      # Sigstore-backed provenance: `gh attestation verify <tarball>
+      # --repo jaltez/ka-agent` proves the archive came from this workflow.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ka-agent-${{ matrix.target }}.tar.gz
 
       - uses: softprops/action-gh-release@v2
         with:

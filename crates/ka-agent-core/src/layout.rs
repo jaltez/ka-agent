@@ -70,15 +70,53 @@ pub fn profile_name() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Why the profile selection outside `-p` cannot be trusted, if it
+/// cannot: an invalid `$KA_AGENT_PROFILE`, or an `active_profile` file
+/// naming a profile that is gone. Silently falling back to `default`
+/// would run commands against the wrong instance.
+pub fn profile_selection_problem() -> Option<String> {
+    if PROFILE_OVERRIDE.get().is_some() {
+        return None;
+    }
+    if let Ok(p) = std::env::var("KA_AGENT_PROFILE")
+        && !p.is_empty()
+    {
+        return (!valid_profile_name(&p)).then(|| {
+            format!(
+                "KA_AGENT_PROFILE={p:?} is not a valid profile name ([a-z0-9-], up to 32 chars)"
+            )
+        });
+    }
+    let file = active_profile_file();
+    let p = std::fs::read_to_string(&file).ok()?.trim().to_string();
+    if p == "default" {
+        return None;
+    }
+    if !valid_profile_name(&p) || !compose_profile_root(&base_dir(), &p).is_dir() {
+        return Some(format!(
+            "active profile {p:?} (from {}) does not exist — `ka-agent profile use default` or `ka-agent profile create {p}`",
+            file.display()
+        ));
+    }
+    None
+}
+
 /// Every profile directory under `<base>/profiles`, sorted (`default`
-/// included once it exists).
+/// included once it exists). A directory only counts with an identity
+/// file — its config or state.db — so a stray `profiles/foo/logs` (a
+/// crashed `create`, a manual copy) never shows up as a profile.
 pub fn list_profiles() -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(base_dir().join("profiles"))
+    let profiles = base_dir().join("profiles");
+    let mut out: Vec<String> = std::fs::read_dir(&profiles)
         .map(|d| {
             d.flatten()
                 .filter(|e| e.path().is_dir())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| valid_profile_name(n))
+                .filter(|n| {
+                    valid_profile_name(n)
+                        && (profiles.join(n).join("config.toml").is_file()
+                            || profiles.join(n).join("state.db").is_file())
+                })
                 .collect()
         })
         .unwrap_or_default();

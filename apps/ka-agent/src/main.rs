@@ -20,6 +20,7 @@ mod profile_cli;
 mod prompt;
 mod service;
 mod setup;
+mod usage_cli;
 use service::ServiceAction;
 mod skills_cli;
 
@@ -50,7 +51,7 @@ enum Command {
     Setup {
         /// Section: all | model | telegram | matrix | service.
         section: Option<String>,
-        /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
+        /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -77,7 +78,7 @@ enum Command {
     },
     /// Local chat surface over the runtime.
     Chat {
-        /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
+        /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
         config: Option<PathBuf>,
         /// Hidden: run the engine with a scripted speaker (e2e tests).
@@ -87,7 +88,7 @@ enum Command {
     /// Run the resident daemon: runtime + channels + admin socket.
     #[command(alias = "daemon")]
     Run {
-        /// Config path (default: ~/.config/ka-agent/ka-agent.toml).
+        /// Config path (default: the active profile's, `ka-agent config path`).
         /// Invalid config exits 1 (no fallback to defaults).
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -143,6 +144,12 @@ enum Command {
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
+    },
+    /// Spend per day: turns, tokens, cost (reads the store directly).
+    Usage {
+        /// How many days back (1-366, default 30).
+        #[arg(long, default_value_t = 30)]
+        days: u32,
     },
     /// Show the daemon log (`-f` to follow).
     Logs {
@@ -410,7 +417,7 @@ enum SkillsAction {
     List,
     /// Provision a skill into the engine home (ka discovers it there).
     Enable {
-        /// Skill name (directory under ~/.config/ka-agent/skills).
+        /// Skill name (directory under ~/.ka-agent/skills).
         name: String,
     },
     /// Remove a skill's provisioning (the source copy is never touched).
@@ -444,6 +451,19 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
         ka_agent_core::layout::set_profile_override(p);
+    }
+    let picking_profile = matches!(
+        cli.command,
+        Some(Command::Profile {
+            action: ProfileAction::Use { .. } | ProfileAction::List | ProfileAction::Create { .. }
+        })
+    );
+    if !picking_profile
+        && std::env::var_os("KA_AGENT_DATA_DIR").is_none_or(|v| v.is_empty())
+        && let Some(problem) = ka_agent_core::layout::profile_selection_problem()
+    {
+        eprintln!("ka-agent: {problem}");
+        return std::process::ExitCode::FAILURE;
     }
     // One-time move to the ~/.ka-agent layout — never for the supervised
     // helper processes (they run inside an already-migrated environment).
@@ -624,6 +644,7 @@ fn main() -> std::process::ExitCode {
         }
         Command::Logs { follow, lines } => service::logs(follow, lines),
         Command::Profile { action } => profile_cli::profile_action(action),
+        Command::Usage { days } => usage_cli::usage(days),
         Command::Grant { action } => grant::grant_action(action),
         Command::Backup { out, keep, config } => ops::backup_to(out, keep, config_path(&config)),
         Command::Restore { dir, force } => ops::restore_from(dir, force),

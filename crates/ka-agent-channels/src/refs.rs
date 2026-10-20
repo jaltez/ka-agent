@@ -298,7 +298,7 @@ mod tests {
                 created_ms: 0,
             })
             .unwrap();
-        let prefix = &turn.id.as_str()[..8];
+        let prefix = ka_agent_core::ids::short_id(turn.id.as_str());
         let out = expand(&store, &ws, &format!("@turn:{prefix}")).await;
         assert!(out.contains(&format!("--- @turn:{prefix} ---")), "{out}");
         assert!(out.contains("> pregunta sembrada"), "{out}");

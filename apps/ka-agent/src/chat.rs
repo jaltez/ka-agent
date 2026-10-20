@@ -297,8 +297,14 @@ fn render(ev: &SurfaceEvent, out: &mut Term) {
 }
 
 fn banner(model: Option<&str>, attached: bool, extra: &[String]) {
+    let profile = ka_agent_core::layout::profile_name();
+    let profile = if profile == "default" || std::env::var_os("KA_AGENT_DATA_DIR").is_some() {
+        String::new()
+    } else {
+        format!(" [{profile}]")
+    };
     println!(
-        "Ka Agent · {} · {} · /help · Ctrl-C stops a reply, Ctrl-D quits",
+        "Ka Agent{profile} · {} · {} · /help · Ctrl-C stops a reply, Ctrl-D quits",
         model.unwrap_or("no model"),
         if attached {
             "connected to the background service"

@@ -482,13 +482,19 @@ impl Store {
     /// Most recent turn whose id starts with `prefix` — `@turn:<prefix>`
     /// references resolve through this. Global, not per-session: one
     /// instance is one operator (SEED.md §8.1).
+    /// A turn by full id, prefix (with or without `turn_`) or the
+    /// [`short_id`](ka_agent_core::ids::short_id) tail; newest wins.
     pub fn find_turn_by_prefix(&self, prefix: &str) -> Result<Option<Turn>> {
         let conn = self.lock();
         let turn = conn
             .query_row(
                 "SELECT id, session, inbound_text, status, stop, error_class, error_message,
                         cost_usd, tokens, created_ms, updated_ms
-                 FROM turns WHERE id LIKE ?1 || '%' ORDER BY created_ms DESC LIMIT 1",
+                 FROM turns
+                 WHERE substr(id, 1, length(?1)) = ?1
+                    OR substr(id, 6, length(?1)) = ?1
+                    OR (length(?1) >= 4 AND substr(id, -length(?1)) = ?1)
+                 ORDER BY created_ms DESC LIMIT 1",
                 params![prefix],
                 row_to_turn,
             )
@@ -507,6 +513,27 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Ok((cost.unwrap_or(0.0), tokens.unwrap_or(0).max(0) as u64))
+    }
+
+    /// One row per finished turn since `since_ms`: `(created_ms, cost_usd,
+    /// tokens)` — everything `ka-agent usage` needs; the CLI buckets days
+    /// in the operator's timezone.
+    pub fn usage_rows_since(&self, since_ms: i64) -> Result<Vec<(i64, f64, u64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT created_ms, COALESCE(cost_usd, 0), COALESCE(tokens, 0)
+             FROM turns WHERE created_ms >= ?1 ORDER BY created_ms",
+        )?;
+        let rows = stmt
+            .query_map(params![since_ms], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // ------------------------------------------------------------------

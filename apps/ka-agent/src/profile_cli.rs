@@ -309,6 +309,11 @@ fn remove(name: &str, yes: bool) -> ExitCode {
             "profile {name} is running — `ka-agent -p {name} service uninstall` (or stop it) first"
         ));
     }
+    if service::is_installed_for(name) {
+        return fail(format!(
+            "profile {name} has a background service installed — `ka-agent -p {name} service uninstall` first"
+        ));
+    }
     if !yes {
         return fail(format!(
             "this deletes {} (memory, sessions, workspace, config) — rerun with --yes",
