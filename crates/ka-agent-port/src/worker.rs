@@ -393,7 +393,9 @@ async fn open_engine(
             cfg.model = Some(model.clone());
         }
         (
-            ka_engine::spawn_full(cfg, ka_dialect::Catalog::embedded(), strand_choice),
+            // embedded + ka-agent's extra providers (opencode…), so setup's
+            // selectors resolve in the engine too.
+            ka_engine::spawn_full(cfg, crate::catalog::full_catalog(), strand_choice),
             model,
         )
     };

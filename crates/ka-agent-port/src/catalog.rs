@@ -40,9 +40,51 @@ fn key_url(name: &str) -> Option<&'static str> {
         "openai" => Some("https://platform.openai.com/api-keys"),
         "google" => Some("https://aistudio.google.com/apikey"),
         "openrouter" => Some("https://openrouter.ai/keys"),
+        // Both plans share one console and one key.
+        "opencode" | "opencode-go" => Some("https://opencode.ai/console"),
         _ => None,
     }
 }
+
+/// Providers ka-dialect 0.3.0 does not register, served by ka-agent's own
+/// dialect rows ([`EXTRA_DIALECTS`]). Order matters for
+/// [`provider_for_key_env`]: the first entry wins a shared env var.
+const EXTRA_PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        name: "opencode-go",
+        note: "OpenCode Go subscription — curated coding models (flat monthly)",
+        base_url: "https://opencode.ai/zen/go/v1",
+        key_env: Some("OPENCODE_API_KEY"),
+        wire: WireKind::OpenAi,
+        key_url: Some("https://opencode.ai/console"),
+    },
+    ProviderInfo {
+        name: "opencode",
+        note: "OpenCode Zen — curated coding models, pay per token",
+        base_url: "https://opencode.ai/zen/v1",
+        key_env: Some("OPENCODE_API_KEY"),
+        wire: WireKind::OpenAi,
+        key_url: Some("https://opencode.ai/console"),
+    },
+];
+
+fn extra_provider(name: &str) -> Option<&'static ProviderInfo> {
+    EXTRA_PROVIDERS.iter().find(|p| p.name == name)
+}
+
+/// ka's embedded dialect catalog plus ka-agent's extra providers
+/// (`opencode_dialects.toml`). The worker spawns the engine on this catalog;
+/// selectors from [`EXTRA_PROVIDERS`] resolve only through it.
+pub fn full_catalog() -> Catalog {
+    let mut catalog = Catalog::embedded();
+    if let Ok(extra) = Catalog::parse(EXTRA_DIALECTS) {
+        catalog.overlay(extra);
+    }
+    catalog
+}
+
+/// ka-agent's dialect rows for [`EXTRA_PROVIDERS`] (models.dev-derived).
+const EXTRA_DIALECTS: &str = include_str!("opencode_dialects.toml");
 
 fn info(p: &Provider) -> ProviderInfo {
     ProviderInfo {
@@ -58,16 +100,27 @@ fn info(p: &Provider) -> ProviderInfo {
     }
 }
 
-/// Every known provider in display order (`vendor_rank`, stable).
+/// Every known provider in display order (`vendor_rank`, stable), with
+/// ka-agent's extras slotted between the community tier and local runtimes.
 pub fn providers() -> Vec<ProviderInfo> {
     let mut all: Vec<&Provider> = providers::PROVIDERS.iter().collect();
     all.sort_by_key(|p| providers::vendor_rank(p.name));
-    all.into_iter().map(info).collect()
+    let local_starts = all
+        .iter()
+        .position(|p| providers::vendor_rank(p.name) >= 900)
+        .unwrap_or(all.len());
+    let mut out: Vec<ProviderInfo> = all[..local_starts].iter().map(|p| info(p)).collect();
+    out.extend(EXTRA_PROVIDERS.iter().cloned());
+    out.extend(all[local_starts..].iter().map(|p| info(p)));
+    out
 }
 
 /// Look a provider up by vendor prefix (legacy z.ai aliases accepted).
 pub fn provider(name: &str) -> Option<ProviderInfo> {
-    providers::find(name).map(info)
+    match providers::find(name) {
+        Some(p) => Some(info(p)),
+        None => extra_provider(name).cloned(),
+    }
 }
 
 /// The first provider (display order) whose key lives in `env`.
@@ -84,6 +137,8 @@ pub fn default_model(vendor: &str) -> Option<&'static str> {
         "deepseek" => Some("deepseek/deepseek-flash"),
         "openrouter" => Some("openrouter/z-ai/glm-5.3"),
         "ollama" => Some("ollama/qwen3-32b"),
+        "opencode-go" => Some("opencode-go/glm-5.3"),
+        "opencode" => Some("opencode/glm-5.3"),
         _ => None,
     }
 }
@@ -91,7 +146,7 @@ pub fn default_model(vendor: &str) -> Option<&'static str> {
 /// Catalog model ids for a vendor (`vendor/…`), in catalog order.
 pub fn catalog_models(vendor: &str) -> Vec<String> {
     let prefix = format!("{vendor}/");
-    Catalog::embedded()
+    full_catalog()
         .dialects
         .into_keys()
         .filter(|k| k.starts_with(&prefix))
@@ -118,7 +173,7 @@ pub fn validate_selector(sel: &str) -> Result<SelectorInfo, String> {
         Some(e) => format!("{model_id}@{e}"),
         None => model_id.clone(),
     };
-    let catalog = Catalog::embedded();
+    let catalog = full_catalog();
     if let Some(d) = catalog.get(&model_id) {
         let key_env = d.api_key_env.clone().or_else(|| {
             providers::find(&parsed.vendor).and_then(|p| p.key_env.map(str::to_string))
@@ -137,7 +192,15 @@ pub fn validate_selector(sel: &str) -> Result<SelectorInfo, String> {
             key_env: p.key_env.map(str::to_string),
             in_catalog: false,
         }),
-        None => Err(unknown()),
+        // ka-agent's own providers synthesize against their dialect rows.
+        None => extra_provider(&parsed.vendor)
+            .map(|p| SelectorInfo {
+                id,
+                vendor: parsed.vendor,
+                key_env: p.key_env.map(str::to_string),
+                in_catalog: false,
+            })
+            .ok_or_else(unknown),
     }
 }
 
@@ -321,19 +384,67 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
+    fn opencode_providers_are_listed_and_resolvable() {
+        let names: Vec<&str> = providers().iter().map(|p| p.name).collect();
+        assert!(names.contains(&"opencode-go"), "{names:?}");
+        assert!(names.contains(&"opencode"), "{names:?}");
+        // Extras slot in before local runtimes (ollama is local-tier).
+        let go = names.iter().position(|n| *n == "opencode-go").unwrap();
+        let ollama = names.iter().position(|n| *n == "ollama").unwrap();
+        assert!(go < ollama);
+
+        // One console key backs both plans; the subscription (Go) wins the
+        // shared env var for the setup wizard's "key found" default.
+        assert_eq!(
+            provider_for_key_env("OPENCODE_API_KEY").unwrap().name,
+            "opencode-go"
+        );
+
+        // The default model resolves and is a real dialect row.
+        let d = default_model("opencode-go").unwrap();
+        let sel = validate_selector(d).unwrap();
+        assert!(sel.in_catalog, "{d} must be a catalog row");
+        assert_eq!(sel.key_env.as_deref(), Some("OPENCODE_API_KEY"));
+
+        // Every model the picker lists resolves through the full catalog.
+        let go_models = catalog_models("opencode-go");
+        assert!(go_models.len() >= 20, "{go_models:?}");
+        for m in &go_models {
+            assert!(full_catalog().get(m).is_some(), "{m} missing");
+        }
+        let zen_models = catalog_models("opencode");
+        assert!(!zen_models.is_empty());
+        for m in &zen_models {
+            assert!(full_catalog().get(m).is_some(), "{m} missing");
+        }
+
+        // A synthetic (non-catalog) opencode model still validates — the
+        // provider exists and the wire is OpenAI-chat.
+        let s = validate_selector("opencode-go/custom-model@high").unwrap();
+        assert!(!s.in_catalog);
+        assert_eq!(s.key_env.as_deref(), Some("OPENCODE_API_KEY"));
+    }
+
+    #[test]
     fn default_models_resolve() {
-        let cat = Catalog::embedded();
+        let cat = full_catalog();
         for p in providers() {
             if let Some(m) = default_model(p.name) {
                 let sel = ka_dialect::parse_selector(m).unwrap();
                 assert!(
-                    cat.get(m).is_some() || providers::find(&sel.vendor).is_some(),
+                    cat.get(m).is_some()
+                        || providers::find(&sel.vendor).is_some()
+                        || extra_provider(&sel.vendor).is_some(),
                     "{m}"
                 );
                 assert!(validate_selector(m).is_ok(), "{m}");
             }
         }
-        assert!(cat.get("anthropic/claude-sonnet-5").is_some());
+        assert!(
+            Catalog::embedded()
+                .get("anthropic/claude-sonnet-5")
+                .is_some()
+        );
     }
 
     #[test]
@@ -508,5 +619,17 @@ mod tests {
         drop(listener);
         let r = check_at(WireKind::OpenAi, &format!("http://{addr}"), Some("k")).await;
         assert!(matches!(r, CredentialCheck::Unreachable { .. }), "{r:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod parse_check_bin {
+    #[test]
+    fn extra_dialects_parse() {
+        match super::Catalog::parse(super::EXTRA_DIALECTS) {
+            Ok(c) => assert!(!c.dialects.is_empty()),
+            Err(e) => panic!("EXTRA_DIALECTS invalid: {e}"),
+        }
     }
 }
