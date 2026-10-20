@@ -9,8 +9,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn home() -> PathBuf {
+    // A per-call counter, not just the clock: macOS SystemTime has
+    // microsecond granularity, and two parallel tests minting a home in
+    // the same microsecond got the *same* directory — one cleanup then
+    // deleted the other's tree mid-flight.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "ka-agent-layout-{}-{}",
+        "ka-agent-layout-{}-{n}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
