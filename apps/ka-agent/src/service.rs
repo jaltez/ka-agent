@@ -523,7 +523,7 @@ mod imp {
 
     pub fn print(c: &Ctx) {
         for (label, text) in plists(c) {
-            println!("<!-- {} -->", plist_path(label).display());
+            println!("<!-- {} -->", plist_path(&label).display());
             println!("{text}");
         }
     }
