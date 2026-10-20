@@ -247,7 +247,8 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     wait_web(port, Duration::from_secs(30));
 
     // Exit criterion: the listener is loopback-only (127.0.0.1) — /proc/net/tcp
-    // reports addresses little-endian in hex.
+    // reports addresses little-endian in hex. (Linux-only probe.)
+    #[cfg(target_os = "linux")]
     match listening_addr(port) {
         Some(addr) => assert_eq!(
             addr.to_ascii_uppercase(),

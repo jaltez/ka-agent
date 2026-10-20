@@ -10,6 +10,9 @@ members = [
     "crates/ka-agent-web",
     "crates/ka-agent-memory",
     "apps/ka-agent",
+    # The example plugin the e2e suite installs (`cargo build --workspace`
+    # must produce its binary; CI relies on it).
+    "examples/plugins/probe",
 ]
 
 [workspace.package]
