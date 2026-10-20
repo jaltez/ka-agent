@@ -279,6 +279,7 @@ mod tests {
     /// Live run against a POSIX-sh MCP plugin: requires bubblewrap (CI
     /// installs it; the README documents it).
     #[test]
+    #[cfg(target_os = "linux")] // bubblewrap is Linux-only
     fn runs_a_script_plugin_and_sees_only_the_sandbox_view() {
         if !bwrap_present() {
             panic!("bubblewrap is required for the sandbox tests: apt install bubblewrap");

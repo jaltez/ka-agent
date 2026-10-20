@@ -2091,6 +2091,9 @@ async fn drain_queue(sh: &Arc<Shared>) -> bool {
     let Some(port) = port else {
         return false;
     };
+    // Queued messages cross channels too: the transcript sees them the
+    // same as directly-submitted ones (drain bypasses handle_message).
+    sh.surface.on_inbound(&item.source, &item.text);
     let mut turn = Turn::new(sid.clone(), item.text.clone());
     if let Err(e) = sh.store.insert_turn(&turn) {
         sh.surface
