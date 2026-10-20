@@ -316,6 +316,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "linux")] // its only caller is the Linux-gated test
     fn bwrap_present() -> bool {
         std::process::Command::new("bwrap")
             .arg("--version")
