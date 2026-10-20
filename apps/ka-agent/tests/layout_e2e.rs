@@ -185,7 +185,18 @@ fn migration_never_lands_in_a_non_default_profile() {
     assert!(out.status.success());
 
     // The legacy tree stays exactly where it was …
-    assert!(old_root.join("memory/facts.md").is_file());
+    if !old_root.join("memory/facts.md").is_file() {
+        panic!(
+            "legacy tree was moved under a non-default profile; child stdout:\n{}\nstderr:\n{}\ntree:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            std::process::Command::new("find")
+                .arg(&home)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default(),
+        );
+    }
     // … the work profile got its own fresh root …
     assert!(home.join(".ka-agent/profiles/work").is_dir());
     // … and nothing moved into it.

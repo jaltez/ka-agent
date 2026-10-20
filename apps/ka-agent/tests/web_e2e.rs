@@ -415,7 +415,9 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     assert_eq!(accented.status, 200, "accented send: {}", accented.body);
 
     // Live stream: an open /events socket sees the inbound echo and the
-    // scripted answer's delta for a message sent while it is open.
+    // scripted answer's delta for a message sent while it is open. Slow
+    // runners may still be finishing the previous turn (this one queues),
+    // so read until both markers arrive, not for a fixed window.
     let events = open_events(port, &cookie);
     let sent = request_h(
         port,
@@ -426,7 +428,11 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
         &[("X-Ka-Agent", "1")],
     );
     assert_eq!(sent.status, 200);
-    let stream = read_events(events, Duration::from_secs(10));
+    let stream = read_events_until(
+        events,
+        &["\"ev\":\"inbound\"", "\"ev\":\"delta\""],
+        Duration::from_secs(30),
+    );
     assert!(stream.contains("\"ev\":\"inbound\""), "stream: {stream}");
     assert!(stream.contains("\"ev\":\"delta\""), "stream: {stream}");
 }
@@ -444,18 +450,34 @@ fn open_events(port: u16, cookie: &str) -> std::net::TcpStream {
     stream
 }
 
-/// Read the SSE stream until `timeout` passes; returns everything received.
-fn read_events(mut stream: std::net::TcpStream, timeout: Duration) -> String {
+/// Read the SSE stream until every marker is seen (or `timeout` passes);
+/// returns everything received.
+fn read_events_until(
+    mut stream: std::net::TcpStream,
+    markers: &[&str],
+    timeout: Duration,
+) -> String {
+    use std::io::Read as _;
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
-        if Instant::now() >= deadline {
-            break;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if markers.iter().all(|m| text.contains(m)) {
+            return text;
         }
+        if Instant::now() >= deadline {
+            return text;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        stream
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(500))))
+            .ok();
         match stream.read(&mut tmp) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) if Instant::now() < deadline => continue,
+            Err(_) => break,
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
