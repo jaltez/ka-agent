@@ -107,13 +107,21 @@ pub fn split_final_text(text: &str, max: usize) -> Vec<String> {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
-            let mut rest: String = para.to_string();
-            while rest.chars().count() > max {
-                let head: String = rest.chars().take(max).collect();
-                rest = rest.chars().skip(max).collect();
-                out.push(head);
+            // One pass over the char boundaries instead of re-counting and
+            // re-collecting the tail per chunk (O(n) vs O(n²) on a
+            // megabyte paragraph).
+            let bounds: Vec<usize> = para
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(para.len()))
+                .collect();
+            let n = bounds.len() - 1;
+            let mut lo = 0;
+            while lo + max < n {
+                out.push(para[bounds[lo]..bounds[lo + max]].to_string());
+                lo += max;
             }
-            cur.push_str(&rest);
+            cur.push_str(&para[bounds[lo]..]);
         } else {
             if !cur.is_empty() {
                 cur.push_str("\n\n");
@@ -570,10 +578,20 @@ impl Runtime {
     /// (gap G4 — ka drops mid-cycle prompts, HTTP 200 notwithstanding).
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
         self.sh.surface.on_inbound(source, text);
+        let mut submit_head = false;
         let submit_now = {
             let mut g = self.lock();
             match g.session.status {
                 SessionStatus::Idle => {
+                    // FIFO across restarts: the worker spawns lazily, so a
+                    // durable queue left by the previous process waits for
+                    // exactly this message — which must not overtake it.
+                    // Enqueue behind it and submit the head instead.
+                    if self.sh.store.queue_len(&g.session.id).unwrap_or(0) > 0 {
+                        let item = QueueItem::new(g.session.id.clone(), text.to_string(), source);
+                        self.sh.store.enqueue(&item)?;
+                        submit_head = true;
+                    }
                     let from = g.session.status;
                     g.session
                         .transition(SessionStatus::Running)
@@ -587,23 +605,28 @@ impl Runtime {
                     // A budget pause lifts itself when the day window rolls
                     // (the verdict is recomputed from the recorded window);
                     // an auth pause needs /resume, which is why the note
-                    // says so honestly.
-                    let verdict = {
-                        let g = self.lock();
-                        g.budget.verdict()
-                    };
-                    if verdict == ka_agent_core::BudgetVerdict::Exceeded {
+                    // says so honestly. `g` is already held — relocking the
+                    // non-reentrant mutex here deadlocked every message
+                    // after a pause.
+                    if g.budget.verdict() == ka_agent_core::BudgetVerdict::Exceeded {
                         self.sh.surface.on_notice(
                             "paused: budget reached for this window; use /resume to override or wait for the window to roll",
                         );
                         false
                     } else {
-                        // From is always Paused here.
+                        // Paused→Running is not a legal edge; go through
+                        // idle. Both writes are persisted: the store checks
+                        // transitions against the stored row, and skipping
+                        // the idle write would make the running write
+                        // illegal.
+                        g.session
+                            .transition(SessionStatus::Idle)
+                            .map_err(|t| illegal_session(SessionStatus::Paused, t))?;
                         g.session
                             .transition(SessionStatus::Running)
-                            .map_err(|t| illegal_session(SessionStatus::Paused, t))?;
+                            .map_err(|t| illegal_session(SessionStatus::Idle, t))?;
                         drop(g);
-                        self.persist_session_status(SessionStatus::Running);
+                        self.persist_session_status(SessionStatus::Idle);
                         true
                     }
                 }
@@ -633,6 +656,22 @@ impl Runtime {
                 }
                 _ => {}
             }
+            return Ok(());
+        }
+        if submit_head {
+            // The head item goes through the same handshake as a direct
+            // submit: the worker is spawned lazily, so it must exist before
+            // the drain (drain_queue only ever uses a live port).
+            if let Err(e) = self.ensure_worker().await {
+                let mut g = self.lock();
+                if g.session.status == SessionStatus::Running {
+                    g.session.transition(SessionStatus::Idle).ok();
+                }
+                drop(g);
+                self.persist_session_status(SessionStatus::Idle);
+                return Err(e);
+            }
+            drain_queue(&self.sh).await;
             return Ok(());
         }
         match self.submit_text(text).await {
@@ -1195,20 +1234,27 @@ impl Runtime {
                 let Some(live) = g.live.as_ref() else {
                     return false;
                 };
-                let turn_open = live.current_turn.as_ref().is_some_and(|t| {
-                    self.sh
-                        .store
-                        .get_turn(t)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| !t.status.is_terminal())
-                });
-                let settled = g.session.status == SessionStatus::Idle
-                    && !turn_open
-                    && live.pending_asks.is_empty()
-                    && self.sh.store.queue_len(&g.session.id).unwrap_or(0) == 0;
+                // Cheap in-memory gates first: the SQL reads below run on
+                // every scheduler tick, and an idle daemon with its worker
+                // already reaped (or mid-turn) has no business querying.
                 let idle_long_enough = now - live.last_activity_ms >= min_idle_ms;
-                (settled, idle_long_enough, live.port.clone())
+                let maybe = g.session.status == SessionStatus::Idle && idle_long_enough;
+                if !maybe {
+                    (false, false, live.port.clone())
+                } else {
+                    let turn_open = live.current_turn.as_ref().is_some_and(|t| {
+                        self.sh
+                            .store
+                            .get_turn(t)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|t| !t.status.is_terminal())
+                    });
+                    let settled = !turn_open
+                        && live.pending_asks.is_empty()
+                        && self.sh.store.queue_len(&g.session.id).unwrap_or(0) == 0;
+                    (settled, idle_long_enough, live.port.clone())
+                }
             };
             if !settled || !idle_long_enough {
                 return false;
@@ -2105,17 +2151,24 @@ async fn drain_queue(sh: &Arc<Shared>) -> bool {
     }
     sh.store.update_turn(&turn).ok();
     sh.store.mark_turned(&item.id, &turn.id).ok();
+    // Claim the turn *before* the submit handshake, exactly like
+    // `submit_text_with`: the engine can stream and finish while we are
+    // still awaiting `port.submit`, and a late claim attributes the finish
+    // to the previous turn (overwriting its chunks and cost) and strands
+    // this one `running`.
+    {
+        let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = g.live.as_mut() {
+            live.current_turn = Some(turn.id.clone());
+            live.live_text.clear();
+        }
+    }
     match port.submit(item.text.clone(), Vec::new(), Vec::new()).await {
         Ok(()) => {
             turn.transition(TurnStatus::Running)
                 .map_err(|t| illegal_turn(turn.status, t))
                 .ok();
             sh.store.update_turn(&turn).ok();
-            let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(live) = g.live.as_mut() {
-                live.current_turn = Some(turn.id.clone());
-                live.live_text.clear();
-            }
             true
         }
         Err(_) => {

@@ -53,7 +53,14 @@ impl BudgetState {
         self.spent_tokens += tokens;
     }
 
+    /// Whether a cap is reached **now**: if the day rolled since the last
+    /// [`record`](Self::record), the window is stale and the verdict is
+    /// `Ok` — a budget pause must lift itself at day-roll, not wait for
+    /// the next spend that may never come.
     pub fn verdict(&self) -> BudgetVerdict {
+        if self.day != crate::day_key(crate::now_ms()) {
+            return BudgetVerdict::Ok;
+        }
         let usd = Self::pct(self.spent_usd, self.daily_usd_cap);
         let tok = Self::pct(
             self.spent_tokens as f64,
@@ -92,6 +99,20 @@ mod tests {
         let mut b = BudgetState::new(None, Some(100));
         b.record(0.0, 100, crate::now_ms()); // cost 0: unpriced model
         assert_eq!(b.verdict(), BudgetVerdict::Exceeded);
+    }
+
+    #[test]
+    fn exceeded_verdict_lifts_when_the_day_rolled_without_new_spend() {
+        // A daemon paused at its cap that idles past midnight: no turn ever
+        // calls `record`, so the roll must be visible through `verdict`
+        // alone — this is the path that un-pauses it.
+        let mut b = BudgetState::new(Some(1.0), None);
+        b.record(1.0, 0, crate::now_ms());
+        assert_eq!(b.verdict(), BudgetVerdict::Exceeded);
+        let yesterday = (crate::day_key(crate::now_ms()) - 1) * 86_400_000;
+        let mut stale = BudgetState::new(Some(1.0), None);
+        stale.record(1.0, 0, yesterday);
+        assert_eq!(stale.verdict(), BudgetVerdict::Ok);
     }
 
     #[test]

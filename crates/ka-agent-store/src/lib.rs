@@ -66,6 +66,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v3.sql"),
     include_str!("schema_v4.sql"),
     include_str!("schema_v5.sql"),
+    include_str!("schema_v6.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -579,6 +580,28 @@ impl Store {
         )
         .optional()
         .map_err(StoreError::from)
+    }
+
+    /// Every not-yet-turned queue item for the session, oldest first
+    /// (what `handle_message` must not overtake, and `/status` shows).
+    pub fn queued_items(&self, session: &SessionId) -> Result<Vec<QueueItem>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, text, source, enqueued_ms, turned
+             FROM queue WHERE session = ?1 AND turned IS NULL
+             ORDER BY enqueued_ms, id",
+        )?;
+        let rows = stmt.query_map(params![session.as_str()], |r| {
+            Ok(QueueItem {
+                id: QueueId(r.get::<_, String>(0)?),
+                session: SessionId(r.get::<_, String>(1)?),
+                text: r.get(2)?,
+                source: r.get(3)?,
+                enqueued_ms: r.get(4)?,
+                turned: r.get::<_, Option<String>>(5)?.map(TurnId),
+            })
+        })?;
+        collect_rows(rows)
     }
 
     /// Record that a queue item became a turn.

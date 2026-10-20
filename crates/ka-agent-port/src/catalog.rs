@@ -73,14 +73,22 @@ fn extra_provider(name: &str) -> Option<&'static ProviderInfo> {
 }
 
 /// ka's embedded dialect catalog plus ka-agent's extra providers
-/// (`opencode_dialects.toml`). The worker spawns the engine on this catalog;
-/// selectors from [`EXTRA_PROVIDERS`] resolve only through it.
+/// (`opencode_dialects.toml`), parsed once per process: `embedded()` +
+/// `parse` walk ~200 KB of TOML and the runtime validates a selector on
+/// every submitted message.
 pub fn full_catalog() -> Catalog {
-    let mut catalog = Catalog::embedded();
-    if let Ok(extra) = Catalog::parse(EXTRA_DIALECTS) {
-        catalog.overlay(extra);
-    }
-    catalog
+    full_catalog_ref().clone()
+}
+
+fn full_catalog_ref() -> &'static Catalog {
+    static CACHED: std::sync::LazyLock<Catalog> = std::sync::LazyLock::new(|| {
+        let mut catalog = Catalog::embedded();
+        if let Ok(extra) = Catalog::parse(EXTRA_DIALECTS) {
+            catalog.overlay(extra);
+        }
+        catalog
+    });
+    &CACHED
 }
 
 /// ka-agent's dialect rows for [`EXTRA_PROVIDERS`] (models.dev-derived).

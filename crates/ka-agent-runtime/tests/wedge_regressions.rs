@@ -272,3 +272,42 @@ fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
         .unwrap()
         .block_on(fut)
 }
+
+/// Restart with a durable queue: the message that wakes the daemon must not
+/// overtake what was already queued (the worker spawns lazily, so nothing
+/// drains the queue until a message arrives).
+#[tokio::test]
+async fn waking_message_does_not_overtake_the_durable_queue() {
+    let root = std::env::temp_dir().join(format!("ka-fifo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let store = store_at(&root.join("data"));
+
+    // A previous process left one message durably queued.
+    let mut session = Session::new(root.join("ws"));
+    store.insert_session(&session).unwrap();
+    store
+        .enqueue(&ka_agent_core::QueueItem::new(
+            session.id.clone(),
+            "from before the restart".into(),
+            "telegram",
+        ))
+        .unwrap();
+
+    // The worker cannot spawn (no binary); what matters is which message
+    // the runtime tries and where the new one lands.
+    let rt = runtime_with(&root, Arc::clone(&store), config(&root));
+    let _ = rt.handle_message("sent after the restart", "console").await;
+
+    // The new message went behind the old one, not in front of it.
+    let queued = store.queued_items(&rt.session_id()).unwrap();
+    let texts: Vec<&str> = queued.iter().map(|q| q.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["from before the restart", "sent after the restart"],
+        "queue order after the waking message"
+    );
+    // And the session is not wedged in `running` by the failed spawn.
+    assert_eq!(rt.session_status(), ka_agent_core::SessionStatus::Idle);
+    let _ = std::fs::remove_dir_all(&root);
+}
