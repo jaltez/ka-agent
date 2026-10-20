@@ -431,7 +431,7 @@ When to use each:
 **[Provisional]** Markdown for stable memory; SQLite (WAL mode) for operational state and indexes:
 
 ```
-~/.local/share/ka-agent/
+~/.ka-agent/profiles/default/
   memory/                 # git repository, auto-committed on every accepted change
     profile.md  persona.md  preferences.md  environment.md  conventions.md
     projects/<slug>.md    facts.md
@@ -652,7 +652,7 @@ Grants are stored in SQLite with creator, time and optional expiry, and are list
 
 **[Requirement]** Isolation is defined per component:
 
-- **Ka workers** run as the operator's user, but each in its own transient systemd scope (cgroup) with memory and CPU limits, a private `HOME`, `KA_DATA_DIR` and `XDG_STATE_HOME` under `~/.local/share/ka-agent/`, and `XDG_CONFIG_HOME` pinned to the engine home (Ka's user config layer reads it, `crates/ka-engine/src/config.rs:789-793`; waypoints live under `KA_DATA_DIR`, `crates/ka-engine/src/engine.rs:3323-3325`). Ka's `[sandbox] mode = "fs"` is enabled when an enforcement tool exists (`crates/ka-sandbox/src/lib.rs:431-432`). It fails closed if configured but unavailable; Ka Agent then reports the failure instead of silently disabling it.
+- **Ka workers** run as the operator's user, but each in its own transient systemd scope (cgroup) with memory and CPU limits, a private `HOME`, `KA_DATA_DIR` and `XDG_STATE_HOME` under `~/.ka-agent/profiles/default/`, and `XDG_CONFIG_HOME` pinned to the engine home (Ka's user config layer reads it, `crates/ka-engine/src/config.rs:789-793`; waypoints live under `KA_DATA_DIR`, `crates/ka-engine/src/engine.rs:3323-3325`). Ka's `[sandbox] mode = "fs"` is enabled when an enforcement tool exists (`crates/ka-sandbox/src/lib.rs:431-432`). It fails closed if configured but unavailable; Ka Agent then reports the failure instead of silently disabling it.
 - **MVP plugins are first-party built-ins** compiled into Ka Agent. There is no third-party code execution.
 - **[Provisional] Phase 5 third-party plugins** run as MCP stdio subprocesses behind the bridge, under bubblewrap: no network namespace by default; egress only through a local allowlisting proxy derived from `requires.network`; read-only root; a private tmp. Each process has a wall-clock limit per call (30 s default), a memory cap and an output cap.
 - **[Requirement]** Plugins never receive the bot token, provider keys or other plugins' secrets. Each process gets only the secrets it declares.
@@ -899,7 +899,7 @@ The workspace is the only default write root, and execution happens only inside 
 - **Resumable sessions through Ka.** Strands resume by path after any restart; policy is re-asserted on resume.
 - **Editable stable memory.** Markdown files, `/remember`, `/memory` (show), `/forget`, `ka-agent memory edit`, compiled into `MEMORY.md`. Model-proposed candidates and their review arrive in Phase 2. **Shipped: all of it, including the CLI editor (`memory path|show|edit`) and candidate prefix matching (2026-10-18).**
 - **Searchable history.** FTS5 over prompt cycles, `/history`.
-- **A minimal skills mechanism.** `SKILL.md` directories in `~/.config/ka-agent/skills/`, enabled with `ka-agent skills enable`, provisioned into the engine home, invoked with `/skill`. **Shipped (2026-10-18): `ka-agent skills list|enable|disable`, engine-home provisioning, `/skills` listing, and `/skill <name> <text>` per-turn invocation through the worker protocol (contract: docs/contract/skills.md).**
+- **A minimal skills mechanism.** `SKILL.md` directories in `~/.ka-agent/skills/`, enabled with `ka-agent skills enable`, provisioned into the engine home, invoked with `/skill`. **Shipped (2026-10-18): `ka-agent skills list|enable|disable`, engine-home provisioning, `/skills` listing, and `/skill <name> <text>` per-turn invocation through the worker protocol (contract: docs/contract/skills.md).**
 - **Approvals for sensitive actions.** Ka asks become cards with a TTL and deny-on-expiry; the audit is complete.
 - **A process supervisor with controlled restart.**
   - A systemd user unit for the daemon (`Restart=on-failure`, start-rate limiting).

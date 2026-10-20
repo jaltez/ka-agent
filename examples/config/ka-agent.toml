@@ -5,8 +5,9 @@
 
 # The single workspace directory every engine runs in. `~` expands against
 # $HOME; the default (what `ka-agent setup` writes) is
-# ~/.local/share/ka-agent/workspace — keep instance-owned files together.
-workspace = "~/.local/share/ka-agent/workspace"
+# ~/.ka-agent/profiles/default/workspace — keep instance-owned files
+# together.
+workspace = "~/.ka-agent/profiles/default/workspace"
 
 # Default ka model selector for new sessions (e.g. "anthropic/claude-sonnet-4-5").
 # Omit to let the engine layer decide.

@@ -10,6 +10,7 @@ mod dashboard;
 mod doctor;
 mod grant;
 mod identity;
+mod layout;
 mod memory_cli;
 mod model_cli;
 mod ops;
@@ -386,22 +387,36 @@ enum SkillsAction {
 use clap::CommandFactory as _;
 
 fn config_path(flag: &Option<PathBuf>) -> PathBuf {
-    flag.clone().unwrap_or_else(|| {
-        if let Some(p) = std::env::var_os("KA_AGENT_CONFIG") {
-            return PathBuf::from(p);
-        }
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME").unwrap_or_default();
-                PathBuf::from(home).join(".config")
-            });
-        base.join("ka-agent/ka-agent.toml")
-    })
+    flag.clone().unwrap_or_else(default_config_path)
+}
+
+/// `$KA_AGENT_CONFIG`, else inside the data root when it is explicitly
+/// pinned (a self-contained instance), else `<base>/config.toml`
+/// (`~/.ka-agent/config.toml`).
+fn default_config_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("KA_AGENT_CONFIG") {
+        return PathBuf::from(p);
+    }
+    if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("config.toml");
+    }
+    ka_agent_core::layout::base_dir().join("config.toml")
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    // One-time move to the ~/.ka-agent layout — never for the supervised
+    // helper processes (they run inside an already-migrated environment).
+    let helper = matches!(
+        cli.command,
+        Some(Command::Worker { .. }) | Some(Command::Mcp)
+    );
+    if !helper && let Err(e) = layout::migrate() {
+        eprintln!("ka-agent: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
     let command = match cli.command {
         // Plain `ka-agent`: chat when configured; first-run setup otherwise
         // (interactive terminals only — a pipe gets help, not a wizard).

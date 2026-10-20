@@ -281,6 +281,21 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
         }
     }
 
+    // Stale pre-0.3 tree next to the new one (migration only runs while the
+    // new base does not exist): say which one is live.
+    if !std::env::var_os("KA_AGENT_HOME").is_some_and(|v| !v.is_empty())
+        && !std::env::var_os("KA_AGENT_DATA_DIR").is_some_and(|v| !v.is_empty())
+    {
+        let legacy = ka_agent_core::layout::legacy_data_root();
+        if paths.root().starts_with(ka_agent_core::layout::base_dir()) && legacy.is_dir() {
+            rep.warn(&format!(
+                "legacy data root {} still exists — the live one is {}; remove or merge manually",
+                legacy.display(),
+                paths.root().display()
+            ));
+        }
+    }
+
     // Sandbox: plugins need bubblewrap, which is Linux-only today.
     #[cfg(target_os = "linux")]
     match std::process::Command::new("bwrap")

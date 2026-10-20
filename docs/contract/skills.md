@@ -7,7 +7,7 @@ the model knows how to do, never what it is allowed to do.
 ## Shape and discovery
 
 - One directory per skill under the operator's library:
-  `~/.config/ka-agent/skills/<name>/SKILL.md` (`$XDG_CONFIG_HOME`-aware).
+  `~/.ka-agent/skills/<name>/SKILL.md` (`$KA_AGENT_HOME`-aware; a pre-0.3 `$XDG_CONFIG_HOME/ka-agent/skills` still wins while it exists).
 - `SKILL.md` is the ecosystem format ka already reads: TOML frontmatter
   (`name`, `description`) + Markdown body. A sample lives at
   `examples/skills/review/` in this repository.

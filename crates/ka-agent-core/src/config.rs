@@ -175,7 +175,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            workspace: PathBuf::from("~/.local/share/ka-agent/workspace"),
+            workspace: PathBuf::from("~/.ka-agent/profiles/default/workspace"),
             model: None,
             mode: "guarded".to_string(),
             approval_ttl_secs: 900,
@@ -459,8 +459,8 @@ digest_time = "07:30"
             "default workspace must be absolute: {ws:?}"
         );
         assert!(
-            ws.ends_with("ka-agent/workspace"),
-            "default workspace lives under the data root: {ws:?}"
+            ws.ends_with(".ka-agent/profiles/default/workspace"),
+            "default workspace lives under the default profile root: {ws:?}"
         );
     }
 }

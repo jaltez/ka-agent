@@ -20,7 +20,7 @@ Direction: D→W (daemon to worker, written to the worker's stdin), W→D
 
 | op | line |
 |---|---|
-| `Open` — start/attach an engine on a strand | `{"op":"open","workspace":"/home/op/work","strand":"/home/op/.local/share/ka-agent/ka/strands/01J….jsonl","model":"anthropic/claude-sonnet-4-5","mode":"guarded","engine_layer_toml":"/home/op/.config/ka-agent/engine.toml","scenario":null}` |
+| `Open` — start/attach an engine on a strand | `{"op":"open","workspace":"/home/op/work","strand":"/home/op/.ka-agent/profiles/default/ka/strands/01J….jsonl","model":"anthropic/claude-sonnet-4-5","mode":"guarded","engine_layer_toml":"/home/op/.config/ka-agent/engine.toml","scenario":null}` |
 | `Submit` — one prompt (text, optional images, optional skills) | `{"op":"submit","text":"fix the failing test","images":[],"skills":[]}` |
 | `Answer` — resolve a pending ask | `{"op":"answer","ask_id":"a-17","choice":"allow"}` |
 | `Abort` — cancel the running cycle | `{"op":"abort"}` |

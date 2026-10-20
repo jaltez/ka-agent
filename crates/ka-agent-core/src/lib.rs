@@ -12,6 +12,7 @@ pub mod budget;
 pub mod config;
 pub mod config_file;
 pub mod ids;
+pub mod layout;
 pub mod outbox;
 pub mod queue;
 pub mod session;

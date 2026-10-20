@@ -1,6 +1,7 @@
 //! Instance directory layout (SEED.md §4.2). Everything Ka Agent owns lives
-//! under one root, overridable with `KA_AGENT_DATA_DIR` (tests, parallel
-//! instances) exactly like ka's own `KA_DATA_DIR`.
+//! under one root: `~/.ka-agent/profiles/<profile>/…` by default (see
+//! `ka_agent_core::layout` for the env overrides — `KA_AGENT_DATA_DIR`
+//! replaces the root wholesale, exactly like ka's own `KA_DATA_DIR`).
 
 use std::path::{Path, PathBuf};
 
@@ -10,20 +11,9 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `$KA_AGENT_DATA_DIR` or `~/.local/share/ka-agent`.
+    /// The default root (`ka_agent_core::layout::default_root`).
     pub fn default_root() -> PathBuf {
-        if let Some(dir) = std::env::var_os("KA_AGENT_DATA_DIR")
-            && !dir.is_empty()
-        {
-            return PathBuf::from(dir);
-        }
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME").unwrap_or_default();
-                Path::new(&home).join(".local/share")
-            });
-        base.join("ka-agent")
+        ka_agent_core::layout::default_root()
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {

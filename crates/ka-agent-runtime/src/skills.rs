@@ -1,5 +1,5 @@
 //! The minimal skills mechanism (SEED.md §9.1, §2.6): ecosystem-standard
-//! `SKILL.md` directories the operator owns in `~/.config/ka-agent/skills/`,
+//! `SKILL.md` directories the operator owns in `~/.ka-agent/skills/`,
 //! provisioned (copied) into the engine home on `ka-agent skills enable`.
 //!
 //! Discovery is ka's own (`$HOME/.config/ka/skills`, progressive
@@ -59,16 +59,21 @@ pub fn valid_skill_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The operator's skill source directory: `$XDG_CONFIG_HOME/ka-agent/skills`
-/// (default `~/.config/ka-agent/skills`), next to the config file.
+/// The operator's skill source directory: `~/.ka-agent/skills`
+/// (`$KA_AGENT_HOME`-aware; `$XDG_CONFIG_HOME/ka-agent/skills` still wins
+/// when it exists, for pre-0.3 installs).
 pub fn user_skills_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    let legacy = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME").unwrap_or_default();
             PathBuf::from(home).join(".config")
-        });
-    base.join("ka-agent/skills")
+        })
+        .join("ka-agent/skills");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    ka_agent_core::layout::base_dir().join("skills")
 }
 
 impl Skills {

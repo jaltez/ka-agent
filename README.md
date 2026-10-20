@@ -90,8 +90,19 @@ account and logs in once. Photos and files sent on Telegram land in
 
 ## Configuration
 
-`ka-agent.toml` lives at `~/.config/ka-agent/ka-agent.toml` (override with
-`$KA_AGENT_CONFIG`); it is strict — unknown keys are errors. A fully
+Ka Agent keeps everything under `~/.ka-agent` (override with
+`$KA_AGENT_HOME`), like other agents:
+
+```
+~/.ka-agent/
+  config.toml                  # instance config ($KA_AGENT_CONFIG overrides)
+  skills/                      # your SKILL.md library
+  profiles/default/            # data for the active profile ($KA_AGENT_PROFILE)
+    workspace/  state.db  memory/  secrets/  backups/  logs/  …
+```
+
+`$KA_AGENT_DATA_DIR` replaces the data root wholesale (tests, service
+units). The config is strict — unknown keys are errors. A fully
 commented copy of the schema is in
 [`examples/config/ka-agent.toml`](examples/config/ka-agent.toml). Edit it
 with `ka-agent config set <key> <value>` / `config edit` — comments and key
@@ -107,8 +118,8 @@ Secrets never go in the file:
 - Channel tokens: `ka-agent secret set <name>` (0600 under `<data>/secrets/`,
   referenced by name from the config).
 
-Data root: `~/.local/share/ka-agent` (or `$KA_AGENT_DATA_DIR`) — state.db,
-memory/, notes/, secrets/, engine homes, workspace, backups.
+A pre-0.3 install (`~/.local/share/ka-agent` + `~/.config/ka-agent`) moves
+itself to the new layout on the next run.
 
 ## Running it for real
 

@@ -332,10 +332,7 @@ async fn open_engine(
         let mut mcp_env = std::collections::HashMap::new();
         let data_dir = std::env::var_os("KA_AGENT_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME").unwrap_or_default();
-                PathBuf::from(home).join(".local/share/ka-agent")
-            });
+            .unwrap_or_else(ka_agent_core::layout::default_root);
         mcp_env.insert(
             "KA_AGENT_DATA_DIR".to_string(),
             data_dir.to_string_lossy().into_owned(),
