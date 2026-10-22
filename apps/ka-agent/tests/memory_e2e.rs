@@ -122,7 +122,8 @@ fn history_remember_forget_flow() {
     let mut chat = spawn_chat(&root, &sc);
     chat.send("what about the eiffel");
     chat.expect("turn done", Duration::from_secs(30));
-    chat.expect("session Idle", Duration::from_secs(10));
+    chat.send("/status");
+    chat.expect("● idle", Duration::from_secs(10));
     let out = chat.seen();
     assert!(
         out.contains("Eiffel"),

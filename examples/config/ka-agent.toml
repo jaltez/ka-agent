@@ -13,6 +13,14 @@ workspace = "~/.ka-agent/profiles/default/workspace"
 # Omit to let the engine layer decide.
 # model = "anthropic/claude-sonnet-4-5"
 
+# Models tried in order when the main one fails (outage, rate limit); at
+# most 2. `ka-agent config set fallback '["openai/gpt-5.1"]'` validates them.
+# fallback = ["openai/gpt-5.1"]
+
+# Operator timezone (IANA name). Default: the system zone. Every reminder
+# and cron time is interpreted here. (Top-level keys go before any [table].)
+# timezone = "Europe/Madrid"
+
 # Permission mode for new sessions: "guarded" (default) | "accept_edits"
 # | "free" | "plan". Re-asserted by the worker after every attach.
 mode = "guarded"
@@ -51,7 +59,7 @@ crash_max = 5
 # Optional ka engine layer in ka's own strict ka.toml format, validated with
 # Config::parse_layer by the worker. See examples/config/engine.toml.
 # The worker's security overlay is applied after it and always wins.
-# engine_layer = "~/.config/ka-agent/engine.toml"
+# engine_layer = "~/.ka-agent/engine.toml"
 
 [telegram]
 # The Telegram channel. Enabling requires token_secret (a secret-store
@@ -75,6 +83,23 @@ enabled = false
 # [calendar]
 # digest_time = "08:00"
 
-# Operator timezone (IANA name). Default: the system zone. Every reminder
-# and cron time is interpreted here.
-# timezone = "Europe/Madrid"
+# Web search for the engine's `web_search` tool (`ka-agent setup search`).
+# The key lives in the engine .env tier: `ka-agent key set TAVILY_API_KEY`
+# (BRAVE_API_KEY / BING_API_KEY for the others).
+# [search]
+# provider = "tavily"   # tavily | brave | bing
+
+# MCP servers whose tools the agent may use (`ka-agent mcp add`). Exactly
+# one of `command` (stdio) or `url` (HTTP). `secret:<name>` values resolve
+# from the secret store (`ka-agent secret set <name>`) when the agent
+# starts; in guarded mode every call asks first.
+# [[mcp]]
+# name = "notes"
+# command = "npx"
+# args = ["-y", "some-notes-mcp"]
+# env = { NOTES_TOKEN = "secret:notes.token" }
+#
+# [[mcp]]
+# name = "home"
+# url = "http://homeassistant.local:8123/mcp"
+# headers = { Authorization = "secret:ha.token" }

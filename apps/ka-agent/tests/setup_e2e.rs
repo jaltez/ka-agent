@@ -62,6 +62,14 @@ fn setup_yes_flow_writes_config_env_and_doctor_passes_model() {
         "setup: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // A2: the run ends with the "you're live" card, not a bare "Done".
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("You're live."), "{stdout}");
+    assert!(
+        stdout.contains("Talk to Ka:") && stdout.contains("Try:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("remind me at 18:30"), "{stdout}");
     let cfg = config_of(&root);
     assert!(
         cfg.contains("model = \"anthropic/claude-sonnet-5\""),
@@ -98,8 +106,9 @@ fn setup_yes_flow_writes_config_env_and_doctor_passes_model() {
 fn setup_piped_stdin_answers_each_prompt_and_eof_aborts() {
     let root = temp_root("piped");
     // Full scripted run: key, model default, timezone, workspace, channel
-    // "3" (not now), save, service, test message.
-    let script = b"sk-piped\n\ny\n\n3\ny\nn\nn\n";
+    // "3" (not now), web search default (not now), save, service, test
+    // message.
+    let script = b"sk-piped\n\ny\n\n3\n\ny\nn\nn\n";
     let mut child = ka(&root)
         .args([
             "setup",
@@ -322,5 +331,45 @@ async fn setup_telegram_section_writes_config_with_a_verified_token() {
     );
     assert!(cfg.contains("enabled = true"), "config: {cfg}");
     ka_agent_core::DaemonConfig::load(&root.join("ka-agent.toml")).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A3: `setup search` turns on web search — provider in the config, key in
+/// the engine `.env` the worker reads — and doctor confirms it.
+#[test]
+fn setup_search_section_writes_provider_and_key() {
+    let root = temp_root("search");
+    std::fs::write(root.join("ka-agent.toml"), "mode = \"guarded\"\n").unwrap();
+    let mut child = ka(&root)
+        .args(["setup", "search"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"1\ntvly-test-key\ny\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("Web search is on"), "{text}");
+    let cfg = config_of(&root);
+    assert!(
+        cfg.contains("[search]") && cfg.contains("provider = \"tavily\""),
+        "{cfg}"
+    );
+    let env = std::fs::read_to_string(root.join("data/engine-home/.config/ka/.env")).unwrap();
+    assert!(env.contains("TAVILY_API_KEY=tvly-test-key"), "{env}");
+    let doctor = ka(&root).arg("doctor").output().unwrap();
+    let d = String::from_utf8_lossy(&doctor.stdout);
+    assert!(d.contains("✓ web search tavily (key set)"), "{d}");
     let _ = std::fs::remove_dir_all(&root);
 }

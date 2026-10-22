@@ -79,7 +79,26 @@ impl Paths {
         ] {
             std::fs::create_dir_all(dir)?;
         }
+        // Memory, state.db, logs and the workspace are personal: only the
+        // owner may enter the tree (secrets are 0600 on their own). Applied
+        // on every start, so older 0755 installs tighten themselves.
+        restrict_dir(&self.root)?;
+        let base = ka_agent_core::layout::base_dir();
+        if self.root.starts_with(&base) {
+            restrict_dir(&base)?;
+        }
         Ok(())
+    }
+
+    /// Whether the data root (or the `~/.ka-agent` base above it) lets
+    /// other users in — `None` when private.
+    pub fn loose_permissions(&self) -> Option<PathBuf> {
+        let base = ka_agent_core::layout::base_dir();
+        let mut dirs = vec![self.root.clone()];
+        if self.root.starts_with(&base) {
+            dirs.push(base);
+        }
+        dirs.into_iter().find(|d| is_loose(d))
     }
 }
 
@@ -124,6 +143,31 @@ impl InstanceLock {
         }
         matches!(Self::acquire(paths), Err(LockError::Held(_)))
     }
+}
+
+#[cfg(unix)]
+fn restrict_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if is_loose(dir) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_loose(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_loose(_dir: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]

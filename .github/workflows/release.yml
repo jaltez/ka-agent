@@ -16,47 +16,46 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
-          # macos-13 (the only x86_64 macOS pool) is retiring and its
-          # runners starve for days; macos-14 cross-compiles the x86_64
-          # target natively instead.
-          - target: x86_64-apple-darwin
-            os: macos-14
-          - target: aarch64-apple-darwin
-            os: macos-14
+          - os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+          # One macOS job builds both Darwin targets (x86_64 cross-compiles
+          # natively on the arm64 runner): a second macOS job would wait for
+          # a second runner from a pool that starves for hours.
+          - os: macos-14
+            targets: aarch64-apple-darwin x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Add targets
+        shell: bash
+        run: rustup target add ${{ matrix.targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.os }}
 
-      - name: Build
-        run: cargo build --release -p ka-agent --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Build and package
         shell: bash
         run: |
-          T=${{ matrix.target }}
-          tar czf "ka-agent-$T.tar.gz" -C "target/$T/release" ka-agent
-          shasum -a 256 "ka-agent-$T.tar.gz" > "ka-agent-$T.tar.gz.sha256"
+          for T in ${{ matrix.targets }}; do
+            cargo build --release -p ka-agent --target "$T"
+            tar czf "ka-agent-$T.tar.gz" -C "target/$T/release" ka-agent
+            shasum -a 256 "ka-agent-$T.tar.gz" > "ka-agent-$T.tar.gz.sha256"
+          done
 
       # Sigstore-backed provenance: `gh attestation verify <tarball>
       # --repo jaltez/ka-agent` proves the archive came from this workflow.
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ka-agent-${{ matrix.target }}.tar.gz
+          subject-path: ka-agent-*.tar.gz
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            ka-agent-${{ matrix.target }}.tar.gz
-            ka-agent-${{ matrix.target }}.tar.gz.sha256
+            ka-agent-*.tar.gz
+            ka-agent-*.tar.gz.sha256

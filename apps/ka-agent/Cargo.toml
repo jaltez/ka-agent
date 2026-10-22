@@ -30,6 +30,7 @@ sha2 = { workspace = true }
 jiff = { workspace = true }
 rpassword = { workspace = true }
 toml_edit = { workspace = true }
+terminal_size = { workspace = true }
 
 [lints]
 workspace = true

@@ -144,3 +144,55 @@ fn config_set_fallback_validates_against_the_catalog() {
     assert!(!o.status.success(), "{}", text(&o));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A1: a fresh machine is "not set up yet", never an I/O error.
+#[test]
+fn commands_on_a_fresh_machine_say_not_set_up_yet() {
+    let root = temp_root("fresh");
+    for args in [&["chat"][..], &["run"][..], &["mcp", "list"][..]] {
+        let o = ka(&root, args);
+        assert!(!o.status.success(), "{args:?}");
+        let t = text(&o);
+        assert!(t.contains("isn't set up yet"), "{args:?}: {t}");
+        assert!(t.contains("ka-agent setup"), "{args:?}: {t}");
+        assert!(!t.contains("No such file"), "{args:?}: {t}");
+    }
+    // An existing but broken config keeps the precise error.
+    std::fs::write(root.join("config.toml"), "mode = \"nonsense\"\n").unwrap();
+    let t = text(&ka(&root, &["chat"]));
+    assert!(
+        t.contains("is invalid") && t.contains("unknown mode"),
+        "{t}"
+    );
+    // No arguments and no terminal: a short "start here", not 28 commands.
+    let t = text(&ka(&temp_root("fresh-noarg"), &[]));
+    assert!(t.contains("Start here"), "{t}");
+    assert!(t.lines().count() <= 8, "{t}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B1: the main help is the everyday set; the rest still works.
+#[test]
+fn help_lists_the_everyday_commands_and_hides_the_rest() {
+    let root = temp_root("help");
+    let o = ka(&root, &["--help"]);
+    let t = text(&o);
+    let commands = t
+        .split("Commands:")
+        .nth(1)
+        .and_then(|rest| rest.split("Options:").next())
+        .unwrap_or("");
+    let n = commands
+        .lines()
+        .filter(|l| l.starts_with("  ") && !l.trim().is_empty())
+        .count();
+    assert!(n <= 16, "{n} commands listed:\n{t}");
+    assert!(!t.contains("SEED.md"), "{t}");
+    assert!(t.contains("More commands:"), "{t}");
+    for hidden in ["grant", "plugin", "purge", "identity", "run"] {
+        let o = ka(&root, &[hidden, "--help"]);
+        assert!(o.status.success(), "{hidden}: {}", text(&o));
+        assert!(!text(&o).contains("SEED.md"), "{hidden}: {}", text(&o));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

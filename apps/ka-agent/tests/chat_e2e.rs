@@ -186,7 +186,8 @@ fn idle_worker_is_stopped_then_restarted_on_demand() {
     // Settled and idle: the maintenance loop reaps the worker within its
     // 2 s timeout plus one loop interval, and books it as deliberate.
     chat.expect("worker stopped", Duration::from_secs(20));
-    chat.expect("session Idle", Duration::from_secs(5));
+    chat.send("/status");
+    chat.expect("worker: stopped", Duration::from_secs(5));
 
     // The next message works exactly as before: a fresh worker on the
     // resumed strand, with zero crash bookkeeping.
@@ -692,6 +693,36 @@ fn operator_mcp_server_tools_are_callable() {
     let text = std::fs::read_to_string(&note)
         .unwrap_or_else(|e| panic!("{}: {e}\n{}", note.display(), chat.transcript()));
     assert!(text.contains("hello via operator mcp"), "{text}");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// C2: a settled turn ends with its footer (with duration), not a
+/// "session Idle" line after it.
+#[test]
+fn settled_turn_prints_a_footer_and_no_session_noise() {
+    let root = temp_root("quiet");
+    let sc = scenario_file(
+        &root,
+        "q.json",
+        r#"{ "steps": [ {"text": "quiet answer"} ], "stop": "done" }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.send("hello");
+    chat.expect("quiet answer", Duration::from_secs(30));
+    chat.expect("· turn done · ", Duration::from_secs(10));
+    chat.send("/status");
+    chat.expect("● idle", Duration::from_secs(10));
+    let t = chat.transcript();
+    assert!(!t.contains("session Idle"), "{t}");
+    let footer = t
+        .lines()
+        .find(|l| l.starts_with("· turn done"))
+        .unwrap_or("");
+    assert!(
+        footer.contains('s') && footer.contains("tokens"),
+        "{footer}"
+    );
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }

@@ -270,3 +270,41 @@ fn profiles_get_their_own_config_and_the_active_one_sticks() {
         base.join("config.toml").display().to_string()
     );
 }
+
+/// L1: a fresh tree is private (0700 base and profile root); a loose one is
+/// reported by doctor and tightened by the next start.
+#[test]
+fn data_tree_is_private_and_doctor_flags_a_loose_one() {
+    let home = home();
+    let base = home.join(".ka-agent");
+    let root = base.join("profiles/default");
+    // `identity list` opens the store, which creates the tree.
+    let o = ka(&home, &["identity", "list"]);
+    assert!(o.status.success(), "{o:?}");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    // A fresh tree is created by the store open; `chat`/`run` tighten it.
+    std::fs::write(base.join("config.toml"), "mode = \"guarded\"\n").unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let d = ka(&home, &["doctor"]);
+    let out = String::from_utf8_lossy(&d.stdout);
+    assert!(out.contains("readable by other users"), "{out}");
+    // Any runtime start applies the fix (chat exits at once on closed stdin).
+    let o = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("chat")
+        .env("HOME", &home)
+        .env_remove("KA_AGENT_DATA_DIR")
+        .env_remove("KA_AGENT_CONFIG")
+        .env_remove("KA_AGENT_HOME")
+        .env_remove("KA_AGENT_PROFILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let _ = o;
+    assert_eq!(mode(&root), 0o700, "profile root");
+    assert_eq!(mode(&base), 0o700, "base");
+    let d = ka(&home, &["doctor"]);
+    let out = String::from_utf8_lossy(&d.stdout);
+    assert!(!out.contains("readable by other users"), "{out}");
+    let _ = std::fs::remove_dir_all(&home);
+}

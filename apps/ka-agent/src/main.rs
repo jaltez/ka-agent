@@ -35,6 +35,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "Ka Agent — resident assistant on the Ka engine"
 )]
+#[command(after_help = ADVANCED_HELP)]
 struct Cli {
     /// Profile to act on (overrides $KA_AGENT_PROFILE and `profile use`).
     #[arg(short = 'p', long, global = true, value_name = "NAME")]
@@ -46,11 +47,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// First-run wizard: provider, live key check, model, timezone,
-    /// channels, service, and a verified first reply.
+    /// Guided setup: model and key, phone, web search, background service.
     #[command(visible_alias = "init")]
     Setup {
-        /// Section: all | model | telegram | matrix | service.
+        /// Section: all | model | telegram | matrix | service | search.
         section: Option<String>,
         /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
@@ -77,7 +77,7 @@ enum Command {
         #[arg(long)]
         no_service: bool,
     },
-    /// Local chat surface over the runtime.
+    /// Talk to Ka in this terminal.
     Chat {
         /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
@@ -87,7 +87,8 @@ enum Command {
         scenario: Option<PathBuf>,
     },
     /// Run the resident daemon: runtime + channels + admin socket.
-    #[command(alias = "daemon")]
+
+    #[command(alias = "daemon", hide = true)]
     Run {
         /// Config path (default: the active profile's, `ka-agent config path`).
         /// Invalid config exits 1 (no fallback to defaults).
@@ -102,10 +103,12 @@ enum Command {
     },
     /// Ask a running daemon to exit gracefully (the background service
     /// restarts it).
+    #[command(hide = true)]
     Restart,
-    /// Query a running daemon over its admin socket.
+    /// Is Ka running, what is it doing, what did it cost today.
     Status,
     /// Issue a one-time pairing code for a channel (`ka-agent pair telegram`).
+    #[command(hide = true)]
     Pair {
         /// telegram | matrix
         channel: String,
@@ -113,7 +116,7 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Show or switch the model (`ka-agent model provider/model`).
+    /// Show or switch the model (`ka-agent model openai/gpt-5.1`).
     Model {
         /// Omit to show the current model and its key state.
         selector: Option<String>,
@@ -121,20 +124,21 @@ enum Command {
         config: Option<PathBuf>,
     },
     /// List models per provider.
+    #[command(hide = true)]
     Models {
         /// Omit for every provider.
         provider: Option<String>,
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Inspect or change the config (format-preserving, live reload).
+    /// Read or change settings (comments kept, applied live).
     Config {
         #[command(subcommand)]
         action: ConfigAction,
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Install, start, stop or remove the background service; `ka-agent logs`.
+    /// Run Ka in the background, starting at login.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -148,12 +152,12 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Manage profiles: independent instances (data, config, service).
+    /// Separate instances (work, home…): own data, settings, service.
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
     },
-    /// Spend per day: turns, tokens, cost (reads the store directly).
+    /// What Ka spent, per day.
     Usage {
         /// How many days back (1-366, default 30).
         #[arg(long, default_value_t = 30)]
@@ -168,37 +172,42 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
     },
-    /// Link channel identities to this instance's operator (SEED.md §8.1).
+    /// Link channel identities (Telegram/Matrix users) to you, the operator.
+    #[command(hide = true)]
     Identity {
         #[command(subcommand)]
         action: IdentityAction,
     },
-    /// Install, inspect and manage plugins (SEED.md §6).
+    /// Install, inspect and manage signed, sandboxed plugins.
+    #[command(hide = true)]
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
     },
     /// Manage engine provider keys (ka's .env tier under the data root).
+    #[command(hide = true)]
     Key {
         #[command(subcommand)]
         action: KeyAction,
     },
     /// Manage channel and connector secrets (0600 files under <data>/secrets).
+    #[command(hide = true)]
     Secret {
         #[command(subcommand)]
         action: SecretAction,
     },
-    /// Inspect or edit the stable-memory Markdown files.
+    /// What Ka remembers (plain Markdown you can edit).
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
     },
-    /// Manage skills: list, enable, disable (SEED.md §9.1).
+    /// Manage skills: list, enable, disable.
+    #[command(hide = true)]
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
     },
-    /// Open the web control panel in your browser (one-shot login link).
+    /// Open the web panel in your browser.
     Dashboard {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -206,7 +215,7 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    /// Instance health report.
+    /// Check everything and say how to fix what isn't right.
     Doctor {
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -224,12 +233,14 @@ enum Command {
     /// Hidden: the MCP bridge the Ka engine spawns as `kagent`.
     #[command(name = "__mcp", hide = true)]
     McpBridge,
-    /// Manage tool grants (SEED.md §8.2).
+    /// Manage tool grants (what the agent may reach: hosts, repos, …).
+    #[command(hide = true)]
     Grant {
         #[command(subcommand)]
         action: GrantAction,
     },
     /// Write a restorable backup (state + memory + notes + config).
+    #[command(hide = true)]
     Backup {
         /// Output directory (default: <data>/backups/<timestamp>, pruned).
         out: Option<PathBuf>,
@@ -241,6 +252,7 @@ enum Command {
         config: Option<PathBuf>,
     },
     /// Restore an instance from a backup into the data root.
+    #[command(hide = true)]
     Restore {
         /// Backup directory (as written by `ka-agent backup`).
         dir: PathBuf,
@@ -249,11 +261,13 @@ enum Command {
         force: bool,
     },
     /// Export instance data to a directory.
+    #[command(hide = true)]
     Export {
         /// Output directory (created if absent).
         out: PathBuf,
     },
     /// Delete all instance data.
+    #[command(hide = true)]
     Purge {
         /// Skip confirmation prompt.
         #[arg(long)]
@@ -459,7 +473,38 @@ enum SkillsAction {
     },
 }
 
-use clap::CommandFactory as _;
+/// The footer of `ka-agent --help`: the commands kept out of the main list
+/// (they all work; `ka-agent <command> --help` explains each).
+const ADVANCED_HELP: &str = "\
+More commands: run restart pair models key secret identity grant plugin skills
+               backup restore export purge — `ka-agent <command> --help`";
+
+/// What a non-interactive `ka-agent` prints on a fresh machine: where to
+/// start, not the full command list.
+const START_HERE: &str = "\
+Ka Agent isn't set up yet. Start here:
+  ka-agent setup       guided setup, about 3 minutes
+  ka-agent chat        talk to it in this terminal
+  ka-agent status      is it running, what it costs
+  ka-agent dashboard   open the web panel
+  ka-agent --help      everything else
+";
+
+/// One wording for "this config can't be used", everywhere a command
+/// needs one: a missing file is "not set up yet", never an I/O error.
+pub(crate) fn config_problem(path: &std::path::Path, err: &dyn std::fmt::Display) -> String {
+    if path.exists() {
+        format!(
+            "ka-agent: config {} is invalid: {err}\nfix it with `ka-agent config edit`",
+            path.display()
+        )
+    } else {
+        format!(
+            "ka-agent: Ka Agent isn't set up yet ({} missing) — run `ka-agent setup` (about 3 minutes)",
+            path.display()
+        )
+    }
+}
 
 fn config_path(flag: &Option<PathBuf>) -> PathBuf {
     flag.clone().unwrap_or_else(default_config_path)
@@ -531,7 +576,7 @@ fn main() -> std::process::ExitCode {
                     no_service: false,
                 }
             } else {
-                Cli::command().print_help().ok();
+                print!("{}", START_HERE);
                 return std::process::ExitCode::from(2);
             }
         }
@@ -574,9 +619,10 @@ fn main() -> std::process::ExitCode {
                 Some("telegram") => setup::Section::Telegram,
                 Some("matrix") => setup::Section::Matrix,
                 Some("service") => setup::Section::Service,
+                Some("search") => setup::Section::Search,
                 Some(other) => {
                     eprintln!(
-                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service"
+                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search"
                     );
                     return std::process::ExitCode::FAILURE;
                 }

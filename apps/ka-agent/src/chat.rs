@@ -55,10 +55,7 @@ impl Backend {
         // config would write to the real data root with a workspace the
         // operator never chose.
         let cfg = ka_agent_core::DaemonConfig::load(config).map_err(|e| {
-            eprintln!(
-                "ka-agent: config ({}) invalid: {e}\nrun `ka-agent setup` to create one",
-                config.display()
-            );
+            eprintln!("{}", crate::config_problem(config, &e));
             std::process::ExitCode::FAILURE
         })?;
         let lock = match InstanceLock::acquire(paths) {
@@ -233,20 +230,102 @@ async fn write_line(
 
 /// Terminal rendering state.
 struct Term {
-    /// Dim progress notes (stdout is a terminal and `NO_COLOR` is unset).
+    /// Dim progress notes and rendered Markdown (stdout is a terminal and
+    /// `NO_COLOR` is unset). Off, replies print verbatim — pipes and tests
+    /// see exactly what the model wrote (minus control characters).
     color: bool,
+    /// The reply line being streamed (printed raw as it arrives, rewritten
+    /// rendered once its newline lands).
+    line: String,
+    /// Inside a fenced code block.
+    in_fence: bool,
+    /// When the current turn started (for the footer's duration).
+    turn_started: Option<std::time::Instant>,
 }
 
 impl Term {
     fn new() -> Self {
         Self {
             color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            line: String::new(),
+            in_fence: false,
+            turn_started: None,
         }
+    }
+
+    /// Stream a reply delta: text shows immediately; each completed line is
+    /// redrawn with its Markdown rendered.
+    fn delta(&mut self, text: &str) {
+        use ka_agent_core::markdown::{Target, escape};
+        if !self.color {
+            print!("{}", escape(text, Target::Ansi));
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        let mut parts = text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            print!("{}", escape(part, Target::Ansi));
+            self.line.push_str(part);
+            if parts.peek().is_some() {
+                self.complete_line();
+                println!();
+            }
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Redraw the pending line rendered (before other output or at the end
+    /// of a reply); a no-op when nothing is pending.
+    fn settle(&mut self) {
+        if self.color && !self.line.is_empty() {
+            self.complete_line();
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    /// Replace the raw echo of `self.line` (possibly soft-wrapped over
+    /// several rows) with its rendered form; leaves the cursor at its end.
+    fn complete_line(&mut self) {
+        use ka_agent_core::markdown::{
+            Target, fence_lang, render_code_line, render_fence_open, render_line,
+        };
+        let line = std::mem::take(&mut self.line);
+        let rendered = if self.in_fence {
+            if line.trim() == "```" {
+                self.in_fence = false;
+                "\x1b[2m──\x1b[22m".to_string()
+            } else {
+                render_code_line(&line, Target::Ansi)
+            }
+        } else if let Some(rest) = line.trim_start().strip_prefix("```") {
+            self.in_fence = true;
+            render_fence_open(fence_lang(rest))
+        } else {
+            render_line(&line, Target::Ansi)
+        };
+        let cols = terminal_size::terminal_size()
+            .map(|(w, _)| usize::from(w.0).max(1))
+            .unwrap_or(80);
+        let width = line.chars().count();
+        let rows = width.div_ceil(cols).max(1);
+        if rows > 1 {
+            print!("\x1b[{}A", rows - 1);
+        }
+        print!("\r\x1b[J{rendered}");
+    }
+
+    /// A reply ended: render what is left and forget fence state.
+    fn end_reply(&mut self) {
+        self.settle();
+        self.in_fence = false;
     }
 }
 
 /// Print one event. The strings are the console's long-standing wording.
 fn render(ev: &SurfaceEvent, out: &mut Term) {
+    if !matches!(ev, SurfaceEvent::Delta { .. }) {
+        out.settle();
+    }
     match ev {
         SurfaceEvent::Hello { .. } => {}
         SurfaceEvent::Reply { text } => println!("{text}"),
@@ -255,11 +334,11 @@ fn render(ev: &SurfaceEvent, out: &mut Term) {
                 println!("\n» you ({source}): {text}");
             }
         }
-        SurfaceEvent::TurnStarted => println!(),
-        SurfaceEvent::Delta { text } => {
-            print!("{text}");
-            let _ = std::io::stdout().flush();
+        SurfaceEvent::TurnStarted => {
+            out.turn_started = Some(std::time::Instant::now());
+            println!();
         }
+        SurfaceEvent::Delta { text } => out.delta(text),
         SurfaceEvent::Note { text } => {
             if out.color {
                 println!("\n\x1b[2m· {text}\x1b[0m");
@@ -292,8 +371,22 @@ fn render(ev: &SurfaceEvent, out: &mut Term) {
             stop,
             cost_usd,
             tokens,
-        } => println!("\n· turn {stop} · ${cost_usd:.4} · {tokens} tokens"),
-        SurfaceEvent::Status { status } => println!("· session {status}"),
+        } => {
+            out.end_reply();
+            let took = out
+                .turn_started
+                .take()
+                .map(|t| format!(" · {:.1}s", t.elapsed().as_secs_f64()))
+                .unwrap_or_default();
+            println!("\n· turn {stop}{took} · ${cost_usd:.4} · {tokens} tokens");
+        }
+        // Only states that need the operator: a settled turn is already
+        // announced by its footer.
+        SurfaceEvent::Status { status } => match status.as_str() {
+            "Paused" => println!("· ⏸ paused — /resume to continue (budget or provider key)"),
+            "Degraded" => println!("· ⚠ degraded — the worker keeps crashing; /new starts fresh"),
+            _ => {}
+        },
         SurfaceEvent::Error { class, message } => println!("\n! [{class}] {message}"),
     }
 }
@@ -348,12 +441,19 @@ fn attached_extras(paths: &Paths, config: &Path) -> Vec<String> {
 /// shutdown). Lines ending in `\` continue; `None` is end of input.
 fn spawn_input(prompt: bool) -> tokio::sync::mpsc::UnboundedReceiver<Option<String>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // `work> ` under a non-default profile: never type into the wrong one.
+    let profile = ka_agent_core::layout::profile_name();
+    let head = if profile == "default" || std::env::var_os("KA_AGENT_DATA_DIR").is_some() {
+        "> ".to_string()
+    } else {
+        format!("{profile}> ")
+    };
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut acc = String::new();
         loop {
             if prompt {
-                print!("{}", if acc.is_empty() { "> " } else { "… " });
+                print!("{}", if acc.is_empty() { &head } else { "… " });
                 let _ = std::io::stdout().flush();
             }
             let mut line = String::new();

@@ -17,9 +17,10 @@ ka-agent                              # first run: the setup wizard
 
 The wizard takes about three minutes: it picks a provider, verifies the API
 key live, picks a model, detects your timezone, offers to pair Telegram or
-Matrix by one-time code, offers to install the background service, and ends
-with a real first reply. Nothing is written until you confirm. From source
-instead: `cargo install --path apps/ka-agent`.
+Matrix by one-time code, offers web search, offers to install the background
+service, and ends with a real first reply and a "you're live" card. Nothing
+is written until you confirm. From source instead: `cargo install --path
+apps/ka-agent`.
 
 Installer knobs (all optional): `KA_AGENT_INSTALL_DIR` (default
 `~/.local/bin`), `KA_AGENT_NO_SETUP=1`, `KA_AGENT_INSTALL_FROM=<tarball>`.
@@ -73,6 +74,26 @@ Scheduling times are always your local time:
 ```
 
 `Ctrl-C` stops a running reply, twice quits; `/quit` leaves the terminal chat.
+
+## What it can do
+
+Out of the box Ka works in its workspace (read, write, edit, run commands —
+behind approvals in the default `guarded` mode), keeps notes and memory,
+and schedules. Three settings widen its reach:
+
+```sh
+ka-agent setup search                 # web search: Tavily (free tier) or Brave
+ka-agent mcp add notes -- npx -y some-notes-mcp     # any MCP server's tools
+ka-agent mcp add home --url http://homeassistant.local:8123/mcp \
+  --header Authorization=secret:ha.token            # secrets stay in the store
+ka-agent config set fallback '["openai/gpt-5.1"]'   # if the main model fails
+```
+
+MCP tools appear to the model as `<server>.<tool>`; in `guarded` mode each
+call asks first (the card names the tool). `secret:<name>` values come from
+`ka-agent secret set <name>` when the agent starts and never touch the
+config file. `ka-agent status` shows a `tools:` line with what is on, and
+`ka-agent doctor` checks the keys and secrets they need.
 
 ## Channels (phone)
 

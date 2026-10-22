@@ -348,6 +348,14 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
         }
     }
 
+    if let Some(dir) = paths.loose_permissions() {
+        rep.warn(&format!(
+            "{} is readable by other users — fixed on the next start, or now: chmod 700 {}",
+            dir.display(),
+            dir.display()
+        ));
+    }
+
     // Stale pre-0.3 tree next to the new one (migration only runs while the
     // new base does not exist): say which one is live.
     if !std::env::var_os("KA_AGENT_HOME").is_some_and(|v| !v.is_empty())

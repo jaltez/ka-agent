@@ -90,10 +90,7 @@ pub async fn run_daemon(
     let cfg = match DaemonConfig::load(&config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "ka-agent: config ({}) invalid: {e}\nrun `ka-agent setup` to create one",
-                config.display()
-            );
+            eprintln!("{}", crate::config_problem(&config, &e));
             return std::process::ExitCode::FAILURE;
         }
     };

@@ -1,6 +1,6 @@
 //! The Telegram channel (SEED.md §5): Bot API long polling in, throttled
 //! messages + approval keyboards out. Final answers and notices render a
-//! safe HTML subset (`tg_format`, everything escaped first) with a
+//! safe HTML subset (`ka_agent_core::markdown`, everything escaped first) with a
 //! plain-text fallback; router replies and approval cards stay plain.
 
 use std::collections::HashMap;
@@ -19,7 +19,6 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::pairing::{self, Redeem};
-use crate::tg_format::to_telegram_html;
 
 const POLL_TIMEOUT_SECS: u64 = 25;
 const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(40);
@@ -168,7 +167,7 @@ impl TelegramClient {
     }
 
     /// `sendMessage` with `parse_mode: HTML`; the caller supplies markup
-    /// built by `tg_format` (input already escaped).
+    /// built by `ka_agent_core::markdown` (input already escaped).
     pub(crate) async fn send_message_html(
         &self,
         chat_id: i64,
@@ -385,7 +384,8 @@ impl SurfaceInner {
         }
         let Some(chat) = self.chat() else { return };
         let plain = balance_fences(text);
-        let html = to_telegram_html(&plain);
+        let html =
+            ka_agent_core::markdown::render(&plain, ka_agent_core::markdown::Target::Telegram);
         let mut fallback = true;
         if html.chars().count() <= MAX_MESSAGE_CHARS {
             match self.client.send_message_html(chat, &html, None).await {

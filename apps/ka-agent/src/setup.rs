@@ -26,6 +26,7 @@ pub enum Section {
     Telegram,
     Matrix,
     Service,
+    Search,
 }
 
 /// Parsed `ka-agent setup` arguments.
@@ -75,6 +76,8 @@ struct Setup {
     telegram_user: Option<String>,
     matrix: Option<(String, String)>, // homeserver, user_id (bot)
     matrix_operator: Option<String>,
+    /// Web search chosen in setup: provider and, when newly entered, its key.
+    search: Option<(String, Option<String>)>,
 }
 
 fn prompt_err(e: PromptError) -> std::process::ExitCode {
@@ -148,6 +151,7 @@ impl Setup {
                 "Telegram".into(),
                 "Matrix".into(),
                 "Background service".into(),
+                "Web search".into(),
                 "Everything".into(),
             ];
             let pick = prompt::choice("What do you want to set up?", &options, 0)?;
@@ -156,6 +160,7 @@ impl Setup {
                 1 => Section::Telegram,
                 2 => Section::Matrix,
                 3 => Section::Service,
+                4 => Section::Search,
                 _ => Section::All,
             };
             if self.args.section != Section::All {
@@ -173,6 +178,7 @@ impl Setup {
         } else {
             None
         };
+        self.step_search()?;
         if !self.confirm_and_write().await? {
             return Ok(std::process::ExitCode::SUCCESS);
         }
@@ -207,6 +213,15 @@ impl Setup {
                 self.post_write(Some("matrix")).await
             }
             Section::Service => self.step_service(),
+            Section::Search => {
+                self.step_search()?;
+                if self.search.is_none() || !self.confirm_and_write().await? {
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                crate::config_cli::apply_live(&self.paths, &self.args.config);
+                println!("Web search is on — try: \"search the web for …\"");
+                Ok(std::process::ExitCode::SUCCESS)
+            }
             Section::All => unreachable!("handled by wizard()"),
         }
     }
@@ -270,9 +285,7 @@ impl Setup {
         self.step_timezone_yes()?;
         self.step_workspace_yes()?;
         self.confirm_and_write().await?;
-        println!(
-            "Done. Next:\n  ka-agent              chat in this terminal\n  ka-agent dashboard    open the web control panel\n  ka-agent doctor       check everything"
-        );
+        print!("{}", self.live_card(false));
         Ok(std::process::ExitCode::SUCCESS)
     }
 
@@ -590,6 +603,44 @@ impl Setup {
         }
     }
 
+    /// Optional web search (engine `web_search`): provider + key into the
+    /// engine `.env` tier the worker reads.
+    fn step_search(&mut self) -> Result<(), PromptError> {
+        let options = vec![
+            "Tavily — free key, 1,000 searches a month (tavily.com)".to_string(),
+            "Brave Search API (brave.com/search/api)".to_string(),
+            "Not now".to_string(),
+        ];
+        let provider =
+            match prompt::choice("Let Ka search the web (news, prices, docs)?", &options, 2)? {
+                0 => "tavily",
+                1 => "brave",
+                _ => return Ok(()),
+            };
+        let env = ka_agent_core::Search {
+            provider: provider.to_string(),
+            base_url: None,
+        }
+        .key_env();
+        let key = if self.engine_env().contains_key(&env) {
+            println!("✓ {env} already saved");
+            None
+        } else if let Some(v) = env_lookup(&env)
+            && prompt::yes_no(&format!("Use {env} from your environment?"), true)?
+        {
+            Some(v)
+        } else {
+            let k = prompt::secret(&env)?;
+            if k.trim().is_empty() {
+                println!("no key — web search stays off");
+                return Ok(());
+            }
+            Some(k.trim().to_string())
+        };
+        self.search = Some((provider.to_string(), key));
+        Ok(())
+    }
+
     async fn setup_telegram(&mut self) -> Result<(), PromptError> {
         println!("In Telegram, open @BotFather → /newbot → copy the token it gives you.");
         loop {
@@ -669,6 +720,9 @@ impl Setup {
         if let Some((hs, bot)) = &self.matrix {
             println!("matrix    : {bot} on {hs}");
         }
+        if let Some((provider, _)) = &self.search {
+            println!("search    : {provider}");
+        }
         // `--yes` never reads input: the summary IS the confirmation.
         if !self.args.yes && !prompt::yes_no("Save this setup?", true)? {
             println!("nothing was written");
@@ -708,6 +762,22 @@ impl Setup {
         if self.fresh {
             ka_agent_core::config_file::set(&self.args.config, "mode", "\"guarded\"")
                 .map_err(|e| e.to_string())?;
+        }
+        if let Some((provider, key)) = &self.search {
+            if let Some(key) = key {
+                let env = ka_agent_core::Search {
+                    provider: provider.clone(),
+                    base_url: None,
+                }
+                .key_env();
+                catalog::upsert_env_file(&self.env_file(), &env, key).map_err(|e| e.to_string())?;
+            }
+            ka_agent_core::config_file::set(
+                &self.args.config,
+                "search.provider",
+                &format!("{provider:?}"),
+            )
+            .map_err(|e| e.to_string())?;
         }
         if let Some(token) = &self.telegram_token {
             // `token_secret` before `enabled`: every config_file::set
@@ -901,14 +971,36 @@ impl Setup {
     }
 
     fn final_lines(&self, paired: bool) {
-        println!();
-        println!("Done. Next:");
-        println!("  ka-agent              chat in this terminal");
-        println!("  ka-agent dashboard    open the web control panel");
+        print!("{}", self.live_card(paired));
+    }
+
+    /// The end of setup: where to talk, what to try (only what this
+    /// install can actually do), where to look when something is off.
+    fn live_card(&self, paired: bool) -> String {
+        let mut out = String::from(
+            "\nYou're live.\n\nTalk to Ka:\n  ka-agent             in this terminal\n",
+        );
         if paired && let Some(u) = &self.telegram_user {
-            println!("  message @{u} on Telegram");
+            out.push_str(&format!("  @{u}  on Telegram\n"));
         }
-        println!("  ka-agent doctor       check everything");
+        if self.matrix.is_some() {
+            out.push_str("  your Matrix room\n");
+        }
+        out.push_str("  ka-agent dashboard   in the browser\n\nTry:\n");
+        out.push_str("  \"remind me at 18:30 to call mum\"\n");
+        out.push_str("  \"remember that I prefer short answers\"\n");
+        let search_on = self.search.is_some()
+            || self
+                .doc
+                .get("search")
+                .and_then(|s| s.get("provider"))
+                .is_some();
+        if search_on {
+            out.push_str("  \"search the web for this week's tech news\"\n");
+        }
+        out.push_str("  /cron add every day at 08:00 summarise my notes\n");
+        out.push_str("\nHealth: ka-agent status · ka-agent doctor\n");
+        out
     }
 }
 
@@ -988,6 +1080,7 @@ pub async fn run(args: SetupArgs) -> std::process::ExitCode {
         telegram_user: None,
         matrix: None,
         matrix_operator: None,
+        search: None,
     };
     setup.run().await
 }
