@@ -1,7 +1,9 @@
-//! `ka-agent update [--check] [--version X]`: fetch the release for this
-//! machine, verify its checksum, replace the running binary atomically, and
-//! restart every installed profile's service. `status`/`doctor` surface an
-//! available update (cached daily, `update.check = false` opts out).
+//! `ka-agent update`: self-update. One line says where it is going
+//! (`0.8.1 → 0.9.0`); the rest is quiet unless something needs the operator.
+//! Downloads the release for this machine, verifies its checksum, replaces
+//! the running binary atomically, and restarts every installed profile's
+//! service. `update check` only reports; `doctor` surfaces a cached newer
+//! release.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -114,13 +116,12 @@ pub fn update(action: UpdateAction) -> ExitCode {
     };
     let latest = release.tag_name.trim_start_matches('v').to_string();
     if !is_newer(&latest, current) && want.is_none() {
-        println!("ka-agent {current} is up to date (latest: {latest})");
+        println!("ka-agent {current} (up to date)");
         record_check(&paths, &latest);
         return ExitCode::SUCCESS;
     }
+    println!("{current} → {latest}");
     if matches!(action, UpdateAction::Check { .. }) {
-        println!("update available: {current} → {latest}");
-        println!("  ka-agent update        install and restart the service");
         record_check(&paths, &latest);
         return ExitCode::SUCCESS;
     }
@@ -134,7 +135,6 @@ pub fn update(action: UpdateAction) -> ExitCode {
     let Some(asset) = release.assets.iter().find(|a| a.name == name) else {
         return fail(format!("release {latest} has no {name}"));
     };
-    println!("downloading {name} ({latest})…");
     let tarball = match http_get(&asset.browser_download_url) {
         Ok(b) => b,
         Err(e) => return fail(e),
@@ -158,6 +158,7 @@ pub fn update(action: UpdateAction) -> ExitCode {
         ));
     }
     record_check(&paths, &latest);
+    println!("✓ verified");
 
     // Extract with the system tar (no tar crate; the archive is one file).
     // KA_AGENT_INSTALL_TO overrides the target (tests); the real path is
@@ -189,7 +190,6 @@ pub fn update(action: UpdateAction) -> ExitCode {
         ));
     }
     let _ = std::fs::remove_file(&staging);
-    println!("installed {latest} → {}", exe.display());
 
     // Restart every installed profile's service (they run the old binary).
     let mut restarted = 0;
@@ -198,23 +198,20 @@ pub fn update(action: UpdateAction) -> ExitCode {
             if !crate::service::is_installed_for(&p) {
                 continue;
             }
-            println!("restarting profile {p}…");
-            match crate::admin::request(
-                &ka_agent_runtime::Paths::new(ka_agent_core::layout::compose_profile_root(
-                    &ka_agent_core::layout::base_dir(),
-                    &p,
-                )),
-                &serde_json::json!({"op": "shutdown"}),
-            ) {
-                Ok(_) => restarted += 1,
-                Err(e) => println!("  {p}: not running ({e})"),
+            let paths = ka_agent_runtime::Paths::new(ka_agent_core::layout::compose_profile_root(
+                &ka_agent_core::layout::base_dir(),
+                &p,
+            ));
+            if crate::admin::request(&paths, &serde_json::json!({"op": "shutdown"})).is_ok() {
+                restarted += 1;
             }
         }
     }
     if restarted > 0 {
-        println!("{restarted} service(s) restarting (the service manager brings them back)");
+        println!("✓ installed · service restarting");
+    } else {
+        println!("✓ installed · ka-agent --version to confirm");
     }
-    println!("updated to {latest} — verify with: ka-agent --version && ka-agent doctor");
     ExitCode::SUCCESS
 }
 

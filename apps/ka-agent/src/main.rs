@@ -57,8 +57,7 @@ enum Command {
         #[command(subcommand)]
         action: ImportAction,
     },
-    /// Install a newer release: download, checksum, swap, restart.
-    #[command(hide = true)]
+    /// Self-update: download the newest release, verify, swap, restart.
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,
@@ -179,6 +178,7 @@ enum Command {
         action: Option<ApprovalsAction>,
     },
     /// A morning briefing: calendar, reminders, what waits for you.
+    #[command(hide = true)]
     Briefing {
         #[command(subcommand)]
         action: Option<BriefingAction>,
@@ -633,8 +633,8 @@ fn completions(shell: clap_complete::Shell) -> std::process::ExitCode {
 /// The footer of `ka-agent --help`: the commands kept out of the main list
 /// (they all work; `ka-agent <command> --help` explains each).
 const ADVANCED_HELP: &str = "\
-More commands: logs run restart pair models key secret identity grant plugin
-               skills backup restore export purge completions
+More commands: logs briefing run restart pair models key secret identity grant
+               plugin skills backup restore export purge completions
                — `ka-agent <command> --help`";
 
 /// What a non-interactive `ka-agent` prints on a fresh machine: where to

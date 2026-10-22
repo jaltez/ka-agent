@@ -373,7 +373,11 @@ fn update_downloads_verifies_and_swaps() {
     };
 
     let (ok, text) = run(&good_api, &["update", "check"]);
-    assert!(ok && text.contains("update available"), "{text}");
+    assert!(
+        ok && text.contains("→ 9.9.9"),
+        "current → target on one line: {text}"
+    );
+    assert_eq!(text.lines().count(), 1, "check output is one line: {text}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old binary");
 
     let (ok, text) = run(&bad_api, &["update", "run"]);

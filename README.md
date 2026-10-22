@@ -197,10 +197,17 @@ itself to the new layout on the next run.
 ## Staying current, switching in
 
 ```sh
-ka-agent update --check   # is there a newer release?
-ka-agent update            # download, checksum-verify, swap, restart the service(s)
-ka-agent import hermes     # memory + skills from Hermes (also: openclaw, claude, codex)
+$ ka-agent update check
+0.8.1 → 0.9.0
+$ ka-agent update
+0.8.1 → 0.9.0
+✓ verified
+✓ installed · service restarting
 ```
+
+The checksum must match before anything moves; a mismatch installs nothing.
+`ka-agent import hermes` (also `openclaw`, `claude`, `codex`) brings memory
+and skills from another agent.
 
 Imports respect the rules: another agent's memory arrives as **candidates**
 you accept one by one, skills land in the shared library.
