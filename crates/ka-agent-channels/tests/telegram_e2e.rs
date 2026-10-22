@@ -635,3 +635,67 @@ async fn memory_proposal_card_accepts_with_one_tap() {
     assert!(facts.contains("Prefers short answers"), "{facts}");
     stop(&mut stack).await;
 }
+
+/// H1: from the phone the mode only gets stricter.
+#[tokio::test(flavor = "multi_thread")]
+async fn phone_can_tighten_but_not_loosen_the_mode() {
+    let mut stack = spawn_channel(vec![42], "tok-mode").await;
+    let cfg_path = stack.db_path.parent().unwrap().join("ka-agent.toml");
+    std::fs::write(&cfg_path, "mode = \"guarded\"\n").unwrap();
+    stack.runtime.set_config_path(cfg_path.clone());
+    stack.server.push_text_message(1, 7, 42, "/mode free");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("only get stricter")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("loosening refused");
+    stack.server.push_text_message(2, 7, 42, "/mode plan");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("mode → plan")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("tightening allowed");
+    assert!(
+        std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .contains("mode = \"plan\"")
+    );
+    stop(&mut stack).await;
+}
+
+/// H2: allow-for-session is not offered from the phone.
+#[tokio::test(flavor = "multi_thread")]
+async fn phone_cannot_allow_for_the_session() {
+    let mut stack = spawn_channel(vec![42], "tok-sess").await;
+    stack.server.push_text_message(1, 7, 42, "/y session");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("only offered in the terminal")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("refused on the phone");
+    stop(&mut stack).await;
+}

@@ -70,6 +70,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         telegram: true,
     },
     CommandSpec {
+        name: "mode",
+        args: "[guarded|accept_edits|plan|free]",
+        summary: "how much the agent may do without asking",
+        example: "/mode plan",
+        telegram: true,
+    },
+    CommandSpec {
         name: "remember",
         args: "<fact>",
         summary: "keep a durable fact",
@@ -148,8 +155,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "y",
-        args: "[id]",
-        summary: "allow a pending approval",
+        args: "[id] [session]",
+        summary: "allow a pending approval (`session`: and identical ones until /new)",
         example: "/y",
         telegram: true,
     },
@@ -388,6 +395,19 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
                     }
                     Err(e) => Outcome::Reply(format!("! [model] {e}")),
                 }
+            }
+        }
+        "/mode" => {
+            let rest = rest_of("/mode");
+            if rest.is_empty() {
+                let current = runtime.config().mode.clone();
+                return Outcome::Reply(format!(
+                    "mode {current} — /mode guarded (asks before acting) · accept_edits (edits without asking) · plan (read and plan only) · free (acts without asking)"
+                ));
+            }
+            match runtime.set_mode(rest, source).await {
+                Ok(mode) => Outcome::Reply(format!("mode → {mode}")),
+                Err(e) => Outcome::Reply(format!("! [mode] {e}")),
             }
         }
         "/remember" => {
@@ -704,7 +724,46 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
             } else {
                 ApprovalDecision::Deny
             };
-            let prefix = rest_of(name);
+            let mut prefix = rest_of(name);
+            // `/y [id] session`: allow this call and identical ones until
+            // /new — terminal and web only (a phone grant would outlive the
+            // glance it was given with).
+            let session = name == "/y" && (prefix == "session" || prefix.ends_with(" session"));
+            if session {
+                if source.starts_with("telegram:") || source.starts_with("matrix:") {
+                    return Outcome::Reply(
+                        "allow-for-session is only offered in the terminal and the web panel"
+                            .into(),
+                    );
+                }
+                prefix = prefix.trim_end_matches("session").trim();
+                let cards = match runtime.pending_approval_cards() {
+                    Ok(c) => c,
+                    Err(e) => return Outcome::Reply(format!("! [approval] {e}")),
+                };
+                let pick: Vec<_> = if prefix.is_empty() {
+                    cards
+                        .iter()
+                        .max_by_key(|c| c.expires_at_ms)
+                        .into_iter()
+                        .collect()
+                } else {
+                    cards
+                        .iter()
+                        .filter(|c| id_matches(&c.approval_id, prefix))
+                        .collect()
+                };
+                return match pick.as_slice() {
+                    [one] => match runtime.decide_for_session(&one.approval_id).await {
+                        Ok(()) => Outcome::Reply(
+                            "allowed — identical requests are allowed until /new".into(),
+                        ),
+                        Err(e) => Outcome::Reply(format!("! [approval] {e}")),
+                    },
+                    [] => Outcome::Reply("no pending approval".into()),
+                    _ => Outcome::Reply("ambiguous approval id — /approvals lists them".into()),
+                };
+            }
             if prefix.is_empty() {
                 match runtime.decide_latest(decision).await {
                     Ok(true) => Outcome::Reply("decided".into()),

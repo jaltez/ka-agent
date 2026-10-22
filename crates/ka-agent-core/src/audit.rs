@@ -43,6 +43,7 @@ impl AuditRecord {
 pub mod actions {
     pub const SESSION_NEW: &str = "session.new";
     pub const SESSION_RESUME: &str = "session.resume";
+    pub const MODE_SET: &str = "mode.set";
     pub const APPROVAL_DECIDE: &str = "approval.decide";
     pub const APPROVAL_EXPIRE: &str = "approval.expire";
     pub const WORKER_RESTART: &str = "worker.restart";

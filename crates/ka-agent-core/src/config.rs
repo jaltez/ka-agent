@@ -172,6 +172,15 @@ impl Search {
     }
 }
 
+/// Approval tuning: strict `[approvals]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Approvals {
+    /// Let the engine's fast model auto-allow unmistakably safe commands
+    /// (it never denies; anything uncertain still asks you). Off by default.
+    pub auto_review: bool,
+}
+
 /// Proactive-message manners: strict `[notify]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -327,6 +336,7 @@ pub struct DaemonConfig {
     /// Voice-note transcription (`None` = voice notes get a setup hint).
     pub voice: Option<Voice>,
     pub notify: Notify,
+    pub approvals: Approvals,
 }
 
 impl Default for DaemonConfig {
@@ -351,6 +361,7 @@ impl Default for DaemonConfig {
             mcp: Vec::new(),
             voice: None,
             notify: Notify::default(),
+            approvals: Approvals::default(),
         }
     }
 }

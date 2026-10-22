@@ -18,7 +18,10 @@ pub fn compose(
     user_layer: Option<&str>,
     resolve_secret: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
-    let has_extras = cfg.search.is_some() || !cfg.fallback.is_empty() || !cfg.mcp.is_empty();
+    let has_extras = cfg.search.is_some()
+        || !cfg.fallback.is_empty()
+        || !cfg.mcp.is_empty()
+        || cfg.approvals.auto_review;
     if !has_extras {
         return Ok(user_layer.map(str::to_string));
     }
@@ -45,6 +48,15 @@ pub fn compose(
             toml::Value::Array(cfg.fallback.iter().cloned().map(Into::into).collect()),
         );
         doc.insert("fallback".into(), fb.into());
+    }
+
+    if cfg.approvals.auto_review {
+        let guards = doc
+            .entry("guards")
+            .or_insert_with(|| toml::Table::new().into());
+        if let Some(g) = guards.as_table_mut() {
+            g.insert("auto_review".into(), true.into());
+        }
     }
 
     if !cfg.mcp.is_empty() {
@@ -204,6 +216,15 @@ headers = { Authorization = "secret:gh.token" }
         assert_eq!(engine.tools.mcp.discovery.as_deref(), Some("lazy"));
         // The secret is resolved into the in-memory layer only.
         assert!(!text.contains("secret:"));
+    }
+
+    #[test]
+    fn auto_review_turns_on_the_engine_guard() {
+        let cfg: DaemonConfig = toml::from_str("[approvals]\nauto_review = true\n").unwrap();
+        let text = compose(&cfg, None, &secrets).unwrap().unwrap();
+        assert_eq!(parse(&text).guards.auto_review, Some(true));
+        let off = DaemonConfig::default();
+        assert_eq!(compose(&off, None, &secrets).unwrap(), None);
     }
 
     #[test]

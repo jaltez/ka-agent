@@ -158,12 +158,22 @@ struct Live {
 
 struct Inner {
     session: Session,
+    /// Calls the operator allowed "for this session" (question + detail,
+    /// exact): asked again, they are answered without a card. Cleared by
+    /// `/new`.
+    session_allow: std::collections::HashSet<String>,
     live: Option<Live>,
     budget: BudgetState,
     /// Timestamps (ms) of recent worker crashes, for the crash-loop breaker.
     crashes: Vec<i64>,
     restart_attempt: u32,
 }
+/// The identity of a gated call for "allow for this session": the exact
+/// question and detail the operator saw.
+fn session_allow_key(question: &str, detail: Option<&str>) -> String {
+    format!("{question}\n{}", detail.unwrap_or(""))
+}
+
 /// Who started the turn being submitted, for the bridge's loop guard.
 fn publish_turn_source(store: &Store, source: &str) {
     let _ = store.meta_set(ka_agent_core::layout::TURN_SOURCE_META_KEY, source);
@@ -372,6 +382,7 @@ impl Runtime {
                 scheduler_tick: tokio::sync::Notify::new(),
                 inner: Mutex::new(Inner {
                     session,
+                    session_allow: std::collections::HashSet::new(),
                     live: None,
                     budget,
                     crashes: Vec::new(),
@@ -501,6 +512,7 @@ impl Runtime {
             ("search", differs(&old.search, &new.search)),
             ("fallback", differs(&old.fallback, &new.fallback)),
             ("mcp", differs(&old.mcp, &new.mcp)),
+            ("approvals", differs(&old.approvals, &new.approvals)),
             (
                 "approval_ttl_secs",
                 differs(&old.approval_ttl_secs, &new.approval_ttl_secs),
@@ -541,9 +553,9 @@ impl Runtime {
             applied: names(&live_fields),
             restart_required: names(&restart_fields),
         };
-        // model, mode, engine layer, search, fallback, mcp: all shape the
+        // model, mode, engine layer, search, fallback, mcp, approvals: all shape the
         // engine the worker was spawned with.
-        let engine_changed = live_fields[..6].iter().any(|(_, c)| *c);
+        let engine_changed = live_fields[..7].iter().any(|(_, c)| *c);
         {
             let mut g = self.lock();
             g.budget.daily_usd_cap = new.budgets.daily_usd;
@@ -574,6 +586,8 @@ impl Runtime {
                 live.deliberate_close = true;
             }
             g.crashes.clear();
+            // "Allow for this session" ends with the session.
+            g.session_allow.clear();
         }
         let live_port = {
             let mut g = self.lock();
@@ -1089,6 +1103,25 @@ impl Runtime {
         Ok(())
     }
 
+    /// "Allow for this session": allow this approval and every identical
+    /// one (same question and detail) until `/new`. Terminal and web only —
+    /// the caller enforces the surface.
+    pub async fn decide_for_session(&self, approval_id: &str) -> Result<(), Error> {
+        let approval = self
+            .sh
+            .store
+            .get_approval(&ApprovalId(approval_id.to_string()))
+            .map_err(|_| Error::UnknownApproval(approval_id.to_string()))?;
+        if let ApprovalKind::KaAsk {
+            question, detail, ..
+        } = &approval.kind
+        {
+            let key = session_allow_key(question, detail.as_deref());
+            self.lock().session_allow.insert(key);
+        }
+        self.decide(approval_id, ApprovalDecision::Allow).await
+    }
+
     /// Expiry sweep (timer-driven): pending approvals past their TTL are
     /// denied, answered to the engine, and audited (fail closed).
     pub async fn expire_approvals(&self) -> Result<Vec<ApprovalId>, Error> {
@@ -1199,6 +1232,50 @@ impl Runtime {
         let new = DaemonConfig::load(&path)?;
         self.reload_config(new, false).await;
         Ok(info.id)
+    }
+
+    /// `/mode`: switch the permission mode, persisted and applied to a
+    /// live worker at once. From a phone channel the mode may only get
+    /// stricter (free < accept_edits < guarded < plan): a lost phone must
+    /// not be able to turn approvals off.
+    pub async fn set_mode(&self, mode: &str, source: &str) -> Result<String, Error> {
+        fn strictness(m: &str) -> Option<u8> {
+            Some(match m {
+                "free" => 0,
+                "accept_edits" => 1,
+                "guarded" => 2,
+                "plan" => 3,
+                _ => return None,
+            })
+        }
+        let mode = mode.trim();
+        let new = strictness(mode).ok_or_else(|| {
+            Error::Refused(format!(
+                "unknown mode {mode:?}: guarded | accept_edits | plan | free"
+            ))
+        })?;
+        let phone = source.starts_with("telegram:") || source.starts_with("matrix:");
+        let current = strictness(&self.cfg().mode).unwrap_or(2);
+        if phone && new < current {
+            return Err(Error::Refused(
+                "from the phone the mode can only get stricter — loosen it from the terminal or web".into(),
+            ));
+        }
+        let path = self
+            .config_path()
+            .ok_or_else(|| Error::Refused("no config file — run ka-agent setup".into()))?;
+        ka_agent_core::config_file::set(&path, "mode", &format!("{mode:?}"))
+            .map_err(Error::Config)?;
+        let mut new_cfg = (*self.cfg()).clone();
+        new_cfg.mode = mode.to_string();
+        // Live worker: switch now (a turn in flight finishes under the old
+        // mode); the config keeps it for the next worker.
+        if let Some(port) = self.live_port() {
+            let _ = port.set_mode(mode.to_string()).await;
+        }
+        *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_cfg);
+        self.audit(audit_actions::MODE_SET, mode, Some(format!("by {source}")))?;
+        Ok(mode.to_string())
     }
 
     /// The `id8` history line listing: the session's last `limit` prompt
@@ -2098,6 +2175,34 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                     )
                 };
                 let question = readable_question(&question, last_call.as_ref());
+                // Allowed for this session already: answer at once, no card
+                // (still audited).
+                let key = session_allow_key(&question, detail.as_deref());
+                let pre_allowed = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.session_allow.contains(&key)
+                };
+                if pre_allowed {
+                    let port = {
+                        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        g.live.as_ref().map(|l| Arc::clone(&l.port))
+                    };
+                    if let Some(port) = port {
+                        let _ = port
+                            .answer(ask_id.clone(), ApprovalDecision::Allow.ka_choice())
+                            .await;
+                    }
+                    let mut rec = AuditRecord::new(
+                        "operator",
+                        audit_actions::APPROVAL_DECIDE,
+                        &ask_id,
+                        Some("Allow (session)".into()),
+                    );
+                    let _ = sh.store.append_audit(&mut rec);
+                    sh.surface
+                        .on_note(&format!("✓ allowed for this session: {question}"));
+                    continue;
+                }
                 let kind = ApprovalKind::KaAsk {
                     ask_id: ask_id.clone(),
                     question: question.clone(),

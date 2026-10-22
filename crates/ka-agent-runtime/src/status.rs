@@ -158,9 +158,14 @@ impl StatusReport {
             .as_deref()
             .map(ka_agent_core::ids::short_id)
             .unwrap_or("(new)");
+        // Anything looser than `guarded` is worth a glance every time.
+        let mode = match self.mode.as_str() {
+            "free" => "⚠ mode free (acts without asking)".to_string(),
+            "accept_edits" => "mode accept_edits (edits without asking)".to_string(),
+            m => format!("mode {m}"),
+        };
         let mut out = format!(
-            "{state} · {model} · mode {}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
-            self.mode,
+            "{state} · {model} · {mode}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
             ka_agent_core::ids::short_id(&self.session_id),
             self.timezone
         );

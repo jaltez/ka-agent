@@ -726,3 +726,64 @@ fn settled_turn_prints_a_footer_and_no_session_noise() {
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// H1: `/mode` switches live and persists; a non-guarded mode carries a
+/// badge in /status.
+#[test]
+fn mode_switches_live_and_persists() {
+    let root = temp_root("mode");
+    let sc = scenario_file(
+        &root,
+        "m.json",
+        r#"{ "steps": [ {"text": "ok"} ], "stop": "done" }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.send("/mode plan");
+    chat.expect("mode → plan", Duration::from_secs(10));
+    chat.send("/status");
+    chat.expect("mode plan", Duration::from_secs(10));
+    chat.send("/mode free");
+    chat.expect("mode → free", Duration::from_secs(10));
+    chat.send("/status");
+    chat.expect("⚠ mode free (acts without asking)", Duration::from_secs(10));
+    chat.send("/mode sideways");
+    chat.expect("unknown mode", Duration::from_secs(10));
+    chat.send("/quit");
+    let cfg = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
+    assert!(cfg.contains("mode = \"free\""), "{cfg}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// H2: "allow for this session" answers identical asks without a card;
+/// a different call still asks.
+#[test]
+fn allow_for_session_skips_identical_asks_only() {
+    let root = temp_root("session-allow");
+    let sc = scenario_file(
+        &root,
+        "s.json",
+        r#"{ "steps": [
+            {"call": {"tool": "bash", "args": {"command": "touch same.txt"}}},
+            {"call": {"tool": "bash", "args": {"command": "touch same.txt"}}},
+            {"call": {"tool": "bash", "args": {"command": "touch other.txt"}}},
+            {"text": "finished"}
+        ], "stop": "done" }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.send("run it");
+    chat.expect("approve: /y", Duration::from_secs(30));
+    chat.send("/y session");
+    chat.expect(
+        "allowed — identical requests are allowed until /new",
+        Duration::from_secs(10),
+    );
+    chat.expect("✓ allowed for this session", Duration::from_secs(30));
+    // The different command still asks.
+    chat.expect("touch other.txt`?", Duration::from_secs(30));
+    chat.send("/n");
+    chat.expect("finished", Duration::from_secs(30));
+    let t = chat.transcript();
+    assert_eq!(t.matches("┌ approval").count(), 2, "{t}");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
