@@ -483,6 +483,22 @@ async fn serve_admin(stream: tokio::net::UnixStream, ctx: AdminCtx) -> std::io::
                     Err(e) => serde_json::json!({"error": e.to_string()}),
                 }
             }
+            // One router command (`ka-agent approvals` and friends): the
+            // same handling as typing it in the chat, reply returned.
+            (Some(req), Some("command")) => {
+                let text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                match ka_agent_channels::commands::route(&ctx.runtime, "cli", text).await {
+                    ka_agent_channels::commands::Outcome::Reply(reply) => {
+                        serde_json::json!({"ok": true, "reply": reply})
+                    }
+                    ka_agent_channels::commands::Outcome::Silent => {
+                        serde_json::json!({"ok": true, "reply": ""})
+                    }
+                    ka_agent_channels::commands::Outcome::NotACommand => {
+                        serde_json::json!({"error": "not a command"})
+                    }
+                }
+            }
             (Some(_), Some("attach")) => return serve_attach(reader, w, ctx).await,
             (Some(_), _) => serde_json::json!({"error": "unknown op"}),
             (None, _) => serde_json::json!({"error": "bad json"}),

@@ -253,6 +253,54 @@ impl CronSpec {
         }
     }
 
+    /// An agent cron from operator words — `in <dur> <text>`, `every <dur>
+    /// <text>`, or `every <day rule> [at] <time> <text>` — with its first
+    /// fire time. `Err` is the operator-facing reason (or the usage).
+    pub fn from_words(
+        words: &[&str],
+        source: &str,
+        now: &jiff::Zoned,
+    ) -> Result<(Self, i64), String> {
+        let usage = "usage: in <duration> <text> · every <duration> <text> · every day|weekday|mon,wed|month on the 1st at <time> <text>";
+        let mut spec = Self {
+            text: String::new(),
+            source: source.to_string(),
+            recurrence_ms: None,
+            mode: CronMode::Agent,
+            at_local: None,
+            weekdays: Vec::new(),
+            month_day: None,
+        };
+        let now_ms = now.timestamp().as_millisecond();
+        let (first_at, used) = match words {
+            ["in", dur, ..] => {
+                let ms = crate::parse_duration(dur)
+                    .ok_or_else(|| format!("bad duration {dur:?}; use Ns, Nm, Nh or Nd"))?;
+                (now_ms + ms as i64, 2)
+            }
+            ["every", rest @ ..] => {
+                if let Some((rule, (hh, mm), used)) = crate::when::parse_recurrence(rest) {
+                    spec.recurrence_ms = Some(86_400_000);
+                    spec.at_local = Some(format!("{hh:02}:{mm:02}"));
+                    spec.set_day_rule(&rule);
+                    (crate::when::next_local(hh, mm, &rule, now), 1 + used)
+                } else {
+                    let dur = rest.first().ok_or(usage)?;
+                    let ms = crate::parse_duration(dur)
+                        .ok_or_else(|| format!("bad duration {dur:?}; use Ns, Nm, Nh or Nd"))?;
+                    spec.recurrence_ms = Some(ms as i64);
+                    (now_ms + ms as i64, 2)
+                }
+            }
+            _ => return Err(usage.into()),
+        };
+        spec.text = words.get(used..).unwrap_or_default().join(" ");
+        if spec.text.trim().is_empty() {
+            return Err(usage.into());
+        }
+        Ok((spec, first_at))
+    }
+
     /// Parse a task-row payload; `None` on malformed or foreign JSON.
     pub fn from_payload(payload: &str) -> Option<Self> {
         serde_json::from_str(payload).ok()

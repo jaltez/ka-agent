@@ -263,94 +263,20 @@ pub fn cron_list_text(tasks: &[ka_agent_core::Task], now: &jiff::Zoned) -> Strin
 /// `/cron add …` → reply text. Shared by the router and the console.
 pub fn cron_add(runtime: &Runtime, args: &str) -> String {
     let now = runtime.now_zoned();
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    if parts.len() < 3 {
-        return cron_add_usage();
-    }
-    let first = parts[0];
-    let anchored = |rule: ka_agent_core::when::DayRule, (hh, mm): (u8, u8), text: String| {
-        let mut spec = ka_agent_core::CronSpec {
-            text,
-            source: "operator".into(),
-            recurrence_ms: Some(86_400_000),
-            mode: ka_agent_core::CronMode::Agent,
-            at_local: Some(format!("{hh:02}:{mm:02}")),
-            weekdays: Vec::new(),
-            month_day: None,
-        };
-        spec.set_day_rule(&rule);
-        let first_at = ka_agent_core::when::next_local(hh, mm, &rule, &now);
-        match runtime.add_cron(spec, first_at) {
-            Ok(id) => format!(
-                "cron {} scheduled — {}",
-                short_id(id.as_str()),
-                ka_agent_core::when::describe(first_at, &now)
-            ),
-            Err(e) => format!("! [cron] {e}"),
-        }
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let (spec, first_at) = match ka_agent_core::CronSpec::from_words(&words, "operator", &now) {
+        Ok(v) => v,
+        Err(e) if e.starts_with("usage:") => return cron_add_usage(),
+        Err(e) => return e,
     };
-    if first == "in" {
-        let Some(ms) = ka_agent_core::parse_duration(parts[1]) else {
-            return format!("bad duration {:?}; use Ns, Nm, Nh or Nd", parts[1]);
-        };
-        let text = parts[2..].join(" ");
-        let spec = ka_agent_core::CronSpec {
-            text,
-            source: "operator".into(),
-            recurrence_ms: None,
-            mode: ka_agent_core::CronMode::Agent,
-            at_local: None,
-            weekdays: Vec::new(),
-            month_day: None,
-        };
-        let at = ka_agent_core::now_ms() + ms as i64;
-        return match runtime.add_cron(spec, at) {
-            Ok(id) => format!(
-                "cron {} scheduled — {}",
-                short_id(id.as_str()),
-                ka_agent_core::when::describe(at, &now)
-            ),
-            Err(e) => format!("! [cron] {e}"),
-        };
+    match runtime.add_cron(spec, first_at) {
+        Ok(id) => format!(
+            "cron {} scheduled — {}",
+            short_id(id.as_str()),
+            ka_agent_core::when::describe(first_at, &now)
+        ),
+        Err(e) => format!("! [cron] {e}"),
     }
-    if first == "every" {
-        let second = parts[1];
-        // Anchored: every day|weekday|weekend|mon,wed|month on the 1st [at] T <text>
-        if let Some((rule, clock, used)) = ka_agent_core::when::parse_recurrence(&parts[1..]) {
-            let text = parts[(1 + used).min(parts.len())..].join(" ");
-            if text.is_empty() {
-                return cron_add_usage();
-            }
-            return anchored(rule, clock, text);
-        }
-        // every <duration> <text>: interval recurrence.
-        let Some(ms) = ka_agent_core::parse_duration(second) else {
-            return format!("bad duration {second:?}; use Ns, Nm, Nh or Nd");
-        };
-        let text = parts[2..].join(" ");
-        if text.is_empty() {
-            return cron_add_usage();
-        }
-        let spec = ka_agent_core::CronSpec {
-            text,
-            source: "operator".into(),
-            recurrence_ms: Some(ms as i64),
-            mode: ka_agent_core::CronMode::Agent,
-            at_local: None,
-            weekdays: Vec::new(),
-            month_day: None,
-        };
-        let at = ka_agent_core::now_ms() + ms as i64;
-        return match runtime.add_cron(spec, at) {
-            Ok(id) => format!(
-                "cron {} scheduled — {}",
-                short_id(id.as_str()),
-                ka_agent_core::when::describe(at, &now)
-            ),
-            Err(e) => format!("! [cron] {e}"),
-        };
-    }
-    cron_add_usage()
 }
 
 fn cron_add_usage() -> String {

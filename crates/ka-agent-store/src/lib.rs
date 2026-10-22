@@ -86,6 +86,22 @@ pub struct RunRow {
     pub ended_ms: Option<i64>,
 }
 
+fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+    Ok(RunRow {
+        id: RunId(r.get::<_, String>(0)?),
+        kind: r.get(1)?,
+        ref_id: r.get(2)?,
+        status: r.get(3)?,
+        stop: r.get(4)?,
+        error_class: r.get(5)?,
+        error_message: r.get(6)?,
+        cost_usd: r.get(7)?,
+        tokens: r.get::<_, Option<i64>>(8)?.map(|t| t.max(0) as u64),
+        started_ms: r.get(9)?,
+        ended_ms: r.get(10)?,
+    })
+}
+
 /// One FTS hit from [`Store::search_episodes`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeHit {
@@ -1467,6 +1483,17 @@ impl Store {
         Ok(())
     }
 
+    /// Runs for one subject (a cron task id), newest first.
+    pub fn runs_for(&self, ref_id: &str, limit: usize) -> Result<Vec<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, ref_id, status, stop, error_class, error_message, cost_usd, tokens, started_ms, ended_ms
+             FROM runs WHERE ref_id = ?1 ORDER BY started_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![ref_id, limit as i64], row_to_run)?;
+        collect_rows(rows)
+    }
+
     /// Most recent runs, newest first.
     pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunRow>> {
         let conn = self.lock();
@@ -1474,21 +1501,7 @@ impl Store {
             "SELECT id, kind, ref_id, status, stop, error_class, error_message, cost_usd, tokens, started_ms, ended_ms
              FROM runs ORDER BY started_ms DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok(RunRow {
-                id: RunId(r.get::<_, String>(0)?),
-                kind: r.get(1)?,
-                ref_id: r.get(2)?,
-                status: r.get(3)?,
-                stop: r.get(4)?,
-                error_class: r.get(5)?,
-                error_message: r.get(6)?,
-                cost_usd: r.get(7)?,
-                tokens: r.get::<_, Option<i64>>(8)?.map(|t| t.max(0) as u64),
-                started_ms: r.get(9)?,
-                ended_ms: r.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit as i64], row_to_run)?;
         collect_rows(rows)
     }
 

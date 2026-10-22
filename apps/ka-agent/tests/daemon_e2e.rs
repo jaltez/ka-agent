@@ -320,3 +320,51 @@ fn briefing_on_now_off() {
     daemon.sigterm_wait(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// B3: crons and approvals from the shell.
+#[test]
+fn cron_and_approvals_cli() {
+    let root = temp_root("cron-cli");
+    let mut daemon = spawn_daemon(&root);
+    daemon.wait_sock(Duration::from_secs(10));
+    let cli = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+            .args(args)
+            .env("KA_AGENT_DATA_DIR", &daemon.data)
+            .env("KA_AGENT_CONFIG", root.join("ka-agent.toml"))
+            .output()
+            .unwrap();
+        (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr),
+        )
+    };
+    let (ok, out) = cli(&["cron", "add", "every", "day", "at", "08:00", "hi", "there"]);
+    assert!(ok && out.contains("scheduled"), "{out}");
+    let id = out.split_whitespace().nth(1).unwrap().to_string();
+    let (ok, out) = cli(&["cron", "list"]);
+    assert!(
+        ok && out.contains("hi there") && out.contains("↻ daily 08:00"),
+        "{out}"
+    );
+    let (ok, out) = cli(&["cron", "list", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert!(ok && v["crons"][0]["text"] == "hi there", "{out}");
+    assert!(cli(&["cron", "pause", &id]).1.contains("paused"));
+    assert!(cli(&["cron", "resume", &id]).1.contains("resumed — next"));
+    assert!(cli(&["cron", "runs", &id]).1.contains("no runs yet"));
+    let (ok, out) = cli(&["cron", "add", "every", "fortnight", "x"]);
+    assert!(!ok && out.contains("bad duration"), "{out}");
+    let (ok, out) = cli(&["approvals"]);
+    assert!(ok && out.contains("no pending approvals"), "{out}");
+    let (ok, out) = cli(&["approvals", "y", "nope"]);
+    assert!(
+        ok && out.contains("no pending approval matches nope"),
+        "{out}"
+    );
+    assert!(cli(&["cron", "rm", &id]).1.contains("removed"));
+    assert!(cli(&["cron", "list"]).1.contains("no crons"));
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}

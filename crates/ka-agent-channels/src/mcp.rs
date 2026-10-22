@@ -745,72 +745,32 @@ fn handle_tool_call(
                     })
                 }
                 "pause" | "resume" | "remove" | "trigger" => {
-                    let id = args["id"].as_str().ok_or("missing 'id'")?;
-                    if id.trim().is_empty() {
-                        return Err("missing 'id'".into());
-                    }
-                    let crons = store.cron_tasks().map_err(|e| format!("store: {e}"))?;
-                    let mut hits = crons
-                        .iter()
-                        .filter(|t| ka_agent_core::ids::id_matches(t.id.as_str(), id));
-                    let task = hits
-                        .next()
-                        .ok_or_else(|| format!("no live cron id starts with {id:?}"))?;
-                    if hits.next().is_some() {
-                        return Err(format!(
-                            "id prefix {id:?} matches several crons — use more characters (see action \"list\")"
-                        ));
-                    }
+                    use ka_agent_runtime::cron_ops;
+                    let task = cron_ops::resolve(&store, args["id"].as_str().unwrap_or(""))?;
                     let short = ka_agent_core::ids::short_id(task.id.as_str());
                     match action {
                         "pause" => {
-                            store
-                                .set_task_status(&task.id, "interrupted")
-                                .map_err(|e| format!("pause: {e}"))?;
+                            cron_ops::pause(&store, &task)?;
                             Ok(format!("cron {short} paused"))
                         }
                         "remove" => {
-                            store
-                                .set_task_status(&task.id, "cancelled")
-                                .map_err(|e| format!("remove: {e}"))?;
+                            cron_ops::remove(&store, &task)?;
                             Ok(format!("cron {short} removed"))
                         }
                         "trigger" => {
-                            store
-                                .update_task_schedule(
-                                    &task.id,
-                                    Some(ka_agent_core::now_ms()),
-                                    "queued",
-                                )
-                                .map_err(|e| format!("trigger: {e}"))?;
+                            cron_ops::trigger(&store, &task)?;
                             Ok(format!(
                                 "cron {short} armed; fires on the next scheduler tick"
                             ))
                         }
                         _ => {
-                            // Resume: skip missed occupations for recurring
-                            // jobs; a one-shot fires now.
-                            let now = ka_agent_core::now_ms();
-                            let spec = task
-                                .payload
-                                .as_deref()
-                                .and_then(ka_agent_core::CronSpec::from_payload);
-                            let next = match (
-                                spec.as_ref().and_then(|s| s.recurrence_ms),
-                                task.scheduled_at_ms,
-                            ) {
-                                (Some(rec), Some(sched)) if rec > 0 => {
-                                    let mut n = sched;
-                                    while n <= now {
-                                        n += rec;
-                                    }
-                                    n
-                                }
-                                _ => now,
-                            };
-                            store
-                                .update_task_schedule(&task.id, Some(next), "queued")
-                                .map_err(|e| format!("resume: {e}"))?;
+                            let tz = store
+                                .meta_get(ka_agent_core::layout::TIMEZONE_META_KEY)
+                                .ok()
+                                .flatten()
+                                .and_then(|n| jiff::tz::TimeZone::get(&n).ok())
+                                .unwrap_or_else(jiff::tz::TimeZone::system);
+                            cron_ops::resume(&store, &task, &jiff::Timestamp::now().to_zoned(tz))?;
                             Ok(format!("cron {short} resumed"))
                         }
                     }

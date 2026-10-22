@@ -1408,6 +1408,25 @@ impl Runtime {
                 String::new()
             }
         };
+        // One `runs` row per cron fire (`ka-agent cron runs <id>`): what
+        // happened, not just that the row moved on.
+        let record = |task: &ka_agent_core::Task, status: &str, error: Option<&str>| {
+            let now = ka_agent_core::now_ms();
+            let run = ka_agent_store::RunRow {
+                id: ka_agent_core::RunId::generate(),
+                kind: "cron".into(),
+                ref_id: Some(task.id.as_str().to_string()),
+                status: status.into(),
+                stop: None,
+                error_class: None,
+                error_message: error.map(str::to_string),
+                cost_usd: None,
+                tokens: None,
+                started_ms: now,
+                ended_ms: Some(now),
+            };
+            let _ = self.sh.store.insert_run(&run);
+        };
         for task in due {
             // Claim: the snapshot is stale the moment another surface
             // (cancel, pause, remove) touched the row. Skip what we lost.
@@ -1464,6 +1483,7 @@ impl Runtime {
                                 }
                             };
                             self.sh.surface.on_notice(&note);
+                            record(&task, "missed", None);
                             continue;
                         }
                         self.sh.surface.on_notice(&format!(
@@ -1472,7 +1492,48 @@ impl Runtime {
                             ka_agent_core::fmt_interval(this_late_by)
                         ));
                         let _ = self.sh.store.settle_task(&task.id, "missed");
+                        record(&task, "missed", None);
                         continue;
+                    }
+                    // Preflight (agent jobs): never spend — or pretend to
+                    // have spent — a turn that cannot happen. No model/key:
+                    // pause the job (it cannot succeed until the operator
+                    // acts). Budget reached: skip this occurrence (the
+                    // window rolls tomorrow).
+                    if spec.mode == ka_agent_core::CronMode::Agent {
+                        if let Err(why) = self.preflight() {
+                            let _ = self.sh.store.set_task_status(&task.id, "interrupted");
+                            self.sh.surface.on_notice(&format!(
+                                "cron '{}' paused: {why} — then `ka-agent cron resume {}`",
+                                spec.text,
+                                ka_agent_core::ids::short_id(task.id.as_str())
+                            ));
+                            record(&task, "blocked", Some(&why));
+                            continue;
+                        }
+                        let exceeded =
+                            self.lock().budget.verdict() == ka_agent_core::BudgetVerdict::Exceeded;
+                        if exceeded {
+                            let next = if recurring {
+                                next_for(&spec, task.scheduled_at_ms.unwrap_or(now))
+                            } else {
+                                None
+                            };
+                            match next {
+                                Some(next) => {
+                                    let _ = self.sh.store.rearm_task(&task.id, next);
+                                }
+                                None => {
+                                    let _ = self.sh.store.settle_task(&task.id, "failed");
+                                }
+                            }
+                            self.sh.surface.on_notice(&format!(
+                                "cron '{}' skipped: today's budget is reached",
+                                spec.text
+                            ));
+                            record(&task, "skipped", Some("daily budget reached"));
+                            continue;
+                        }
                     }
                     let ok = match &spec.mode {
                         ka_agent_core::CronMode::Agent => {
@@ -1516,6 +1577,7 @@ impl Runtime {
                             }
                         }
                     };
+                    record(&task, if ok { "fired" } else { "failed" }, None);
                     if !ok {
                         // Failed jobs are not re-armed: the failure is
                         // visible on the surface and the row stays `failed`.

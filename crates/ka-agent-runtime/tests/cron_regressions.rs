@@ -410,3 +410,113 @@ async fn recurring_beyond_grace_skips_and_rearms_oneshot_is_missed() {
     assert!(!seen.contains("echo[tick]"), "must not fire: {seen}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// G4: an agent cron that cannot run spends nothing and pretends nothing —
+/// no model: the job pauses with the remedy; every fire leaves a run row.
+#[tokio::test]
+async fn agent_cron_without_a_model_pauses_and_records_a_blocked_run() {
+    let root = root("preflight");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+    let mut agent = spec("summarise my inbox", Some(3_600_000));
+    agent.mode = CronMode::Agent;
+    let id = rt.add_cron(agent, ka_agent_core::now_ms() - 1).unwrap();
+    rt.fire_due_tasks().await.unwrap();
+
+    let task = store.get_task(&id).unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        ka_agent_core::TaskStatus::Interrupted,
+        "paused"
+    );
+    let said = notes.0.lock().unwrap().join("\n");
+    assert!(said.contains("paused: no model configured"), "{said}");
+    assert!(said.contains("ka-agent cron resume"), "{said}");
+    let runs = store.runs_for(id.as_str(), 10).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "blocked");
+    // Nothing reached the session.
+    assert!(
+        store.usage_rows_since(0).unwrap().is_empty(),
+        "no turn recorded"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// G4: fires of a working (no-agent) job are recorded too.
+#[tokio::test]
+async fn every_fire_leaves_a_run_row() {
+    let root = root("runs");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
+    rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
+    let id = rt
+        .add_cron(spec("tick", Some(3_600_000)), ka_agent_core::now_ms() - 1)
+        .unwrap();
+    rt.fire_due_tasks().await.unwrap();
+    let runs = store.runs_for(id.as_str(), 10).unwrap();
+    assert_eq!(
+        runs.iter().map(|r| r.status.as_str()).collect::<Vec<_>>(),
+        vec!["fired"]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// G4: with today's budget spent, an agent cron skips this occurrence
+/// (re-armed for the next), records `skipped`, and submits nothing.
+#[tokio::test]
+async fn agent_cron_over_budget_skips_the_occurrence() {
+    let root = root("over-budget");
+    let store = store_at(&root.join("data"));
+    // A model with its key, so only the budget stands in the way.
+    let paths = ka_agent_runtime::Paths::new(root.clone());
+    let env = paths.engine_home().join(".config/ka/.env");
+    std::fs::create_dir_all(env.parent().unwrap()).unwrap();
+    std::fs::write(&env, "ANTHROPIC_API_KEY=sk-test\n").unwrap();
+    let mut spent = ka_agent_core::BudgetState::new(Some(1.0), None);
+    spent.record(2.0, 0, ka_agent_core::now_ms());
+    store
+        .meta_set("budget", &serde_json::to_string(&spent).unwrap())
+        .unwrap();
+    let notes = Arc::new(Notes::default());
+    let mut cfg = config(&root);
+    cfg.model = Some("anthropic/claude-sonnet-5".into());
+    cfg.budgets.daily_usd = Some(1.0);
+    let mut port = ka_agent_port::WorkerPort::with_current_exe();
+    port.binary = std::path::PathBuf::from("/nonexistent/ka-agent");
+    let rt = Runtime::new(
+        cfg,
+        paths,
+        Arc::clone(&store),
+        port,
+        Arc::clone(&notes) as Arc<_>,
+    )
+    .unwrap();
+
+    let mut agent = spec("daily digest", Some(86_400_000));
+    agent.mode = CronMode::Agent;
+    let due = ka_agent_core::now_ms() - 1;
+    let id = rt.add_cron(agent, due).unwrap();
+    rt.fire_due_tasks().await.unwrap();
+
+    let runs = store.runs_for(id.as_str(), 10).unwrap();
+    assert_eq!(runs[0].status, "skipped");
+    let task = store.get_task(&id).unwrap().unwrap();
+    assert_eq!(task.status, ka_agent_core::TaskStatus::Queued, "still live");
+    assert!(
+        task.scheduled_at_ms.unwrap() > due,
+        "re-armed for the next occurrence"
+    );
+    let said = notes.0.lock().unwrap().join("\n");
+    assert!(
+        said.contains("skipped: today's budget is reached"),
+        "{said}"
+    );
+    assert!(
+        store.usage_rows_since(0).unwrap().is_empty(),
+        "no turn recorded"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

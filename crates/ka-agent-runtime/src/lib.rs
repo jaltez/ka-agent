@@ -4,6 +4,7 @@
 
 pub mod briefing;
 pub mod bus;
+pub mod cron_ops;
 pub mod paths;
 pub mod runtime;
 pub mod skills;

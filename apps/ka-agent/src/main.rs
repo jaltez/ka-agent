@@ -6,6 +6,7 @@ mod admin;
 mod briefing_cli;
 mod chat;
 mod config_cli;
+mod cron_cli;
 mod daemon;
 mod dashboard;
 mod doctor;
@@ -146,6 +147,19 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Scheduled prompts: list, add, pause, resume, run, history.
+    Cron {
+        #[command(subcommand)]
+        action: Option<CronAction>,
+        /// Machine-readable output (`list`, `runs`).
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Pending approvals: list, allow (`y <id>`) or deny (`n <id>`).
+    Approvals {
+        #[command(subcommand)]
+        action: Option<ApprovalsAction>,
+    },
     /// A morning briefing: calendar, reminders, what waits for you.
     Briefing {
         #[command(subcommand)]
@@ -170,6 +184,7 @@ enum Command {
         days: u32,
     },
     /// Show the daemon log (`-f` to follow).
+    #[command(hide = true)]
     Logs {
         /// Follow the log like `tail -f`.
         #[arg(short, long)]
@@ -279,6 +294,37 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum CronAction {
+    /// Live crons, next fire first.
+    List,
+    /// `add every weekday at 9 standup notes` · `add in 2h check the build`.
+    Add {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
+    /// Remove a cron.
+    Rm { id: String },
+    /// Pause a cron (kept, not fired).
+    Pause { id: String },
+    /// Resume at its next occurrence.
+    Resume { id: String },
+    /// Fire now (then again on schedule).
+    Run { id: String },
+    /// What happened on its last fires.
+    Runs { id: String },
+}
+
+#[derive(clap::Subcommand)]
+enum ApprovalsAction {
+    /// What is waiting for a decision.
+    List,
+    /// Allow one (id or its tail).
+    Y { id: String },
+    /// Deny one.
+    N { id: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -492,8 +538,8 @@ enum SkillsAction {
 /// The footer of `ka-agent --help`: the commands kept out of the main list
 /// (they all work; `ka-agent <command> --help` explains each).
 const ADVANCED_HELP: &str = "\
-More commands: run restart pair models key secret identity grant plugin skills
-               backup restore export purge — `ka-agent <command> --help`";
+More commands: logs run restart pair models key secret identity grant plugin
+               skills backup restore export purge — `ka-agent <command> --help`";
 
 /// What a non-interactive `ka-agent` prints on a fresh machine: where to
 /// start, not the full command list.
@@ -741,6 +787,8 @@ fn main() -> std::process::ExitCode {
         Command::Logs { follow, lines } => service::logs(follow, lines),
         Command::Profile { action } => profile_cli::profile_action(action),
         Command::Briefing { action } => briefing_cli::briefing_action(action),
+        Command::Cron { action, json } => cron_cli::cron_action(action, json),
+        Command::Approvals { action } => cron_cli::approvals_action(action),
         Command::Mcp { action, config } => mcp_cli::mcp_action(action, config_path(&config)),
         Command::Usage { days } => usage_cli::usage(days),
         Command::Grant { action } => grant::grant_action(action),
