@@ -520,3 +520,60 @@ async fn agent_cron_over_budget_skips_the_occurrence() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// G2: inside quiet hours a due cron waits for the window's end (recorded
+/// `deferred`), while a reminder due at the same moment still fires.
+#[tokio::test]
+async fn quiet_hours_defer_crons_but_not_reminders() {
+    let root = root("quiet");
+    let store = store_at(&root.join("data"));
+    let notes = Arc::new(Notes::default());
+    // A one-hour window around "now", in UTC.
+    let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);
+    let h = now.hour();
+    let window = format!("{:02}:00-{:02}:00", h, (h + 1) % 24);
+    let mut cfg = config(&root);
+    cfg.timezone = Some("UTC".into());
+    cfg.notify.quiet_hours = Some(window);
+    let mut port = ka_agent_port::WorkerPort::with_current_exe();
+    port.binary = std::path::PathBuf::from("/nonexistent/ka-agent");
+    let rt = Runtime::new(
+        cfg,
+        ka_agent_runtime::Paths::new(root.clone()),
+        Arc::clone(&store),
+        port,
+        Arc::clone(&notes) as Arc<_>,
+    )
+    .unwrap();
+    rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
+    let due = ka_agent_core::now_ms() - 1;
+    let cron = rt.add_cron(spec("nightly", Some(3_600_000)), due).unwrap();
+    let mut reminder = ka_agent_core::Task::new("drink water".into(), "reminder", false);
+    reminder.scheduled_at_ms = Some(due);
+    store.insert_task(&reminder).unwrap();
+    rt.fire_due_tasks().await.unwrap();
+
+    let task = store.get_task(&cron).unwrap().unwrap();
+    let end = jiff::Timestamp::from_millisecond(task.scheduled_at_ms.unwrap())
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::UTC);
+    assert_eq!(
+        (end.hour(), end.minute()),
+        ((h + 1) % 24, 0),
+        "waits for the window's end"
+    );
+    assert_eq!(
+        store.runs_for(cron.as_str(), 5).unwrap()[0].status,
+        "deferred"
+    );
+    let said = notes.0.lock().unwrap().join("\n");
+    assert!(
+        !said.contains("echo[nightly]"),
+        "the cron did not run: {said}"
+    );
+    assert!(
+        said.contains("drink water"),
+        "the reminder still fired: {said}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

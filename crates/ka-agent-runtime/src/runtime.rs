@@ -164,6 +164,16 @@ struct Inner {
     crashes: Vec<i64>,
     restart_attempt: u32,
 }
+/// Who started the turn being submitted, for the bridge's loop guard.
+fn publish_turn_source(store: &Store, source: &str) {
+    let _ = store.meta_set(ka_agent_core::layout::TURN_SOURCE_META_KEY, source);
+}
+
+/// The end of the quiet window when `now` is inside it.
+fn cfg_quiet_until(cfg: &DaemonConfig, now: &jiff::Zoned) -> Option<i64> {
+    cfg.notify.quiet_until(now)
+}
+
 /// The operator zone for out-of-process readers (the MCP bridge
 /// schedules local-time crons with it). Best effort: a failed write only
 /// means the bridge falls back to the system zone.
@@ -510,6 +520,7 @@ impl Runtime {
             ("budgets", differs(&old.budgets, &new.budgets)),
             ("timezone", differs(&old.timezone, &new.timezone)),
             ("calendar", differs(&old.calendar, &new.calendar)),
+            ("notify", differs(&old.notify, &new.notify)),
         ];
         let restart_fields = [
             ("workspace", differs(&old.workspace, &new.workspace)),
@@ -696,6 +707,7 @@ impl Runtime {
             return Ok(());
         }
         if submit_head {
+            // (drain_queue publishes the head item's own source.)
             // The head item goes through the same handshake as a direct
             // submit: the worker is spawned lazily, so it must exist before
             // the drain (drain_queue only ever uses a live port).
@@ -711,6 +723,7 @@ impl Runtime {
             drain_queue(&self.sh).await;
             return Ok(());
         }
+        publish_turn_source(&self.sh.store, source);
         match self.submit_text(text).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -1493,6 +1506,14 @@ impl Runtime {
                         ));
                         let _ = self.sh.store.settle_task(&task.id, "missed");
                         record(&task, "missed", None);
+                        continue;
+                    }
+                    // Quiet hours: a scheduled prompt that falls due inside
+                    // the window waits for its end (nothing runs for nobody
+                    // to read); reminders above are never held.
+                    if let Some(until) = cfg_quiet_until(&self.cfg(), &now_zoned) {
+                        let _ = self.sh.store.rearm_task(&task.id, until);
+                        record(&task, "deferred", Some("quiet hours"));
                         continue;
                     }
                     // Preflight (agent jobs): never spend — or pretend to
@@ -2372,6 +2393,7 @@ async fn drain_queue(sh: &Arc<Shared>) -> bool {
     // Queued messages cross channels too: the transcript sees them the
     // same as directly-submitted ones (drain bypasses handle_message).
     sh.surface.on_inbound(&item.source, &item.text);
+    publish_turn_source(&sh.store, &item.source);
     let mut turn = Turn::new(sid.clone(), item.text.clone());
     if let Err(e) = sh.store.insert_turn(&turn) {
         sh.surface

@@ -133,6 +133,14 @@ ka-agent briefing off
 One message a day instead of a stream of nudges: it lists what needs
 action and says "Nothing notable today." when that is the truth.
 
+Scheduled prompts take local times and days — `/cron add every weekday at 9
+standup notes`, `every mon,wed,fri at 18:00 …`, `every month on the 1st at 9
+…` — from chat or from the shell (`ka-agent cron add …`, `cron list`, `cron
+pause|resume|run|runs <id>`). Every fire is recorded; a job that cannot run
+(no model, budget reached) is paused or skipped without spending anything.
+`ka-agent config set notify.quiet_hours '"22:00-07:00"'` keeps scheduled
+prompts quiet at night (reminders still ring).
+
 ## Configuration
 
 Ka Agent keeps everything under `~/.ka-agent` (override with

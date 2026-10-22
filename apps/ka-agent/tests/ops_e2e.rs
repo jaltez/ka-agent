@@ -654,3 +654,53 @@ fn backup_default_path_prunes_to_keep() {
     assert_eq!(dirs, 1, "keep=1 must prune to one: {stamps:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// G5: a turn started by a cron cannot schedule more crons (loop guard);
+/// any other turn can.
+#[test]
+fn cron_started_turn_cannot_schedule_crons() {
+    use std::io::Write as _;
+    let root = temp_root("cron-loop");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let _cfg = write_config(&root);
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    let schedule = |source: &str| {
+        store.meta_set("turn.source", source).unwrap();
+        let mut child = ka(&data)
+            .arg("__mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        for msg in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"1h","text":"spawned"}}}"#,
+        ] {
+            stdin.write_all(msg.as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("\"id\":2"))
+            .unwrap_or("")
+            .to_string()
+    };
+    let refused = schedule("cron");
+    assert!(
+        refused.contains("isError") && refused.contains("scheduled job"),
+        "{refused}"
+    );
+    assert!(store.cron_tasks().unwrap().is_empty());
+    let allowed = schedule("telegram:42");
+    assert!(
+        allowed.contains("scheduled") && !allowed.contains("isError"),
+        "{allowed}"
+    );
+    assert_eq!(store.cron_tasks().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}

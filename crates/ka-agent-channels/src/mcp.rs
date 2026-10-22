@@ -605,6 +605,19 @@ fn handle_tool_call(
                 .map_err(|e| format!("store: {e}"))?;
             match action {
                 "schedule" => {
+                    // Loop guard: a scheduled run may not schedule more
+                    // jobs (a cron that creates crons runs away).
+                    if store
+                        .meta_get(ka_agent_core::layout::TURN_SOURCE_META_KEY)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some("cron")
+                    {
+                        return Err(
+                            "refused: this turn was started by a scheduled job, and scheduled jobs cannot schedule more (ask the operator to add it)".into(),
+                        );
+                    }
                     let text = args["text"].as_str().ok_or("missing 'text'")?;
                     if text.trim().is_empty() {
                         return Err("text must not be empty".into());

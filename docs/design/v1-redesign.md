@@ -310,12 +310,17 @@ and exposes **none** of it. The largest capability jump costs no engine change.
   (scripted-speaker e2e sees the prompt).
 
 ### G2 · Quiet hours — *M*
-- **Change:** `[notify] quiet_hours = "22:00-07:00"`: cron/briefing
-  results and notices produced in the window are held and delivered as one
-  digest at its end; reminders the operator set explicitly still fire;
-  approvals still post (they expire).
-- **Acceptance:** runtime test with a fixed clock: a cron result at 23:00
-  is held, delivered at 07:00 with its timestamp.
+- **Change:** `[notify] quiet_hours = "22:00-07:00"`: scheduled prompts
+  (crons, the briefing) that fall due inside the window wait until it ends
+  — the job itself is deferred (run recorded `deferred`), so nothing runs
+  at night for nobody to read and no tokens are spent then. Reminders the
+  operator set explicitly still fire; approvals still post (they expire).
+  *(Refined from "hold the result": a turn's output streams live to every
+  surface, so holding output would mean buffering every channel; deferring
+  the job is simpler and cheaper.)*
+- **Acceptance:** runtime test with a window around now: a due cron is
+  re-armed to the window's end with a `deferred` run, a reminder due at the
+  same moment still fires.
 
 ### G3 · Recurrence grammar — *S*
 - **Change:** `every weekday at 9`, `every mon,wed,fri at 18:00`,

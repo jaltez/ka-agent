@@ -172,6 +172,39 @@ impl Search {
     }
 }
 
+/// Proactive-message manners: strict `[notify]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Notify {
+    /// `"22:00-07:00"`: scheduled prompts (crons, the briefing) that fall
+    /// due inside this local window wait until it ends. Reminders and
+    /// approvals are never held.
+    pub quiet_hours: Option<String>,
+}
+
+impl Notify {
+    /// The parsed window: (start, end) as (hh, mm).
+    pub fn quiet_window(&self) -> Option<((u8, u8), (u8, u8))> {
+        let (a, b) = self.quiet_hours.as_deref()?.split_once('-')?;
+        Some((crate::when::parse_hhmm(a)?, crate::when::parse_hhmm(b)?))
+    }
+
+    /// When `now` falls inside the quiet window: the instant it ends.
+    pub fn quiet_until(&self, now: &jiff::Zoned) -> Option<i64> {
+        let ((sh, sm), (eh, em)) = self.quiet_window()?;
+        let minute = |h: u8, m: u8| u32::from(h) * 60 + u32::from(m);
+        let (start, end) = (minute(sh, sm), minute(eh, em));
+        let t = minute(now.hour() as u8, now.minute() as u8);
+        let inside = if start <= end {
+            t >= start && t < end
+        } else {
+            // Over midnight (22:00-07:00).
+            t >= start || t < end
+        };
+        inside.then(|| crate::when::next_local(eh, em, &crate::when::DayRule::Daily, now))
+    }
+}
+
 /// Voice-note transcription: strict `[voice]`. OpenAI-compatible
 /// `/audio/transcriptions` — OpenAI, Groq, or a local Whisper server.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -293,6 +326,7 @@ pub struct DaemonConfig {
     pub mcp: Vec<McpServer>,
     /// Voice-note transcription (`None` = voice notes get a setup hint).
     pub voice: Option<Voice>,
+    pub notify: Notify,
 }
 
 impl Default for DaemonConfig {
@@ -316,6 +350,7 @@ impl Default for DaemonConfig {
             search: None,
             mcp: Vec::new(),
             voice: None,
+            notify: Notify::default(),
         }
     }
 }
@@ -422,6 +457,11 @@ impl DaemonConfig {
                 "search.provider {:?}: tavily | brave | bing",
                 search.provider
             )));
+        }
+        if self.notify.quiet_hours.is_some() && self.notify.quiet_window().is_none() {
+            return Err(Error::Validate(
+                "notify.quiet_hours must be \"HH:MM-HH:MM\" (e.g. \"22:00-07:00\")".into(),
+            ));
         }
         if let Some(v) = &self.voice {
             if !Voice::PROVIDERS.contains(&v.provider.as_str()) {
@@ -549,6 +589,46 @@ mod tests {
     fn unknown_mode_rejected() {
         let cfg = DaemonConfig {
             mode: "yolo".into(),
+            ..DaemonConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn quiet_hours_span_midnight_and_end_at_the_window_end() {
+        let n = Notify {
+            quiet_hours: Some("22:00-07:00".into()),
+        };
+        let at = |s: &str| -> jiff::Zoned { s.parse().unwrap() };
+        let night = at("2026-10-29T23:30:00+01:00[Europe/Madrid]");
+        let end = n.quiet_until(&night).expect("inside");
+        let end = jiff::Timestamp::from_millisecond(end)
+            .unwrap()
+            .to_zoned(night.time_zone().clone());
+        assert_eq!((end.day(), end.hour(), end.minute()), (30, 7, 0));
+        assert!(
+            n.quiet_until(&at("2026-10-30T06:59:00+01:00[Europe/Madrid]"))
+                .is_some()
+        );
+        assert!(
+            n.quiet_until(&at("2026-10-30T07:00:00+01:00[Europe/Madrid]"))
+                .is_none()
+        );
+        assert!(
+            n.quiet_until(&at("2026-10-30T12:00:00+01:00[Europe/Madrid]"))
+                .is_none()
+        );
+        let day = Notify {
+            quiet_hours: Some("13:00-15:00".into()),
+        };
+        assert!(
+            day.quiet_until(&at("2026-10-30T14:00:00+01:00[Europe/Madrid]"))
+                .is_some()
+        );
+        let cfg = DaemonConfig {
+            notify: Notify {
+                quiet_hours: Some("late-early".into()),
+            },
             ..DaemonConfig::default()
         };
         assert!(cfg.validate().is_err());

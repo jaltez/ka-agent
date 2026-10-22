@@ -27,7 +27,8 @@ pub use approval::{Approval, ApprovalDecision, ApprovalKind, ApprovalStatus};
 pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
 pub use config::{
-    Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Search, Voice, Web,
+    Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Notify, Search, Voice,
+    Web,
 };
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};

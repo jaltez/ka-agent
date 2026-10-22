@@ -32,6 +32,11 @@ pub fn base_dir() -> PathBuf {
 /// out-of-process readers (the MCP bridge) that have no config.
 pub const TIMEZONE_META_KEY: &str = "operator.timezone";
 
+/// Store meta key holding the source of the turn being submitted
+/// (`console`, `telegram:<id>`, `cron`, …): the MCP bridge reads it to
+/// refuse scheduling from inside a scheduled run (loop guard).
+pub const TURN_SOURCE_META_KEY: &str = "turn.source";
+
 /// Process-wide profile chosen on the command line (`-p/--profile`).
 /// Set once by the binary before anything resolves a path.
 static PROFILE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

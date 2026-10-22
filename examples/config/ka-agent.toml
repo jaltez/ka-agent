@@ -83,6 +83,17 @@ enabled = false
 # [calendar]
 # digest_time = "08:00"
 
+# Quiet hours (local time): scheduled prompts — crons, the daily briefing —
+# that fall due inside the window wait until it ends. Reminders and
+# approvals are never held.
+# [notify]
+# quiet_hours = "22:00-07:00"
+
+# Voice notes from Telegram/Matrix (`ka-agent setup voice`): openai | groq
+# | local (an OpenAI-compatible Whisper server; set base_url).
+# [voice]
+# provider = "groq"
+
 # Web search for the engine's `web_search` tool (`ka-agent setup search`).
 # The key lives in the engine .env tier: `ka-agent key set TAVILY_API_KEY`
 # (BRAVE_API_KEY / BING_API_KEY for the others).
