@@ -12,6 +12,7 @@ pub mod multi;
 pub mod pairing;
 pub mod refs;
 pub mod telegram;
+pub mod voice;
 
 pub use channel::Channel;
 pub use commands::{cron_add, cron_list_text, fmt_interval, help_for, help_text};

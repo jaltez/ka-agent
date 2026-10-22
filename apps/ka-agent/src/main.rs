@@ -51,7 +51,7 @@ enum Command {
     /// Guided setup: model and key, phone, web search, background service.
     #[command(visible_alias = "init")]
     Setup {
-        /// Section: all | model | telegram | matrix | service | search | briefing.
+        /// Section: all | model | telegram | matrix | service | search | briefing | voice.
         section: Option<String>,
         /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
@@ -637,9 +637,10 @@ fn main() -> std::process::ExitCode {
                 Some("service") => setup::Section::Service,
                 Some("search") => setup::Section::Search,
                 Some("briefing") => setup::Section::Briefing,
+                Some("voice") => setup::Section::Voice,
                 Some(other) => {
                     eprintln!(
-                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search | briefing"
+                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search | briefing | voice"
                     );
                     return std::process::ExitCode::FAILURE;
                 }

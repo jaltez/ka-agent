@@ -196,10 +196,12 @@ fn candidate_review_accept_flow() {
 
     let mut chat = spawn_chat(&root, &sc);
     chat.send("/memory review");
-    chat.expect("mem_cand-test-0001", Duration::from_secs(10));
+    // Review lists the short handle every surface shows (the id's tail).
+    chat.expect("[est-0001] (model)", Duration::from_secs(10));
     let out = chat.seen();
     assert!(out.contains("Madrid"), "review shows text:\n{out}");
 
+    // The full id still works, like the short one.
     chat.send("/memory accept mem_cand-test-0001");
     chat.expect("accepted into stable memory", Duration::from_secs(10));
     // Now it is stable memory: facts.md + compiled MEMORY.md + git commit.

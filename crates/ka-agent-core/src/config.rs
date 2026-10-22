@@ -172,6 +172,51 @@ impl Search {
     }
 }
 
+/// Voice-note transcription: strict `[voice]`. OpenAI-compatible
+/// `/audio/transcriptions` — OpenAI, Groq, or a local Whisper server.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Voice {
+    /// `openai` | `groq` | `local`.
+    pub provider: String,
+    /// API base (required for `local`, e.g. `http://127.0.0.1:8000/v1`).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Transcription model; a sensible default per provider.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl Voice {
+    pub const PROVIDERS: &'static [&'static str] = &["openai", "groq", "local"];
+
+    /// API base without the trailing `/audio/transcriptions`.
+    pub fn base(&self) -> String {
+        match (&self.base_url, self.provider.as_str()) {
+            (Some(b), _) => b.trim_end_matches('/').to_string(),
+            (None, "groq") => "https://api.groq.com/openai/v1".into(),
+            (None, _) => "https://api.openai.com/v1".into(),
+        }
+    }
+
+    pub fn model(&self) -> String {
+        match (&self.model, self.provider.as_str()) {
+            (Some(m), _) => m.clone(),
+            (None, "groq") => "whisper-large-v3-turbo".into(),
+            (None, _) => "whisper-1".into(),
+        }
+    }
+
+    /// The engine `.env` key the provider needs (`None` for a local server).
+    pub fn key_env(&self) -> Option<&'static str> {
+        match self.provider.as_str() {
+            "openai" => Some("OPENAI_API_KEY"),
+            "groq" => Some("GROQ_API_KEY"),
+            _ => None,
+        }
+    }
+}
+
 /// One operator-declared MCP server (`[[mcp]]`). Values written
 /// `secret:<name>` in `env`/`headers` resolve from the secret store when the
 /// worker starts, so tokens never live in the config file.
@@ -246,6 +291,8 @@ pub struct DaemonConfig {
     pub search: Option<Search>,
     /// Operator-declared MCP servers.
     pub mcp: Vec<McpServer>,
+    /// Voice-note transcription (`None` = voice notes get a setup hint).
+    pub voice: Option<Voice>,
 }
 
 impl Default for DaemonConfig {
@@ -268,6 +315,7 @@ impl Default for DaemonConfig {
             calendar: Calendar::default(),
             search: None,
             mcp: Vec::new(),
+            voice: None,
         }
     }
 }
@@ -374,6 +422,19 @@ impl DaemonConfig {
                 "search.provider {:?}: tavily | brave | bing",
                 search.provider
             )));
+        }
+        if let Some(v) = &self.voice {
+            if !Voice::PROVIDERS.contains(&v.provider.as_str()) {
+                return Err(Error::Validate(format!(
+                    "voice.provider {:?}: openai | groq | local",
+                    v.provider
+                )));
+            }
+            if v.provider == "local" && v.base_url.is_none() {
+                return Err(Error::Validate(
+                    "voice.provider = \"local\" needs voice.base_url (your Whisper server)".into(),
+                ));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for m in &self.mcp {

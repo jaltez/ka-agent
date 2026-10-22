@@ -54,6 +54,13 @@ fn audit_details(dir: &std::path::Path) -> Vec<(String, String)> {
 }
 
 async fn spawn_stack(link_operator: bool) -> (Stack, std::path::PathBuf) {
+    spawn_stack_with(link_operator, None).await
+}
+
+async fn spawn_stack_with(
+    link_operator: bool,
+    transcriber: Option<ka_agent_channels::voice::Transcriber>,
+) -> (Stack, std::path::PathBuf) {
     let (fake, base) = FakeHomeserver::spawn();
     let dir = std::env::temp_dir().join(format!(
         "ka-ch-mx-{}-{}",
@@ -69,6 +76,7 @@ async fn spawn_stack(link_operator: bool) -> (Stack, std::path::PathBuf) {
         homeserver: base.clone(),
         user_id: FAKE_MATRIX_BOT.to_string(),
         token: "tok".to_string(),
+        transcriber: transcriber.clone(),
     };
     let initial_room = store.meta_get("matrix.room_id").ok().flatten();
     let surface = Arc::new(MatrixSurface::new(mcfg(), initial_room));
@@ -285,5 +293,39 @@ async fn replies_carry_formatted_html() {
         hit.body["formatted_body"].as_str(),
         Some("<strong>done</strong> with <code>x &lt; y</code>")
     );
+    stack.stop().await;
+}
+
+/// D2 on Matrix: an `m.audio` message is downloaded (authenticated media),
+/// transcribed and echoed; without a transcriber the room gets the hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_message_is_transcribed_and_echoed() {
+    use ka_agent_channels::fake::FakeTranscriber;
+    let (stt, stt_base) = FakeTranscriber::spawn("call the plumber");
+    let t = ka_agent_channels::voice::Transcriber::new(stt_base, "whisper-1".into(), None);
+    let (stack, _dir) = spawn_stack_with(true, Some(t)).await;
+    stack
+        .fake
+        .push_media("example.org/abc", b"OggS matrix audio");
+    stack
+        .fake
+        .push_audio_message(ROOM, OPERATOR, "mxc://example.org/abc");
+    stack
+        .fake
+        .await_sent("🎙 “call the plumber”", Duration::from_secs(10))
+        .expect("transcript echo");
+    let req = stt.requests();
+    assert_eq!(req.len(), 1);
+    assert!(String::from_utf8_lossy(&req[0].body).contains("OggS matrix audio"));
+    stack.stop().await;
+
+    let (stack, _dir) = spawn_stack_with(true, None).await;
+    stack
+        .fake
+        .push_audio_message(ROOM, OPERATOR, "mxc://example.org/abc");
+    stack
+        .fake
+        .await_sent("voice messages are off", Duration::from_secs(10))
+        .expect("setup hint");
     stack.stop().await;
 }

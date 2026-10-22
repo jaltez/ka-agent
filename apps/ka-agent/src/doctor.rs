@@ -190,6 +190,15 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
             )),
             None => rep.warn("web search off — ka-agent setup search"),
         }
+        if let Some(v) = &cfg.voice {
+            match v.key_env() {
+                Some(k) if !has(k) => rep.fail(format!(
+                    "voice notes {}: {k} missing — ka-agent key set {k}",
+                    v.provider
+                )),
+                _ => rep.ok(format!("voice notes {} ({})", v.provider, v.model())),
+            }
+        }
         for m in &cfg.fallback {
             match catalog::validate_selector(m) {
                 Ok(_) => rep.ok(format!("fallback {m}")),

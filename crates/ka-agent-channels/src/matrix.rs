@@ -48,6 +48,9 @@ pub struct MatrixConfig {
     pub homeserver: String,
     pub user_id: String,
     pub token: String,
+    /// Voice-message transcription (`m.audio`); `None` answers them with
+    /// the setup hint.
+    pub transcriber: Option<crate::voice::Transcriber>,
 }
 
 /// A small CS-API client. URLs are built segment by segment so room ids
@@ -111,6 +114,33 @@ impl Client {
             req = req.json(b);
         }
         send_json(req).await
+    }
+
+    /// Download `mxc://<server>/<id>` (authenticated media, capped).
+    async fn download_media(&self, mxc: &str) -> Result<Vec<u8>, String> {
+        let (server, id) = mxc
+            .strip_prefix("mxc://")
+            .and_then(|r| r.split_once('/'))
+            .ok_or_else(|| format!("not an mxc url: {mxc}"))?;
+        let url = endpoint(
+            &self.base,
+            &["_matrix", "client", "v1", "media", "download", server, id],
+        )?;
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("media: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("media: {}", resp.status()));
+        }
+        let bytes = resp.bytes().await.map_err(|e| format!("media: {e}"))?;
+        if bytes.len() > crate::voice::MAX_BYTES {
+            return Err("media: too large".into());
+        }
+        Ok(bytes.to_vec())
     }
 
     async fn sync(&self, since: Option<&str>) -> Result<Value, String> {
@@ -471,6 +501,18 @@ impl MatrixChannel {
             return;
         }
         self.set_room(room);
+        let transcript;
+        let body = if event["content"]["msgtype"].as_str() == Some("m.audio") {
+            match self.transcribe_audio(room, &event["content"]).await {
+                Some(t) => {
+                    transcript = t;
+                    transcript.as_str()
+                }
+                None => return,
+            }
+        } else {
+            body
+        };
         match commands::route(&self.runtime, &format!("matrix:{sender}"), body).await {
             Outcome::Reply(reply) => self.surface.client.send_split(room, &reply).await,
             Outcome::Silent => {}
@@ -483,6 +525,50 @@ impl MatrixChannel {
                 {
                     eprintln!("matrix: handle_message: {e}");
                 }
+            }
+        }
+    }
+
+    /// An `m.audio` message → its transcript (echoed back); `None` when
+    /// nothing should be submitted (voice off, too long, failure — each
+    /// answered in the room).
+    async fn transcribe_audio(&self, room: &str, content: &Value) -> Option<String> {
+        let client = &self.surface.client;
+        let Some(t) = &self.cfg.transcriber else {
+            client
+                .send_split(
+                    room,
+                    "🎙 voice messages are off — `ka-agent setup voice` turns them on",
+                )
+                .await;
+            return None;
+        };
+        let ms = content["info"]["duration"].as_i64().unwrap_or(0);
+        if ms / 1000 > crate::voice::MAX_SECONDS {
+            client
+                .send_split(room, "🎙 too long — voice messages up to 10 minutes")
+                .await;
+            return None;
+        }
+        let heard = match client
+            .download_media(content["url"].as_str().unwrap_or(""))
+            .await
+        {
+            Ok(bytes) => t.transcribe(bytes, "voice.ogg").await,
+            Err(e) => Err(e),
+        };
+        match heard {
+            Ok(text) if !text.is_empty() => {
+                client.send_split(room, &format!("🎙 “{text}”")).await;
+                Some(text)
+            }
+            Ok(_) => {
+                client.send_split(room, "🎙 (nothing heard)").await;
+                None
+            }
+            Err(e) => {
+                client.send_split(room, &format!("! [voice] {e}")).await;
+                None
             }
         }
     }

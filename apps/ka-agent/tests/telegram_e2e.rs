@@ -310,3 +310,84 @@ async fn commands_never_reach_the_engine() {
     daemon.sigterm_wait(Duration::from_secs(10));
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// D2: a voice note is transcribed, echoed back, and becomes a turn whose
+/// inbound text is the transcript. Without `[voice]` it gets the setup
+/// hint and no turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_note_becomes_a_turn_with_its_transcript() {
+    use ka_agent_channels::fake::FakeTranscriber;
+    let root = temp_root("voice");
+    let (fake, base) = FakeBotServer::spawn();
+    let (stt, stt_base) = FakeTranscriber::spawn("remind me to water the plants");
+    let cfg = write_config(&root, &base);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    // Top-level keys first would be cleaner; a table appended at the end
+    // is equally valid TOML.
+    text.push_str(&format!(
+        "\n[voice]\nprovider = \"local\"\nbase_url = {stt_base:?}\n"
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    let sc = scenario_file(
+        &root,
+        "voice.json",
+        r#"{ "steps": [ {"text": "Watering noted"} ], "stop": "done" }"#,
+    );
+    let data = root.join("data");
+    fake.push_file("v-1", "voice/v-1.oga", b"OggS fake audio");
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    wait_polling(&fake);
+    fake.push_voice_message(1, 42, 42, "v-1", 4);
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("🎙 “remind me to water the plants”")),
+        Duration::from_secs(30),
+    )
+    .expect("transcript echo");
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("Watering noted")),
+        Duration::from_secs(30),
+    )
+    .expect("answer to the voice note");
+    let req = stt.requests();
+    assert_eq!(req.len(), 1);
+    let body = String::from_utf8_lossy(&req[0].body);
+    assert!(
+        body.contains("whisper-1") && body.contains("OggS fake audio"),
+        "{body}"
+    );
+    let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    let inbound: String = conn
+        .query_row(
+            "SELECT inbound_text FROM turns ORDER BY created_ms DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(inbound, "remind me to water the plants");
+    daemon.sigterm_wait(Duration::from_secs(10));
+
+    // Voice off: the hint, nothing submitted.
+    std::fs::write(
+        &cfg,
+        std::fs::read_to_string(&cfg)
+            .unwrap()
+            .split("\n[voice]")
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    wait_polling(&fake);
+    fake.push_voice_message(2, 42, 42, "v-1", 4);
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("voice notes are off")),
+        Duration::from_secs(30),
+    )
+    .expect("setup hint");
+    let turns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns, 1, "no turn for a voice note while voice is off");
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}

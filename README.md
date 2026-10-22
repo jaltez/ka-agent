@@ -109,6 +109,30 @@ exact `identity link` command). Telegram setup needs a bot token from
 account and logs in once. Photos and files sent on Telegram land in
 `<workspace>/attachments/` with an `@reference` you can paste back.
 
+On the phone, replies stream in as they are written (Telegram drafts),
+every message you send gets a 👀 receipt, and Matrix shows formatted text.
+When Ka proposes remembering something, you get a card — ✅ Remember /
+✖ Discard — instead of a queue to check. Voice notes work once you pick a
+transcriber:
+
+```sh
+ka-agent setup voice     # OpenAI or Groq Whisper, or a local Whisper server
+```
+
+The voice note is transcribed, shown back to you (`🎙 “…”`), and handled
+like typed text.
+
+## Daily briefing
+
+```sh
+ka-agent briefing on 07:30    # every morning: calendar, reminders, what waits for you
+ka-agent briefing now         # one right away
+ka-agent briefing off
+```
+
+One message a day instead of a stream of nudges: it lists what needs
+action and says "Nothing notable today." when that is the truth.
+
 ## Configuration
 
 Ka Agent keeps everything under `~/.ka-agent` (override with

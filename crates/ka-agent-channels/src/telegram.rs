@@ -804,6 +804,9 @@ pub struct TelegramConfig {
     pub api_base: String,
     pub token: String,
     pub allow_user_ids: Vec<i64>,
+    /// Voice-note transcription; `None` answers voice notes with the
+    /// setup hint.
+    pub transcriber: Option<crate::voice::Transcriber>,
 }
 
 impl TelegramConfig {
@@ -812,6 +815,7 @@ impl TelegramConfig {
             api_base: cfg.telegram.api_base().to_string(),
             token,
             allow_user_ids: cfg.telegram.allow_user_ids.clone(),
+            transcriber: None,
         }
     }
 }
@@ -1134,7 +1138,18 @@ impl TelegramChannel {
         self.adopt_chat(surface, chat_id).await;
         let client = surface.client.clone();
 
-        if message.get("photo").is_some() || message.get("document").is_some() {
+        let voice = message.get("voice").or_else(|| message.get("audio"));
+        let transcript = match voice {
+            Some(v) => match self.transcribe_voice(&client, chat_id, v).await {
+                Some(t) => Some(t),
+                None => return,
+            },
+            None => None,
+        };
+
+        if transcript.is_none()
+            && (message.get("photo").is_some() || message.get("document").is_some())
+        {
             let reply = match self.save_attachment(&client, message).await {
                 Ok(rel) => format!("saved {rel} — reference it with @{rel} in your next message"),
                 Err(e) => format!("! [attachment] {e}"),
@@ -1143,7 +1158,7 @@ impl TelegramChannel {
             return;
         }
 
-        let Some(text) = message["text"].as_str() else {
+        let Some(text) = transcript.as_deref().or_else(|| message["text"].as_str()) else {
             return;
         };
 
@@ -1216,6 +1231,64 @@ impl TelegramChannel {
                     Some(json!({ "inline_keyboard": [] })),
                 )
                 .await;
+        }
+    }
+
+    /// A voice note (or audio file) → its transcript, echoed back so the
+    /// operator sees what was heard. `None` when there is nothing to submit
+    /// (voice off, too long, transcription failed — each answered).
+    async fn transcribe_voice(
+        &self,
+        client: &TelegramClient,
+        chat_id: i64,
+        voice: &Value,
+    ) -> Option<String> {
+        let Some(t) = &self.cfg.transcriber else {
+            let _ = client
+                .send_message(
+                    chat_id,
+                    "🎙 voice notes are off — `ka-agent setup voice` turns them on",
+                    None,
+                )
+                .await;
+            return None;
+        };
+        let duration = voice["duration"].as_i64().unwrap_or(0);
+        let size = voice["file_size"].as_u64().unwrap_or(0) as usize;
+        if duration > crate::voice::MAX_SECONDS || size > crate::voice::MAX_BYTES {
+            let _ = client
+                .send_message(chat_id, "🎙 too long — voice notes up to 10 minutes", None)
+                .await;
+            return None;
+        }
+        let file_id = voice["file_id"].as_str().unwrap_or("");
+        let audio = match client.get_file(file_id).await {
+            Ok(path) => client.download_file(&path).await,
+            Err(e) => Err(e),
+        };
+        let heard = match audio {
+            Ok(bytes) => t.transcribe(bytes, "voice.ogg").await,
+            Err(e) => Err(format!("download: {e}")),
+        };
+        match heard {
+            Ok(text) if !text.is_empty() => {
+                let _ = client
+                    .send_message(chat_id, &format!("🎙 “{text}”"), None)
+                    .await;
+                Some(text)
+            }
+            Ok(_) => {
+                let _ = client
+                    .send_message(chat_id, "🎙 (nothing heard)", None)
+                    .await;
+                None
+            }
+            Err(e) => {
+                let _ = client
+                    .send_message(chat_id, &format!("! [voice] {e}"), None)
+                    .await;
+                None
+            }
         }
     }
 

@@ -207,6 +207,7 @@ pub async fn run_daemon(
                     homeserver,
                     user_id: cfg.matrix.user_id.clone(),
                     token: t.clone(),
+                    transcriber: None,
                 },
                 initial_room,
             ));
@@ -258,9 +259,21 @@ pub async fn run_daemon(
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Voice-note transcription for the phone channels (key from the engine
+    // `.env` tier, like every provider key).
+    let transcriber = cfg.voice.as_ref().and_then(|voice| {
+        let env = ka_agent_port::catalog::read_env_file(&ka_agent_port::catalog::engine_env_path(
+            &paths.engine_home(),
+        ));
+        ka_agent_channels::voice::Transcriber::from_config(voice, &env)
+            .map_err(|e| eprintln!("ka-agent: {e} (voice notes off)"))
+            .ok()
+    });
+
     // Channels (inbound) when enabled: one task each, same runtime.
     if let Some(token) = token {
-        let tcfg = ka_agent_channels::TelegramConfig::from_config(&cfg, token);
+        let mut tcfg = ka_agent_channels::TelegramConfig::from_config(&cfg, token);
+        tcfg.transcriber = transcriber.clone();
         let channel =
             ka_agent_channels::TelegramChannel::new(tcfg, runtime.clone(), Arc::clone(&store));
         tokio::spawn(channel.run(shutdown_rx.clone()));
@@ -270,6 +283,7 @@ pub async fn run_daemon(
             homeserver: cfg.matrix.homeserver.clone().unwrap_or_default(),
             user_id: cfg.matrix.user_id.clone(),
             token,
+            transcriber: transcriber.clone(),
         };
         let channel = ka_agent_channels::MatrixChannel::new(
             mcfg,

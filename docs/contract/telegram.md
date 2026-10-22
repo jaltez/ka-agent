@@ -34,14 +34,29 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   `@attachments/…` reference the operator can paste into the next
   message (`@` expansion resolves against the workspace). A failed
   download is a visible `! [attachment] …` reply, never a silent drop.
+- Accepted free text gets a `👀` reaction (`setMessageReaction`) at once —
+  a receipt, kept after the answer (clearing costs a call per message).
+- Voice notes / audio (`voice`, `audio`): with `[voice]` configured the file
+  is downloaded (20 MB / 10 min caps), sent to the OpenAI-compatible
+  `/audio/transcriptions` endpoint, echoed back as `🎙 “…”`, and handled
+  exactly like typed text. Without `[voice]`: one reply naming
+  `ka-agent setup voice`, nothing submitted. Failures are a visible
+  `! [voice] …`.
+- Callback `m:<short>:y|n` settles a memory proposal card (below).
 - Bad token (getMe 401/404): one `! [auth]` message to the known chat, then
   the channel exits (the daemon exits). Network errors: 1 s→60 s backoff.
 
 ## Outbound (TelegramSurface)
 
-- No per-delta streaming: the delivery boundary is `idle` (SEED.md §3.7).
-  While a turn runs: typing action every 4 s plus one editable progress
-  message (edits throttled to 1 per 3 s, last 3 notes buffered).
+- Streaming (`telegram.stream`, default on): deltas accumulate per turn
+  and are pushed with Bot API 9.5 `sendMessageDraft` (stable non-zero
+  `draft_id` per turn, plain text, ≤ 1 request/s, only after ≥ 40 new
+  characters, one request in flight). The first API refusal turns drafts
+  off for the process and the turn still ends with the final message. The
+  delivery boundary stays `idle` (SEED.md §3.7): the final answer is always
+  sent as normal messages. While a turn runs: typing action every 4 s plus
+  one editable progress message (edits throttled to 1 per 3 s, last 3
+  notes buffered).
 - Final answer: `on_final_chunk` sends one message per chunk (runtime chunks
   ≤3800 chars at paragraph boundaries); the surface closes unbalanced ```
   fences per chunk and spaces sends ≥1 s (official per-chat guidance ~1/s).
@@ -52,12 +67,19 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   (≤64 bytes, asserted by test). Decisions answer the engine ask, audit, and
   edit the card to `[Approved]/[Denied]/[Expired]` with the keyboard removed.
   "Always" is never offered from Telegram (gap G12).
-- Plain text only (no `parse_mode`) — engine markdown is never interpreted as
-  Telegram entities.
+- Formatting: answers are rendered by `ka_agent_core::markdown` (Telegram
+  HTML subset, everything escaped first) and sent with `parse_mode: HTML`;
+  a refusal (`can't parse entities`) or an over-long render falls back to
+  the plain text.
+- Memory proposal cards: each new `memory_propose` candidate (found by the
+  runtime's maintenance tick, at most 3 per tick plus a "N more" notice) is
+  posted with `✅ Remember` / `✖ Discard` (`callback_data =
+  m:<short-id>:y|n`); the press accepts/rejects it and edits the card to
+  its outcome with the keyboard removed.
 
 ## Secrets
 
-`telegram.token_secret` resolves via `ka_agent_channels::secret`:
+`telegram.token_secret` resolves via `ka_agent_core::secret`:
 `$KA_AGENT_SECRET_<NAME>` first, then `<data>/secrets/<name>` (0600 file,
 single line). The OS-keyring tier is a later addition; the lookup order is
 fixed.

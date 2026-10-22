@@ -373,3 +373,44 @@ fn setup_search_section_writes_provider_and_key() {
     assert!(d.contains("✓ web search tavily (key set)"), "{d}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A3 (voice): `setup voice` writes `[voice]` and the provider key.
+#[test]
+fn setup_voice_section_writes_provider_and_key() {
+    let root = temp_root("voice");
+    std::fs::write(root.join("ka-agent.toml"), "mode = \"guarded\"\n").unwrap();
+    let mut child = ka(&root)
+        .args(["setup", "voice"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"2\ngsk-test\ny\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = config_of(&root);
+    assert!(
+        cfg.contains("[voice]") && cfg.contains("provider = \"groq\""),
+        "{cfg}"
+    );
+    let env = std::fs::read_to_string(root.join("data/engine-home/.config/ka/.env")).unwrap();
+    assert!(env.contains("GROQ_API_KEY=gsk-test"), "{env}");
+    let doctor = ka(&root).arg("doctor").output().unwrap();
+    let d = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        d.contains("✓ voice notes groq (whisper-large-v3-turbo)"),
+        "{d}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

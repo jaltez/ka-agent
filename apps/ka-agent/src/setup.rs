@@ -28,6 +28,7 @@ pub enum Section {
     Service,
     Search,
     Briefing,
+    Voice,
 }
 
 /// Parsed `ka-agent setup` arguments.
@@ -81,6 +82,8 @@ struct Setup {
     search: Option<(String, Option<String>)>,
     /// Daily briefing time chosen in setup (`HH:MM`).
     briefing: Option<String>,
+    /// Voice notes: the `[voice]` choice and, when newly entered, its key.
+    voice: Option<(ka_agent_core::Voice, Option<String>)>,
 }
 
 fn prompt_err(e: PromptError) -> std::process::ExitCode {
@@ -156,6 +159,7 @@ impl Setup {
                 "Background service".into(),
                 "Web search".into(),
                 "Daily briefing".into(),
+                "Voice notes".into(),
                 "Everything".into(),
             ];
             let pick = prompt::choice("What do you want to set up?", &options, 0)?;
@@ -166,6 +170,7 @@ impl Setup {
                 3 => Section::Service,
                 4 => Section::Search,
                 5 => Section::Briefing,
+                6 => Section::Voice,
                 _ => Section::All,
             };
             if self.args.section != Section::All {
@@ -185,6 +190,10 @@ impl Setup {
         };
         self.step_search()?;
         self.step_briefing()?;
+        // Voice notes only matter once a phone can send them.
+        if channel.is_some() {
+            self.step_voice()?;
+        }
         if !self.confirm_and_write().await? {
             return Ok(std::process::ExitCode::SUCCESS);
         }
@@ -219,6 +228,15 @@ impl Setup {
                 self.post_write(Some("matrix")).await
             }
             Section::Service => self.step_service(),
+            Section::Voice => {
+                self.step_voice()?;
+                if self.voice.is_none() || !self.confirm_and_write().await? {
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                crate::config_cli::apply_live(&self.paths, &self.args.config);
+                println!("Voice notes on — restart the agent so the phone channels pick it up");
+                Ok(std::process::ExitCode::SUCCESS)
+            }
             Section::Briefing => {
                 self.step_briefing()?;
                 if self.briefing.is_none() || !self.confirm_and_write().await? {
@@ -655,6 +673,57 @@ impl Setup {
         Ok(())
     }
 
+    /// Optional voice-note transcription (OpenAI, Groq or a local server).
+    fn step_voice(&mut self) -> Result<(), PromptError> {
+        let options = vec![
+            "OpenAI Whisper (OPENAI_API_KEY)".to_string(),
+            "Groq Whisper — fast, generous free tier (GROQ_API_KEY)".to_string(),
+            "A Whisper server on this machine/network".to_string(),
+            "Not now".to_string(),
+        ];
+        let voice = match prompt::choice("Understand voice notes from your phone?", &options, 3)? {
+            0 => ka_agent_core::Voice {
+                provider: "openai".into(),
+                ..ka_agent_core::Voice::default()
+            },
+            1 => ka_agent_core::Voice {
+                provider: "groq".into(),
+                ..ka_agent_core::Voice::default()
+            },
+            2 => ka_agent_core::Voice {
+                provider: "local".into(),
+                base_url: Some(prompt::text(
+                    "Server base URL (OpenAI-compatible)",
+                    Some("http://127.0.0.1:8000/v1"),
+                )?),
+                model: None,
+            },
+            _ => return Ok(()),
+        };
+        let key = match voice.key_env() {
+            None => None,
+            Some(env) if self.engine_env().contains_key(env) => {
+                println!("✓ {env} already saved");
+                None
+            }
+            Some(env) => match env_lookup(env) {
+                Some(v) if prompt::yes_no(&format!("Use {env} from your environment?"), true)? => {
+                    Some(v)
+                }
+                _ => {
+                    let k = prompt::secret(env)?;
+                    if k.trim().is_empty() {
+                        println!("no key — voice notes stay off");
+                        return Ok(());
+                    }
+                    Some(k.trim().to_string())
+                }
+            },
+        };
+        self.voice = Some((voice, key));
+        Ok(())
+    }
+
     /// Optional daily briefing (one morning message, not a heartbeat).
     fn step_briefing(&mut self) -> Result<(), PromptError> {
         let options = vec![
@@ -765,6 +834,9 @@ impl Setup {
         if let Some(t) = &self.briefing {
             println!("briefing  : every day at {t}");
         }
+        if let Some((v, _)) = &self.voice {
+            println!("voice     : {}", v.provider);
+        }
         // `--yes` never reads input: the summary IS the confirmation.
         if !self.args.yes && !prompt::yes_no("Save this setup?", true)? {
             println!("nothing was written");
@@ -804,6 +876,25 @@ impl Setup {
         if self.fresh {
             ka_agent_core::config_file::set(&self.args.config, "mode", "\"guarded\"")
                 .map_err(|e| e.to_string())?;
+        }
+        if let Some((voice, key)) = &self.voice {
+            if let (Some(key), Some(env)) = (key, voice.key_env()) {
+                catalog::upsert_env_file(&self.env_file(), env, key).map_err(|e| e.to_string())?;
+            }
+            if let Some(base) = &voice.base_url {
+                ka_agent_core::config_file::set(
+                    &self.args.config,
+                    "voice.base_url",
+                    &format!("{base:?}"),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            ka_agent_core::config_file::set(
+                &self.args.config,
+                "voice.provider",
+                &format!("{:?}", voice.provider),
+            )
+            .map_err(|e| e.to_string())?;
         }
         if let Some((provider, key)) = &self.search {
             if let Some(key) = key {
@@ -1128,6 +1219,7 @@ pub async fn run(args: SetupArgs) -> std::process::ExitCode {
         matrix_operator: None,
         search: None,
         briefing: None,
+        voice: None,
     };
     setup.run().await
 }

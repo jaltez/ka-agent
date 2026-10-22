@@ -506,6 +506,8 @@ impl Runtime {
             ("telegram", differs(&old.telegram, &new.telegram)),
             ("matrix", differs(&old.matrix, &new.matrix)),
             ("web", differs(&old.web, &new.web)),
+            // The phone channels build their transcriber at start.
+            ("voice", differs(&old.voice, &new.voice)),
         ];
         let names = |fields: &[(&str, bool)]| -> Vec<String> {
             fields

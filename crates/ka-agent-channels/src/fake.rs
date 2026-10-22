@@ -191,6 +191,27 @@ impl FakeBotServer {
         }));
     }
 
+    /// Queue a private-chat voice note (`voice.file_id`, `duration` s).
+    pub fn push_voice_message(
+        &self,
+        update_id: i64,
+        chat_id: i64,
+        user_id: i64,
+        file_id: &str,
+        duration: i64,
+    ) {
+        self.push_update(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": update_id,
+                "from": { "id": user_id, "is_bot": false },
+                "chat": { "id": chat_id, "type": "private" },
+                "date": 0,
+                "voice": { "file_id": file_id, "duration": duration, "mime_type": "audio/ogg" },
+            }
+        }));
+    }
+
     /// Queue a private-chat document message.
     pub fn push_document_message(
         &self,
@@ -383,6 +404,8 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
 
 #[derive(Default)]
 struct MatrixState {
+    /// Media served at `/_matrix/client/v1/media/download/<server>/<id>`.
+    media: Vec<(String, Vec<u8>)>,
     /// The room timeline the server is holding, FIFO: every sync delivers
     /// whatever arrived since the last one served (a homeserver queues
     /// server-side; tokens do not "attach" to events).
@@ -562,6 +585,30 @@ impl FakeHomeserver {
             .push((room.to_string(), event));
     }
 
+    /// Serve `bytes` as `mxc://<server>/<id>` (key `"<server>/<id>"`).
+    pub fn push_media(&self, key: &str, bytes: &[u8]) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .media
+            .push((key.to_string(), bytes.to_vec()));
+    }
+
+    /// Queue an `m.audio` message pointing at `mxc`.
+    pub fn push_audio_message(&self, room: &str, sender: &str, mxc: &str) {
+        let event = serde_json::json!({
+            "type": "m.room.message",
+            "sender": sender,
+            "content": {"msgtype": "m.audio", "body": "voice.ogg", "url": mxc,
+                        "info": {"duration": 4000, "size": 15}},
+        });
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .timeline
+            .push((room.to_string(), event));
+    }
+
     /// Queue a raw timeline event (e.g. with `origin_server_ts`, or an
     /// `m.room.encrypted` event).
     pub fn push_room_event(&self, room: &str, event: Value) {
@@ -658,6 +705,15 @@ impl FakeHomeserver {
 
 fn matrix_handle(state: &Arc<Mutex<MatrixState>>, path: &str, body: &Value) -> String {
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(key) = path.strip_prefix("/_matrix/client/v1/media/download/") {
+        // Test media is ASCII; the JSON-only writer sends it verbatim.
+        return st
+            .media
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+    }
     if path.contains("/send/m.room.message/") {
         st.sent.push(CapturedRequest {
             method: "PUT".into(),
@@ -672,5 +728,105 @@ fn matrix_handle(state: &Arc<Mutex<MatrixState>>, path: &str, body: &Value) -> S
         serde_json::json!({"room_id": percent_decode(room)}).to_string()
     } else {
         serde_json::json!({}).to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fake transcription API (`POST /audio/transcriptions`): answers every
+// request with a fixed transcript and records what it was sent.
+// ---------------------------------------------------------------------------
+
+/// What the fake transcription server received: the request head and body.
+#[derive(Debug, Clone)]
+pub struct TranscriptionRequest {
+    pub head: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FakeTranscriber {
+    seen: Arc<Mutex<Vec<TranscriptionRequest>>>,
+}
+
+impl FakeTranscriber {
+    /// Serve `transcript` on an ephemeral port; returns the API base
+    /// (`http://127.0.0.1:<port>/v1`).
+    pub fn spawn(transcript: &str) -> (Self, String) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake = Self {
+            seen: Arc::clone(&seen),
+        };
+        let Ok(std_listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            eprintln!("fake transcriber: bind failed");
+            std::process::exit(1);
+        };
+        let addr = std_listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let answer = json!({ "text": transcript }).to_string();
+        tokio::spawn(async move {
+            let _ = std_listener.set_nonblocking(true);
+            let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) else {
+                return;
+            };
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    continue;
+                };
+                let seen = Arc::clone(&seen);
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    let mut need: Option<usize> = None;
+                    loop {
+                        let Ok(n) = socket.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if need.is_none()
+                            && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            need = Some(end + 4 + len);
+                        }
+                        if need.is_some_and(|n| buf.len() >= n) {
+                            break;
+                        }
+                    }
+                    let end = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .unwrap_or(buf.len());
+                    seen.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(TranscriptionRequest {
+                            head: String::from_utf8_lossy(&buf[..end]).into_owned(),
+                            body: buf.get(end + 4..).unwrap_or_default().to_vec(),
+                        });
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        answer.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        (fake, format!("http://{addr}/v1"))
+    }
+
+    /// Requests received so far.
+    pub fn requests(&self) -> Vec<TranscriptionRequest> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }

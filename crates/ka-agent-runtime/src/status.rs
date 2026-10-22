@@ -69,6 +69,8 @@ impl MemoryUse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Capabilities {
     pub search: Option<String>,
+    #[serde(default)]
+    pub voice: Option<String>,
     pub mcp: Vec<String>,
     pub fallback: Vec<String>,
 }
@@ -77,6 +79,7 @@ impl Capabilities {
     pub fn from_config(cfg: &ka_agent_core::DaemonConfig) -> Self {
         Self {
             search: cfg.search.as_ref().map(|s| s.provider.clone()),
+            voice: cfg.voice.as_ref().map(|v| v.provider.clone()),
             mcp: cfg.mcp.iter().map(|m| m.name.clone()).collect(),
             fallback: cfg.fallback.clone(),
         }
@@ -88,6 +91,9 @@ impl Capabilities {
         let mut parts = Vec::new();
         if let Some(p) = &self.search {
             parts.push(format!("web search ({p})"));
+        }
+        if let Some(p) = &self.voice {
+            parts.push(format!("voice notes ({p})"));
         }
         if !self.mcp.is_empty() {
             parts.push(format!("mcp {}", self.mcp.join(", ")));
@@ -282,6 +288,7 @@ mod tests {
         let mut r = report();
         r.capabilities = Capabilities {
             search: Some("tavily".into()),
+            voice: None,
             mcp: vec!["github".into(), "home".into()],
             fallback: vec!["openai/gpt-5.1".into()],
         };
