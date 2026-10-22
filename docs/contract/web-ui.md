@@ -1,8 +1,14 @@
-# Web UI contract (M7, SEED.md §10 Phase 4)
+# Web UI contract (M7, SEED.md §10 Phase 4; redesigned v0.8)
 
 A loopback-only HTTP/1.1 server inside the daemon (`ka-agent-web`), serving
-server-rendered HTML. No JavaScript, no external assets, no CDN, no asset
-pipeline: the pages are strings the runtime renders per request.
+server-rendered HTML plus one embedded stylesheet (no external assets, no
+CDN, no asset pipeline; light/dark via `prefers-color-scheme`). The chat
+page loads `/static/chat.js` — the only script, same-origin under a strict
+CSP — for SSE streaming; it builds DOM nodes only (never `innerHTML`), so
+model Markdown can never become markup. Answers are rendered Markdown: the
+same subset as every other surface (bold, `code`, http(s) links, bullets,
+headings, fences), server-side for history and client-side for live turns
+(streamed raw, redrawn rendered when the turn settles).
 
 ## Enabling it
 
@@ -31,7 +37,9 @@ daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 |---|---|---|
 | GET | `/healthz` | `ok` (unauthenticated liveness) |
 | GET | `/auth?token=…` | login, sets the cookie |
-| GET | `/` | dashboard: session, status, strand, budget (USD + tokens), crashes |
+| GET | `/` | chat: bubbles (last 20 turns), SSE live updates, Markdown rendered |
+| GET | `/usage` | spend per day (30 d), CSS bars, today vs the cap |
+| POST | `/settings` | the status page form (model, mode, timezone, daily budget): format-preserving writes + live reload; invalid values are refused |
 | GET | `/history` | search form; `?q=` runs FTS over episodes |
 | GET | `/history/show/<turn>` | one turn: inbound text + the outbound answer |
 | GET | `/memory` | report (bytes/budget), proposal form, the review inbox (candidates with diffs), accepted entries, compiled text |

@@ -1,6 +1,6 @@
 # Ka Agent v1 redesign
 
-Status: **proposal — awaiting approval** · baseline v0.4.2 (`ea5d8b6`) · 2026-10-22
+Status: **implemented** (all items approved 2026-10-22; shipped v0.5.0–v0.8.1) · baseline v0.4.2 (`ea5d8b6`)
 
 Ka Agent should become the resident agent people leave running: useful on day
 one, pleasant on the phone, cheap and quiet when idle, and trustworthy with

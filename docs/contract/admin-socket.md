@@ -23,7 +23,9 @@ only.)
 
 | op | request | reply |
 |---|---|---|
-| status | `{"op":"status"}` | `{"ok":true,"session":"sess_…","status":"Idle","strand":"s…"\|null,"budget_usd":0.0,"budget_tokens":0,"crashes":0,"queue":0}` |
+| status | `{"op":"command","text":"/approvals"}` runs one router command in the
+daemon and returns its reply (`{"ok":true,"reply":"…"}`) — this is what
+`ka-agent approvals` drives; `{"op":"status"}` | `{"ok":true,"session":"sess_…","status":"Idle","strand":"s…"\|null,"budget_usd":0.0,"budget_tokens":0,"crashes":0,"queue":0}` |
 | — | anything else | `{"error":"unknown op"}` |
 | — | invalid JSON | `{"error":"bad json"}` |
 
