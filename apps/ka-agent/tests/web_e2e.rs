@@ -880,7 +880,7 @@ fn chat_page_renders_markdown_and_keeps_csp() {
     )
     .unwrap();
     let data = root.join("data");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
         .arg("run")
         .arg("--config")
         .arg(&cfg)
@@ -955,7 +955,7 @@ fn settings_form_and_usage_page() {
             // insert_turn then a raw update of created/cost is store-level;
             // reuse usage accounting via a direct row.
             store.insert_turn(&t).unwrap();
-            let conn = rusqlite::Connection::open(&daemon.data.join("state.db")).unwrap();
+            let conn = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
             conn.execute(
                 "UPDATE turns SET cost_usd = ?2 WHERE id = ?1",
                 rusqlite::params![t.id.as_str(), cost],
