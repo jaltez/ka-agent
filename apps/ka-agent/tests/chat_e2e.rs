@@ -529,7 +529,11 @@ fn calendar_digest_on_demand() {
     .unwrap();
     chat.send("/calendar today");
     chat.expect("CTest-RRULE", Duration::from_secs(30));
-    assert!(!chat.transcript().contains("does not expand"), "{}", chat.transcript());
+    assert!(
+        !chat.transcript().contains("does not expand"),
+        "{}",
+        chat.transcript()
+    );
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }

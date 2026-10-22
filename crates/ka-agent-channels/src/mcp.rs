@@ -181,6 +181,29 @@ fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "history_search".into(),
+            description: "Search past conversations with the operator (all sessions) by words; returns up to 10 snippets with their turn ids and dates. Use it to recall what was said or decided before.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "words to find"},
+                    "limit": {"type": "integer", "description": "max hits, 1-10 (default 5)"}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "history_show".into(),
+            description: "Show one past turn in full (the operator's message and the answer), by the turn id from history_search.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "turn": {"type": "string", "description": "turn id (or its tail) from history_search"}
+                },
+                "required": ["turn"]
+            }),
+        },
+        ToolDef {
             name: "notes_search".into(),
             description: "Search the operator's local markdown notes under the notes/ directory. Returns matching lines with file paths.".into(),
             schema: json!({
@@ -365,6 +388,61 @@ fn handle_tool_call(
                 .map_err(|e| format!("candidate: {e}"))?;
             Ok(format!(
                 "proposed for review: {id} (the operator will see it in /memory review)"
+            ))
+        }
+        "history_search" => {
+            let query = args["query"].as_str().unwrap_or("").trim();
+            if query.is_empty() {
+                return Err("missing 'query'".into());
+            }
+            let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 10) as usize;
+            let store = ka_agent_store::Store::open(&data_root()?.join("state.db"))
+                .map_err(|e| format!("store: {e}"))?;
+            let hits = store
+                .search_episodes(query, limit)
+                .map_err(|e| format!("search: {e}"))?;
+            if hits.is_empty() {
+                return Ok(format!("nothing found for {query:?}"));
+            }
+            Ok(hits
+                .iter()
+                .map(|h| {
+                    let when = jiff::Timestamp::from_millisecond(h.at_ms)
+                        .map(|t| t.strftime("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    format!(
+                        "[{}] {when} {}: {}",
+                        ka_agent_core::ids::short_id(&h.turn),
+                        h.role,
+                        h.snippet
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "history_show" => {
+            let turn = args["turn"].as_str().unwrap_or("").trim();
+            if turn.is_empty() {
+                return Err("missing 'turn'".into());
+            }
+            let store = ka_agent_store::Store::open(&data_root()?.join("state.db"))
+                .map_err(|e| format!("store: {e}"))?;
+            let t = store
+                .find_turn_by_prefix(turn)
+                .map_err(|e| format!("store: {e}"))?
+                .ok_or_else(|| format!("no turn {turn:?}"))?;
+            let answer: String = store
+                .chunks_for_turn(&t.id)
+                .map_err(|e| format!("store: {e}"))?
+                .into_iter()
+                .map(|c| c.text)
+                .collect();
+            // Bounded: one turn must not flood the context.
+            const MAX: usize = 4_000;
+            Ok(format!(
+                "operator: {}\n\nanswer: {}",
+                ka_agent_core::truncate_at_char(&t.inbound_text, MAX / 4),
+                ka_agent_core::truncate_at_char(&answer, MAX)
             ))
         }
         "notes_search" => {

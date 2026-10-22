@@ -704,3 +704,78 @@ fn cron_started_turn_cannot_schedule_crons() {
     assert_eq!(store.cron_tasks().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// E5: the model can recall past conversations — search, then show.
+#[test]
+fn bridge_history_tools_find_and_show_past_turns() {
+    use std::io::Write as _;
+    let root = temp_root("history-tools");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let _cfg = write_config(&root);
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    let session = ka_agent_core::Session::new(root.join("ws"));
+    store.insert_session(&session).unwrap();
+    let turn = ka_agent_core::Turn::new(session.id.clone(), "where is the Eiffel tower".into());
+    store.insert_turn(&turn).unwrap();
+    store
+        .push_chunk(&ka_agent_core::OutboxChunk::new(
+            turn.id.clone(),
+            0,
+            "In Paris, by the Seine.".into(),
+        ))
+        .unwrap();
+    store
+        .index_episode(&session.id, &turn.id, "user", "where is the Eiffel tower")
+        .unwrap();
+    store
+        .index_episode(
+            &session.id,
+            &turn.id,
+            "assistant",
+            "In Paris, by the Seine.",
+        )
+        .unwrap();
+    let short = ka_agent_core::ids::short_id(turn.id.as_str()).to_string();
+
+    let mut child = ka(&data)
+        .arg("__mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    let show = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"history_show","arguments":{{"turn":"{short}"}}}}}}"#
+    );
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"history_search","arguments":{"query":"Eiffel"}}}"#.to_string(),
+        show,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"history_search","arguments":{"query":"zzzz-nothing"}}}"#.to_string(),
+    ] {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+    }
+    drop(child.stdin.take());
+    let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned();
+    let line = |id: u32| {
+        out.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(
+        line(2).contains(&format!("[{short}]")) && line(2).contains("Eiffel"),
+        "{}",
+        line(2)
+    );
+    assert!(
+        line(3).contains("In Paris, by the Seine.") && line(3).contains("where is the Eiffel"),
+        "{}",
+        line(3)
+    );
+    assert!(line(4).contains("nothing found"), "{}", line(4));
+    let _ = std::fs::remove_dir_all(&root);
+}

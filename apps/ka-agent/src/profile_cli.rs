@@ -40,11 +40,13 @@ pub fn profile_action(action: ProfileAction) -> ExitCode {
     }
     match action {
         ProfileAction::List { json } => list(json),
+        ProfileAction::Rename { from, to } => rename(&from, &to),
         ProfileAction::Create {
             name,
             from,
             copy_keys,
-        } => create(&name, &from, copy_keys),
+            clone_memory,
+        } => create(&name, &from, copy_keys, clone_memory),
         ProfileAction::Use { name } => use_profile(&name),
         ProfileAction::Show { name } => show(&name.unwrap_or_else(layout::profile_name)),
         ProfileAction::Remove { name, yes } => remove(&name, yes),
@@ -191,7 +193,60 @@ fn derive_config(source: &str, port: u16) -> Result<String, String> {
     Ok(doc.to_string())
 }
 
-fn create(name: &str, from: &str, copy_keys: bool) -> ExitCode {
+/// Rename: move data and config, replace the units, follow the active
+/// pointer. The `default` profile is not a name you chose — it stays.
+fn rename(from: &str, to: &str) -> ExitCode {
+    if from == "default" {
+        return fail("the default profile cannot be renamed");
+    }
+    if !exists(from) {
+        return fail(format!("no profile {from:?}"));
+    }
+    if !layout::valid_profile_name(to) {
+        return fail(format!("profile name {to:?}: [a-z0-9-], up to 32 chars"));
+    }
+    if exists(to) {
+        return fail(format!("profile {to:?} already exists"));
+    }
+    let paths = paths_for(from);
+    if admin::is_running(&paths) {
+        return fail(format!(
+            "profile {from} is running — `ka-agent -p {from} service stop` first"
+        ));
+    }
+    // Old units out first (or their daemon would hold the old root).
+    if service::is_installed_for(from) {
+        match service::uninstall_for(from) {
+            Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
+            Err(e) => return fail(format!("uninstalling {from}'s service: {e}")),
+        }
+    }
+    let root = paths.root().to_path_buf();
+    let new_root = paths_for(to).root().to_path_buf();
+    if let Some(parent) = new_root.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{}: {e}", parent.display()))
+            .map_err(fail)
+            .ok();
+    }
+    if let Err(e) = std::fs::rename(&root, &new_root) {
+        return fail(format!("{} → {}: {e}", root.display(), new_root.display()));
+    }
+    let old_config = layout::config_path_for(from);
+    if old_config.is_file() {
+        let new_config = layout::config_path_for(to);
+        let _ = std::fs::rename(&old_config, &new_config);
+    }
+    if layout::profile_name() == from {
+        let _ = std::fs::write(layout::active_profile_file(), to);
+        println!("active profile: {to}");
+    }
+    println!("renamed {from} → {to} (data and config moved)");
+    println!("  reinstall the service if it had one: ka-agent -p {to} service install");
+    ExitCode::SUCCESS
+}
+
+fn create(name: &str, from: &str, copy_keys: bool, clone_memory: bool) -> ExitCode {
     if !layout::valid_profile_name(name) {
         return fail(format!("profile name {name:?}: [a-z0-9-], up to 32 chars"));
     }
@@ -217,6 +272,37 @@ fn create(name: &str, from: &str, copy_keys: bool) -> ExitCode {
         return fail(format!("{}: {e}", config.display()));
     }
 
+    if clone_memory {
+        // A fresh git repo whose first commit records where it came from;
+        // sessions, crons and identities are never copied (they would run
+        // twice).
+        let src_mem = paths_for(from).root().join("memory");
+        let dst_mem = paths.root().join("memory");
+        if src_mem.is_dir() {
+            let _ = std::fs::create_dir_all(&dst_mem);
+            let copy = |name: &str| {
+                let _ = std::fs::copy(src_mem.join(name), dst_mem.join(name));
+            };
+            for name in [
+                "facts.md",
+                "profile.md",
+                "persona.md",
+                "preferences.md",
+                "environment.md",
+                "conventions.md",
+            ] {
+                copy(name);
+            }
+            let memory = ka_agent_memory::MemoryStore::open(&dst_mem)
+                .map_err(|e| format!("memory: {e}"))
+                .map_err(fail)
+                .ok();
+            if let Some(memory) = memory {
+                let _ = memory.commit(&format!("memory cloned from profile {from}"));
+            }
+            println!("  memory  cloned from {from}");
+        }
+    }
     if copy_keys {
         let src = ka_agent_port::catalog::engine_env_path(&paths_for(from).engine_home());
         let dst = ka_agent_port::catalog::engine_env_path(&paths.engine_home());
@@ -330,10 +416,17 @@ fn remove(name: &str, yes: bool) -> ExitCode {
             "profile {name} is running — `ka-agent -p {name} service uninstall` (or stop it) first"
         ));
     }
+    // Its units would start against a missing root at next login: take
+    // them out as part of the removal.
     if service::is_installed_for(name) {
-        return fail(format!(
-            "profile {name} has a background service installed — `ka-agent -p {name} service uninstall` first"
-        ));
+        match service::uninstall_for(name) {
+            Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
+            Err(e) => {
+                return fail(format!(
+                    "uninstalling the service: {e} — remove the profile only after it is gone"
+                ));
+            }
+        }
     }
     if !yes {
         return fail(format!(

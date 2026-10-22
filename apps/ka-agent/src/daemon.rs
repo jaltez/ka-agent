@@ -270,7 +270,31 @@ pub async fn run_daemon(
             .ok()
     });
 
-    // Channels (inbound) when enabled: one task each, same runtime.
+    // One bot token, one poller: refuse before the fight starts (the
+    // provider would answer 409 and the two daemons would steal updates).
+    let base = ka_agent_core::layout::base_dir();
+    if let Some(t) = &token
+        && let Err(e) = ka_agent_port::token_lock::acquire(
+            "telegram",
+            t,
+            &ka_agent_core::layout::profile_name(),
+            &base,
+        )
+    {
+        eprintln!("ka-agent: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Some(t) = &matrix_token
+        && let Err(e) = ka_agent_port::token_lock::acquire(
+            "matrix",
+            t,
+            &ka_agent_core::layout::profile_name(),
+            &base,
+        )
+    {
+        eprintln!("ka-agent: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
     if let Some(token) = token {
         let mut tcfg = ka_agent_channels::TelegramConfig::from_config(&cfg, token);
         tcfg.transcriber = transcriber.clone();

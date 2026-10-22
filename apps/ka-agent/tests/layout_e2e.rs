@@ -308,3 +308,77 @@ fn data_tree_is_private_and_doctor_flags_a_loose_one() {
     assert!(!out.contains("readable by other users"), "{out}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// J1: rename moves data + config and follows the active pointer; create
+/// --clone-memory copies memory files as a fresh repo but nothing live.
+#[test]
+fn profile_rename_and_clone_memory() {
+    let home = home();
+    let base = home.join(".ka-agent");
+    let out = ka(&home, &["profile", "create", "work"]);
+    assert!(out.status.success(), "{out:?}");
+    let work = base.join("profiles/work");
+    std::fs::create_dir_all(work.join("memory")).unwrap();
+    std::fs::write(work.join("memory/facts.md"), "- prefers brief answers\n").unwrap();
+    std::fs::write(
+        base.join("profiles/work/config.toml"),
+        "mode = \"guarded\"\n",
+    )
+    .unwrap();
+    assert!(
+        ka(&home, &["profile", "rename", "work", "job"])
+            .status
+            .success()
+    );
+    assert!(
+        base.join("profiles/job/memory/facts.md").is_file(),
+        "data moved"
+    );
+    assert!(
+        base.join("profiles/job/config.toml").is_file(),
+        "config moved"
+    );
+    assert!(!work.exists(), "old root gone");
+    assert!(
+        !ka(&home, &["profile", "rename", "default", "x"])
+            .status
+            .success()
+    );
+    assert!(
+        !ka(&home, &["profile", "rename", "job", "default"])
+            .status
+            .success()
+    );
+
+    // clone-memory: memory files, not sessions or crons.
+    let out = ka(
+        &home,
+        &[
+            "profile",
+            "create",
+            "copy",
+            "--from",
+            "job",
+            "--clone-memory",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let copy = base.join("profiles/copy");
+    assert!(copy.join("memory/facts.md").is_file(), "memory cloned");
+    assert!(!copy.join("state.db").exists(), "state.db never copied");
+
+    // The active pointer follows a renamed profile.
+    assert!(ka(&home, &["profile", "use", "job"]).status.success());
+    assert!(
+        ka(&home, &["profile", "rename", "job", "work2"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(base.join("active_profile"))
+            .unwrap()
+            .trim(),
+        "work2"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

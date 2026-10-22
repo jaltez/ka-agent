@@ -385,6 +385,8 @@ enum ProfileAction {
         #[arg(long)]
         json: bool,
     },
+    /// Rename a profile (data, config, units, the active pointer).
+    Rename { from: String, to: String },
     /// Create a profile (config copied from another, minus channels).
     Create {
         name: String,
@@ -394,6 +396,9 @@ enum ProfileAction {
         /// Also copy that profile's provider keys.
         #[arg(long)]
         copy_keys: bool,
+        /// Also copy its memory files (never sessions, crons or identities).
+        #[arg(long)]
+        clone_memory: bool,
     },
     /// Make a profile the default for commands without `-p`.
     Use { name: String },

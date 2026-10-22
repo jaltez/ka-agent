@@ -17,6 +17,7 @@ pub mod engine_layer;
 pub mod port;
 pub mod proto;
 pub mod scenario;
+pub mod token_lock;
 pub mod worker;
 
 pub use port::{

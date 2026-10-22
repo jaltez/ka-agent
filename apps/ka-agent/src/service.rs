@@ -348,11 +348,14 @@ mod imp {
     }
 
     pub fn uninstall() -> Result<Vec<String>, String> {
-        let n = names();
+        uninstall_by_names(&names())
+    }
+
+    pub fn uninstall_by_names(n: &ServiceNames) -> Result<Vec<String>, String> {
         let _ = systemctl(&["disable", "--now", &n.daemon_unit, &n.backup_timer]);
         let dir = unit_dir();
         let mut lines = Vec::new();
-        for name in [n.daemon_unit, n.backup_service, n.backup_timer] {
+        for name in [&n.daemon_unit, &n.backup_service, &n.backup_timer] {
             let p = dir.join(name);
             if p.exists() {
                 std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -470,12 +473,15 @@ mod imp {
     }
 
     pub fn uninstall() -> Result<Vec<String>, String> {
+        uninstall_by_names(&names())
+    }
+
+    pub fn uninstall_by_names(n: &ServiceNames) -> Result<Vec<String>, String> {
         let u = uid()?;
         let mut lines = Vec::new();
-        let n = names();
-        for label in [n.daemon_label, n.backup_label] {
+        for label in [&n.daemon_label, &n.backup_label] {
             let _ = run_quiet("launchctl", &["bootout", &format!("gui/{u}/{label}")]);
-            let p = plist_path(&label);
+            let p = plist_path(label);
             if p.exists() {
                 std::fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
                 lines.push(format!("removed {}", p.display()));
@@ -591,6 +597,9 @@ mod imp {
     pub fn uninstall() -> Result<Vec<String>, String> {
         Err(UNSUPPORTED.into())
     }
+    pub fn uninstall_by_names(_n: &ServiceNames) -> Result<Vec<String>, String> {
+        Err(UNSUPPORTED.into())
+    }
     pub fn start() -> Result<(), String> {
         Err(UNSUPPORTED.into())
     }
@@ -619,6 +628,11 @@ pub fn is_installed() -> bool {
 /// Whether `profile`'s daemon unit/plist is installed.
 pub fn is_installed_for(profile: &str) -> bool {
     imp::is_installed_for(profile)
+}
+
+/// Remove `profile`'s units and stop them (profile removal, rename).
+pub fn uninstall_for(profile: &str) -> Result<Vec<String>, String> {
+    imp::uninstall_by_names(&unit_names(profile))
 }
 
 /// Whether the service manager reports the daemon service running.
