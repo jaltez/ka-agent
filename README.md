@@ -90,7 +90,7 @@ ka-agent mcp add home --url http://homeassistant.local:8123/mcp \
 ka-agent config set fallback '["openai/gpt-5.1"]'   # if the main model fails
 ```
 
-MCP tools appear to the model as `<server>.<tool>`; in `guarded` mode each
+MCP tools appear to the model as `<server>__<tool>`; in `guarded` mode each
 call asks first (the card names the tool). `secret:<name>` values come from
 `ka-agent secret set <name>` when the agent starts and never touch the
 config file. `ka-agent status` shows a `tools:` line with what is on, and

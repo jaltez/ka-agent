@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "clap",
  "clap_complete",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-channels"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "jiff",
  "ka-agent-core",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-core"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "jiff",
  "serde",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-memory"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "ka-agent-core",
  "thiserror",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-plugins"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "ed25519-dalek",
  "ka-agent-core",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-port"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "fs2",
  "ka-agent-core",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-runtime"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "jiff",
  "ka-agent-core",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-store"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "ka-agent-core",
  "parking_lot",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-web"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "jiff",
  "ka-agent-channels",
@@ -1115,8 +1115,7 @@ dependencies = [
 [[package]]
 name = "ka-dialect"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2516371f0c93745bebcb703ffd343bea3651bcee3f66ae9518f84eba13a86592"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
 dependencies = [
  "futures-util",
  "ka-protocol",
@@ -1131,8 +1130,7 @@ dependencies = [
 [[package]]
 name = "ka-engine"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f3296202bd2a88afbe3cd224e10e387a9052d2d906c5796485272c158cdc87"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
 dependencies = [
  "ignore",
  "ka-dialect",
@@ -1159,8 +1157,7 @@ dependencies = [
 [[package]]
 name = "ka-protocol"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d352c4d6ddcbf8e9613613fe45b4661c4de76c7fdedcb4d839e2ce8cf24850ad"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
 dependencies = [
  "schemars",
  "serde",
@@ -1170,8 +1167,7 @@ dependencies = [
 [[package]]
 name = "ka-sandbox"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2522fdab1a41a73e13c8ec6d02f141d41ca33332ff2557a4a887e66ea22afc22"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
 dependencies = [
  "landlock",
  "serde",
@@ -1181,8 +1177,7 @@ dependencies = [
 [[package]]
 name = "ka-strand"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d37c58b6e60129ae8431b5462a0cb02ac045017c2bbccd2316e750698d82a1a8"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
 dependencies = [
  "ka-protocol",
  "serde",

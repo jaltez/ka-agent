@@ -39,11 +39,17 @@ if [[ $fail -ne 0 ]]; then
 fi
 echo "ok: no ka-* dependencies outside ka-agent-port and ka-agent"
 
-# The pin constant the binary reports must match the manifest's version pin.
-manifest_pin="$(grep -oE 'ka-protocol = \{ version = "=[^"]+"' Cargo.toml | grep -oE '"=[^"]+"' | tr -d '"=' | head -1)"
+# The pin constant the binary reports must match the manifest's pin:
+# the `rev` of the git pin, or the `=version` of a registry pin.
+if grep -q 'ka-protocol = { git =' Cargo.toml; then
+  manifest_pin="$(grep -oE 'ka-protocol = \{ git = "[^"]+", rev = "[0-9a-f]+" \}' Cargo.toml \
+    | grep -oE 'rev = "[0-9a-f]+"' | sed -E 's/^rev = "([0-9a-f]+)"$/\1/')"
+else
+  manifest_pin="$(grep -oE 'ka-protocol = \{ version = "=[^"]+"' Cargo.toml | grep -oE '"=[^"]+"' | tr -d '"=' | head -1)"
+fi
 const_pin="$(grep -o 'KA_PIN: &str = "[^"]*"' crates/ka-agent-port/src/lib.rs | cut -d'"' -f2)"
 if [ -z "$manifest_pin" ]; then
-  echo "error: no exact ka-protocol version pin found in Cargo.toml"
+  echo "error: no exact ka-protocol pin (git rev or =version) found in Cargo.toml"
   exit 1
 fi
 if [ "$manifest_pin" != "$const_pin" ]; then

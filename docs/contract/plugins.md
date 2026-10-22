@@ -137,7 +137,7 @@ For each `tools/call` of a plugin tool the bridge:
 Effect floors in v1: `read` needs only the plugin to be enabled;
 `local_write`/`external_write` need their scopes granted (the grant is the
 approval, as for the first-party GitHub tools). Plugin tools reach engines
-as `kagent.<tool>` through the single `[[mcp]]` bridge, so ka's own
+as `kagent__<tool>` through the single `[[mcp]]` bridge, so ka's own
 permission logic never gates them.
 
 ## Authoring

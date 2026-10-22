@@ -2689,8 +2689,8 @@ This workspace is served by ka-agent, a resident personal assistant running
 on the Ka engine. One operator per instance; everything is auditable.
 
 - Memory: durable facts live under `<data>/memory/` and are compiled into the
-  engine's MEMORY.md. Propose new facts with the `memory_propose` tool for
-  operator review; never store them yourself.
+  engine's MEMORY.md. Propose new facts with the `kagent__memory_propose`
+  tool for operator review; never store them yourself.
 - Operator commands: /help lists them all (/status /new /stop /resume
   /model /remember /memory /history /remind /reminders /cron /calendar
   /approvals /skills /y /n).

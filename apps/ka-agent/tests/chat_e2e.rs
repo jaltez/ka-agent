@@ -668,7 +668,7 @@ fn operator_mcp_server_tools_are_callable() {
         &root,
         "mcp.json",
         r#"{ "steps": [
-            {"call": {"tool": "extra.notes_append", "args": {"file": "from-mcp", "text": "hello via operator mcp"}}},
+            {"call": {"tool": "extra__notes_append", "args": {"file": "from-mcp", "text": "hello via operator mcp"}}},
             {"text": "noted"}
         ], "stop": "done" }"#,
     );
@@ -684,7 +684,7 @@ fn operator_mcp_server_tools_are_callable() {
     chat.send("write a note");
     // Guarded mode keeps operator MCP tools behind the approval card — and
     // the card names the tool instead of the engine's empty "run ``?".
-    chat.expect("use `extra.notes_append`", Duration::from_secs(60));
+    chat.expect("use `extra__notes_append`", Duration::from_secs(60));
     chat.send("/y");
     chat.expect("noted", Duration::from_secs(60));
     let note = extra.join("notes/from-mcp.md");

@@ -29,7 +29,8 @@ pub use proto::{ImagePayload, StrandSel, WorkerCommand, WorkerEvent};
 pub use scenario::{Scenario, ScenarioSpeaker, Step};
 pub use worker::{WorkerRun, run_worker};
 
-/// The exact released ka-harness version this build is pinned to
-/// (`Cargo.toml`, `=0.3.0`). `doctor` reports it and backups record it;
+/// The ka-harness content this build is pinned to (`Cargo.toml`): the
+/// `engine-0.3.x` rev `7099a52` — v0.3.0 plus pattern-safe MCP wire
+/// names. `doctor` reports it and backups record it;
 /// `scripts/check-ka-deps.sh` verifies it matches the manifest.
-pub const KA_PIN: &str = "0.3.0";
+pub const KA_PIN: &str = "7099a52";

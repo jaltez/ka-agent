@@ -332,7 +332,7 @@ async fn open_engine(
     }
     cfg.cwd = Some(workspace.to_string_lossy().into_owned());
 
-    // MCP bridge: the engine's kagent.* tools (memory_propose, notes_*).
+    // MCP bridge: the engine's kagent__* tools (memory_propose, notes_*).
     // Spawned as this same binary with `__mcp`; it inherits the worker's
     // sanitized env, including KA_AGENT_DATA_DIR for the store.
     //

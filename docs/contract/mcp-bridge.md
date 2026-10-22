@@ -2,7 +2,9 @@
 
 Status: implemented, 2026-10-15. The Ka engine spawns `ka-agent __mcp` as
 the `kagent` MCP server (stdio JSON-RPC 2.0, MCP 2025-06-18). Ka Agent
-tools reach the engine as `kagent.<tool>` exec-tier hands.
+tools reach the engine as `kagent__<tool>` exec-tier hands (providers
+validate tool names against `[a-zA-Z0-9_-]+`, so the engine's wire name
+is `server__tool`).
 
 ## Wiring
 
@@ -24,7 +26,7 @@ resolve from the secret store at worker spawn — in memory, never in the
 config file. With more than one operator server the engine's
 `tools.mcp.discovery` defaults to `lazy`. Their tools are exec-tier hands
 like the bridge's: in `guarded` mode every call asks, and the approval card
-names the tool (`use \`server.tool\`?`).
+names the tool (`use \`server__tool\`?`).
 
 The MCP server inherits the worker's sanitized env, including
 `KA_AGENT_DATA_DIR` (the instance root — set by `WorkerEnv::sanitize`).
@@ -35,10 +37,10 @@ daemon).
 
 | tool | effect | description |
 |---|---|---|
-| `kagent.memory_propose` | pending candidate | Model proposes a memory for operator review (SEED.md §4.4). Nothing is stored until the operator accepts via `/memory accept`. Text: 1–300 chars, third person, no secrets. |
-| `kagent.notes_search` | read | Case-insensitive substring search across `<data>/notes/*.md`. Max 20 hits. |
-| `kagent.notes_append` | local write | Append a line to `<data>/notes/<name>.md`. Name: `[a-z0-9-]{1,64}`. |
-| `kagent.notes_read` | read | Read a note file (truncated at 8 KB). |
+| `kagent__memory_propose` | pending candidate | Model proposes a memory for operator review (SEED.md §4.4). Nothing is stored until the operator accepts via `/memory accept`. Text: 1–300 chars, third person, no secrets. |
+| `kagent__notes_search` | read | Case-insensitive substring search across `<data>/notes/*.md`. Max 20 hits. |
+| `kagent__notes_append` | local write | Append a line to `<data>/notes/<name>.md`. Name: `[a-z0-9-]{1,64}`. |
+| `kagent__notes_read` | read | Read a note file (truncated at 8 KB). |
 
 ## Protocol (ka-side)
 
