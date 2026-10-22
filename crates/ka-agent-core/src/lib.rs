@@ -15,6 +15,7 @@ pub mod ids;
 pub mod layout;
 pub mod outbox;
 pub mod queue;
+pub mod secret;
 pub mod session;
 pub mod task;
 pub mod time;
@@ -24,7 +25,9 @@ pub mod when;
 pub use approval::{Approval, ApprovalDecision, ApprovalKind, ApprovalStatus};
 pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
-pub use config::{Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, Web};
+pub use config::{
+    Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Search, Web,
+};
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use queue::QueueItem;

@@ -49,7 +49,7 @@ fn run(channel: String, config: PathBuf) -> Result<std::process::ExitCode, PairE
     if channel == "telegram" && !admin::is_running(&paths) {
         // Standalone wait: talk to Bot API directly, no daemon needed.
         let base = cfg.telegram.api_base().to_string();
-        let token = ka_agent_channels::secret::resolve(
+        let token = ka_agent_core::secret::resolve(
             cfg.telegram
                 .token_secret
                 .as_deref()

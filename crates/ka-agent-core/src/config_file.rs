@@ -9,7 +9,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::config::{DaemonConfig, Error};
 
-const ARRAYS_MSG: &str = "arrays are edited with `ka-agent config edit`";
+const ARRAYS_MSG: &str = "only flat arrays can be set (`[\"a\", \"b\"]`); arrays of tables are edited with `ka-agent config edit`";
 const TABLES_MSG: &str = "tables are edited with `ka-agent config edit`";
 
 /// Read the config as an editable document; a missing file is an empty
@@ -52,7 +52,9 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<DaemonConfig, Error> {
     }
     match table.get_mut(last) {
         Some(Item::Value(old)) => {
-            if old.is_array() {
+            // An array is replaced only by an array: `allow_user_ids = 2`
+            // is almost certainly a mistake for `[2]`.
+            if old.is_array() != new.is_array() {
                 return Err(Error::Edit(ARRAYS_MSG.into()));
             }
             if old.is_inline_table() {
@@ -190,7 +192,18 @@ fn typed_value(raw: &str) -> Result<Value, Error> {
         _ => {}
     }
     if s.starts_with('[') {
-        return Err(Error::Edit(ARRAYS_MSG.into()));
+        // Flat arrays of scalars only (`fallback = ["a/b"]`); nested
+        // arrays and inline tables stay with `config edit`.
+        let v: Value = s
+            .parse()
+            .map_err(|e| Error::Edit(format!("array {s}: {e}")))?;
+        let flat = v
+            .as_array()
+            .is_some_and(|a| a.iter().all(|x| !x.is_array() && !x.is_inline_table()));
+        if !flat {
+            return Err(Error::Edit(ARRAYS_MSG.into()));
+        }
+        return Ok(v);
     }
     if s.starts_with('{') {
         return Err(Error::Edit(TABLES_MSG.into()));
@@ -339,23 +352,30 @@ mod tests {
     }
 
     #[test]
-    fn arrays_and_tables_are_not_settable() {
+    fn flat_arrays_are_settable_tables_and_nested_arrays_are_not() {
         let p = tmp_config(
             "arrays",
             Some("workspace = \"/tmp/ws\"\n[telegram]\nallow_user_ids = [1]\n"),
         );
+        // A scalar never silently replaces an array.
         let e = set(&p, "telegram.allow_user_ids", "2").unwrap_err();
-        assert!(e.to_string().contains("arrays are edited with"), "{e}");
+        assert!(e.to_string().contains("only flat arrays"), "{e}");
         let e = set(&p, "telegram", "x").unwrap_err();
         assert!(e.to_string().contains("tables are edited with"), "{e}");
-        let e = set(&p, "model", "[1, 2]").unwrap_err();
-        assert!(e.to_string().contains("arrays are edited with"), "{e}");
+        let e = set(&p, "fallback", "[[\"a\"]]").unwrap_err();
+        assert!(e.to_string().contains("only flat arrays"), "{e}");
+        // A wrong-typed array still fails schema validation.
+        assert!(set(&p, "model", "[1, 2]").is_err());
+        let cfg = set(&p, "fallback", "[\"openai/gpt-5.1\", \"zai/glm-4.6\"]").unwrap();
+        assert_eq!(cfg.fallback, vec!["openai/gpt-5.1", "zai/glm-4.6"]);
+        let cfg = set(&p, "telegram.allow_user_ids", "[1, 2]").unwrap();
+        assert_eq!(cfg.telegram.allow_user_ids, vec![1, 2]);
         let e = set(&p, "workspace.inner", "1").unwrap_err();
         assert!(e.to_string().contains("workspace is not a table"), "{e}");
         assert!(set(&p, "budgets..x", "1").is_err());
         assert_eq!(
             get(&p, "telegram.allow_user_ids").unwrap().as_deref(),
-            Some("[1]")
+            Some("[1, 2]")
         );
     }
 

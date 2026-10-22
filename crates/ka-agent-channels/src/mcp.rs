@@ -100,7 +100,7 @@ fn call_plugin(
     let secrets_dir = data_root().map_err(|e| e.to_string())?.join("secrets");
     let mut secrets = std::collections::HashMap::new();
     for name in &plugin.manifest.requires.secrets {
-        let value = crate::secret::resolve(name, &secrets_dir)
+        let value = ka_agent_core::secret::resolve(name, &secrets_dir)
             .map_err(|e| format!("secret {name:?}: {e}"))?;
         secrets.insert(name.clone(), value);
     }

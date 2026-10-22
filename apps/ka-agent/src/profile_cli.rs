@@ -113,7 +113,7 @@ pub fn profiles_polling_token(token: &str) -> Vec<String> {
                     .token_secret
                     .clone()
                     .unwrap_or_else(|| "telegram.bot_token".into());
-                ka_agent_channels::secret::resolve(&name, &paths.root().join("secrets"))
+                ka_agent_core::secret::resolve(&name, &paths.root().join("secrets"))
                     .is_ok_and(|t| t == token)
             }
         })

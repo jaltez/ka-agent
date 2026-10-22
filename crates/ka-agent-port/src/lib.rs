@@ -13,6 +13,7 @@
 //!   tests and e2e runs.
 
 pub mod catalog;
+pub mod engine_layer;
 pub mod port;
 pub mod proto;
 pub mod scenario;

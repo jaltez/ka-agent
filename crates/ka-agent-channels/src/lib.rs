@@ -11,7 +11,6 @@ pub mod mcp;
 pub mod multi;
 pub mod pairing;
 pub mod refs;
-pub mod secret;
 pub mod telegram;
 pub mod tg_format;
 

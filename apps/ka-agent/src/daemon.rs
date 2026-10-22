@@ -142,7 +142,7 @@ pub async fn run_daemon(
             .token_secret
             .clone()
             .unwrap_or_else(|| "telegram.bot_token".to_string());
-        match ka_agent_channels::secret::resolve(&secret_name, &paths.root().join("secrets")) {
+        match ka_agent_core::secret::resolve(&secret_name, &paths.root().join("secrets")) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!(
@@ -163,7 +163,7 @@ pub async fn run_daemon(
             .token_secret
             .clone()
             .unwrap_or_else(|| "matrix.access_token".to_string());
-        match ka_agent_channels::secret::resolve(&secret_name, &paths.root().join("secrets")) {
+        match ka_agent_core::secret::resolve(&secret_name, &paths.root().join("secrets")) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!(

@@ -649,3 +649,49 @@ fn no_model_preflight_refuses_with_the_fix() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// E2: an operator `[[mcp]]` server's tools reach the engine. The server is
+/// this binary's own bridge under another name with its own data root, so
+/// a note landing *there* proves the call went through the operator
+/// server; its env carries a `secret:` value resolved from the secret store.
+#[test]
+fn operator_mcp_server_tools_are_callable() {
+    let root = temp_root("mcp-operator");
+    let extra = root.join("extra-data");
+    std::fs::create_dir_all(&extra).unwrap();
+    let sc = scenario_file(
+        &root,
+        "mcp.json",
+        r#"{ "steps": [
+            {"call": {"tool": "extra.notes_append", "args": {"file": "from-mcp", "text": "hello via operator mcp"}}},
+            {"text": "noted"}
+        ], "stop": "done" }"#,
+    );
+    let extra_cfg = format!(
+        "[[mcp]]\nname = \"extra\"\ncommand = {:?}\nargs = [\"__mcp\"]\nenv = {{ KA_AGENT_DATA_DIR = {:?}, PROBE = \"secret:probe.token\" }}\n",
+        env!("CARGO_BIN_EXE_ka-agent"),
+        extra.display().to_string()
+    );
+    let secrets = root.join("data/secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join("probe.token"), "s3cret\n").unwrap();
+    let mut chat = spawn_chat_cfg(&root, &sc, &extra_cfg);
+    chat.send("write a note");
+    // Guarded mode keeps operator MCP tools behind the approval card — and
+    // the card names the tool instead of the engine's empty "run ``?".
+    chat.expect("use `extra.notes_append`", Duration::from_secs(60));
+    chat.send("/y");
+    chat.expect("noted", Duration::from_secs(60));
+    let note = extra.join("notes/from-mcp.md");
+    for _ in 0..50 {
+        if note.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let text = std::fs::read_to_string(&note)
+        .unwrap_or_else(|e| panic!("{}: {e}\n{}", note.display(), chat.transcript()));
+    assert!(text.contains("hello via operator mcp"), "{text}");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}

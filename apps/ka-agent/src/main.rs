@@ -11,6 +11,7 @@ mod doctor;
 mod grant;
 mod identity;
 mod layout;
+mod mcp_cli;
 mod memory_cli;
 mod model_cli;
 mod ops;
@@ -140,6 +141,13 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Connect MCP servers: their tools become the agent's tools.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     /// Manage profiles: independent instances (data, config, service).
     Profile {
         #[command(subcommand)]
@@ -215,7 +223,7 @@ enum Command {
     },
     /// Hidden: the MCP bridge the Ka engine spawns as `kagent`.
     #[command(name = "__mcp", hide = true)]
-    Mcp,
+    McpBridge,
     /// Manage tool grants (SEED.md §8.2).
     Grant {
         #[command(subcommand)]
@@ -251,6 +259,30 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum McpAction {
+    /// List configured MCP servers.
+    List,
+    /// Add a server: `mcp add notes -- npx -y notes-mcp` or `mcp add home --url http://…`.
+    Add {
+        name: String,
+        /// Streamable-HTTP endpoint (instead of a command).
+        #[arg(long)]
+        url: Option<String>,
+        /// Environment for a stdio server; `KEY=secret:<name>` reads the secret store.
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// HTTP header for a url server; `Authorization=secret:<name>` works too.
+        #[arg(long, value_name = "KEY=VALUE")]
+        header: Vec<String>,
+        /// The command and its arguments (after `--`).
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Remove a server.
+    Rm { name: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -469,7 +501,7 @@ fn main() -> std::process::ExitCode {
     // helper processes (they run inside an already-migrated environment).
     let helper = matches!(
         cli.command,
-        Some(Command::Worker { .. }) | Some(Command::Mcp)
+        Some(Command::Worker { .. }) | Some(Command::McpBridge)
     );
     if !helper && let Err(e) = layout::migrate() {
         eprintln!("ka-agent: {e}");
@@ -517,7 +549,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        Command::Mcp => match ka_agent_channels::run_mcp() {
+        Command::McpBridge => match ka_agent_channels::run_mcp() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("ka-agent mcp: {e}");
@@ -644,6 +676,7 @@ fn main() -> std::process::ExitCode {
         }
         Command::Logs { follow, lines } => service::logs(follow, lines),
         Command::Profile { action } => profile_cli::profile_action(action),
+        Command::Mcp { action, config } => mcp_cli::mcp_action(action, config_path(&config)),
         Command::Usage { days } => usage_cli::usage(days),
         Command::Grant { action } => grant::grant_action(action),
         Command::Backup { out, keep, config } => ops::backup_to(out, keep, config_path(&config)),

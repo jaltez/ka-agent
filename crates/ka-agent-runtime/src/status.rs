@@ -24,6 +24,44 @@ pub struct StatusReport {
     pub next_task: Option<(String, i64)>,
     /// IANA name of the operator zone.
     pub timezone: String,
+    /// What the engine can reach beyond the workspace: web search
+    /// provider, operator MCP servers, fallback models.
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+/// The configured capability set, for one status line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Capabilities {
+    pub search: Option<String>,
+    pub mcp: Vec<String>,
+    pub fallback: Vec<String>,
+}
+
+impl Capabilities {
+    pub fn from_config(cfg: &ka_agent_core::DaemonConfig) -> Self {
+        Self {
+            search: cfg.search.as_ref().map(|s| s.provider.clone()),
+            mcp: cfg.mcp.iter().map(|m| m.name.clone()).collect(),
+            fallback: cfg.fallback.clone(),
+        }
+    }
+
+    /// `tools: web search (tavily) · mcp github, home · fallback openai/gpt-5.1`,
+    /// or `None` when nothing is configured.
+    fn line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(p) = &self.search {
+            parts.push(format!("web search ({p})"));
+        }
+        if !self.mcp.is_empty() {
+            parts.push(format!("mcp {}", self.mcp.join(", ")));
+        }
+        if !self.fallback.is_empty() {
+            parts.push(format!("fallback {}", self.fallback.join(" → ")));
+        }
+        (!parts.is_empty()).then(|| format!("tools: {}", parts.join(" · ")))
+    }
 }
 
 impl StatusReport {
@@ -79,12 +117,17 @@ impl StatusReport {
             .as_deref()
             .map(ka_agent_core::ids::short_id)
             .unwrap_or("(new)");
-        format!(
+        let mut out = format!(
             "{state} · {model} · mode {}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
             self.mode,
             ka_agent_core::ids::short_id(&self.session_id),
             self.timezone
-        )
+        );
+        if let Some(line) = self.capabilities.line() {
+            out.push('\n');
+            out.push_str(&line);
+        }
+        out
     }
 }
 
@@ -141,6 +184,7 @@ mod tests {
             crashes: 0,
             next_task: None,
             timezone: "Europe/Madrid".into(),
+            capabilities: Capabilities::default(),
         }
     }
 
@@ -162,6 +206,22 @@ mod tests {
                 "session a1b2c3d4 · strand (new) · Europe/Madrid",
             ]
         );
+    }
+
+    #[test]
+    fn capabilities_add_one_line_only_when_configured() {
+        let mut r = report();
+        r.capabilities = Capabilities {
+            search: Some("tavily".into()),
+            mcp: vec!["github".into(), "home".into()],
+            fallback: vec!["openai/gpt-5.1".into()],
+        };
+        let text = r.render(&now());
+        assert_eq!(
+            text.lines().last(),
+            Some("tools: web search (tavily) · mcp github, home · fallback openai/gpt-5.1")
+        );
+        assert_eq!(report().render(&now()).lines().count(), 5);
     }
 
     #[test]

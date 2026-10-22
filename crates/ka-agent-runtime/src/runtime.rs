@@ -150,6 +150,10 @@ struct Live {
     /// Last time anything happened on this session (event, submit, ask) —
     /// the idle reap's clock. `now_ms` while a turn is in flight.
     last_activity_ms: i64,
+    /// The latest tool call (name, argument summary): the engine's
+    /// permission question for MCP tools carries no command, so the card
+    /// names the call instead of reading "run ``?".
+    last_call: Option<(String, String)>,
 }
 
 struct Inner {
@@ -442,6 +446,7 @@ impl Runtime {
             crashes,
             next_task,
             timezone: tz.iana_name().unwrap_or("UTC").to_string(),
+            capabilities: crate::status::Capabilities::from_config(&cfg),
         })
     }
 
@@ -459,6 +464,9 @@ impl Runtime {
                 "ka.engine_layer",
                 differs(&old.ka.engine_layer, &new.ka.engine_layer),
             ),
+            ("search", differs(&old.search, &new.search)),
+            ("fallback", differs(&old.fallback, &new.fallback)),
+            ("mcp", differs(&old.mcp, &new.mcp)),
             (
                 "approval_ttl_secs",
                 differs(&old.approval_ttl_secs, &new.approval_ttl_secs),
@@ -496,7 +504,9 @@ impl Runtime {
             applied: names(&live_fields),
             restart_required: names(&restart_fields),
         };
-        let engine_changed = live_fields[..3].iter().any(|(_, c)| *c);
+        // model, mode, engine layer, search, fallback, mcp: all shape the
+        // engine the worker was spawned with.
+        let engine_changed = live_fields[..6].iter().any(|(_, c)| *c);
         {
             let mut g = self.lock();
             g.budget.daily_usd_cap = new.budgets.daily_usd;
@@ -1708,11 +1718,20 @@ impl Runtime {
                 cache_dir: self.sh.paths.engine_cache(),
                 agent_data_root: self.sh.paths.root().to_path_buf(),
             };
-            let layer = cfg
+            let user_layer = cfg
                 .engine_layer_path()
                 .and_then(|p| std::fs::read_to_string(p).ok());
-            (g.session.clone(), env, layer)
+            (g.session.clone(), env, user_layer)
         };
+        // Ka Agent's own engine features (search, fallback, MCP servers)
+        // join the operator's layer; `secret:` values resolve here, in
+        // memory, from the secret store.
+        let secrets_dir = self.sh.paths.root().join("secrets");
+        let engine_layer_toml =
+            ka_agent_port::engine_layer::compose(&cfg, engine_layer_toml.as_deref(), &|name| {
+                ka_agent_core::secret::resolve(name, &secrets_dir).map_err(|e| e.to_string())
+            })
+            .map_err(Error::Refused)?;
         let selector = match (&session.strand_path, session.strand_id.as_ref()) {
             (Some(p), Some(_)) if p.exists() => StrandSelector::Path(p.clone()),
             _ => StrandSelector::New,
@@ -1750,6 +1769,7 @@ impl Runtime {
                 current_turn: None,
                 deliberate_close: false,
                 last_activity_ms: ka_agent_core::now_ms(),
+                last_call: None,
             });
         }
         tokio::spawn(drive(Arc::clone(&self.sh), port, rx));
@@ -1809,7 +1829,11 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
             }
             PortEvent::DeltaThought(t) => sh.surface.on_delta_thought(&t),
             PortEvent::CallStarted { tool, detail, .. } => {
-                sh.surface.on_note(&format!("▸ {tool} {detail}"));
+                sh.surface.on_note(format!("▸ {tool} {detail}").trim_end());
+                let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(live) = g.live.as_mut() {
+                    live.last_call = Some((tool, detail));
+                }
             }
             PortEvent::CallFinished {
                 tool, ok: false, ..
@@ -1834,7 +1858,7 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                 detail,
                 options,
             } => {
-                let (sid, turn_id, ttl) = {
+                let (sid, turn_id, ttl, last_call) = {
                     let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     (
                         g.session.id.clone(),
@@ -1843,8 +1867,10 @@ async fn drive(sh: Arc<Shared>, port: Arc<PortSession>, mut rx: mpsc::Receiver<P
                             .and_then(|l| l.current_turn.clone())
                             .unwrap_or_else(TurnId::generate),
                         cfg_of(&sh).approval_ttl_secs,
+                        g.live.as_ref().and_then(|l| l.last_call.clone()),
                     )
                 };
+                let question = readable_question(&question, last_call.as_ref());
                 let kind = ApprovalKind::KaAsk {
                     ask_id: ask_id.clone(),
                     question: question.clone(),
@@ -2178,6 +2204,23 @@ async fn drain_queue(sh: &Arc<Shared>) -> bool {
             sh.store.update_turn(&turn).ok();
             false
         }
+    }
+}
+
+/// The engine phrases every gated call as "run `<command>`?"; tools without
+/// a command (MCP servers, bridge tools) come out as "run ``?". Name the
+/// call instead so the operator knows what they are allowing.
+fn readable_question(question: &str, last_call: Option<&(String, String)>) -> String {
+    match last_call {
+        Some((tool, detail)) if question.contains("``") => {
+            let detail = detail.trim();
+            if detail.is_empty() {
+                format!("use `{tool}`?")
+            } else {
+                format!("use `{tool}` ({detail})?")
+            }
+        }
+        _ => question.to_string(),
     }
 }
 

@@ -174,6 +174,51 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
         None => rep.fail("no model — run `ka-agent setup`".into()),
     }
 
+    // Capabilities the engine gets from Ka Agent's config.
+    if let Some(cfg) = &cfg {
+        let env = catalog::read_env_file(&catalog::engine_env_path(&paths.engine_home()));
+        // Only the engine `.env` tier counts: the worker runs with a
+        // sanitized environment and never sees this shell's variables.
+        let has = |name: &str| env.get(name).is_some_and(|v| !v.is_empty());
+        match &cfg.search {
+            Some(s) if has(&s.key_env()) => rep.ok(format!("web search {} (key set)", s.provider)),
+            Some(s) => rep.fail(format!(
+                "web search {}: {} missing — ka-agent key set {}",
+                s.provider,
+                s.key_env(),
+                s.key_env()
+            )),
+            None => rep.warn("web search off — ka-agent setup search"),
+        }
+        for m in &cfg.fallback {
+            match catalog::validate_selector(m) {
+                Ok(_) => rep.ok(format!("fallback {m}")),
+                Err(e) => rep.fail(format!("fallback {m}: {e}")),
+            }
+        }
+        let secrets_dir = paths.root().join("secrets");
+        for m in &cfg.mcp {
+            let missing: Vec<&str> = m
+                .env
+                .values()
+                .chain(m.headers.values())
+                .filter_map(|v| v.strip_prefix(ka_agent_port::engine_layer::SECRET_PREFIX))
+                .filter(|name| ka_agent_core::secret::resolve(name, &secrets_dir).is_err())
+                .collect();
+            let target = m.command.as_deref().or(m.url.as_deref()).unwrap_or("?");
+            if missing.is_empty() {
+                rep.ok(format!("mcp {} ({target})", m.name));
+            } else {
+                rep.fail(format!(
+                    "mcp {}: secret {} not set — ka-agent secret set {}",
+                    m.name,
+                    missing.join(", "),
+                    missing[0]
+                ));
+            }
+        }
+    }
+
     // git (memory backing is a git repo).
     match std::process::Command::new("git").arg("--version").output() {
         Ok(out) if out.status.success() => {
@@ -218,7 +263,7 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
                 .token_secret
                 .clone()
                 .unwrap_or_else(|| "telegram.bot_token".into());
-            match ka_agent_channels::secret::resolve(&name, &secrets) {
+            match ka_agent_core::secret::resolve(&name, &secrets) {
                 Ok(token) => {
                     rep.ok(format!("telegram token {name:?} resolves"));
                     for p in crate::profile_cli::profiles_polling_token(&token) {
@@ -252,7 +297,7 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
                 .token_secret
                 .clone()
                 .unwrap_or_else(|| "matrix.access_token".into());
-            match ka_agent_channels::secret::resolve(&name, &secrets) {
+            match ka_agent_core::secret::resolve(&name, &secrets) {
                 Ok(_) => rep.ok(format!("matrix token {name:?} resolves")),
                 Err(e) => rep.fail(format!(
                     "matrix token {name:?} missing: {e} — ka-agent setup matrix"

@@ -31,7 +31,7 @@ fn restart_hint(_paths: &Paths) -> &'static str {
     }
 }
 
-fn apply_live(paths: &Paths, _config: &PathBuf) -> std::process::ExitCode {
+pub fn apply_live(paths: &Paths, _config: &PathBuf) -> std::process::ExitCode {
     if !admin::is_running(paths) {
         println!("takes effect when Ka Agent starts");
         return std::process::ExitCode::SUCCESS;
@@ -76,6 +76,28 @@ fn apply_live(paths: &Paths, _config: &PathBuf) -> std::process::ExitCode {
     }
 }
 
+/// `model` and `fallback` name catalog models: refuse unknown selectors
+/// before anything is written (the schema alone cannot know the catalog).
+fn check_selectors(key: &str, value: &str) -> Result<(), String> {
+    let selectors: Vec<String> = match key {
+        "model" => vec![value.trim().trim_matches('"').to_string()],
+        "fallback" => toml::from_str::<toml::Table>(&format!("v = {value}"))
+            .ok()
+            .and_then(|t| t.get("v").and_then(|v| v.as_array()).cloned())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => return Ok(()),
+    };
+    for sel in &selectors {
+        ka_agent_port::catalog::validate_selector(sel).map_err(|e| format!("{key}: {e}"))?;
+    }
+    Ok(())
+}
+
 pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode {
     let paths = Paths::new(Paths::default_root());
     match command {
@@ -112,6 +134,10 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
             }
         },
         ConfigCommand::Set { key, value } => {
+            if let Err(e) = check_selectors(&key, &value) {
+                eprintln!("ka-agent: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
             match ka_agent_core::config_file::set(&config, &key, &value) {
                 Ok(_) => {
                     let rendered = ka_agent_core::config_file::get(&config, &key)

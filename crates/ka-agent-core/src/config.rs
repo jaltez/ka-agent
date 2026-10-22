@@ -136,6 +136,59 @@ impl Default for Calendar {
     }
 }
 
+/// Web search for the engine's `web_search` tool: strict `[search]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Search {
+    /// `tavily` | `brave` | `bing`.
+    pub provider: String,
+    /// API base override (proxies, test fixtures).
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl Search {
+    pub const PROVIDERS: &'static [&'static str] = &["tavily", "brave", "bing"];
+
+    /// The engine `.env` / environment variable holding this provider's key.
+    pub fn key_env(&self) -> String {
+        format!("{}_API_KEY", self.provider.to_ascii_uppercase())
+    }
+}
+
+/// One operator-declared MCP server (`[[mcp]]`). Values written
+/// `secret:<name>` in `env`/`headers` resolve from the secret store when the
+/// worker starts, so tokens never live in the config file.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServer {
+    /// Tool prefix: tools appear to the model as `<name>.<tool>`.
+    pub name: String,
+    /// stdio transport: the executable (exclusive with `url`).
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Streamable-HTTP transport (exclusive with `command`).
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl McpServer {
+    /// `[a-z0-9_-]`, 1..=32, not the built-in bridge's `kagent`.
+    pub fn valid_name(name: &str) -> bool {
+        (1..=32).contains(&name.len())
+            && name != "kagent"
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonConfig {
@@ -146,6 +199,9 @@ pub struct DaemonConfig {
     pub workspace: PathBuf,
     /// Default ka model selector for new sessions.
     pub model: Option<String>,
+    /// Models tried in order when the main one fails (outage, rate
+    /// limit); at most two hops per turn.
+    pub fallback: Vec<String>,
     /// `guarded` (default) | `accept_edits` | `free` | `plan`.
     pub mode: String,
     /// Approval card TTL; deny on expiry.
@@ -170,6 +226,10 @@ pub struct DaemonConfig {
     pub timezone: Option<String>,
     pub web: Web,
     pub calendar: Calendar,
+    /// Web search for the engine (`None` = the `web_search` tool is off).
+    pub search: Option<Search>,
+    /// Operator-declared MCP servers.
+    pub mcp: Vec<McpServer>,
 }
 
 impl Default for DaemonConfig {
@@ -177,6 +237,7 @@ impl Default for DaemonConfig {
         Self {
             workspace: PathBuf::from("~/.ka-agent/profiles/default/workspace"),
             model: None,
+            fallback: Vec::new(),
             mode: "guarded".to_string(),
             approval_ttl_secs: 900,
             turn_grace_secs: 10,
@@ -189,6 +250,8 @@ impl Default for DaemonConfig {
             timezone: None,
             web: Web::default(),
             calendar: Calendar::default(),
+            search: None,
+            mcp: Vec::new(),
         }
     }
 }
@@ -282,6 +345,40 @@ impl DaemonConfig {
             return Err(Error::Validate(
                 "calendar.digest_time must be HH:MM (24h)".into(),
             ));
+        }
+        if self.fallback.len() > 2 {
+            return Err(Error::Validate(
+                "fallback takes at most 2 models (the engine tries 2 hops per turn)".into(),
+            ));
+        }
+        if let Some(search) = &self.search
+            && !Search::PROVIDERS.contains(&search.provider.as_str())
+        {
+            return Err(Error::Validate(format!(
+                "search.provider {:?}: tavily | brave | bing",
+                search.provider
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for m in &self.mcp {
+            if !McpServer::valid_name(&m.name) {
+                return Err(Error::Validate(format!(
+                    "mcp name {:?}: [a-z0-9_-], up to 32 chars, not \"kagent\"",
+                    m.name
+                )));
+            }
+            if !seen.insert(m.name.as_str()) {
+                return Err(Error::Validate(format!(
+                    "mcp name {:?} is used twice",
+                    m.name
+                )));
+            }
+            if m.command.is_some() == m.url.is_some() {
+                return Err(Error::Validate(format!(
+                    "mcp {:?} needs exactly one of `command` (stdio) or `url` (http)",
+                    m.name
+                )));
+            }
         }
         Ok(())
     }

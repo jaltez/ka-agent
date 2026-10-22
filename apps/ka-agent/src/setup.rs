@@ -723,7 +723,7 @@ impl Setup {
             ka_agent_core::config_file::set(&self.args.config, "telegram.enabled", "true")
                 .map_err(|e| e.to_string())?;
             let dir = self.paths.root().join("secrets");
-            ka_agent_channels::secret::store("telegram.bot_token", token, &dir)
+            ka_agent_core::secret::store("telegram.bot_token", token, &dir)
                 .map_err(|e| e.to_string())?;
         }
         if let Some((homeserver, user)) = &self.matrix {
@@ -1125,7 +1125,7 @@ pub fn secret_action(action: SecretAction) -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            match ka_agent_channels::secret::store(&name, &value, &dir) {
+            match ka_agent_core::secret::store(&name, &value, &dir) {
                 Ok(path) => {
                     println!("{name} set at {} (0600)", path.display());
                     std::process::ExitCode::SUCCESS
