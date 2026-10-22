@@ -80,44 +80,61 @@ static CONTRACT_DOCS: &[(&str, &[u8])] = &[
     ),
 ];
 
+/// The checks as they run: printed line by line, or (`--json`) collected
+/// into one document printed at the end.
 struct Report {
     failed: bool,
+    json: Option<std::cell::RefCell<Vec<serde_json::Value>>>,
 }
 
 impl Report {
-    fn new() -> Self {
-        Self { failed: false }
+    fn new(json: bool) -> Self {
+        Self {
+            failed: false,
+            json: json.then(|| std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    fn emit(&self, level: &str, mark: &str, line: &str) {
+        match &self.json {
+            Some(rows) => rows
+                .borrow_mut()
+                .push(serde_json::json!({"level": level, "text": line})),
+            None => println!("{mark} {line}"),
+        }
     }
 
     fn ok(&self, line: String) {
-        println!("✓ {line}");
+        self.emit("ok", "✓", &line);
     }
 
     fn info(&self, line: &str) {
-        println!("· {line}");
+        self.emit("info", "·", line);
     }
 
     fn warn(&self, line: &str) {
-        println!("! {line}");
+        self.emit("warn", "!", line);
     }
 
     fn fail(&mut self, line: String) {
-        println!("✗ {line}");
+        self.emit("fail", "✗", &line);
         self.failed = true;
     }
 }
 
-pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
-    let rep = Report::new();
-    let mut rep = rep;
+pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCode {
+    let mut rep = Report::new(json);
     let paths = Paths::new(Paths::default_root());
-    println!(
+    let header = format!(
         "ka-agent {} · ka {} · contracts {}… ({} documents)",
         env!("CARGO_PKG_VERSION"),
         ka_agent_port::KA_PIN,
         &contract_suite_hash()[..16],
         CONTRACT_DOCS.len()
     );
+    if !json {
+        println!("{header}");
+    }
     if std::env::var_os("KA_AGENT_DATA_DIR").is_none() {
         rep.info(&format!(
             "profile {} · data {}",
@@ -498,6 +515,16 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
         }
     }
 
+    if let Some(rows) = &rep.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": !rep.failed,
+                "version": env!("CARGO_PKG_VERSION"),
+                "checks": rows.borrow().clone(),
+            })
+        );
+    }
     if rep.failed {
         std::process::ExitCode::FAILURE
     } else {

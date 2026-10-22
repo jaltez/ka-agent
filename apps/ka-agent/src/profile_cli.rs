@@ -31,10 +31,15 @@ fn exists(profile: &str) -> bool {
 
 pub fn profile_action(action: ProfileAction) -> ExitCode {
     if std::env::var_os("KA_AGENT_DATA_DIR").is_some_and(|v| !v.is_empty()) {
-        return fail("KA_AGENT_DATA_DIR pins a single instance; unset it to manage profiles");
+        let msg = "KA_AGENT_DATA_DIR pins a single instance; unset it to manage profiles";
+        if matches!(action, ProfileAction::List { json: true }) {
+            println!("{}", serde_json::json!({"ok": false, "error": msg}));
+            return ExitCode::FAILURE;
+        }
+        return fail(msg);
     }
     match action {
-        ProfileAction::List => list(),
+        ProfileAction::List { json } => list(json),
         ProfileAction::Create {
             name,
             from,
@@ -54,8 +59,24 @@ fn all_profiles() -> Vec<String> {
     all
 }
 
-fn list() -> ExitCode {
+fn list(json: bool) -> ExitCode {
     let active = layout::profile_name();
+    if json {
+        let rows: Vec<serde_json::Value> = all_profiles()
+            .into_iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p,
+                    "active": p == active,
+                    "running": admin::is_running(&paths_for(&p)),
+                    "web_port": web_port(&layout::config_path_for(&p)),
+                    "data": paths_for(&p).root(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "ok": true, "profiles": rows }));
+        return ExitCode::SUCCESS;
+    }
     for p in all_profiles() {
         let mark = if p == active { "*" } else { " " };
         let running = if admin::is_running(&paths_for(&p)) {

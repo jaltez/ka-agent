@@ -6,21 +6,25 @@ use std::process::ExitCode;
 use ka_agent_runtime::paths::Paths;
 use ka_agent_store::Store;
 
-pub fn usage(days: u32) -> ExitCode {
+pub fn usage(days: u32, json: bool) -> ExitCode {
     let paths = Paths::new(Paths::default_root());
+    let fail = |msg: String| {
+        if json {
+            println!("{}", serde_json::json!({"ok": false, "error": msg}));
+        } else {
+            eprintln!("ka-agent: {msg}");
+        }
+        ExitCode::FAILURE
+    };
     if !paths.state_db().exists() {
-        eprintln!(
-            "ka-agent: no {} yet — nothing recorded",
+        return fail(format!(
+            "no {} yet — nothing recorded",
             paths.state_db().display()
-        );
-        return ExitCode::FAILURE;
+        ));
     }
     let store = match Store::open(&paths.state_db()) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("ka-agent: {}: {e}", paths.state_db().display());
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(format!("{}: {e}", paths.state_db().display())),
     };
     let cfg = ka_agent_core::DaemonConfig::load(&crate::default_config_path()).ok();
     let tz = cfg
@@ -35,10 +39,7 @@ pub fn usage(days: u32) -> ExitCode {
 
     let rows = match store.usage_rows_since(since) {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("ka-agent: store: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(format!("store: {e}")),
     };
     // Bucket by local calendar day; a turn lands on the day it started.
     let mut days_usage: Vec<(String, u64, u64, f64)> = Vec::new();
@@ -59,6 +60,24 @@ pub fn usage(days: u32) -> ExitCode {
         turns += 1;
         tokens += t;
         cost += c;
+    }
+    if json {
+        let rows: Vec<serde_json::Value> = days_usage
+            .iter()
+            .map(|(day, t, tok, c)| {
+                serde_json::json!({"day": day, "turns": t, "tokens": tok, "cost_usd": c})
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "days": rows,
+                "total": {"turns": turns, "tokens": tokens, "cost_usd": cost},
+                "daily_budget_usd": cfg.as_ref().and_then(|c| c.budgets.daily_usd),
+            })
+        );
+        return ExitCode::SUCCESS;
     }
     let rule = "-".repeat(34);
     println!("{rule}");

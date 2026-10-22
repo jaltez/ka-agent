@@ -191,7 +191,9 @@ and exposes **none** of it. The largest capability jump costs no engine change.
 ### B4 · Shell completions — *S*
 - **Change:** `ka-agent completions bash|zsh|fish` (clap_complete), profile
   names completed after `-p`.
-- **Acceptance:** `ka-agent completions bash` exits 0 and contains `_ka-agent`.
+- **Acceptance:** `ka-agent completions bash` exits 0 and defines
+  `_ka__agent()`; sourcing it in bash completes `ka-agent -p w<Tab>` to a
+  profile named `work`.
 
 ---
 

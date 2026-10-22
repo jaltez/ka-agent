@@ -196,3 +196,74 @@ fn help_lists_the_everyday_commands_and_hides_the_rest() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// B2: every `--json` output is one valid JSON document, success or not.
+#[test]
+fn json_outputs_are_single_valid_documents() {
+    let root = temp_root("json");
+    std::fs::write(root.join("config.toml"), "mode = \"guarded\"\n").unwrap();
+    for args in [
+        &["doctor", "--json"][..],
+        &["status", "--json"][..],
+        &["usage", "--json"][..],
+        &["cron", "list", "--json"][..],
+        &["profile", "list", "--json"][..],
+    ] {
+        let o = ka(&root, args);
+        let out = String::from_utf8_lossy(&o.stdout);
+        let v: serde_json::Value = serde_json::from_str(out.trim())
+            .unwrap_or_else(|e| panic!("{args:?}: not one JSON document ({e}):\n{out}"));
+        assert!(v.get("ok").is_some_and(|b| b.is_boolean()), "{args:?}: {v}");
+        assert_eq!(
+            v["ok"].as_bool(),
+            Some(o.status.success()),
+            "{args:?}: exit code agrees"
+        );
+    }
+    // The checks carry level + text.
+    let v: serde_json::Value =
+        serde_json::from_slice(&ka(&root, &["doctor", "--json"]).stdout).unwrap();
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["level"].is_string() && c["text"].is_string())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B4: completions generate, and bash completes profile names after -p.
+#[test]
+fn bash_completion_offers_profile_names() {
+    let root = temp_root("compl");
+    let o = ka(&root, &["completions", "bash"]);
+    assert!(o.status.success());
+    let script = root.join("ka.bash");
+    std::fs::write(&script, &o.stdout).unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("_ka__agent()"));
+    for shell in ["zsh", "fish", "powershell"] {
+        assert!(
+            ka(&root, &["completions", shell]).status.success(),
+            "{shell}"
+        );
+    }
+    std::fs::create_dir_all(root.join(".ka-agent/profiles/work")).unwrap();
+    std::fs::create_dir_all(root.join(".ka-agent/profiles/home")).unwrap();
+    let probe = format!(
+        "source {s}; COMP_WORDS=(ka-agent -p w); COMP_CWORD=2; _ka__agent ka-agent w -p; echo \"${{COMPREPLY[@]}}\"",
+        s = script.display()
+    );
+    let out = Command::new("bash")
+        .args(["-c", &probe])
+        .env("HOME", &root)
+        .env_remove("KA_AGENT_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "work",
+        "{out:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

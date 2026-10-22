@@ -54,6 +54,7 @@ url = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "multipart"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 jiff = "0.2"
 toml_edit = "0.25"
 terminal_size = "0.4"

@@ -108,7 +108,11 @@ enum Command {
     #[command(hide = true)]
     Restart,
     /// Is Ka running, what is it doing, what did it cost today.
-    Status,
+    Status {
+        /// One JSON document (`{ok, report}`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Issue a one-time pairing code for a channel (`ka-agent pair telegram`).
     #[command(hide = true)]
     Pair {
@@ -182,6 +186,9 @@ enum Command {
         /// How many days back (1-366, default 30).
         #[arg(long, default_value_t = 30)]
         days: u32,
+        /// One JSON document.
+        #[arg(long)]
+        json: bool,
     },
     /// Show the daemon log (`-f` to follow).
     #[command(hide = true)]
@@ -243,6 +250,15 @@ enum Command {
         /// Also check the provider key and channel tokens live.
         #[arg(long)]
         online: bool,
+        /// One JSON document (`{ok, checks: [{level, text}]}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a shell completion script (`source <(ka-agent completions bash)`).
+    #[command(hide = true)]
+    Completions {
+        /// bash | zsh | fish | elvish | powershell
+        shell: clap_complete::Shell,
     },
     /// Hidden: the supervised worker process (spawned by the runtime).
     #[command(name = "__worker", hide = true)]
@@ -364,7 +380,11 @@ enum McpAction {
 #[derive(clap::Subcommand)]
 enum ProfileAction {
     /// List profiles (active one marked, running ones flagged).
-    List,
+    List {
+        /// One JSON document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a profile (config copied from another, minus channels).
     Create {
         name: String,
@@ -535,11 +555,43 @@ enum SkillsAction {
     },
 }
 
+/// The completion script for `shell`, with profile names completed after
+/// `-p/--profile` (read from the profiles directory when you press Tab).
+fn completions(shell: clap_complete::Shell) -> std::process::ExitCode {
+    use clap::CommandFactory as _;
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "ka-agent", &mut buf);
+    let mut script = String::from_utf8_lossy(&buf).into_owned();
+    let profiles = r#"ls -1 "${KA_AGENT_HOME:-$HOME/.ka-agent}/profiles" 2>/dev/null"#;
+    match shell {
+        clap_complete::Shell::Bash => {
+            // clap offers file names for every valued option; profiles are
+            // directory names under ~/.ka-agent/profiles.
+            for opt in ["--profile", "-p"] {
+                script = script.replace(
+                    &format!("{opt})\n                    COMPREPLY=($(compgen -f \"${{cur}}\"))"),
+                    &format!("{opt})\n                    COMPREPLY=($(compgen -W \"$({profiles})\" -- \"${{cur}}\"))"),
+                );
+            }
+        }
+        clap_complete::Shell::Fish => {
+            script.push_str(&format!(
+                "complete -c ka-agent -s p -l profile -x -a '({profiles})'\n"
+            ));
+        }
+        _ => {}
+    }
+    // `| head` closes the pipe early: that is not an error worth a panic.
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), script.as_bytes());
+    std::process::ExitCode::SUCCESS
+}
+
 /// The footer of `ka-agent --help`: the commands kept out of the main list
 /// (they all work; `ka-agent <command> --help` explains each).
 const ADVANCED_HELP: &str = "\
 More commands: logs run restart pair models key secret identity grant plugin
-               skills backup restore export purge — `ka-agent <command> --help`";
+               skills backup restore export purge completions
+               — `ka-agent <command> --help`";
 
 /// What a non-interactive `ka-agent` prints on a fresh machine: where to
 /// start, not the full command list.
@@ -594,7 +646,9 @@ fn main() -> std::process::ExitCode {
     let picking_profile = matches!(
         cli.command,
         Some(Command::Profile {
-            action: ProfileAction::Use { .. } | ProfileAction::List | ProfileAction::Create { .. }
+            action: ProfileAction::Use { .. }
+                | ProfileAction::List { .. }
+                | ProfileAction::Create { .. }
         })
     );
     if !picking_profile
@@ -739,7 +793,8 @@ fn main() -> std::process::ExitCode {
             rt.block_on(daemon::run_daemon(config_path(&config), scenario, web_port))
         }
         Command::Restart => daemon::restart_client(),
-        Command::Status => daemon::status_client(),
+        Command::Status { json } => daemon::status_client(json),
+        Command::Completions { shell } => completions(shell),
         Command::Pair { channel, config } => pair::pair(channel, config_path(&config)),
         Command::Model { selector, config } => {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -790,7 +845,7 @@ fn main() -> std::process::ExitCode {
         Command::Cron { action, json } => cron_cli::cron_action(action, json),
         Command::Approvals { action } => cron_cli::approvals_action(action),
         Command::Mcp { action, config } => mcp_cli::mcp_action(action, config_path(&config)),
-        Command::Usage { days } => usage_cli::usage(days),
+        Command::Usage { days, json } => usage_cli::usage(days, json),
         Command::Grant { action } => grant::grant_action(action),
         Command::Backup { out, keep, config } => ops::backup_to(out, keep, config_path(&config)),
         Command::Restore { dir, force } => ops::restore_from(dir, force),
@@ -814,6 +869,10 @@ fn main() -> std::process::ExitCode {
         Command::Dashboard { config, no_open } => {
             dashboard::dashboard(config_path(&config), no_open)
         }
-        Command::Doctor { config, online } => doctor::doctor(config_path(&config), online),
+        Command::Doctor {
+            config,
+            online,
+            json,
+        } => doctor::doctor(config_path(&config), online, json),
     }
 }

@@ -659,19 +659,36 @@ pub fn zoned_now(tz_name: &str) -> jiff::Zoned {
     jiff::Timestamp::now().to_zoned(tz)
 }
 
-pub fn status_client() -> std::process::ExitCode {
+pub fn status_client(json: bool) -> std::process::ExitCode {
     let paths = Paths::new(Paths::default_root());
+    let fail_json = |error: &str| {
+        println!("{}", serde_json::json!({"ok": false, "error": error}));
+        std::process::ExitCode::FAILURE
+    };
     let v = match admin::request(&paths, &serde_json::json!({"op": "status"})) {
         Ok(v) => v,
+        Err(admin::AdminError::NotRunning(_)) if json => return fail_json("not running"),
         Err(admin::AdminError::NotRunning(_)) => {
             println!("{}", not_running_text());
             return std::process::ExitCode::FAILURE;
         }
+        Err(e) if json => return fail_json(&e.to_string()),
         Err(e) => {
             eprintln!("ka-agent: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "profile": ka_agent_core::layout::profile_name(),
+                "report": v["report"],
+            })
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     match serde_json::from_value::<ka_agent_runtime::StatusReport>(v["report"].clone()) {
         Ok(report) => {
             let profile = ka_agent_core::layout::profile_name();
