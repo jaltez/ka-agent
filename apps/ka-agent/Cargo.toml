@@ -27,6 +27,7 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
+reqwest = { workspace = true }
 sha2 = { workspace = true }
 jiff = { workspace = true }
 rpassword = { workspace = true }

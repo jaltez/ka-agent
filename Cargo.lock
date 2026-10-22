@@ -972,6 +972,7 @@ dependencies = [
  "ka-agent-runtime",
  "ka-agent-store",
  "ka-agent-web",
+ "reqwest",
  "rpassword",
  "rusqlite",
  "serde",

@@ -12,6 +12,7 @@ mod dashboard;
 mod doctor;
 mod grant;
 mod identity;
+mod import_cli;
 mod layout;
 mod mcp_cli;
 mod memory_cli;
@@ -23,6 +24,7 @@ mod profile_cli;
 mod prompt;
 mod service;
 mod setup;
+mod update_cli;
 mod usage_cli;
 use service::ServiceAction;
 mod skills_cli;
@@ -49,6 +51,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Bring memory and skills from hermes | openclaw | claude | codex.
+    #[command(hide = true)]
+    Import {
+        #[command(subcommand)]
+        action: ImportAction,
+    },
+    /// Install a newer release: download, checksum, swap, restart.
+    #[command(hide = true)]
+    Update {
+        #[command(subcommand)]
+        action: Option<UpdateAction>,
+    },
     /// Guided setup: model and key, phone, web search, background service.
     #[command(visible_alias = "init")]
     Setup {
@@ -309,6 +323,31 @@ enum Command {
         /// Skip confirmation prompt.
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ImportAction {
+    /// `import hermes` / `openclaw` / `claude` / `codex`.
+    Agent {
+        agent: String,
+        /// List what would be imported; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum UpdateAction {
+    /// Show whether a newer release exists (no download).
+    Check {
+        /// A specific version instead of the latest.
+        version: Option<String>,
+    },
+    /// Install the newer release and restart the service(s).
+    Run {
+        /// A specific version instead of the latest.
+        version: Option<String>,
     },
 }
 
@@ -848,6 +887,10 @@ fn main() -> std::process::ExitCode {
         Command::Profile { action } => profile_cli::profile_action(action),
         Command::Briefing { action } => briefing_cli::briefing_action(action),
         Command::Cron { action, json } => cron_cli::cron_action(action, json),
+        Command::Import { action } => import_cli::import(action),
+        Command::Update { action } => {
+            update_cli::update(action.unwrap_or(UpdateAction::Run { version: None }))
+        }
         Command::Approvals { action } => cron_cli::approvals_action(action),
         Command::Mcp { action, config } => mcp_cli::mcp_action(action, config_path(&config)),
         Command::Usage { days, json } => usage_cli::usage(days, json),

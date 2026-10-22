@@ -267,3 +267,170 @@ fn bash_completion_offers_profile_names() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// K1: `update` against fixture release servers — check reports the newer
+/// version and downloads nothing; install checksum-verifies and swaps the
+/// target; a mismatched checksum installs nothing.
+#[test]
+fn update_downloads_verifies_and_swaps() {
+    use std::io::{Read as _, Write as _};
+    let dir = temp_root("update");
+    let staging = dir.join("rel");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(
+        staging.join("ka-agent"),
+        "#!/bin/sh\necho i am the update\n",
+    )
+    .unwrap();
+    let tar_out = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(staging.join("t.tar.gz"))
+        .arg("-C")
+        .arg(&staging)
+        .arg("ka-agent")
+        .output()
+        .unwrap();
+    assert!(tar_out.status.success());
+    let tarball = std::fs::read(staging.join("t.tar.gz")).unwrap();
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(&tarball)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    // One fake release server; `checksum` may be wrong on purpose.
+    let serve = move |good_checksum: bool| -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let index = serde_json::json!({
+            "tag_name": "v9.9.9",
+            "assets": [{
+                "name": "ka-agent-x86_64-unknown-linux-gnu.tar.gz",
+                "browser_download_url": format!("http://127.0.0.1:{port}/t.tar.gz")
+            }]
+        });
+        let meta = serde_json::to_vec(&index).unwrap();
+        let checksum = if good_checksum {
+            format!("{digest}\n").into_bytes()
+        } else {
+            format!("{}deadbeef\n", &digest[..8]).into_bytes()
+        };
+        let tarball = tarball.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let (head, body): (&str, Vec<u8>) = if buf.starts_with(b"GET /meta") {
+                    ("application/json", meta.clone())
+                } else if buf.starts_with(b"GET /t.tar.gz.sha256") {
+                    ("text/plain", checksum.clone())
+                } else {
+                    ("application/octet-stream", tarball.clone())
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        format!("http://127.0.0.1:{port}/meta")
+    };
+    let good_api = serve(true);
+    let bad_api = serve(false);
+
+    let target = dir.join("bin/ka-agent");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "old binary").unwrap();
+    let run = |api: &str, args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+            .args(args)
+            .env("KA_AGENT_UPDATE_API", api)
+            .env("KA_AGENT_INSTALL_TO", &target)
+            .output()
+            .unwrap();
+        (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+
+    let (ok, text) = run(&good_api, &["update", "check"]);
+    assert!(ok && text.contains("update available"), "{text}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old binary");
+
+    let (ok, text) = run(&bad_api, &["update", "run"]);
+    assert!(!ok, "a bad checksum must fail: {text}");
+    assert!(text.contains("mismatch"), "{text}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old binary");
+
+    let (ok, text) = run(&good_api, &["update", "run"]);
+    assert!(ok, "{text}");
+    assert!(
+        std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("i am the update"),
+        "target swapped: {}",
+        std::fs::read_to_string(&target).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A4: import turns another agent's memory into candidates (never straight
+/// into stable memory) and its skills into library entries; --dry-run
+/// writes nothing.
+#[test]
+fn import_brings_memory_as_candidates_and_skills() {
+    let home = temp_root("import-home");
+    // A fake Hermes install.
+    std::fs::create_dir_all(home.join(".hermes/memories")).unwrap();
+    std::fs::create_dir_all(home.join(".hermes/skills/research")).unwrap();
+    std::fs::write(
+        home.join(".hermes/memories/MEMORY.md"),
+        "# Memory\n\n- Prefers short answers\n- Lives in Madrid\n\nsome prose line about tea\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".hermes/skills/research/SKILL.md"),
+        "---\nname: research\n---\nDo research.\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["import", "agent", "hermes", "--dry-run"])
+        .env("HOME", &home)
+        .env("KA_AGENT_DATA_DIR", home.join("data"))
+        .env("KA_AGENT_CONFIG", home.join("config.toml"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("3 fact(s)"), "{text}");
+    assert!(text.contains("dry run — nothing was written"), "{text}");
+    assert!(!home.join("data/state.db").exists(), "nothing written");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["import", "agent", "hermes"])
+        .env("HOME", &home)
+        .env("KA_AGENT_DATA_DIR", home.join("data"))
+        .env("KA_AGENT_CONFIG", home.join("config.toml"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    let store = ka_agent_store::Store::open(&home.join("data/state.db")).unwrap();
+    let pending = store.pending_candidates_full().unwrap();
+    assert_eq!(pending.len(), 3, "{pending:?}");
+    assert!(pending.iter().all(|c| c.source == "import"), "{pending:?}");
+    assert!(
+        std::fs::read_to_string(home.join(".ka-agent/skills/research/SKILL.md")).is_ok(),
+        "skill copied into the library"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

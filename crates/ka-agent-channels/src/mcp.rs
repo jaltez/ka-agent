@@ -934,6 +934,27 @@ fn github_token() -> Result<String, String> {
 /// unique-local, private and unspecified targets — as IP literals in any
 /// form (v4/v6, bracketed) — unless the operator granted `http:get:private`.
 /// Redirects are followed manually and every hop re-checks the same guard.
+/// Resolve `host` and reject private addresses before connecting (DNS
+/// rebinding: a public name that resolves to 127.0.0.1 or link-local).
+/// `Ok(())` when every address is public; the caller connects with
+/// `resolve` so the answer cannot change between check and connect.
+pub(crate) fn assert_public_host(host: &str) -> Result<std::net::IpAddr, String> {
+    use std::net::ToSocketAddrs as _;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let with_port = format!("{bare}:80");
+    let addrs: Vec<std::net::SocketAddr> = match with_port.to_socket_addrs() {
+        Ok(a) => a.collect(),
+        Err(e) => return Err(format!("cannot resolve {bare:?}: {e}")),
+    };
+    let Some(addr) = addrs.first() else {
+        return Err(format!("no address for {bare:?}"));
+    };
+    if http_target_is_private(bare) || http_target_is_private(&addr.ip().to_string()) {
+        return Err("private target refused (grant http:get:private to allow)".into());
+    }
+    Ok(addr.ip())
+}
+
 pub(crate) fn http_target_is_private(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
@@ -1007,9 +1028,25 @@ pub(crate) fn http_get_no_redirect(
     grants: &grants::Grants,
 ) -> Result<String, String> {
     let allow_private = grants.check("http:get:private");
-    let client = http_client(timeout_secs)?;
     let mut current = url.clone();
     for _ in 0..5 {
+        // DNS rebinding guard: resolve now, refuse private answers, and
+        // pin the connection to the address we checked — a second lookup
+        // could answer differently between check and connect.
+        let client = if allow_private {
+            http_client(timeout_secs)?
+        } else {
+            let host = current.host_str().unwrap_or("").to_string();
+            let ip = assert_public_host(&host)?;
+            let port = current.port_or_known_default().unwrap_or(80);
+            reqwest::blocking::Client::builder()
+                .user_agent("ka-agent")
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve(&host, std::net::SocketAddr::new(ip, port))
+                .build()
+                .map_err(|e| format!("http client: {e}"))?
+        };
         let resp = client
             .get(current.as_str())
             .send()
@@ -1025,11 +1062,15 @@ pub(crate) fn http_get_no_redirect(
             let next = url::Url::parse(&location)
                 .or_else(|_| current.join(&location))
                 .map_err(|e| format!("redirect target: {e}"))?;
-            if !allow_private && http_target_is_private(next.host_str().unwrap_or("")) {
-                return Err(format!(
-                    "redirect to private target {} refused (grant http:get:private to allow)",
-                    next.host_str().unwrap_or("?")
-                ));
+            if !allow_private {
+                // Name check first (literal IPs), then the resolved answer.
+                let host = next.host_str().unwrap_or("");
+                if http_target_is_private(host) {
+                    return Err(format!(
+                        "redirect to private target {host} refused (grant http:get:private to allow)"
+                    ));
+                }
+                assert_public_host(host)?;
             }
             current = next;
             continue;
@@ -1228,5 +1269,24 @@ mod ssrf_tests {
         ] {
             assert!(!http_target_is_private(host), "{host} must not be private");
         }
+    }
+}
+
+#[cfg(test)]
+mod rebinding_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn a_public_name_resolving_to_a_private_address_is_refused() {
+        // "localhost" resolves to 127.0.0.1 on every machine: the name is
+        // not private by spelling, only by answer.
+        let err = assert_public_host("localhost").unwrap_err();
+        assert!(err.contains("private target refused"), "{err}");
+        // A literal private IP is refused the same way.
+        let err = assert_public_host("127.0.0.1").unwrap_err();
+        assert!(err.contains("private target refused"), "{err}");
+        // A syntactically invalid host is a resolution error, not a panic.
+        assert!(assert_public_host("no-such-host.invalid").is_err());
     }
 }

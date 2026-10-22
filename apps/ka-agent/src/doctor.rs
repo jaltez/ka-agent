@@ -396,6 +396,24 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
         }
     }
 
+    // A cached update check (refreshed by `ka-agent update [--check]`).
+    if let Some((latest, at)) = crate::update_cli::last_check(&paths)
+        && ka_agent_core::now_ms() - at < 7 * 86_400_000
+    {
+        let current = env!("CARGO_PKG_VERSION");
+        let num = |s: &str| -> Vec<u64> {
+            s.trim_start_matches('v')
+                .split('.')
+                .map(|p| p.parse().unwrap_or(0))
+                .collect()
+        };
+        if num(&latest) > num(current) {
+            rep.warn(&format!(
+                "update available: {current} → {latest} — ka-agent update"
+            ));
+        }
+    }
+
     if let Some(dir) = paths.loose_permissions() {
         rep.warn(&format!(
             "{} is readable by other users — fixed on the next start, or now: chmod 700 {}",
