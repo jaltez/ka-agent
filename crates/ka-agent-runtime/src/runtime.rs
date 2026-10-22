@@ -450,6 +450,17 @@ impl Runtime {
             next_task,
             timezone: tz.iana_name().unwrap_or("UTC").to_string(),
             capabilities: crate::status::Capabilities::from_config(&cfg),
+            memory: self.memory_report().ok().map(|r| crate::status::MemoryUse {
+                used_bytes: r.total_bytes,
+                budget_bytes: r.budget_bytes,
+                truncated: r.truncated,
+                to_review: self
+                    .sh
+                    .store
+                    .pending_candidates_full()
+                    .map(|c| c.len())
+                    .unwrap_or(0),
+            }),
         })
     }
 
@@ -1450,12 +1461,22 @@ impl Runtime {
                     }
                     let ok = match &spec.mode {
                         ka_agent_core::CronMode::Agent => {
-                            self.sh.surface.on_notice(&format!(
-                                "cron: {}{}",
-                                spec.text,
-                                late_suffix(this_late_by)
-                            ));
-                            match self.handle_message(&spec.text, "cron").await {
+                            let (prompt, label) = if spec.source == crate::briefing::SOURCE {
+                                (
+                                    format!(
+                                        "{}\n\n{}",
+                                        crate::briefing::PROMPT,
+                                        self.briefing_context()
+                                    ),
+                                    "☀ daily briefing".to_string(),
+                                )
+                            } else {
+                                (spec.text.clone(), format!("cron: {}", spec.text))
+                            };
+                            self.sh
+                                .surface
+                                .on_notice(&format!("{label}{}", late_suffix(this_late_by)));
+                            match self.handle_message(&prompt, "cron").await {
                                 Ok(()) => true,
                                 Err(e) => {
                                     self.sh
@@ -1570,6 +1591,70 @@ impl Runtime {
                 _ = self.sh.scheduler_tick.notified() => {}
             }
         }
+    }
+
+    /// What the briefing prompt needs and the model cannot see: today's
+    /// reminders, what waits for the operator, calendar digests.
+    fn briefing_context(&self) -> String {
+        let now = self.now_zoned();
+        let end_of_day = now
+            .date()
+            .tomorrow()
+            .ok()
+            .and_then(|d| d.to_zoned(now.time_zone().clone()).ok())
+            .map(|z| z.timestamp().as_millisecond())
+            .unwrap_or(i64::MAX);
+        let mut lines = vec![format!(
+            "Context (now {}):",
+            now.strftime("%A %Y-%m-%d %H:%M")
+        )];
+        let tasks = self.sh.store.scheduled_tasks().unwrap_or_default();
+        let today: Vec<String> = tasks
+            .iter()
+            .filter(|t| t.kind == "reminder")
+            .filter_map(|t| t.scheduled_at_ms.map(|at| (at, t)))
+            .filter(|(at, _)| *at < end_of_day)
+            .map(|(at, t)| {
+                format!(
+                    "- reminder {} — {}",
+                    ka_agent_core::when::describe(at, &now),
+                    t.title
+                )
+            })
+            .collect();
+        if today.is_empty() {
+            lines.push("- no reminders today".into());
+        } else {
+            lines.extend(today);
+        }
+        let approvals = self
+            .sh
+            .store
+            .pending_approvals(&self.session_id())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let review = self
+            .sh
+            .store
+            .pending_candidates_full()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        lines.push(format!(
+            "- waiting for the operator: {approvals} approval(s), {review} memory proposal(s)"
+        ));
+        for t in &tasks {
+            if let Some(spec) = t
+                .payload
+                .as_deref()
+                .and_then(ka_agent_core::CronSpec::from_payload)
+                && let ka_agent_core::CronMode::NoAgent(kind) = &spec.mode
+                && kind == "calendar"
+                && let Ok(digest) = self.run_no_agent(kind, &spec.text)
+            {
+                lines.push(format!("- calendar:\n{digest}"));
+            }
+        }
+        lines.join("\n")
     }
 
     /// Offer each new `memory_propose` candidate to the operator once (the

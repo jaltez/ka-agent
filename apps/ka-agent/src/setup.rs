@@ -27,6 +27,7 @@ pub enum Section {
     Matrix,
     Service,
     Search,
+    Briefing,
 }
 
 /// Parsed `ka-agent setup` arguments.
@@ -78,6 +79,8 @@ struct Setup {
     matrix_operator: Option<String>,
     /// Web search chosen in setup: provider and, when newly entered, its key.
     search: Option<(String, Option<String>)>,
+    /// Daily briefing time chosen in setup (`HH:MM`).
+    briefing: Option<String>,
 }
 
 fn prompt_err(e: PromptError) -> std::process::ExitCode {
@@ -152,6 +155,7 @@ impl Setup {
                 "Matrix".into(),
                 "Background service".into(),
                 "Web search".into(),
+                "Daily briefing".into(),
                 "Everything".into(),
             ];
             let pick = prompt::choice("What do you want to set up?", &options, 0)?;
@@ -161,6 +165,7 @@ impl Setup {
                 2 => Section::Matrix,
                 3 => Section::Service,
                 4 => Section::Search,
+                5 => Section::Briefing,
                 _ => Section::All,
             };
             if self.args.section != Section::All {
@@ -179,6 +184,7 @@ impl Setup {
             None
         };
         self.step_search()?;
+        self.step_briefing()?;
         if !self.confirm_and_write().await? {
             return Ok(std::process::ExitCode::SUCCESS);
         }
@@ -213,6 +219,14 @@ impl Setup {
                 self.post_write(Some("matrix")).await
             }
             Section::Service => self.step_service(),
+            Section::Briefing => {
+                self.step_briefing()?;
+                if self.briefing.is_none() || !self.confirm_and_write().await? {
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                println!("Daily briefing on — `ka-agent briefing now` sends one right away");
+                Ok(std::process::ExitCode::SUCCESS)
+            }
             Section::Search => {
                 self.step_search()?;
                 if self.search.is_none() || !self.confirm_and_write().await? {
@@ -641,6 +655,31 @@ impl Setup {
         Ok(())
     }
 
+    /// Optional daily briefing (one morning message, not a heartbeat).
+    fn step_briefing(&mut self) -> Result<(), PromptError> {
+        let options = vec![
+            "Yes, at 07:30".to_string(),
+            "Yes, at another time".to_string(),
+            "Not now".to_string(),
+        ];
+        self.briefing = match prompt::choice(
+            "A short briefing every morning (calendar, reminders, what waits for you)?",
+            &options,
+            2,
+        )? {
+            0 => Some("07:30".to_string()),
+            1 => loop {
+                let t = prompt::text("Time (HH:MM, 24h)", Some("08:00"))?;
+                if ka_agent_core::when::parse_hhmm(&t).is_some() {
+                    break Some(t);
+                }
+                println!("✗ use HH:MM, e.g. 07:45");
+            },
+            _ => None,
+        };
+        Ok(())
+    }
+
     async fn setup_telegram(&mut self) -> Result<(), PromptError> {
         println!("In Telegram, open @BotFather → /newbot → copy the token it gives you.");
         loop {
@@ -722,6 +761,9 @@ impl Setup {
         }
         if let Some((provider, _)) = &self.search {
             println!("search    : {provider}");
+        }
+        if let Some(t) = &self.briefing {
+            println!("briefing  : every day at {t}");
         }
         // `--yes` never reads input: the summary IS the confirmation.
         if !self.args.yes && !prompt::yes_no("Save this setup?", true)? {
@@ -822,6 +864,10 @@ impl Setup {
         // complete store and compiled memory (like the old init did).
         let store = Store::open(&self.paths.state_db()).map_err(|e| e.to_string())?;
         let cfg = DaemonConfig::load(&self.args.config).map_err(|e| e.to_string())?;
+        if let Some(t) = &self.briefing {
+            let now = jiff::Timestamp::now().to_zoned(cfg.time_zone());
+            ka_agent_runtime::briefing::enable(&store, t, &now)?;
+        }
         let memory = ka_agent_memory::MemoryStore::open(&self.paths.root().join("memory"))
             .map_err(|e| e.to_string())?;
         memory
@@ -1081,6 +1127,7 @@ pub async fn run(args: SetupArgs) -> std::process::ExitCode {
         matrix: None,
         matrix_operator: None,
         search: None,
+        briefing: None,
     };
     setup.run().await
 }

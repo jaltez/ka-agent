@@ -28,6 +28,41 @@ pub struct StatusReport {
     /// provider, operator MCP servers, fallback models.
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Compiled memory against its budget, and proposals awaiting the
+    /// operator.
+    #[serde(default)]
+    pub memory: Option<MemoryUse>,
+}
+
+/// How full the compiled memory is (it truncates silently past the budget).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryUse {
+    pub used_bytes: usize,
+    pub budget_bytes: usize,
+    pub truncated: bool,
+    pub to_review: usize,
+}
+
+impl MemoryUse {
+    /// `memory 4.1 of 6.0 KB · 2 to review` (+ a warning when it no longer
+    /// fits).
+    pub fn line(&self) -> String {
+        let kb = |b: usize| b as f64 / 1024.0;
+        let mut out = format!(
+            "memory {:.1} of {:.1} KB",
+            kb(self.used_bytes),
+            kb(self.budget_bytes)
+        );
+        if self.to_review > 0 {
+            out.push_str(&format!(" · {} to review (/memory review)", self.to_review));
+        }
+        if self.truncated {
+            out.push_str(" · ⚠ full — older entries are left out; /memory to prune");
+        } else if self.used_bytes * 10 >= self.budget_bytes * 9 {
+            out.push_str(" · nearly full");
+        }
+        out
+    }
 }
 
 /// The configured capability set, for one status line.
@@ -123,6 +158,10 @@ impl StatusReport {
             ka_agent_core::ids::short_id(&self.session_id),
             self.timezone
         );
+        if let Some(m) = &self.memory {
+            out.push('\n');
+            out.push_str(&m.line());
+        }
         if let Some(line) = self.capabilities.line() {
             out.push('\n');
             out.push_str(&line);
@@ -185,6 +224,7 @@ mod tests {
             next_task: None,
             timezone: "Europe/Madrid".into(),
             capabilities: Capabilities::default(),
+            memory: None,
         }
     }
 
@@ -206,6 +246,35 @@ mod tests {
                 "session a1b2c3d4 · strand (new) · Europe/Madrid",
             ]
         );
+    }
+
+    #[test]
+    fn memory_line_warns_before_it_silently_truncates() {
+        let mut r = report();
+        r.memory = Some(MemoryUse {
+            used_bytes: 4200,
+            budget_bytes: 6144,
+            truncated: false,
+            to_review: 2,
+        });
+        let text = r.render(&now());
+        assert!(
+            text.contains("memory 4.1 of 6.0 KB · 2 to review (/memory review)"),
+            "{text}"
+        );
+        let near = MemoryUse {
+            used_bytes: 5600,
+            budget_bytes: 6144,
+            ..MemoryUse::default()
+        };
+        assert!(near.line().ends_with("nearly full"), "{}", near.line());
+        let full = MemoryUse {
+            used_bytes: 6144,
+            budget_bytes: 6144,
+            truncated: true,
+            to_review: 0,
+        };
+        assert!(full.line().contains("⚠ full"), "{}", full.line());
     }
 
     #[test]

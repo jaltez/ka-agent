@@ -3,6 +3,7 @@
 //! hidden `__worker` / `__mcp` subcommands the runtime and engine supervise.
 
 mod admin;
+mod briefing_cli;
 mod chat;
 mod config_cli;
 mod daemon;
@@ -50,7 +51,7 @@ enum Command {
     /// Guided setup: model and key, phone, web search, background service.
     #[command(visible_alias = "init")]
     Setup {
-        /// Section: all | model | telegram | matrix | service | search.
+        /// Section: all | model | telegram | matrix | service | search | briefing.
         section: Option<String>,
         /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
@@ -144,6 +145,11 @@ enum Command {
         action: ServiceAction,
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+    /// A morning briefing: calendar, reminders, what waits for you.
+    Briefing {
+        #[command(subcommand)]
+        action: Option<BriefingAction>,
     },
     /// Connect MCP servers: their tools become the agent's tools.
     Mcp {
@@ -273,6 +279,16 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum BriefingAction {
+    /// Send it every day at this local time (`on 07:30`).
+    On { time: String },
+    /// Stop the daily briefing.
+    Off,
+    /// Send it now (then again at its usual time).
+    Now,
 }
 
 #[derive(clap::Subcommand)]
@@ -620,9 +636,10 @@ fn main() -> std::process::ExitCode {
                 Some("matrix") => setup::Section::Matrix,
                 Some("service") => setup::Section::Service,
                 Some("search") => setup::Section::Search,
+                Some("briefing") => setup::Section::Briefing,
                 Some(other) => {
                     eprintln!(
-                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search"
+                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search | briefing"
                     );
                     return std::process::ExitCode::FAILURE;
                 }
@@ -722,6 +739,7 @@ fn main() -> std::process::ExitCode {
         }
         Command::Logs { follow, lines } => service::logs(follow, lines),
         Command::Profile { action } => profile_cli::profile_action(action),
+        Command::Briefing { action } => briefing_cli::briefing_action(action),
         Command::Mcp { action, config } => mcp_cli::mcp_action(action, config_path(&config)),
         Command::Usage { days } => usage_cli::usage(days),
         Command::Grant { action } => grant::grant_action(action),

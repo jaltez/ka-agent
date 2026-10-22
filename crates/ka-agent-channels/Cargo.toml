@@ -11,6 +11,7 @@ ka-agent-core = { workspace = true }
 ka-agent-plugins = { workspace = true }
 ka-agent-store = { workspace = true }
 ka-agent-runtime = { workspace = true }
+ka-agent-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

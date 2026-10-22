@@ -252,3 +252,71 @@ fn chat_attaches_to_the_running_daemon() {
     daemon.sigterm_wait(Duration::from_secs(10));
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// G1: `briefing on` schedules exactly one briefing cron; `briefing now`
+/// makes the running daemon send it — the engine sees the briefing prompt
+/// with today's context; `briefing off` removes it.
+#[test]
+fn briefing_on_now_off() {
+    let root = temp_root("briefing");
+    let sc = root.join("brief.json");
+    std::fs::write(
+        &sc,
+        r#"{ "steps": [ {"text": "Nothing notable today."} ], "stop": "done" }"#,
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon_with(&root, Some(&sc));
+    daemon.wait_sock(Duration::from_secs(10));
+    let cli = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+            .args(args)
+            .env("KA_AGENT_DATA_DIR", &daemon.data)
+            .env("KA_AGENT_CONFIG", root.join("ka-agent.toml"))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {o:?}");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    assert!(cli(&["briefing", "on", "08:00"]).contains("daily briefing on"));
+    assert!(cli(&["briefing", "on", "07:30"]).contains("daily briefing on"));
+    let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
+    let briefings = || {
+        store
+            .cron_tasks()
+            .unwrap()
+            .into_iter()
+            .filter(|t| {
+                t.payload
+                    .as_deref()
+                    .is_some_and(|p| p.contains("\"briefing\""))
+            })
+            .count()
+    };
+    assert_eq!(briefings(), 1, "re-enabling replaces");
+    assert!(cli(&["briefing", "now"]).contains("armed"));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let conn = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
+    loop {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE inbound_text LIKE 'Daily briefing%' AND inbound_text LIKE '%waiting for the operator%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if n >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "briefing never reached the engine"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // It re-armed for its time instead of disappearing.
+    assert_eq!(briefings(), 1);
+    assert!(cli(&["briefing", "off"]).contains("off"));
+    assert_eq!(briefings(), 0);
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}

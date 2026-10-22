@@ -348,6 +348,28 @@ pub fn doctor(config: PathBuf, online: bool) -> std::process::ExitCode {
         }
     }
 
+    // Memory: compiled under a byte budget; past it entries are left out
+    // without anyone noticing unless we say so.
+    if paths.root().join("memory").is_dir()
+        && let Ok(mem) = ka_agent_memory::MemoryStore::open(&paths.root().join("memory"))
+        && let Ok(report) = mem.compile(ka_agent_memory::DEFAULT_BUDGET_BYTES)
+    {
+        let line = format!(
+            "memory {:.1} of {:.1} KB",
+            report.total_bytes as f64 / 1024.0,
+            report.budget_bytes as f64 / 1024.0
+        );
+        if report.truncated {
+            rep.warn(&format!(
+                "{line} — full: older entries are left out; prune with /memory"
+            ));
+        } else if report.total_bytes * 10 >= report.budget_bytes * 9 {
+            rep.warn(&format!("{line} — nearly full"));
+        } else {
+            rep.ok(line);
+        }
+    }
+
     if let Some(dir) = paths.loose_permissions() {
         rep.warn(&format!(
             "{} is readable by other users — fixed on the next start, or now: chmod 700 {}",

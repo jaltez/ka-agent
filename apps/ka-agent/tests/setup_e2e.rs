@@ -106,9 +106,9 @@ fn setup_yes_flow_writes_config_env_and_doctor_passes_model() {
 fn setup_piped_stdin_answers_each_prompt_and_eof_aborts() {
     let root = temp_root("piped");
     // Full scripted run: key, model default, timezone, workspace, channel
-    // "3" (not now), web search default (not now), save, service, test
-    // message.
-    let script = b"sk-piped\n\ny\n\n3\n\ny\nn\nn\n";
+    // "3" (not now), web search default (not now), briefing default (not
+    // now), save, service, test message.
+    let script = b"sk-piped\n\ny\n\n3\n\n\ny\nn\nn\n";
     let mut child = ka(&root)
         .args([
             "setup",

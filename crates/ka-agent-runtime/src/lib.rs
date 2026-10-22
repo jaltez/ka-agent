@@ -2,6 +2,7 @@
 //! and the worker supervisor (SEED.md §3.2, §3.8). This crate glues the port
 //! (Ka boundary), the store (state) and a channel-agnostic `Surface`.
 
+pub mod briefing;
 pub mod bus;
 pub mod paths;
 pub mod runtime;

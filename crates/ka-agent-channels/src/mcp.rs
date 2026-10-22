@@ -354,6 +354,7 @@ fn handle_tool_call(
             if text.is_empty() || text.len() > 300 {
                 return Err("text must be 1-300 chars".into());
             }
+            ka_agent_memory::screen_proposal(text)?;
             let root = data_root()?;
             let store = ka_agent_store::Store::open(&root.join("state.db"))
                 .map_err(|e| format!("store: {e}"))?;
