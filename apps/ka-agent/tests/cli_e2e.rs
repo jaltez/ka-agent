@@ -312,18 +312,20 @@ fn update_downloads_verifies_and_swaps() {
                 other => other,
             }
         );
+        let asset = format!("ka-agent-{triple}.tar.gz");
         let index = serde_json::json!({
             "tag_name": "v9.9.9",
             "assets": [{
-                "name": format!("ka-agent-{triple}.tar.gz"),
+                "name": asset,
                 "browser_download_url": format!("http://127.0.0.1:{port}/t.tar.gz")
             }]
         });
         let meta = serde_json::to_vec(&index).unwrap();
+        // Real releases ship `shasum -a 256` output: `HEX  FILENAME`.
         let checksum = if good_checksum {
-            format!("{digest}\n").into_bytes()
+            format!("{digest}  {asset}\n").into_bytes()
         } else {
-            format!("{}deadbeef\n", &digest[..8]).into_bytes()
+            format!("{}deadbeef  {asset}\n", &digest[..8]).into_bytes()
         };
         let tarball = tarball.clone();
         std::thread::spawn(move || {

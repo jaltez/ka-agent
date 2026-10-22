@@ -96,7 +96,6 @@ fn is_newer(latest: &str, current: &str) -> bool {
     num(latest) > num(current)
 }
 
-/// The one non-empty line of `<tarball>.sha256`, hex.
 fn sha256_of(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -139,12 +138,13 @@ pub fn update(action: UpdateAction) -> ExitCode {
         Ok(b) => b,
         Err(e) => return fail(e),
     };
+    // `.sha256` is `shasum -a 256` output (`HEX  FILENAME`); compare the hash token only.
     let expected = match http_get(&format!("{}.sha256", asset.browser_download_url)) {
         Ok(b) => String::from_utf8_lossy(&b)
             .lines()
             .next()
+            .and_then(|l| l.split_whitespace().next())
             .unwrap_or("")
-            .trim()
             .to_ascii_lowercase(),
         Err(e) => return fail(e),
     };
