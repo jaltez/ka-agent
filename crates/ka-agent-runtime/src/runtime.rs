@@ -1742,6 +1742,8 @@ impl Runtime {
                     .on_error("internal", &format!("scheduler: {e}"));
             }
             self.reap_idle_worker().await;
+            // Bounded launchd/redirect logs (journal systems rotate alone).
+            let _ = self.sh.paths.rotate_log(5 * 1024 * 1024);
             if let Err(e) = self.announce_memory_proposals() {
                 self.sh
                     .surface

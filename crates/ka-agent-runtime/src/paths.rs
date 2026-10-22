@@ -211,3 +211,66 @@ mod tests {
         InstanceLock::acquire(&p).unwrap();
     }
 }
+
+impl Paths {
+    /// Keep `<logs>/daemon.log` bounded: past `max_bytes` it becomes
+    /// `daemon.log.1` (keeping two older ones). Called at start and from
+    /// the maintenance loop — launchd and `run >log` write to that file
+    /// unbounded otherwise (Linux logs to the journal, which rotates).
+    pub fn rotate_log(&self, max_bytes: u64) -> std::io::Result<bool> {
+        let path = self.logs().join("daemon.log");
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Ok(false);
+        };
+        if meta.len() < max_bytes {
+            return Ok(false);
+        }
+        let dir = self.logs();
+        let _ = std::fs::remove_file(dir.join("daemon.log.3"));
+        for n in (1..=2).rev() {
+            let from = dir.join(format!("daemon.log.{n}"));
+            let to = dir.join(format!("daemon.log.{}", n + 1));
+            if from.exists() {
+                std::fs::rename(from, to)?;
+            }
+        }
+        std::fs::rename(&path, dir.join("daemon.log.1"))?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn a_big_log_rotates_and_keeps_two_generations() {
+        let dir = std::env::temp_dir().join(format!(
+            "ka-rot-{}-{}",
+            std::process::id(),
+            ka_agent_core::now_ms()
+        ));
+        let paths = Paths::new(dir.join("root"));
+        paths.ensure_dirs().unwrap();
+        let log = paths.logs().join("daemon.log");
+        std::fs::write(&log, "0".repeat(5 * 1024 * 1024 + 1)).unwrap();
+        std::fs::write(paths.logs().join("daemon.log.1"), "one").unwrap();
+        std::fs::write(paths.logs().join("daemon.log.2"), "two").unwrap();
+        assert!(paths.rotate_log(5 * 1024 * 1024).unwrap());
+        assert!(paths.logs().join("daemon.log.1").is_file());
+        assert_eq!(
+            std::fs::read_to_string(paths.logs().join("daemon.log.2")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.logs().join("daemon.log.3")).unwrap(),
+            "two"
+        );
+        assert!(!log.exists(), "the live log starts fresh on the next write");
+        // Small logs are left alone.
+        std::fs::write(&log, "small").unwrap();
+        assert!(!paths.rotate_log(5 * 1024 * 1024).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
