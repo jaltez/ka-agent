@@ -135,8 +135,14 @@ impl Setup {
         if self.args.yes {
             return self.yes_flow().await;
         }
-        // Which section? (Only when no SECTION was given and a config exists.)
-        if self.args.section == Section::All && !self.fresh {
+        // An explicit `ka-agent setup telegram` runs only that section;
+        // before, it fell through to the full wizard and buried the
+        // channel steps behind provider/model prompts.
+        if self.args.section != Section::All {
+            return self.partial(self.args.section).await;
+        }
+        // No SECTION given and a config exists: ask which.
+        if !self.fresh {
             let options: Vec<String> = vec![
                 "Model & provider key".into(),
                 "Telegram".into(),
@@ -704,21 +710,23 @@ impl Setup {
                 .map_err(|e| e.to_string())?;
         }
         if let Some(token) = &self.telegram_token {
-            ka_agent_core::config_file::set(&self.args.config, "telegram.enabled", "true")
-                .map_err(|e| e.to_string())?;
+            // `token_secret` before `enabled`: every config_file::set
+            // validates the whole file, and `enabled = true` without a
+            // secret name is invalid — the wizard used to abort right
+            // after accepting a perfectly good token.
             ka_agent_core::config_file::set(
                 &self.args.config,
                 "telegram.token_secret",
                 "\"telegram.bot_token\"",
             )
             .map_err(|e| e.to_string())?;
+            ka_agent_core::config_file::set(&self.args.config, "telegram.enabled", "true")
+                .map_err(|e| e.to_string())?;
             let dir = self.paths.root().join("secrets");
             ka_agent_channels::secret::store("telegram.bot_token", token, &dir)
                 .map_err(|e| e.to_string())?;
         }
         if let Some((homeserver, user)) = &self.matrix {
-            ka_agent_core::config_file::set(&self.args.config, "matrix.enabled", "true")
-                .map_err(|e| e.to_string())?;
             ka_agent_core::config_file::set(
                 &self.args.config,
                 "matrix.homeserver",
@@ -737,6 +745,8 @@ impl Setup {
                 "\"matrix.access_token\"",
             )
             .map_err(|e| e.to_string())?;
+            ka_agent_core::config_file::set(&self.args.config, "matrix.enabled", "true")
+                .map_err(|e| e.to_string())?;
         }
         // The instance opens now so the first `run` or `chat` starts from a
         // complete store and compiled memory (like the old init did).

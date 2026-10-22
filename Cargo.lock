@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "clap",
  "jiff",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-channels"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "jiff",
  "ka-agent-core",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "jiff",
  "serde",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-memory"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ka-agent-core",
  "thiserror",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-plugins"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ed25519-dalek",
  "ka-agent-core",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-port"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ka-agent-core",
  "ka-agent-port",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-runtime"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "jiff",
  "ka-agent-core",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-store"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ka-agent-core",
  "parking_lot",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-web"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "jiff",
  "ka-agent-channels",

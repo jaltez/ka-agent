@@ -250,3 +250,77 @@ fn config_edit_is_format_preserving_and_live_with_a_daemon() {
     let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Regression: the wizard accepted a *correct* bot token (getMe answered)
+/// and then aborted writing the config — `telegram.enabled` was written
+/// before `telegram.token_secret`, and every `config set` validates the
+/// whole file. The token itself was never the problem.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_telegram_section_writes_config_with_a_verified_token() {
+    use ka_agent_channels::fake::FakeBotServer;
+    use std::io::Write as _;
+
+    let root = temp_root("tg-write");
+    let (fake, base) = FakeBotServer::spawn();
+    std::fs::write(
+        root.join("ka-agent.toml"),
+        format!("[telegram]\napi_base = {base:?}\n"),
+    )
+    .unwrap();
+
+    let mut child = ka(&root)
+        .args(["setup", "telegram"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"123:correct-token\ny\n")
+        .unwrap();
+    // Pair for real (instead of waiting out the code's TTL): read the code
+    // the wizard prints and send it from the fake Bot API's "phone".
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Some(code) = line.split("/pair ").nth(1) {
+                let _ = tx.send(code.trim().to_string());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let code = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("wizard printed a pairing code");
+    fake.push_text_message(1, 42, 42, &format!("/pair {code}"));
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        reader.join().unwrap(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("connected to @fake_bot"), "{text}");
+    assert!(!text.contains("write failed"), "{text}");
+    assert!(text.contains("paired with"), "{text}");
+
+    // The config landed with both keys, in a state validation accepts.
+    let cfg = config_of(&root);
+    assert!(
+        cfg.contains("token_secret = \"telegram.bot_token\""),
+        "config: {cfg}"
+    );
+    assert!(cfg.contains("enabled = true"), "config: {cfg}");
+    ka_agent_core::DaemonConfig::load(&root.join("ka-agent.toml")).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
