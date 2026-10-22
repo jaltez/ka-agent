@@ -238,6 +238,20 @@ async fn send_cmd(tx: &Sender<Command>, cmd: Command) {
 /// `KA_DATA_DIR` (the port pins it before spawn). `None` while the file
 /// does not exist on disk yet — a fresh strand materializes only on its
 /// first append.
+/// A stable session id for the OpenCode routing header: one worker holds
+/// one continuous strand, so one id per process is the conversation.
+fn session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // OS entropy via the hasher seed + counter + clock: any unique string
+    // works, this one needs no new dependency.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(n);
+    h.write_u64(ka_agent_core::now_ms() as u64);
+    format!("ka-agent-{:016x}", h.finish())
+}
+
 fn strand_path(workspace: &Path, id: &str) -> Option<String> {
     match ka_strand::resolve_id(workspace, id) {
         Ok(ka_strand::IdMatch::Unique(summary)) => {
@@ -391,8 +405,18 @@ async fn open_engine(
         }
         (
             // embedded + ka-agent's extra providers (opencode…), so setup's
-            // selectors resolve in the engine too.
-            ka_engine::spawn_full(cfg, crate::catalog::full_catalog(), strand_choice),
+            // selectors resolve in the engine too. opencode-go rows are
+            // rerouted through the loopback header proxy: the Go endpoint
+            // refuses requests without x-opencode-session (HTTP 400), which
+            // the pinned ka-dialect wire cannot send.
+            ka_engine::spawn_full(
+                cfg,
+                crate::opencode_proxy::proxied_catalog(
+                    crate::catalog::full_catalog(),
+                    &session_id(),
+                ),
+                strand_choice,
+            ),
             model,
         )
     };

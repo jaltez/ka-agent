@@ -14,6 +14,7 @@
 
 pub mod catalog;
 pub mod engine_layer;
+pub mod opencode_proxy;
 pub mod port;
 pub mod proto;
 pub mod scenario;
