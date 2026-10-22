@@ -52,6 +52,7 @@ in your terminal too.
 | | |
 |---|---|
 | `/status` | model, spend vs limits, queue, next task |
+| `/mode [m]` | guarded (asks) · accept_edits · plan (read-only) · free — with a badge when not guarded |
 | `/model provider/model` | switch model, applied live |
 | `/new` · `/stop` · `/resume` | fresh session · abort reply · lift a pause |
 | `/remember <fact>` · `/forget <id>` | durable memory (git-backed; `/memory` lists ids) |
@@ -192,6 +193,17 @@ Secrets never go in the file:
 
 A pre-0.3 install (`~/.local/share/ka-agent` + `~/.config/ka-agent`) moves
 itself to the new layout on the next run.
+
+## Staying current, switching in
+
+```sh
+ka-agent update --check   # is there a newer release?
+ka-agent update            # download, checksum-verify, swap, restart the service(s)
+ka-agent import hermes     # memory + skills from Hermes (also: openclaw, claude, codex)
+```
+
+Imports respect the rules: another agent's memory arrives as **candidates**
+you accept one by one, skills land in the shared library.
 
 ## Running it for real
 

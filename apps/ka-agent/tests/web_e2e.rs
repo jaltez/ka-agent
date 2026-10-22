@@ -310,12 +310,18 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     // The status page (the old dashboard) renders the operator report.
     let dashboard = request(port, "GET", "/status", Some(&cookie), "");
     assert_eq!(dashboard.status, 200);
+    // The redesign renders the report as stat cards (today's spend, the
+    // worker state) instead of one <pre>.
     assert!(
-        dashboard.body.contains("today: $"),
+        dashboard.body.contains("today") && dashboard.body.contains("$"),
         "status shows spend: {}",
         dashboard.body
     );
-    assert!(dashboard.body.contains("worker:"), "status shows worker");
+    assert!(
+        dashboard.body.contains("stopped") || dashboard.body.contains("running"),
+        "status shows worker: {}",
+        dashboard.body
+    );
 
     for (path, needle) in [
         ("/memory", "Memory"),
