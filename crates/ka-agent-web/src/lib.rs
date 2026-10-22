@@ -480,6 +480,11 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             pages::chat_send(runtime, store, &body).await
         }
         ("GET", "/status") => pages::status(runtime),
+        ("GET", "/usage") => pages::usage(runtime, store),
+        ("POST", "/settings") => {
+            let body = String::from_utf8_lossy(&req.body).into_owned();
+            pages::settings_apply(runtime, &body).await
+        }
         ("GET", "/tasks") => pages::tasks(runtime),
         ("POST", "/tasks/cancel") => {
             let body = String::from_utf8_lossy(&req.body);

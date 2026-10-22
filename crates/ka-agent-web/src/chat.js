@@ -11,7 +11,7 @@
 
   function bubble(cls) {
     var card = document.createElement("div");
-    card.className = "card " + (cls || "");
+    card.className = "bubble " + (cls || "");
     log.appendChild(card);
     return card;
   }
@@ -24,11 +24,98 @@
     return div;
   }
 
+  // The same Markdown subset the other surfaces render (bold, `code`,
+  // [links](http…), bullets, headings, fences) — built from nodes, never
+  // innerHTML, so nothing is ever interpreted as markup.
+  function md(parent, text) {
+    var lines = String(text).split("\n");
+    var i = 0;
+    while (i < lines.length) {
+      var l = lines[i];
+      if (/^```/.test(l.trim())) {
+        var pre = document.createElement("pre");
+        var code = document.createElement("code");
+        pre.appendChild(code);
+        i++;
+        while (i < lines.length && lines[i].trim() !== "```") {
+          code.appendChild(document.createTextNode(lines[i]));
+          code.appendChild(document.createTextNode("\n"));
+          i++;
+        }
+        i++; // closing fence
+        parent.appendChild(pre);
+        continue;
+      }
+      parent.appendChild(mdLine(l));
+      i++;
+    }
+  }
+
+  function mdLine(l) {
+    var h = /^(#{1,6}) (.*)$/.exec(l);
+    if (h) {
+      var b = document.createElement("b");
+      mdInline(b, h[2]);
+      return b;
+    }
+    var m = /^(\s*)[-*+] (.*)$/.exec(l);
+    if (m) {
+      var out = document.createElement("span");
+      out.appendChild(document.createTextNode(m[1] + "• "));
+      mdInline(out, m[2]);
+      out.appendChild(document.createElement("br"));
+      return out;
+    }
+    var p = document.createElement("span");
+    mdInline(p, l);
+    p.appendChild(document.createElement("br"));
+    return p;
+  }
+
+  function mdInline(parent, s) {
+    var rest = s;
+    for (;;) {
+      var code = /`([^`]+)`/.exec(rest);
+      var bold = /\*\*(.+?)\*\*|__(.+?)__/.exec(rest);
+      var link = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/.exec(rest);
+      var first = null;
+      if (code) first = code;
+      if (bold && (!first || bold.index < first.index)) first = bold;
+      if (link && (!first || link.index < first.index)) first = link;
+      if (!first) break;
+      parent.appendChild(document.createTextNode(rest.slice(0, first.index)));
+      if (first === code) {
+        var c = document.createElement("code");
+        c.textContent = code[1];
+        parent.appendChild(c);
+        rest = rest.slice(first.index + first[0].length);
+      } else if (first === link) {
+        var a = document.createElement("a");
+        a.href = link[2];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = link[1];
+        parent.appendChild(a);
+        rest = rest.slice(first.index + first[0].length);
+      } else {
+        var b = document.createElement("b");
+        mdInline(b, bold[1] || bold[2]);
+        parent.appendChild(b);
+        rest = rest.slice(first.index + first[0].length);
+      }
+    }
+    parent.appendChild(document.createTextNode(rest));
+  }
+
   var current = null; // the in-flight assistant bubble
+  var currentText = ""; // its raw text, re-rendered when the turn ends
   var notes = [];
 
   function assistant() {
-    if (!current) current = bubble("assistant");
+    if (!current) {
+      current = bubble("assistant");
+      currentText = "";
+    }
     return current;
   }
 
@@ -42,8 +129,14 @@
   }
 
   function finish() {
+    if (current && currentText) {
+      // Streamed raw while typing; rendered when the turn settles.
+      while (current.firstChild) current.removeChild(current.firstChild);
+      md(current, currentText);
+    }
     flushNotes();
     current = null;
+    currentText = "";
   }
 
   function handleEvent(ev) {
@@ -59,10 +152,12 @@
         current = bubble("assistant");
         line(current, "…", "muted").className = "pending muted";
         break;
+
       case "delta":
         if (!current) current = bubble("assistant");
         var pending = current.querySelector(".pending");
         if (pending) pending.remove();
+        currentText += ev.text;
         current.appendChild(document.createTextNode(ev.text));
         break;
       case "note":
@@ -141,6 +236,7 @@
     if (!v) return;
     input.value = "";
     line(bubble("user"), v);
+    current = null;
     var body = "text=" + encodeURIComponent(v);
     fetch("/chat/send", {
       method: "POST",

@@ -89,7 +89,17 @@ fn spawn_daemon(cfg: &Path, data: &Path, scenario: Option<&Path>) -> Daemon {
         .arg("--config")
         .arg(cfg)
         .env("KA_AGENT_DATA_DIR", data)
-        .env("KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN", "tok")
+        .env(
+            "KA_AGENT_SECRET_TELEGRAM_BOT_TOKEN",
+            format!(
+                "tok-{}",
+                data.display()
+                    .to_string()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+            ),
+        )
         .env_remove("KA_MODEL")
         .stdout(Stdio::null())
         .stderr(Stdio::null());

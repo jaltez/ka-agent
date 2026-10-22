@@ -81,7 +81,17 @@ fn spawn_daemon(cfg: &Path, data: &Path, scenario: Option<&Path>) -> Daemon {
         .arg("--config")
         .arg(cfg)
         .env("KA_AGENT_DATA_DIR", data)
-        .env("KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN", "tok")
+        .env(
+            "KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN",
+            format!(
+                "tok-{}",
+                data.display()
+                    .to_string()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+            ),
+        )
         .env_remove("KA_MODEL")
         .stdout(Stdio::null())
         .stderr(if std::env::var("KAGENT_E2E_STDERR").is_ok() {

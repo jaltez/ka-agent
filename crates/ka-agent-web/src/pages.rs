@@ -6,60 +6,98 @@ use ka_agent_core::ApprovalDecision;
 use ka_agent_runtime::Runtime;
 use ka_agent_store::Store;
 
-const STYLE: &str = "<style>body{font-family:sans-serif;max-width:800px;margin:2em auto;padding:0 1em}\\
-         pre{background:#f4f4f4;padding:1em;overflow-x:auto}\\
-         table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:0.4em;text-align:left}\\
-         .card{border:1px solid #ddd;border-radius:4px;padding:1em;margin:1em 0}\\
-         .card button{margin:0 0.5em}\\
-         nav a{margin-right:0.8em}\\
-         .muted{color:#666}</style>";
+const STYLE: &str = "<style>\
+:root{--bg:#fafafa;--fg:#1a1a1a;--muted:#6b7280;--border:#e5e7eb;--accent:#4f46e5;--accent-soft:#eef2ff;--ok:#047857;--bad:#b91c1c;--warn:#b45309;--surface:#fff;--radius:10px}\
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8ea;--muted:#9aa1ab;--border:#262b33;--accent:#818cf8;--accent-soft:#1c2033;--ok:#34d399;--bad:#f87171;--warn:#fbbf24;--surface:#171a20}}\
+*{box-sizing:border-box}\
+body{margin:0;font:15px/1.55 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--fg)}\
+.layout{display:flex;min-height:100vh;max-width:1100px;margin:0 auto}\
+aside{width:190px;flex:none;padding:1.2rem .8rem;border-right:1px solid var(--border)}\
+aside .brand{font-weight:700;padding:.2rem .6rem 1rem;letter-spacing:.02em}\
+aside a{display:flex;justify-content:space-between;gap:.4rem;padding:.42rem .6rem;border-radius:8px;color:var(--fg);text-decoration:none}\
+aside a:hover{background:var(--accent-soft)}\
+aside a.active{background:var(--accent-soft);font-weight:600}\
+aside .badge{background:var(--accent);color:#fff;font-size:.72rem;border-radius:99px;padding:0 .5rem;line-height:1.4}\
+main{flex:1;padding:1.4rem 1.6rem;min-width:0}\
+h1{font-size:1.35rem;margin:.1rem 0 1.1rem}\
+@media(max-width:760px){.layout{flex-direction:column}aside{width:auto;border-right:none;border-bottom:1px solid var(--border);padding:.5rem .6rem}aside .brand{padding:.3rem .6rem}aside a{display:inline-block;margin:.15rem .2rem}main{padding:1rem}}\
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;margin:.7rem 0}\
+button{font:inherit;border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;padding:.35rem .9rem;cursor:pointer}\
+button:hover{border-color:var(--accent)}\
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}\
+.muted{color:var(--muted)}\
+pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.7rem .9rem;overflow-x:auto}\
+code{background:var(--bg);border-radius:4px;padding:.05rem .3rem}\
+pre code{background:none;padding:0}\
+table{border-collapse:collapse;width:100%;font-size:.92rem}\
+th,td{border-bottom:1px solid var(--border);padding:.45rem .5rem;text-align:left}\
+th{color:var(--muted);font-weight:600}\
+#chat{display:flex;flex-direction:column;height:calc(100vh - 8.4rem)}\
+#log{flex:1;overflow-y:auto;padding:.4rem 0}\
+.bubble{max-width:78%;border-radius:14px;padding:.55rem .9rem;margin:.3rem 0;white-space:pre-wrap;word-wrap:break-word}\
+.bubble.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}\
+.bubble.assistant{align-self:flex-start;background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px}\
+.bubble.system{align-self:center;background:none;color:var(--muted);font-size:.85rem;max-width:100%}\
+.bubble.approval{align-self:flex-start;background:var(--surface);border:1px solid var(--warn);max-width:100%}\
+#log{display:flex;flex-direction:column}\
+.bubble code{background:var(--bg)}\
+.bubble.user code{background:rgba(255,255,255,.2)}\
+form#send{display:flex;gap:.5rem;padding:.6rem 0}\
+#text{flex:1;font:inherit;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);padding:.55rem .8rem}\
+.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.7rem}\
+.statgrid .card{margin:0}\
+.statgrid .k{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}\
+.statgrid .v{font-size:1.15rem;margin-top:.15rem}\
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}</style>";
 
-/// The viewport-aware head + top navigation. The current page is bold.
+/// The viewport-aware head + sidebar layout (top bar on narrow screens).
 fn html_page(title: &str, body: String) -> String {
     format!(
         "<!DOCTYPE html>\n<html><head><title>{title} — Ka Agent</title>\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{STYLE}</head><body>\
-         <h1>{title}</h1>{body}</body></html>"
+         {body}</body></html>"
     )
 }
 
-/// A page with the shared navigation (approvals count from the runtime).
+/// A page with the shared sidebar navigation. Badges: approvals waiting,
+/// memory to review.
 fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Response {
     let count = runtime
         .pending_approval_cards()
         .map(|c| c.len())
         .unwrap_or(0);
-    let items = [
-        ("/", "Chat"),
-        ("/status", "Status"),
-        ("/tasks", "Tasks"),
-        ("/memory", "Memory"),
-        ("/skills", "Skills"),
-        ("/approvals", "Approvals"),
-        ("/history", "History"),
-        ("/contacts", "Contacts"),
-        ("/audit", "Audit"),
+    let review = runtime.pending_candidates().map(|c| c.len()).unwrap_or(0);
+    let items: [(&str, &str, usize); 10] = [
+        ("/", "Chat", 0),
+        ("/status", "Status", 0),
+        ("/tasks", "Tasks", 0),
+        ("/memory", "Memory", review),
+        ("/skills", "Skills", 0),
+        ("/approvals", "Approvals", count),
+        ("/history", "History", 0),
+        ("/usage", "Usage", 0),
+        ("/contacts", "Contacts", 0),
+        ("/audit", "Audit", 0),
     ];
     let nav: String = items
         .iter()
-        .map(|(href, label)| {
-            let label = if *href == "/approvals" {
-                format!("{label} ({count})")
+        .map(|(href, label, n)| {
+            let badge = if *n > 0 {
+                format!("<span class=\"badge\">{n}</span>")
             } else {
-                (*label).to_string()
+                String::new()
             };
-            if *href == active {
-                format!("<b><a href=\"{href}\">{label}</a></b>")
-            } else {
-                format!("<a href=\"{href}\">{label}</a>")
-            }
+            let class = if *href == active { "active" } else { "" };
+            format!("<a class=\"{class}\" href=\"{href}\">{label}{badge}</a>")
         })
         .collect::<Vec<_>>()
-        .join(" · ");
-    Response::html(format!(
-        "<!DOCTYPE html>\n<html><head><title>{title} — Ka Agent</title>\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{STYLE}</head><body>\
-         <nav>{nav}</nav><h1>{title}</h1>{body}</body></html>"
+        .join("");
+    Response::html(html_page(
+        title,
+        format!(
+            "<div class=\"layout\"><aside><div class=\"brand\">ka-agent</div>{nav}</aside>\
+             <main><h1>{title}</h1>{body}</main></div>"
+        ),
     ))
 }
 
@@ -89,19 +127,72 @@ pub fn status(runtime: &Runtime) -> crate::Response {
     })
     .collect::<Vec<_>>()
     .join("");
+    let card = |k: &str, v: String| {
+        format!("<div class='card'><div class='k'>{k}</div><div class='v'>{v}</div></div>")
+    };
+    let report_line = |i: usize| {
+        report
+            .render(&runtime.now_zoned())
+            .lines()
+            .nth(i)
+            .unwrap_or("")
+            .to_string()
+    };
+    let usd = match report.limit_usd {
+        Some(cap) => format!("${:.4} / ${cap:.2}", report.spent_usd),
+        None => format!("${:.4}", report.spent_usd),
+    };
     let body = format!(
-        "<pre>{}</pre>\
-         <h2>settings</h2><table>\
-         <tr><td>model</td><td>{}</td><td><code>ka-agent model &lt;provider/model&gt;</code></td></tr>\
-         <tr><td>mode</td><td>{}</td><td><code>ka-agent config set mode &lt;mode&gt;</code></td></tr>\
-         <tr><td>timezone</td><td>{}</td><td><code>ka-agent config set timezone \"Europe/Madrid\"</code></td></tr>\
-         <tr><td>workspace</td><td>{}</td><td><code>ka-agent config edit</code> (restart)</td></tr>\
-         <tr><td>web port</td><td>{}</td><td><code>ka-agent config set web.port &lt;port&gt;</code> (restart)</td></tr>\
-         </table><h2>channels</h2><ul>{channels}</ul>",
-        escape_html(&report.render(&runtime.now_zoned())),
-        escape_html(cfg.model.as_deref().unwrap_or("(none)")),
-        escape_html(&cfg.mode),
+        "<div class='statgrid'>\
+         {}{}{}{}{}{}\
+         </div>\
+         <h2>settings</h2>\
+         <form method='post' action='/settings'><table>\
+         <tr><td>model</td><td colspan='2'><input name='model' value='{}' placeholder='provider/model'></td></tr>\
+         <tr><td>mode</td><td colspan='2'><select name='mode'>{}</select></td></tr>\
+         <tr><td>timezone</td><td colspan='2'><input name='timezone' value='{}' placeholder='Europe/Madrid'></td></tr>\
+         <tr><td>daily budget $</td><td colspan='2'><input name='budgets_daily_usd' value='{}' placeholder='(none)'></td></tr>\
+         </table><button class='primary'>save</button> <span class='muted'>applied live; workspace <code>{}</code> and web port {} need a restart</span></form>\
+         <h2>channels</h2><ul>{channels}</ul>",
+        card("state", escape_html(&report_line(0))),
+        card(
+            "model",
+            escape_html(cfg.model.as_deref().unwrap_or("(none)"))
+        ),
+        card("today", escape_html(&usd)),
+        card(
+            "queue / approvals",
+            format!("{} / {}", report.queue, report.pending_approvals)
+        ),
+        card(
+            "memory",
+            report
+                .memory
+                .as_ref()
+                .map(|m| escape_html(&m.line()))
+                .unwrap_or_else(|| "—".into())
+        ),
+        card(
+            "worker",
+            if report.worker_running {
+                "running".into()
+            } else {
+                "stopped (starts with your next message)".into()
+            }
+        ),
+        escape_html(cfg.model.as_deref().unwrap_or("")),
+        ["guarded", "accept_edits", "plan", "free"]
+            .iter()
+            .map(|m| format!(
+                "<option value='{m}'{}>{m}</option>",
+                if *m == cfg.mode { " selected" } else { "" }
+            ))
+            .collect::<String>(),
         escape_html(&report.timezone),
+        cfg.budgets
+            .daily_usd
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         escape_html(&cfg.workspace.display().to_string()),
         cfg.web.port,
     );
@@ -118,19 +209,25 @@ pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
                 .map(|ts| ts.to_zoned(now.time_zone().clone()))
                 .unwrap_or_else(|_| now.clone());
             let time = format!("{:02}:{:02}", at.hour(), at.minute());
+            // The answer is rendered by the shared Markdown renderer (it
+            // escapes first, so only its own tags appear); the operator's
+            // words stay verbatim.
+            let answer_html =
+                ka_agent_core::markdown::render(answer, ka_agent_core::markdown::Target::Html);
             turns_html.push_str(&format!(
-                "<div class='card'><div class='muted'>{} · {}</div><p><b>you:</b> {}</p><p><b>ka:</b> {}</p></div>",
+                "<div class='bubble user'>{}</div>\
+                 <div class='bubble assistant'><div class='muted'>{} · {}</div>{}</div>",
+                escape_html(&t.inbound_text),
                 time,
                 escape_html(ka_agent_core::ids::short_id(t.id.as_str())),
-                escape_html(&t.inbound_text),
-                escape_html(answer)
+                answer_html
             ));
         }
     }
     let _ = store;
     let body = format!(
-        "<div id='log'>{turns_html}</div>\
-         <form id='send'><textarea id='text' rows='3' cols='60' placeholder='talk to ka (Enter sends, Shift+Enter newline)'></textarea><br><button>send</button></form>\
+        "<div id='chat'><div id='log'>{turns_html}</div>\
+         <form id='send'><textarea id='text' rows='2' placeholder='talk to ka (Enter sends, Shift+Enter newline)'></textarea><button class='primary'>send</button></form></div>\
          <script src=\"/static/chat.js\" defer></script>"
     );
     nav_page(runtime, "/", "Chat", body)
@@ -749,4 +846,123 @@ pub fn intents(store: &Store) -> crate::Response {
         rows.join("")
     );
     Response::html(html_page("Intents", body))
+}
+
+/// `GET /usage`: spend per day, CSS bars, today against the budget.
+pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
+    let cfg = runtime.config();
+    let since = jiff::Timestamp::now()
+        .checked_sub(jiff::Span::new().days(30))
+        .map(|t| t.as_millisecond())
+        .unwrap_or(0);
+    let rows = store.usage_rows_since(since).unwrap_or_default();
+    // Bucket by local day (a turn lands on the day it started).
+    let tz = runtime.now_zoned().time_zone().clone();
+    let mut buckets: Vec<(String, u64, u64, f64)> = Vec::new();
+    for (at_ms, cost, tokens) in rows {
+        let day = jiff::Timestamp::from_millisecond(at_ms)
+            .map(|t| t.to_zoned(tz.clone()).strftime("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        match buckets.last_mut() {
+            Some(last) if last.0 == day => {
+                last.1 += 1;
+                last.2 += tokens;
+                last.3 += cost;
+            }
+            _ => buckets.push((day, 1, tokens, cost)),
+        }
+    }
+    let max = buckets
+        .iter()
+        .map(|b| b.3)
+        .fold(0.0_f64, f64::max)
+        .max(0.01);
+    let cap = cfg.budgets.daily_usd;
+    let rows_html: String = buckets
+        .iter()
+        .rev()
+        .map(|(day, turns, tokens, cost)| {
+            let pct = (cost / max * 100.0).clamp(1.0, 100.0);
+            let over = cap.is_some_and(|c| *cost > c);
+            format!(
+                "<tr><td>{day}</td><td>{turns}</td><td>{tokens}</td>\
+                 <td><span class='bar{}' style='width:{}em'></span> <span class='{}'>${:.4}</span></td></tr>",
+                if over { " over" } else { "" },
+                (pct / 4.0) as u32,
+                if over { "bad" } else { "" },
+                cost
+            )
+        })
+        .collect();
+    let today = buckets.last().map(|b| b.3).unwrap_or(0.0);
+    let budget_note = match cap {
+        Some(c) => format!("${today:.4} of ${c:.2} today"),
+        None => format!("${today:.4} today (no cap set)"),
+    };
+    let body = format!(
+        "<p class='muted'>{budget_note}</p>\
+         <table><tr><th>day</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table>\
+         <style>.bar{{display:inline-block;height:0.8em;background:var(--accent);border-radius:3px;vertical-align:middle}}.bar.over{{background:var(--bad)}}</style>"
+    );
+    nav_page(runtime, "/usage", "Usage", body)
+}
+
+/// `POST /settings`: format-preserving writes, then a live apply. Keys that
+/// would need a restart are not offered here.
+pub async fn settings_apply(runtime: &Runtime, body: &str) -> crate::Response {
+    use std::fmt::Write as _;
+    let Some(path) = runtime.config_path() else {
+        return Response::see_other("/status");
+    };
+    let mut applied: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (key, field, quote) in [
+        ("model", "model", true),
+        ("mode", "mode", false),
+        ("timezone", "timezone", true),
+        ("budgets.daily_usd", "budgets_daily_usd", false),
+    ] {
+        let raw = form_field_url(body, field);
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let v = crate::url_decode(&raw.replace('+', " ")).trim().to_string();
+        let rendered = if quote { format!("{v:?}") } else { v.clone() };
+        match ka_agent_core::config_file::set(&path, key, &rendered) {
+            Ok(_) => applied.push(format!("{key} = {rendered}")),
+            Err(e) => errors.push(format!("{key}: {e}")),
+        }
+    }
+    let mut flash = String::new();
+    if !applied.is_empty() {
+        match ka_agent_core::DaemonConfig::load(&path) {
+            Ok(cfg) => {
+                let report = runtime.reload_config(cfg, false).await;
+                let restart = report.restart_required;
+                let _ = write!(
+                    flash,
+                    "<p class='muted'>saved: {}{}</p>",
+                    applied.join(", "),
+                    if restart.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — restart needed for: {}", restart.join(", "))
+                    }
+                );
+            }
+            Err(e) => errors.push(format!("reload: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        let _ = write!(flash, "<p class='bad'>{}</p>", errors.join("; "));
+    }
+    // The redirect drops the message; park it in a meta-like query param is
+    // overkill — surface it on the status page via a cookie-free flash by
+    // rendering the status page directly.
+    let mut page = status(runtime);
+    if let Some(body_start) = page.body.find("<h1>Status</h1>") {
+        let at = body_start + "<h1>Status</h1>".len();
+        page.body.insert_str(at, &flash);
+    }
+    page
 }

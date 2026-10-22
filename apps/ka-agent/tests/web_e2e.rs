@@ -854,3 +854,151 @@ fn approvals_card_renders_escaped_and_only_live_asks_decide() {
         "an undeliverable decision must not settle the ask"
     );
 }
+
+/// I1: the redesigned panel — chat bubbles with rendered (escaped) Markdown,
+/// the sidebar, one stylesheet, strict CSP.
+#[test]
+fn chat_page_renders_markdown_and_keeps_csp() {
+    let root = temp_root("redesign");
+    let port = free_port();
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let cfg = root.join("ka-agent.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "workspace = {:?}\nmode = \"guarded\"\nturn_grace_secs = 5\n",
+            ws.display().to_string()
+        ),
+    )
+    .unwrap();
+    // The scripted ANSWER carries the markup the page must render.
+    let sc = root.join("md.json");
+    std::fs::write(
+        &sc,
+        r#"{ "steps": [ {"text": "**bold** and `code` and <script>alert(1)</script>"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 3 }"#,
+    )
+    .unwrap();
+    let data = root.join("data");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("run")
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--web-port")
+        .arg(port.to_string())
+        .arg("--scenario")
+        .arg(&sc)
+        .env("KA_AGENT_DATA_DIR", &data)
+        .env_remove("KA_MODEL")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon { child, data, port };
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+    request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=render+please",
+        &[("X-Ka-Agent", "1")],
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let page = loop {
+        let page = request(port, "GET", "/", Some(&cookie), "");
+        if page.body.contains("<strong>bold</strong>") || Instant::now() > deadline {
+            break page;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(page.body.contains("<style>"), "stylesheet embedded");
+    assert!(page.body.contains("class=\"layout\""), "sidebar layout");
+    assert!(page.body.contains("bubble"), "chat bubbles");
+    assert!(page.body.contains("<strong>bold</strong>"), "rendered");
+    assert!(page.body.contains("<code>code</code>"), "code rendered");
+    assert!(
+        !page.body.contains("<script>alert"),
+        "script text stays text"
+    );
+    assert!(
+        page.header("Content-Security-Policy")
+            .unwrap_or("")
+            .contains("script-src 'self'"),
+        "CSP present"
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// I2/I3: the settings form writes valid config and applies it live; the
+/// usage page lists seeded days.
+#[test]
+fn settings_form_and_usage_page() {
+    let root = temp_root("settings");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+    // Seed two days of spend straight into the store.
+    {
+        let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
+        let now = ka_agent_core::now_ms();
+        let session = ka_agent_core::Session::new(root.join("ws"));
+        store.insert_session(&session).unwrap();
+        for (i, cost) in [0.0123_f64, 0.0456].into_iter().enumerate() {
+            let mut t = ka_agent_core::Turn::new(session.id.clone(), "q".into());
+            t.cost_usd = cost;
+            t.created_ms = now - i as i64 * 86_400_000;
+            // insert_turn then a raw update of created/cost is store-level;
+            // reuse usage accounting via a direct row.
+            store.insert_turn(&t).unwrap();
+            let conn = rusqlite::Connection::open(&daemon.data.join("state.db")).unwrap();
+            conn.execute(
+                "UPDATE turns SET cost_usd = ?2 WHERE id = ?1",
+                rusqlite::params![t.id.as_str(), cost],
+            )
+            .unwrap();
+        }
+    }
+    // Save a budget through the form.
+    let resp = request_h(
+        port,
+        "POST",
+        "/settings",
+        Some(&cookie),
+        "budgets_daily_usd=3",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let cfg = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
+    assert!(cfg.contains("daily_usd = 3"), "{cfg}");
+    // The POST answers the rendered status page with the confirmation.
+    assert!(
+        resp.body.contains("saved: budgets.daily_usd = 3"),
+        "flash: {}",
+        resp.body
+    );
+    // An invalid value is refused and nothing is written.
+    request_h(
+        port,
+        "POST",
+        "/settings",
+        Some(&cookie),
+        "mode=nonsense",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert!(
+        !std::fs::read_to_string(root.join("ka-agent.toml"))
+            .unwrap()
+            .contains("nonsense")
+    );
+    // Usage page lists both days.
+    let usage = request(port, "GET", "/usage", Some(&cookie), "");
+    assert!(usage.body.contains("0.0456"), "usage: {}", usage.body);
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
