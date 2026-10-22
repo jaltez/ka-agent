@@ -68,6 +68,12 @@ impl Surface for MultiSurface {
         }
     }
 
+    fn on_memory_proposal(&self, id: &str, text: &str) {
+        for s in &self.inner {
+            s.on_memory_proposal(id, text);
+        }
+    }
+
     fn on_final_chunk(&self, index: u32, text: &str) {
         for s in &self.inner {
             s.on_final_chunk(index, text);

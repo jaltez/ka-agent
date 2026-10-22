@@ -182,6 +182,41 @@ impl TelegramClient {
         Ok(result["message_id"].as_i64().unwrap_or(0))
     }
 
+    /// Bot API 9.5 `sendMessageDraft`: show `text` as the reply being
+    /// written (private chats). The same `draft_id` updates in place.
+    pub(crate) async fn send_message_draft(
+        &self,
+        chat_id: i64,
+        draft_id: i64,
+        text: &str,
+    ) -> Result<(), ChannelError> {
+        self.call(
+            "sendMessageDraft",
+            json!({ "chat_id": chat_id, "draft_id": draft_id, "text": text }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// React to a message with one emoji (the receipt acknowledgement).
+    pub(crate) async fn set_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<(), ChannelError> {
+        self.call(
+            "setMessageReaction",
+            json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reaction": [{ "type": "emoji", "emoji": emoji }],
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn delete_message(
         &self,
         chat_id: i64,
@@ -334,7 +369,28 @@ struct SurfaceInner {
     cards: Mutex<HashMap<String, (String, i64, String)>>,
     last_send_ms: AsyncMutex<i64>,
     typing: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Stream replies with `sendMessageDraft`; cleared for good the first
+    /// time the API refuses a draft (older Bot API servers).
+    drafts: AtomicBool,
+    /// One draft request at a time: a slow one is never overtaken by an
+    /// older snapshot.
+    draft_in_flight: AtomicBool,
+    draft: Mutex<Draft>,
 }
+
+/// The reply being streamed in the current turn.
+#[derive(Default)]
+struct Draft {
+    id: i64,
+    text: String,
+    pushed_len: usize,
+    pushed_ms: i64,
+}
+
+/// Throttle for `sendMessageDraft`: at most one per second, and only when
+/// the text grew enough to be worth a request.
+const DRAFT_MIN_INTERVAL_MS: i64 = 1000;
+const DRAFT_MIN_GROWTH: usize = 40;
 
 impl SurfaceInner {
     fn new(client: TelegramClient) -> Self {
@@ -348,6 +404,9 @@ impl SurfaceInner {
             cards: Mutex::new(HashMap::new()),
             last_send_ms: AsyncMutex::new(0),
             typing: Mutex::new(None),
+            drafts: AtomicBool::new(true),
+            draft_in_flight: AtomicBool::new(false),
+            draft: Mutex::new(Draft::default()),
         }
     }
 
@@ -405,6 +464,49 @@ impl SurfaceInner {
         *last = now_ms();
     }
 
+    /// Add streamed text to the draft and push it when the throttle allows.
+    fn push_draft(self: &Arc<Self>, delta: &str) {
+        if !self.drafts.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(chat) = self.chat() else { return };
+        let snapshot = {
+            let mut d = self.draft.lock().unwrap_or_else(|e| e.into_inner());
+            if d.id == 0 {
+                return; // no turn started on this surface
+            }
+            d.text.push_str(delta);
+            let now = now_ms();
+            let grew = d.text.len().saturating_sub(d.pushed_len) >= DRAFT_MIN_GROWTH;
+            let due = now - d.pushed_ms >= DRAFT_MIN_INTERVAL_MS;
+            if !(grew && due) || self.draft_in_flight.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            d.pushed_len = d.text.len();
+            d.pushed_ms = now;
+            // Drafts are plain text (a half-written reply has unbalanced
+            // Markdown); Telegram caps a message at 4096 characters.
+            let text: String = d.text.chars().take(MAX_MESSAGE_CHARS - 1).collect();
+            (d.id, text)
+        };
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let (id, text) = snapshot;
+            match inner.client.send_message_draft(chat, id, &text).await {
+                Ok(()) => {}
+                Err(ChannelError::Api { description }) => {
+                    if inner.drafts.swap(false, Ordering::AcqRel) {
+                        eprintln!(
+                            "telegram: streaming off ({description}); replies arrive when finished"
+                        );
+                    }
+                }
+                Err(e) => eprintln!("telegram: draft: {e}"),
+            }
+            inner.draft_in_flight.store(false, Ordering::Release);
+        });
+    }
+
     fn stop_typing(&self) {
         if let Some(handle) = self.typing.lock().unwrap_or_else(|e| e.into_inner()).take() {
             handle.abort();
@@ -458,12 +560,22 @@ impl TelegramSurface {
     pub fn set_chat(&self, chat_id: i64) {
         self.inner.set_chat(chat_id);
     }
+
+    /// `telegram.stream`: stream replies as drafts (default on).
+    pub fn set_streaming(&self, on: bool) {
+        self.inner.drafts.store(on, Ordering::Release);
+    }
 }
 
 impl Surface for TelegramSurface {
     /// Typing indicator only; a progress message appears with the first note.
     fn on_turn_started(&self) {
         self.inner.turn_active.store(true, Ordering::Release);
+        // A fresh draft per turn: a non-zero id the API keys the bubble by.
+        *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft {
+            id: (now_ms() & 0x7fff_ffff).max(1),
+            ..Draft::default()
+        };
         *self
             .inner
             .progress
@@ -575,9 +687,11 @@ impl Surface for TelegramSurface {
         tokio::spawn(async move { inner.send_rich(&text).await });
     }
 
-    /// No per-delta edits: streaming text over Bot API edits would be a
-    /// throttle hazard; final chunks carry the content.
-    fn on_delta_text(&self, _text: &str) {}
+    /// Streamed as a Bot API draft (throttled, plain text); the final
+    /// chunks still carry the rendered answer.
+    fn on_delta_text(&self, text: &str) {
+        self.inner.push_draft(text);
+    }
 
     fn on_delta_thought(&self, _text: &str) {}
 
@@ -592,6 +706,7 @@ impl Surface for TelegramSurface {
 
     /// Stops typing and deletes the progress message; cost lives in /status.
     fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {
+        *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft::default();
         self.inner.stop_typing();
         self.inner.turn_active.store(false, Ordering::Release);
         self.inner
@@ -613,6 +728,24 @@ impl Surface for TelegramSurface {
                 let _ = client.delete_message(chat, message_id).await;
             });
         }
+    }
+
+    fn on_memory_proposal(&self, id: &str, text: &str) {
+        let Some(chat) = self.inner.chat() else {
+            return;
+        };
+        let short = ka_agent_core::ids::short_id(id).to_string();
+        let markup = json!({
+            "inline_keyboard": [[
+                { "text": "✅ Remember", "callback_data": format!("m:{short}:y") },
+                { "text": "✖ Discard", "callback_data": format!("m:{short}:n") }
+            ]]
+        });
+        let body = format!("💡 Remember this?\n\n{text}");
+        let client = self.inner.client.clone();
+        tokio::spawn(async move {
+            let _ = client.send_message(chat, &body, Some(markup)).await;
+        });
     }
 
     fn on_approval(&self, card: &ApprovalCard) {
@@ -1026,6 +1159,14 @@ impl TelegramChannel {
             }
             crate::commands::Outcome::Silent => {}
             crate::commands::Outcome::NotACommand => {
+                // 👀 on the message: received and accepted, before any
+                // engine start-up or queueing makes the chat look dead.
+                if let Some(message_id) = message["message_id"].as_i64() {
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        let _ = client.set_message_reaction(chat_id, message_id, "👀").await;
+                    });
+                }
                 let text = crate::refs::expand(&self.store, &self.runtime.workspace(), text).await;
                 if let Err(e) = self
                     .runtime
@@ -1035,6 +1176,46 @@ impl TelegramChannel {
                     eprintln!("telegram: handle_message: {e}");
                 }
             }
+        }
+    }
+
+    /// ✅ / ✖ on a memory proposal: accept or reject, then turn the card
+    /// into its outcome (buttons removed) so it cannot be pressed twice.
+    async fn memory_callback(&self, cb: &Value, rest: &str, chat_id: i64, client: &TelegramClient) {
+        let Some((short, verdict)) = rest.rsplit_once(':') else {
+            return;
+        };
+        let text = cb["message"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .trim_start_matches("💡 Remember this?")
+            .trim()
+            .to_string();
+        let (outcome, toast) = match verdict {
+            "y" => match self.runtime.accept_candidate(short) {
+                Ok(true) => (format!("✅ Remembered: {text}"), "remembered"),
+                Ok(false) => (format!("(already decided) {text}"), "already decided"),
+                Err(e) => (format!("! [memory] {e}"), "error"),
+            },
+            "n" => match self.runtime.reject_candidate(short) {
+                Ok(true) => (format!("✖ Discarded: {text}"), "discarded"),
+                Ok(false) => (format!("(already decided) {text}"), "already decided"),
+                Err(e) => (format!("! [memory] {e}"), "error"),
+            },
+            _ => return,
+        };
+        let _ = client
+            .answer_callback_query(cb["id"].as_str().unwrap_or(""), toast)
+            .await;
+        if let Some(message_id) = cb["message"]["message_id"].as_i64() {
+            let _ = client
+                .edit_message_text(
+                    chat_id,
+                    message_id,
+                    &outcome,
+                    Some(json!({ "inline_keyboard": [] })),
+                )
+                .await;
         }
     }
 
@@ -1058,6 +1239,11 @@ impl TelegramChannel {
         let Some(data) = cb["data"].as_str() else {
             return;
         };
+        // `m:<short>:y|n` — a memory proposal card.
+        if let Some(rest) = data.strip_prefix("m:") {
+            self.memory_callback(cb, rest, chat_id, &client).await;
+            return;
+        }
         // `a:<short>:y|n`
         let Some(rest) = data.strip_prefix("a:") else {
             return;

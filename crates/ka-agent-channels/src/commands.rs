@@ -578,7 +578,9 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
                         Ok(rows) if rows.is_empty() => "no pending candidates".to_string(),
                         Ok(rows) => rows
                             .into_iter()
-                            .map(|c| format!("{} ({}): {}", c.id.as_str(), c.source, c.text))
+                            .map(|c| {
+                                format!("[{}] ({}) {}", short_id(c.id.as_str()), c.source, c.text)
+                            })
                             .collect::<Vec<_>>()
                             .join("\n"),
                         Err(e) => format!("! [memory] {e}"),

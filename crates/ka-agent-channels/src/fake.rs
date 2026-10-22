@@ -27,6 +27,9 @@ struct State {
     /// When set, any request carrying `parse_mode` is refused the way
     /// Telegram refuses malformed HTML.
     reject_html: bool,
+    /// When set, `sendMessageDraft` fails like a Bot API server that
+    /// predates it.
+    reject_drafts: bool,
 }
 
 /// A fake `api.telegram.org`. Spawn on an ephemeral local port and point
@@ -251,6 +254,14 @@ impl FakeBotServer {
             .unwrap_or_else(|e| e.into_inner())
             .reject_html = on;
     }
+
+    /// Fail `sendMessageDraft` like a Bot API server that predates it.
+    pub fn set_reject_drafts(&self, on: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reject_drafts = on;
+    }
 }
 
 /// Read one request: request line + headers, then Content-Length body.
@@ -318,6 +329,13 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
         });
         return json!({ "ok": false, "description": "Bad Request: can't parse entities" })
             .to_string();
+    }
+    if st.reject_drafts && method == "sendMessageDraft" {
+        st.captured.push(CapturedRequest {
+            method,
+            body: body.clone(),
+        });
+        return json!({ "ok": false, "description": "Not Found: method not found" }).to_string();
     }
     let result = match method.as_str() {
         "getUpdates" => {

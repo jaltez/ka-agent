@@ -265,3 +265,25 @@ async fn pair_code_links_the_sender() {
     );
     stack.stop().await;
 }
+
+/// D5: replies carry rendered HTML (`formatted_body`) next to the plain body.
+#[tokio::test(flavor = "multi_thread")]
+async fn replies_carry_formatted_html() {
+    let (stack, _dir) = spawn_stack(true).await;
+    stack.fake.push_room_message(ROOM, OPERATOR, "/status");
+    stack
+        .fake
+        .await_sent("queue", Duration::from_secs(10))
+        .expect("no /status reply");
+    stack.surface.on_final_chunk(0, "**done** with `x < y`");
+    let hit = stack
+        .fake
+        .await_sent("**done**", Duration::from_secs(5))
+        .expect("reply sent");
+    assert_eq!(hit.body["format"].as_str(), Some("org.matrix.custom.html"));
+    assert_eq!(
+        hit.body["formatted_body"].as_str(),
+        Some("<strong>done</strong> with <code>x &lt; y</code>")
+    );
+    stack.stop().await;
+}

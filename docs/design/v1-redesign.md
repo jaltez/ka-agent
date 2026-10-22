@@ -249,8 +249,10 @@ and exposes **none** of it. The largest capability jump costs no engine change.
   yields the setup hint and no turn.
 
 ### D3 · Receipt reaction — *S*
-- **Change:** `setMessageReaction 👀` when a message is accepted (queued or
-  started), cleared when answered — the acknowledgement users expect [S10].
+- **Change:** `setMessageReaction 👀` when a free-text message is accepted
+  (queued or started) — the acknowledgement users expect [S10]. Kept as a
+  receipt rather than cleared on answer: clearing costs a call per message
+  and is ambiguous once messages queue.
 - **Acceptance:** fake captures `setMessageReaction` for an inbound message.
 
 ### D4 · Memory proposals as one-tap cards — *S/M*

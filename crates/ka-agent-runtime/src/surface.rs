@@ -82,6 +82,16 @@ pub trait Surface: Send + Sync {
     /// these; streaming surfaces may ignore them.
     fn on_final_chunk(&self, _index: u32, _text: &str) {}
 
+    /// The model proposed a memory (`memory_propose`): offer the operator
+    /// a one-tap keep/discard. Surfaces with buttons override this; the
+    /// default is a notice naming the two commands.
+    fn on_memory_proposal(&self, id: &str, text: &str) {
+        let short = ka_agent_core::ids::short_id(id);
+        self.on_notice(&format!(
+            "💡 remember this? {text}\n   /memory accept {short} · /memory reject {short}"
+        ));
+    }
+
     fn on_turn_finished(&self, stop: &str, cost_usd: f64, tokens: u64);
 
     fn on_session_status(&self, status: SessionStatus);

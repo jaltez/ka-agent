@@ -164,6 +164,9 @@ struct Inner {
     crashes: Vec<i64>,
     restart_attempt: u32,
 }
+/// Meta key: `created_ms` of the newest memory candidate already offered.
+const MEMORY_ANNOUNCED_KEY: &str = "memory.announced_ms";
+
 /// A no-agent cron handler: input is the spec text, output the digest text.
 pub type NoAgentFn = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
@@ -1543,6 +1546,11 @@ impl Runtime {
                     .on_error("internal", &format!("scheduler: {e}"));
             }
             self.reap_idle_worker().await;
+            if let Err(e) = self.announce_memory_proposals() {
+                self.sh
+                    .surface
+                    .on_error("internal", &format!("memory proposals: {e}"));
+            }
             let wait = match self.sh.store.next_due_ms() {
                 Ok(Some(next)) => {
                     let now = ka_agent_core::now_ms();
@@ -1562,6 +1570,42 @@ impl Runtime {
                 _ = self.sh.scheduler_tick.notified() => {}
             }
         }
+    }
+
+    /// Offer each new `memory_propose` candidate to the operator once (the
+    /// bridge writes them from another process; the tick finds them). A
+    /// burst shows three cards and a pointer to the rest.
+    pub fn announce_memory_proposals(&self) -> Result<usize, Error> {
+        const MAX_CARDS: usize = 3;
+        let since: i64 = self
+            .sh
+            .store
+            .meta_get(MEMORY_ANNOUNCED_KEY)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let fresh: Vec<_> = self
+            .sh
+            .store
+            .pending_candidates_full()?
+            .into_iter()
+            .filter(|c| c.created_ms > since)
+            .collect();
+        let Some(newest) = fresh.iter().map(|c| c.created_ms).max() else {
+            return Ok(0);
+        };
+        for c in fresh.iter().take(MAX_CARDS) {
+            self.sh.surface.on_memory_proposal(c.id.as_str(), &c.text);
+        }
+        if fresh.len() > MAX_CARDS {
+            self.sh.surface.on_notice(&format!(
+                "{} more memory proposals — /memory review",
+                fresh.len() - MAX_CARDS
+            ));
+        }
+        self.sh
+            .store
+            .meta_set(MEMORY_ANNOUNCED_KEY, &newest.to_string())?;
+        Ok(fresh.len())
     }
 
     fn live_port(&self) -> Option<Arc<PortSession>> {

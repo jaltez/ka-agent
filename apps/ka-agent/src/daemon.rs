@@ -192,6 +192,7 @@ pub async fn run_daemon(
                 t.clone(),
                 initial_chat,
             ));
+        s.set_streaming(cfg.telegram.stream);
         surfaces.push(s.clone());
         s
     });

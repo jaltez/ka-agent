@@ -78,7 +78,7 @@ pub struct MatrixSettings {
     pub token_secret: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Telegram {
     /// Enable the Telegram channel in the daemon.
@@ -92,6 +92,22 @@ pub struct Telegram {
     /// Bot API base URL. Default `https://api.telegram.org`; tests point it
     /// at a local fake server.
     pub api_base: Option<String>,
+    /// Stream replies as they are written (Bot API `sendMessageDraft`,
+    /// private chats). Falls back to the finished message by itself when
+    /// the API refuses drafts. Default on.
+    pub stream: bool,
+}
+
+impl Default for Telegram {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_secret: None,
+            allow_user_ids: Vec::new(),
+            api_base: None,
+            stream: true,
+        }
+    }
 }
 
 impl Telegram {

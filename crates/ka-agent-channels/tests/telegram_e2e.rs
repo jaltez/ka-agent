@@ -73,6 +73,7 @@ fn spawn_on(
             token_secret: None,
             allow_user_ids: allow,
             api_base: Some(base),
+            ..TelegramSettings::default()
         },
         ..DaemonConfig::default()
     };
@@ -406,6 +407,7 @@ async fn approval_card_and_callback_settle() {
             token_secret: None,
             allow_user_ids: vec![42],
             api_base: Some(base),
+            ..TelegramSettings::default()
         },
         ..DaemonConfig::default()
     };
@@ -476,4 +478,160 @@ async fn surface_noops_until_chat_is_known() {
         "no outbound traffic before set_chat, got {:?}",
         server.captured()
     );
+}
+
+/// D1: a streamed reply shows as a Bot API draft (throttled, growing),
+/// then arrives as the finished message.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-draft".to_string(), Some(7));
+    surface.on_turn_started();
+    let chunk = "word ".repeat(12); // 60 chars per delta
+    for _ in 0..3 {
+        surface.on_delta_text(&chunk);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+    surface.on_final_chunk(1, &chunk.repeat(3));
+    surface.on_turn_finished("done", 0.0, 0);
+    let final_msg = server
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .expect("final message");
+    let drafts: Vec<_> = server
+        .captured()
+        .into_iter()
+        .filter(|c| c.method == "sendMessageDraft")
+        .collect();
+    assert!(drafts.len() >= 2, "throttled drafts: {}", drafts.len());
+    let id = drafts[0].body["draft_id"].as_i64().unwrap();
+    assert!(
+        id != 0
+            && drafts
+                .iter()
+                .all(|d| d.body["draft_id"].as_i64() == Some(id))
+    );
+    let lens: Vec<usize> = drafts
+        .iter()
+        .map(|d| d.body["text"].as_str().unwrap().len())
+        .collect();
+    assert!(
+        lens.windows(2).all(|w| w[0] < w[1]),
+        "drafts grow: {lens:?}"
+    );
+    assert!(final_msg.body["text"].as_str().unwrap().contains("word"));
+}
+
+/// D1 fallback: a Bot API server without drafts — the first refusal turns
+/// streaming off and the answer still arrives as a normal message.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_drafts_fall_back_to_the_finished_message() {
+    let (server, base) = FakeBotServer::spawn();
+    server.set_reject_drafts(true);
+    let surface = TelegramSurface::new(base, "tok-nodraft".to_string(), Some(7));
+    surface.on_turn_started();
+    let chunk = "word ".repeat(12);
+    for _ in 0..3 {
+        surface.on_delta_text(&chunk);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+    surface.on_final_chunk(1, "the whole answer");
+    surface.on_turn_finished("done", 0.0, 0);
+    server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["text"].as_str() == Some("the whole answer"),
+            Duration::from_secs(5),
+        )
+        .expect("final message despite refused drafts");
+    let drafts = server
+        .captured()
+        .into_iter()
+        .filter(|c| c.method == "sendMessageDraft")
+        .count();
+    assert_eq!(drafts, 1, "one refusal, then streaming stays off");
+}
+
+/// D3: an accepted free-text message gets a 👀 receipt; commands and
+/// strangers do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_message_gets_a_receipt_reaction() {
+    let mut stack = spawn_channel(vec![42], "tok-react").await;
+    stack.server.push_text_message(1, 7, 43, "stranger says hi");
+    stack.server.push_text_message(2, 7, 42, "/status");
+    stack
+        .server
+        .push_text_message(3, 7, 42, "please look into this");
+    let reaction = stack
+        .server
+        .await_capture(|c| c.method == "setMessageReaction", Duration::from_secs(5))
+        .expect("receipt reaction");
+    assert_eq!(reaction.body["chat_id"].as_i64(), Some(7));
+    assert_eq!(reaction.body["reaction"][0]["emoji"].as_str(), Some("👀"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let count = stack
+        .server
+        .captured()
+        .iter()
+        .filter(|c| c.method == "setMessageReaction")
+        .count();
+    assert_eq!(count, 1, "only the operator's free text is acknowledged");
+    stop(&mut stack).await;
+}
+
+/// D4: a model memory proposal reaches the phone as a card; ✅ makes it
+/// stable memory (the operator still decides — one tap instead of
+/// `/memory review`), and the card turns into its outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_proposal_card_accepts_with_one_tap() {
+    let mut stack = spawn_channel(vec![42], "tok-mem").await;
+    // The operator's chat is known once they wrote.
+    stack.server.push_text_message(1, 7, 42, "/status");
+    stack
+        .server
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .expect("status reply");
+    let id = ka_agent_core::ids::MemoryId::generate();
+    stack
+        .store
+        .add_candidate(&id, "kagent", "Prefers short answers", Some("turn x"))
+        .unwrap();
+    assert_eq!(stack.runtime.announce_memory_proposals().unwrap(), 1);
+    // Announced once: the next tick finds nothing new.
+    assert_eq!(stack.runtime.announce_memory_proposals().unwrap(), 0);
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Remember this?")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("memory card");
+    let short = ka_agent_core::ids::short_id(id.as_str()).to_string();
+    let data = card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(data, format!("m:{short}:y"));
+    stack.server.push_callback(2, 7, 42, &data);
+    let edited = stack
+        .server
+        .await_capture(|c| c.method == "editMessageText", Duration::from_secs(5))
+        .expect("card settled");
+    assert!(
+        edited.body["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("✅ Remembered"),
+        "{:?}",
+        edited.body
+    );
+    assert!(stack.store.pending_candidates_full().unwrap().is_empty());
+    let facts =
+        std::fs::read_to_string(stack.db_path.parent().unwrap().join("memory/facts.md")).unwrap();
+    assert!(facts.contains("Prefers short answers"), "{facts}");
+    stop(&mut stack).await;
 }

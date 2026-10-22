@@ -141,10 +141,18 @@ impl Client {
                 &txn,
             ],
         )?;
+        // Plain `body` for every client, rendered HTML for the ones that
+        // read `formatted_body` (same renderer as Telegram and the web).
+        let html = ka_agent_core::markdown::render(text, ka_agent_core::markdown::Target::Html);
         self.request(
             reqwest::Method::PUT,
             url,
-            Some(&json!({"msgtype": "m.text", "body": text})),
+            Some(&json!({
+                "msgtype": "m.text",
+                "body": text,
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+            })),
         )
         .await
         .map(|_| ())
