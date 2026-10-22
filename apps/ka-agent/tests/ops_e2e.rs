@@ -448,6 +448,8 @@ fn cron_manage_tool_schedules_and_lists() {
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"2h","text":"second"}}}"#,
         // Every task id starts `task_`: ambiguous, refused.
         r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":"task_"}}}"#,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","repeat":"every weekday at 9","text":"standup notes"}}}"#,
+        r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","repeat":"every fortnight at 9","text":"nope"}}}"#,
     ] {
         stdin.write_all(msg.as_bytes()).unwrap();
         stdin.write_all(b"\n").unwrap();
@@ -495,11 +497,27 @@ fn cron_manage_tool_schedules_and_lists() {
         "{ambiguous}"
     );
 
-    // Both valid rows are in the store with a valid payload (the daemon's
+    // G3: local-time recurrence from the model, same grammar as /cron.
+    let repeat = answer(9);
+    assert!(repeat.contains("weekdays at 09:00"), "{repeat}");
+    assert!(answer(10).contains("isError"), "{}", answer(10));
+
+    // The valid rows are in the store with a valid payload (the daemon's
     // scheduler will pick them up from here); nothing was removed.
     let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
     let crons = store.cron_tasks().unwrap();
-    assert_eq!(crons.len(), 2, "{crons:?}");
+    assert_eq!(crons.len(), 3, "{crons:?}");
+    let standup = crons
+        .iter()
+        .find(|t| {
+            t.payload
+                .as_deref()
+                .is_some_and(|p| p.contains("standup notes"))
+        })
+        .unwrap();
+    let spec = ka_agent_core::CronSpec::from_payload(standup.payload.as_deref().unwrap()).unwrap();
+    assert_eq!(spec.at_local.as_deref(), Some("09:00"));
+    assert_eq!(spec.weekdays, vec![0, 1, 2, 3, 4]);
     let first = crons
         .iter()
         .find(|t| {

@@ -28,6 +28,10 @@ pub fn base_dir() -> PathBuf {
     Path::new(&home).join(".ka-agent")
 }
 
+/// Store meta key where the daemon publishes the operator's IANA zone, for
+/// out-of-process readers (the MCP bridge) that have no config.
+pub const TIMEZONE_META_KEY: &str = "operator.timezone";
+
 /// Process-wide profile chosen on the command line (`-p/--profile`).
 /// Set once by the binary before anything resolves a path.
 static PROFILE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

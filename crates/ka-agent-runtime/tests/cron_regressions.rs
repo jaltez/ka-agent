@@ -69,7 +69,8 @@ fn spec(text: &str, recurrence_ms: Option<i64>) -> CronSpec {
         recurrence_ms,
         mode: CronMode::NoAgent("echo".into()),
         at_local: None,
-        weekday: None,
+        weekdays: Vec::new(),
+        month_day: None,
     }
 }
 

@@ -164,6 +164,15 @@ struct Inner {
     crashes: Vec<i64>,
     restart_attempt: u32,
 }
+/// The operator zone for out-of-process readers (the MCP bridge
+/// schedules local-time crons with it). Best effort: a failed write only
+/// means the bridge falls back to the system zone.
+fn publish_timezone(store: &Store, cfg: &DaemonConfig) {
+    if let Some(name) = cfg.time_zone().iana_name() {
+        let _ = store.meta_set(ka_agent_core::layout::TIMEZONE_META_KEY, name);
+    }
+}
+
 /// Meta key: `created_ms` of the newest memory candidate already offered.
 const MEMORY_ANNOUNCED_KEY: &str = "memory.announced_ms";
 
@@ -314,6 +323,7 @@ impl Runtime {
             }
         }
         let session = session;
+        publish_timezone(&store, &cfg);
         let mut budget = BudgetState::new(cfg.budgets.daily_usd, cfg.budgets.daily_tokens);
         if let Some(saved) = store.meta_get("budget")?
             && let Ok(b) = serde_json::from_str::<BudgetState>(&saved)
@@ -528,6 +538,7 @@ impl Runtime {
             g.budget.daily_usd_cap = new.budgets.daily_usd;
             g.budget.daily_token_cap = new.budgets.daily_tokens;
         }
+        publish_timezone(&self.sh.store, &new);
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
         if restart_worker || engine_changed {
             self.stop_idle_worker().await;
@@ -1382,10 +1393,12 @@ impl Runtime {
                 );
             };
             let (hh, mm) = ka_agent_core::when::parse_hhmm(at)?;
-            let weekday = spec
-                .weekday
-                .and_then(|w| jiff::civil::Weekday::from_monday_zero_offset(w as i8).ok());
-            Some(ka_agent_core::when::next_local(hh, mm, weekday, &now_zoned))
+            Some(ka_agent_core::when::next_local(
+                hh,
+                mm,
+                &spec.day_rule(),
+                &now_zoned,
+            ))
         };
         let late_by = |task: &ka_agent_core::Task| now - task.scheduled_at_ms.unwrap_or(now);
         let late_suffix = |late_by: i64| {

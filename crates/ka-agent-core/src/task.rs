@@ -199,9 +199,13 @@ pub struct CronSpec {
     /// the next fire is computed from it instead of `recurrence_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_local: Option<String>,
-    /// With `at_local`: only on this weekday (0 = Monday); `None` = daily.
+    /// With `at_local`: only on these weekdays (0 = Monday); empty = every
+    /// day.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weekdays: Vec<u8>,
+    /// With `at_local`: this day of the month (1–31, clamped to month end).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub weekday: Option<u8>,
+    pub month_day: Option<u8>,
 }
 
 impl CronSpec {
@@ -212,6 +216,41 @@ impl CronSpec {
     #[allow(clippy::expect_used)]
     pub fn to_payload(&self) -> String {
         serde_json::to_string(self).expect("CronSpec always serializes")
+    }
+
+    /// The days an anchored (`at_local`) recurrence fires on.
+    pub fn day_rule(&self) -> crate::when::DayRule {
+        use crate::when::DayRule;
+        if let Some(d) = self.month_day {
+            return DayRule::MonthDay(d);
+        }
+        let days: Vec<jiff::civil::Weekday> = self
+            .weekdays
+            .iter()
+            .filter_map(|w| jiff::civil::Weekday::from_monday_zero_offset(*w as i8).ok())
+            .collect();
+        if days.is_empty() {
+            DayRule::Daily
+        } else {
+            DayRule::Weekdays(days)
+        }
+    }
+
+    /// Store a [`crate::when::DayRule`] in the spec's fields.
+    pub fn set_day_rule(&mut self, rule: &crate::when::DayRule) {
+        use crate::when::DayRule;
+        self.weekdays.clear();
+        self.month_day = None;
+        match rule {
+            DayRule::Daily => {}
+            DayRule::Weekdays(days) => {
+                self.weekdays = days
+                    .iter()
+                    .map(|d| d.to_monday_zero_offset() as u8)
+                    .collect();
+            }
+            DayRule::MonthDay(d) => self.month_day = Some(*d),
+        }
     }
 
     /// Parse a task-row payload; `None` on malformed or foreign JSON.
@@ -261,7 +300,8 @@ mod cron_tests {
             recurrence_ms: None,
             mode: CronMode::Agent,
             at_local: None,
-            weekday: None,
+            weekdays: Vec::new(),
+            month_day: None,
         };
         assert_eq!(
             CronSpec::from_payload(&one_shot.to_payload()),
@@ -274,7 +314,8 @@ mod cron_tests {
             recurrence_ms: Some(86_400_000),
             mode: CronMode::NoAgent("calendar".into()),
             at_local: Some("08:00".into()),
-            weekday: None,
+            weekdays: Vec::new(),
+            month_day: None,
         };
         let payload = recurring.to_payload();
         assert!(payload.contains(r#""mode":"no_agent""#), "{payload}");

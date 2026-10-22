@@ -43,9 +43,11 @@ pub fn enable(store: &Store, at_local: &str, now: &jiff::Zoned) -> Result<(TaskI
         recurrence_ms: Some(86_400_000),
         mode: CronMode::Agent,
         at_local: Some(format!("{hh:02}:{mm:02}")),
-        weekday: None,
+        weekdays: Vec::new(),
+        month_day: None,
     };
-    let first_at = ka_agent_core::when::next_local(hh, mm, None, now);
+    let first_at =
+        ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, now);
     let mut task = Task::new(spec.text.clone(), "cron", false);
     task.scheduled_at_ms = Some(first_at);
     task.payload = Some(spec.to_payload());

@@ -67,6 +67,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v4.sql"),
     include_str!("schema_v5.sql"),
     include_str!("schema_v6.sql"),
+    include_str!("schema_v7.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -2115,7 +2116,8 @@ mod tests {
             recurrence_ms: Some(86_400_000),
             mode: ka_agent_core::CronMode::NoAgent("calendar".into()),
             at_local: None,
-            weekday: None,
+            weekdays: Vec::new(),
+            month_day: None,
         };
         let mut task = ka_agent_core::Task::new("cron".into(), "cron", false);
         task.scheduled_at_ms = Some(ka_agent_core::now_ms() + 60_000);
@@ -2308,6 +2310,49 @@ mod tests {
             Some("2.50")
         );
     }
+    #[test]
+    fn v7_rewrites_single_weekday_cron_payloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "ka-store-v7-{}-{}",
+            std::process::id(),
+            ka_agent_core::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..6] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id, title, kind, status, scheduled_at_ms, payload, created_ms, updated_ms)
+                 VALUES ('task_w', 'gym', 'cron', 'queued', 1, ?1, 1, 1),
+                        ('task_d', 'daily', 'cron', 'queued', 1, ?2, 1, 1)",
+                params![
+                    r#"{"text":"gym","source":"operator","recurrence_ms":86400000,"mode":{"mode":"agent"},"at_local":"18:00","weekday":4}"#,
+                    r#"{"text":"daily","source":"operator","recurrence_ms":86400000,"mode":{"mode":"agent"},"at_local":"08:00"}"#,
+                ],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let tasks = store.cron_tasks().unwrap();
+        let spec = |id: &str| {
+            let t = tasks.iter().find(|t| t.id.as_str() == id).unwrap();
+            ka_agent_core::CronSpec::from_payload(t.payload.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(spec("task_w").weekdays, vec![4]);
+        assert_eq!(spec("task_w").day_rule().describe(), "fri");
+        assert!(spec("task_d").weekdays.is_empty());
+        assert!(
+            !tasks
+                .iter()
+                .any(|t| t.payload.as_deref().unwrap().contains("\"weekday\""))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn pending_chunks_for_session_orders_and_scopes() {
         let store = Store::open_in_memory().unwrap();

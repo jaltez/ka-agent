@@ -294,17 +294,75 @@ pub fn parse_when(tokens: &[&str], now: &Zoned) -> Option<When> {
         .find_map(|n| parse_exact(&lower[..n], now).map(|at_ms| When { at_ms, consumed: n }))
 }
 
+/// Which days an anchored recurrence fires on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DayRule {
+    Daily,
+    /// These weekdays (any order, no duplicates needed).
+    Weekdays(Vec<Weekday>),
+    /// This day of the month (1–31); months that are shorter fire on their
+    /// last day, so "the 31st" means "month end".
+    MonthDay(u8),
+}
+
+impl DayRule {
+    fn matches(&self, date: Date) -> bool {
+        match self {
+            Self::Daily => true,
+            Self::Weekdays(days) => days.contains(&date.weekday()),
+            Self::MonthDay(d) => {
+                let want = (*d).clamp(1, 31) as i8;
+                let last = date.days_in_month();
+                date.day() == want.min(last)
+            }
+        }
+    }
+
+    /// Operator wording: `daily`, `weekdays`, `mon,wed,fri`, `monthly on the 1st`.
+    pub fn describe(&self) -> String {
+        const NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+        match self {
+            Self::Daily => "daily".into(),
+            Self::Weekdays(days) => {
+                let mut idx: Vec<usize> = days
+                    .iter()
+                    .map(|d| d.to_monday_zero_offset().clamp(0, 6) as usize)
+                    .collect();
+                idx.sort_unstable();
+                idx.dedup();
+                match idx.as_slice() {
+                    [0, 1, 2, 3, 4] => "weekdays".into(),
+                    [5, 6] => "weekends".into(),
+                    _ => idx.iter().map(|i| NAMES[*i]).collect::<Vec<_>>().join(","),
+                }
+            }
+            Self::MonthDay(d) => format!("monthly on the {}", ordinal(*d)),
+        }
+    }
+}
+
+fn ordinal(n: u8) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 /// The next instant strictly after `now` whose local clock reads `hh:mm`
-/// (on `weekday`, when given), DST-correct. Out-of-range clock values are
+/// on a day `rule` allows, DST-correct. Out-of-range clock values are
 /// clamped to 23:59.
-pub fn next_local(hh: u8, mm: u8, weekday: Option<Weekday>, now: &Zoned) -> i64 {
+pub fn next_local(hh: u8, mm: u8, rule: &DayRule, now: &Zoned) -> i64 {
     let (hh, mm) = (hh.min(23), mm.min(59));
     let after = now_ms(now);
     let mut date = now.date();
-    // Today plus up to a week covers every weekday, including "today but
-    // already past".
-    for _ in 0..=8 {
-        if weekday.is_none_or(|wd| wd == date.weekday())
+    // Two months cover every rule (a month day, including "today but
+    // already past").
+    for _ in 0..=62 {
+        if rule.matches(date)
             && let Some(at) = local_ms(date, hh, mm, now)
             && at > after
         {
@@ -317,6 +375,62 @@ pub fn next_local(hh: u8, mm: u8, weekday: Option<Weekday>, now: &Zoned) -> i64 
     }
     // Only reachable at the end of jiff's supported range.
     after.saturating_add(DAY_MS)
+}
+
+/// A recurrence after the word `every`: the day rule, the clock (hh, mm)
+/// and how many tokens it used. Forms (case-insensitive, `at` optional):
+///
+/// - `day at 08:00`
+/// - `weekday at 9` · `weekend at 10am`
+/// - `mon at 9` · `mon,wed,fri at 18:00`
+/// - `month on the 1st at 9` · `month on 15 at 09:30`
+pub fn parse_recurrence(tokens: &[&str]) -> Option<(DayRule, (u8, u8), usize)> {
+    let lower: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let first = lower.first()?;
+    let (rule, mut used) = match first.as_str() {
+        "day" | "daily" => (DayRule::Daily, 1),
+        "weekday" | "weekdays" => (
+            DayRule::Weekdays(vec![
+                Weekday::Monday,
+                Weekday::Tuesday,
+                Weekday::Wednesday,
+                Weekday::Thursday,
+                Weekday::Friday,
+            ]),
+            1,
+        ),
+        "weekend" | "weekends" => (
+            DayRule::Weekdays(vec![Weekday::Saturday, Weekday::Sunday]),
+            1,
+        ),
+        "month" => {
+            let mut i = 1;
+            if lower.get(i).is_some_and(|t| t == "on") {
+                i += 1;
+            }
+            if lower.get(i).is_some_and(|t| t == "the") {
+                i += 1;
+            }
+            let raw = lower.get(i)?;
+            let digits: String = raw.chars().take_while(char::is_ascii_digit).collect();
+            let rest = &raw[digits.len()..];
+            if !matches!(rest, "" | "st" | "nd" | "rd" | "th") {
+                return None;
+            }
+            let day: u8 = digits.parse().ok().filter(|d| (1..=31).contains(d))?;
+            (DayRule::MonthDay(day), i + 1)
+        }
+        list => {
+            let days: Option<Vec<Weekday>> = list.split(',').map(parse_weekday).collect();
+            let days = days.filter(|d| !d.is_empty())?;
+            (DayRule::Weekdays(days), 1)
+        }
+    };
+    if lower.get(used).is_some_and(|t| t == "at") {
+        used += 1;
+    }
+    let clock = parse_hhmm(lower.get(used)?)?;
+    Some((rule, clock, used + 1))
 }
 
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -528,9 +642,14 @@ mod tests {
         assert_eq!(local(w.at_ms, "America/New_York"), "2026-11-01T09:00");
         // 23 wall hours + the extra repeated hour = 24 h of real time.
         assert_eq!(w.at_ms - now_ms(&now), 24 * 3_600_000);
-        let next = next_local(9, 0, None, &zoned("2026-11-01T00:30", "America/New_York"));
+        let next = next_local(
+            9,
+            0,
+            &DayRule::Daily,
+            &zoned("2026-11-01T00:30", "America/New_York"),
+        );
         assert_eq!(local(next, "America/New_York"), "2026-11-01T09:00");
-        let sun = next_local(8, 0, Some(Weekday::Sunday), &now);
+        let sun = next_local(8, 0, &DayRule::Weekdays(vec![Weekday::Sunday]), &now);
         assert_eq!(local(sun, "America/New_York"), "2026-11-01T08:00");
     }
 
@@ -538,16 +657,21 @@ mod tests {
     fn next_local_across_madrid_dst() {
         // Europe DST ends 2026-10-25 03:00 → 02:00.
         let now = zoned("2026-10-25T07:30", "Europe/Madrid");
-        let next = next_local(8, 0, None, &now);
+        let next = next_local(8, 0, &DayRule::Daily, &now);
         assert_eq!(local(next, "Europe/Madrid"), "2026-10-25T08:00");
         assert_eq!(next - now_ms(&now), 1_800_000);
         // From the day before, the next 08:00 is 25 h away in real time.
         let before = zoned("2026-10-24T08:00", "Europe/Madrid");
-        let next = next_local(8, 0, None, &before);
+        let next = next_local(8, 0, &DayRule::Daily, &before);
         assert_eq!(local(next, "Europe/Madrid"), "2026-10-25T08:00");
         assert_eq!(next - now_ms(&before), 25 * 3_600_000);
         // Weekday anchored: Friday 10:00 asking for Friday 09:00 → next week.
-        let fri = next_local(9, 0, Some(Weekday::Friday), &madrid_now());
+        let fri = next_local(
+            9,
+            0,
+            &DayRule::Weekdays(vec![Weekday::Friday]),
+            &madrid_now(),
+        );
         assert_eq!(local(fri, "Europe/Madrid"), "2026-11-06T09:00");
     }
 
@@ -568,5 +692,85 @@ mod tests {
         assert_eq!(describe(base + 3 * 3_600_000, &now), "today 19:25 (in 3h)");
         let next_year = parse_when(&["2027-01-04"], &now).unwrap().at_ms;
         assert!(describe(next_year, &now).starts_with("Mon 4 Jan 2027 09:00"));
+    }
+
+    #[test]
+    fn recurrence_grammar_covers_every_form() {
+        let rec = |s: &str| {
+            let t: Vec<&str> = s.split_whitespace().collect();
+            parse_recurrence(&t).map(|(r, c, n)| (r.describe(), c, n))
+        };
+        assert_eq!(rec("day at 08:00 x"), Some(("daily".into(), (8, 0), 3)));
+        assert_eq!(
+            rec("weekday at 9 standup"),
+            Some(("weekdays".into(), (9, 0), 3))
+        );
+        assert_eq!(rec("weekend 10am"), Some(("weekends".into(), (10, 0), 2)));
+        assert_eq!(
+            rec("mon,wed,fri at 18:00 gym"),
+            Some(("mon,wed,fri".into(), (18, 0), 3))
+        );
+        assert_eq!(rec("Fri at 17:30"), Some(("fri".into(), (17, 30), 3)));
+        assert_eq!(
+            rec("month on the 1st at 9 rent"),
+            Some(("monthly on the 1st".into(), (9, 0), 6))
+        );
+        assert_eq!(
+            rec("month on 22 at 09:30"),
+            Some(("monthly on the 22nd".into(), (9, 30), 5))
+        );
+        assert_eq!(rec("month on the 32nd at 9"), None);
+        assert_eq!(rec("mon,funday at 9"), None);
+        assert_eq!(rec("1h ping"), None, "intervals are not anchored");
+    }
+
+    #[test]
+    fn rules_pick_the_right_next_day() {
+        // Thu 2026-10-29 10:00 Madrid.
+        let now = zoned("2026-10-29T10:00", "Europe/Madrid");
+        let day_of = |ms: i64| {
+            let z = jiff::Timestamp::from_millisecond(ms)
+                .unwrap()
+                .to_zoned(now.time_zone().clone());
+            (z.month(), z.day(), z.hour())
+        };
+        let weekdays = DayRule::Weekdays(vec![
+            Weekday::Monday,
+            Weekday::Tuesday,
+            Weekday::Wednesday,
+            Weekday::Thursday,
+            Weekday::Friday,
+        ]);
+        // 09:00 already passed Thursday → Friday 30th.
+        assert_eq!(day_of(next_local(9, 0, &weekdays, &now)), (10, 30, 9));
+        let mwf = DayRule::Weekdays(vec![Weekday::Monday, Weekday::Wednesday, Weekday::Friday]);
+        assert_eq!(day_of(next_local(9, 0, &mwf, &now)), (10, 30, 9));
+        // Month day 31 in November (30 days) fires on the 30th.
+        let month_end = DayRule::MonthDay(31);
+        assert_eq!(day_of(next_local(9, 0, &month_end, &now)), (10, 31, 9));
+        let after = zoned("2026-10-31T10:00", "Europe/Madrid");
+        let z = jiff::Timestamp::from_millisecond(next_local(9, 0, &month_end, &after))
+            .unwrap()
+            .to_zoned(after.time_zone().clone());
+        assert_eq!((z.month(), z.day()), (11, 30));
+        // DST: Madrid leaves summer time on Sun 2026-10-25 at 03:00; a
+        // weekly Sunday 09:00 from the 18th to the 25th stays 09:00 local.
+        let before = zoned("2026-10-17T12:00", "Europe/Madrid");
+        let sun = DayRule::Weekdays(vec![Weekday::Sunday]);
+        let first = next_local(9, 0, &sun, &before);
+        let z1 = jiff::Timestamp::from_millisecond(first)
+            .unwrap()
+            .to_zoned(before.time_zone().clone());
+        assert_eq!((z1.day(), z1.hour()), (18, 9));
+        let second = next_local(9, 0, &sun, &z1);
+        let z2 = jiff::Timestamp::from_millisecond(second)
+            .unwrap()
+            .to_zoned(before.time_zone().clone());
+        assert_eq!((z2.month(), z2.day(), z2.hour()), (10, 25, 9));
+        assert_eq!(
+            second - first,
+            7 * DAY_MS + 3_600_000,
+            "a 169 h week across the change"
+        );
     }
 }

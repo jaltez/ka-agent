@@ -277,7 +277,7 @@ fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "cron_manage".into(),
-            description: "Manage ka-agent cron jobs: schedule prompts to run later (one-shot 'in' or 'at') or on a fixed interval ('every'), and list/pause/resume/remove/trigger existing jobs. A scheduled prompt runs as a normal operator turn through the approval flow. Use 'at' with the operator's UTC offset for clock times.".into(),
+            description: "Manage ka-agent cron jobs: schedule prompts to run later (one-shot 'in' or 'at'), on a fixed interval ('every'), or at a local clock time on chosen days ('repeat', in the operator's timezone), and list/pause/resume/remove/trigger existing jobs. A scheduled prompt runs as a normal operator turn through the approval flow.".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -286,6 +286,7 @@ fn tools(plugins: &[LoadedPlugin]) -> Vec<ToolDef> {
                     "in": {"type": "string", "description": "schedule: one-shot delay, Ns/Nm/Nh/Nd"},
                     "at": {"type": "string", "description": "schedule: one-shot absolute time, RFC 3339 with offset (e.g. 2026-10-20T09:00:00+02:00)"},
                     "every": {"type": "string", "description": "schedule: recurring interval, Nm/Nh/Nd (minimum 60s)"},
+                    "repeat": {"type": "string", "description": "schedule: local-time recurrence — 'every day at 08:00', 'every weekday at 9', 'every mon,wed,fri at 18:00', 'every month on the 1st at 9'"},
                     "id": {"type": "string", "description": "pause/resume/remove/trigger: job id or id prefix"}
                 },
                 "required": ["action"]
@@ -611,7 +612,41 @@ fn handle_tool_call(
                     let every = args["every"].as_str();
                     let once = args["in"].as_str();
                     let at = args["at"].as_str();
+                    // `repeat`: anchored local-time recurrence, in the zone
+                    // the daemon publishes (the bridge has no config).
+                    let tz = store
+                        .meta_get(ka_agent_core::layout::TIMEZONE_META_KEY)
+                        .ok()
+                        .flatten()
+                        .and_then(|n| jiff::tz::TimeZone::get(&n).ok())
+                        .unwrap_or_else(jiff::tz::TimeZone::system);
+                    let mut anchored: Option<(ka_agent_core::when::DayRule, (u8, u8))> = None;
+                    if let Some(repeat) = args["repeat"].as_str() {
+                        if every.is_some() || once.is_some() || at.is_some() {
+                            return Err(
+                                "give 'repeat' alone (not with 'in', 'every' or 'at')".into()
+                            );
+                        }
+                        let words: Vec<&str> = repeat.split_whitespace().collect();
+                        let words = words.strip_prefix(&["every"]).unwrap_or(&words);
+                        let (rule, clock, used) = ka_agent_core::when::parse_recurrence(words)
+                            .ok_or_else(|| format!("bad 'repeat' {repeat:?}: use e.g. 'every weekday at 9', 'every mon,wed at 18:00', 'every month on the 1st at 9'"))?;
+                        if used != words.len() {
+                            return Err(format!(
+                                "bad 'repeat' {repeat:?}: unexpected words after the time"
+                            ));
+                        }
+                        anchored = Some((rule, clock));
+                    }
                     let (recurrence_ms, first_at_ms) = match (every, once, at) {
+                        _ if anchored.is_some() => {
+                            let (rule, (hh, mm)) = anchored.clone().ok_or("internal: repeat")?;
+                            let now = jiff::Timestamp::now().to_zoned(tz.clone());
+                            (
+                                Some(86_400_000),
+                                ka_agent_core::when::next_local(hh, mm, &rule, &now),
+                            )
+                        }
                         (Some(d), None, None) => {
                             let ms = ka_agent_core::parse_duration(d).ok_or_else(|| {
                                 format!("bad duration {d:?}; use Ns, Nm, Nh or Nd")
@@ -640,7 +675,7 @@ fn handle_tool_call(
                         }
                         _ => {
                             return Err(
-                                "give exactly one of 'in' (one-shot), 'every' (recurring) or 'at' (absolute RFC 3339)".into(),
+                                "give exactly one of 'in' (one-shot), 'every' (interval), 'repeat' (local-time days) or 'at' (absolute RFC 3339)".into(),
                             );
                         }
                     };
@@ -660,14 +695,20 @@ fn handle_tool_call(
                             "{live} model-scheduled crons are live (limit {MAX_MODEL_CRONS}) — remove some first"
                         ));
                     }
-                    let spec = ka_agent_core::CronSpec {
+                    let mut spec = ka_agent_core::CronSpec {
                         text: text.to_string(),
                         source: "kagent".into(),
                         recurrence_ms,
                         mode: ka_agent_core::CronMode::Agent,
-                        at_local: None,
-                        weekday: None,
+                        at_local: anchored
+                            .as_ref()
+                            .map(|(_, (hh, mm))| format!("{hh:02}:{mm:02}")),
+                        weekdays: Vec::new(),
+                        month_day: None,
                     };
+                    if let Some((rule, _)) = &anchored {
+                        spec.set_day_rule(rule);
+                    }
                     let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
                     task.scheduled_at_ms = Some(first_at_ms);
                     task.payload = Some(spec.to_payload());
@@ -677,9 +718,14 @@ fn handle_tool_call(
                     Ok(format!(
                         "cron {} scheduled ({})",
                         ka_agent_core::ids::short_id(task.id.as_str()),
-                        match recurrence_ms {
-                            Some(ms) => format!("every {}", crate::commands::fmt_interval(ms)),
-                            None => "once".to_string(),
+                        match (&anchored, recurrence_ms) {
+                            (Some((rule, (hh, mm))), _) => {
+                                format!("{} at {hh:02}:{mm:02}", rule.describe())
+                            }
+                            (None, Some(ms)) => {
+                                format!("every {}", crate::commands::fmt_interval(ms))
+                            }
+                            (None, None) => "once".to_string(),
                         }
                     ))
                 }
@@ -688,7 +734,13 @@ fn handle_tool_call(
                     Ok(if crons.is_empty() {
                         "no crons".to_string()
                     } else {
-                        let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system());
+                        let tz = store
+                            .meta_get(ka_agent_core::layout::TIMEZONE_META_KEY)
+                            .ok()
+                            .flatten()
+                            .and_then(|n| jiff::tz::TimeZone::get(&n).ok())
+                            .unwrap_or_else(jiff::tz::TimeZone::system);
+                        let now = jiff::Timestamp::now().to_zoned(tz);
                         crate::commands::cron_list_text(&crons, &now)
                     })
                 }

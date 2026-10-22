@@ -215,44 +215,17 @@ pub fn fmt_interval(ms: i64) -> String {
 fn cadence(spec: Option<&ka_agent_core::CronSpec>) -> String {
     match spec {
         Some(s) if s.at_local.is_some() => {
-            let day = match s.weekday {
-                Some(w) => weekday_name(w),
-                None => "daily".to_string(),
-            };
-            format!("↻ {day} {}", s.at_local.clone().unwrap_or_default())
+            format!(
+                "↻ {} {}",
+                s.day_rule().describe(),
+                s.at_local.clone().unwrap_or_default()
+            )
         }
         Some(s) if s.recurrence_ms.is_some_and(|r| r > 0) => {
             format!("↻ every {}", fmt_interval(s.recurrence_ms.unwrap_or(0)))
         }
         _ => "⏰".to_string(),
     }
-}
-
-fn weekday_name(w: u8) -> String {
-    const NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-    match jiff::civil::Weekday::from_monday_zero_offset(w as i8) {
-        Ok(d) => NAMES[d.to_monday_zero_offset() as usize].to_string(),
-        Err(_) => "daily".to_string(),
-    }
-}
-
-fn weekday_from_name(s: &str) -> Option<u8> {
-    let n = s.trim().to_lowercase();
-    let full = [
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-    ];
-    for (i, d) in full.iter().enumerate() {
-        if n == *d || n == d[..3.min(d.len())] {
-            return Some(i as u8);
-        }
-    }
-    None
 }
 
 /// One line per live task: `[id8] cadence next-fire title`.
@@ -295,27 +268,18 @@ pub fn cron_add(runtime: &Runtime, args: &str) -> String {
         return cron_add_usage();
     }
     let first = parts[0];
-    let anchored = |at_local: &str, weekday: Option<u8>, text: String| {
-        let Some((hh, mm)) = ka_agent_core::when::parse_hhmm(at_local) else {
-            return format!("bad time {at_local:?} — use HH:MM (24h), e.g. 08:30");
-        };
-        let spec = ka_agent_core::CronSpec {
+    let anchored = |rule: ka_agent_core::when::DayRule, (hh, mm): (u8, u8), text: String| {
+        let mut spec = ka_agent_core::CronSpec {
             text,
             source: "operator".into(),
             recurrence_ms: Some(86_400_000),
             mode: ka_agent_core::CronMode::Agent,
-            at_local: Some(at_local.to_string()),
-            weekday,
+            at_local: Some(format!("{hh:02}:{mm:02}")),
+            weekdays: Vec::new(),
+            month_day: None,
         };
-        let first_at = ka_agent_core::when::next_local(
-            hh,
-            mm,
-            weekday.map(|w| {
-                jiff::civil::Weekday::from_monday_zero_offset(w as i8)
-                    .unwrap_or(jiff::civil::Weekday::Monday)
-            }),
-            &now,
-        );
+        spec.set_day_rule(&rule);
+        let first_at = ka_agent_core::when::next_local(hh, mm, &rule, &now);
         match runtime.add_cron(spec, first_at) {
             Ok(id) => format!(
                 "cron {} scheduled — {}",
@@ -336,7 +300,8 @@ pub fn cron_add(runtime: &Runtime, args: &str) -> String {
             recurrence_ms: None,
             mode: ka_agent_core::CronMode::Agent,
             at_local: None,
-            weekday: None,
+            weekdays: Vec::new(),
+            month_day: None,
         };
         let at = ka_agent_core::now_ms() + ms as i64;
         return match runtime.add_cron(spec, at) {
@@ -350,30 +315,13 @@ pub fn cron_add(runtime: &Runtime, args: &str) -> String {
     }
     if first == "every" {
         let second = parts[1];
-        if second.eq_ignore_ascii_case("day") {
-            // every day at HH:MM <text>  |  every day HH:MM <text>
-            let (at, off) = if parts[2].eq_ignore_ascii_case("at") {
-                (parts.get(3).copied().unwrap_or(""), 4)
-            } else {
-                (parts[2], 3)
-            };
-            let text = parts[off.min(parts.len())..].join(" ");
+        // Anchored: every day|weekday|weekend|mon,wed|month on the 1st [at] T <text>
+        if let Some((rule, clock, used)) = ka_agent_core::when::parse_recurrence(&parts[1..]) {
+            let text = parts[(1 + used).min(parts.len())..].join(" ");
             if text.is_empty() {
                 return cron_add_usage();
             }
-            return anchored(at, None, text);
-        }
-        if let Some(w) = weekday_from_name(second) {
-            let (at, off) = if parts[2].eq_ignore_ascii_case("at") {
-                (parts.get(3).copied().unwrap_or(""), 4)
-            } else {
-                (parts[2], 3)
-            };
-            let text = parts[off.min(parts.len())..].join(" ");
-            if text.is_empty() {
-                return cron_add_usage();
-            }
-            return anchored(at, Some(w), text);
+            return anchored(rule, clock, text);
         }
         // every <duration> <text>: interval recurrence.
         let Some(ms) = ka_agent_core::parse_duration(second) else {
@@ -389,7 +337,8 @@ pub fn cron_add(runtime: &Runtime, args: &str) -> String {
             recurrence_ms: Some(ms as i64),
             mode: ka_agent_core::CronMode::Agent,
             at_local: None,
-            weekday: None,
+            weekdays: Vec::new(),
+            month_day: None,
         };
         let at = ka_agent_core::now_ms() + ms as i64;
         return match runtime.add_cron(spec, at) {
@@ -405,7 +354,7 @@ pub fn cron_add(runtime: &Runtime, args: &str) -> String {
 }
 
 fn cron_add_usage() -> String {
-    "usage: /cron add in <duration> <text>\n      /cron add every <duration> <text>\n      /cron add every day at 08:00 <text>\n      /cron add every mon at 09:00 <text>".into()
+    "usage: /cron add in <duration> <text>\n      /cron add every <duration> <text>\n      /cron add every day at 08:00 <text>\n      /cron add every weekday at 9 <text>\n      /cron add every mon,wed,fri at 18:00 <text>\n      /cron add every month on the 1st at 9 <text>".into()
 }
 
 /// Cancel a reminder or cron by prefix; shared by `/remind rm` and `/cron rm`.
@@ -925,9 +874,11 @@ async fn calendar_command(runtime: &Runtime, rest: &str) -> Outcome {
                 recurrence_ms: Some(86_400_000),
                 mode: ka_agent_core::CronMode::NoAgent("calendar".into()),
                 at_local: Some(digest_time.clone()),
-                weekday: None,
+                weekdays: Vec::new(),
+                month_day: None,
             };
-            let first_at = ka_agent_core::when::next_local(hh, mm, None, &now);
+            let first_at =
+                ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, &now);
             match runtime.add_cron(spec, first_at) {
                 Ok(_) => Outcome::Reply(format!(
                     "calendar digest daily at {digest_time} ({tz_name})"
@@ -991,10 +942,12 @@ mod tests {
             recurrence_ms: Some(86_400_000),
             mode: ka_agent_core::CronMode::Agent,
             at_local: Some("08:00".into()),
-            weekday: None,
+            weekdays: Vec::new(),
+            month_day: None,
         };
         let weekly = ka_agent_core::CronSpec {
-            weekday: Some(0),
+            weekdays: vec![0],
+            month_day: None,
             at_local: Some("09:00".into()),
             ..anchored.clone()
         };
@@ -1006,13 +959,5 @@ mod tests {
             ..anchored
         };
         assert_eq!(cadence(Some(&interval)), "↻ every 1h");
-    }
-
-    #[test]
-    fn weekday_names_map_to_monday_zero() {
-        assert_eq!(weekday_from_name("mon"), Some(0));
-        assert_eq!(weekday_from_name("Friday"), Some(4));
-        assert_eq!(weekday_from_name("sunday"), Some(6));
-        assert_eq!(weekday_from_name("noday"), None);
     }
 }
