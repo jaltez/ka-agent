@@ -93,14 +93,20 @@ approval/budget precepts. A read-only workspace logs a warning and boots.
 that fires daily at 08:00 UTC and renders the ICS source's next 24 h as
 text. `/calendar today` renders it on demand. No engine involved.
 
-Minimal ICS support, documented limits:
+ICS support:
 
-- `VEVENT` with `SUMMARY`, `DTSTART`, `DTEND`; line unfolding per RFC 5545.
-- Window `[now, now+24h)`, lines `HH:MM[-HH:MM] SUMMARY` (or `(all day)`).
-- **No timezone conversion**: times are shown exactly as the ICS states
-  them; a trailing `Z` is displayed (`08:30Z`).
-- **No RRULE expansion**: recurring events are counted and noted
-  (`N recurring event(s) not expanded`).
+- `VEVENT` with `SUMMARY`, `DTSTART`, `DTEND`, `RRULE`, `EXDATE`; line
+  unfolding per RFC 5545.
+- Window: the operator's local day `[today 00:00, tomorrow 00:00)`; lines
+  `HH:MM[-HH:MM] SUMMARY` (or `(all day)`), sorted by start.
+- Times: `…Z` is UTC, `TZID=Area/City` is that zone, a bare time is
+  floating (the operator's zone); every time is shown in the operator's
+  zone.
+- Recurrence: `FREQ=DAILY|WEEKLY|MONTHLY` with `INTERVAL`, `BYDAY` (weekly,
+  plain day names), `COUNT`, `UNTIL` is expanded inside the window, stepped
+  in the event's own zone (DST-correct); `EXDATE` occurrences are skipped.
+  Other rules (positional `BYDAY=1MO`, `BYSETPOS`, yearly…) are noted as
+  `N recurring event(s) with rules this digest does not expand`.
 - URL sources need the `http:get:<host>` grant (plus `http:get:private` for
   private targets) exactly like the `http_get` tool; file paths are the
   operator's own machine, unrestricted (read-only).

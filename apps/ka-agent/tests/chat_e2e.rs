@@ -517,19 +517,19 @@ fn calendar_digest_on_demand() {
     chat.send("/calendar today");
     chat.expect("CTest-XYZ", Duration::from_secs(30));
 
-    // Same source, now with a recurring event: counted, not expanded. Same
-    // local-day clamping as above.
+    // Same source, now a daily rule that started yesterday: today's
+    // occurrence is expanded and listed.
     std::fs::write(
         &ics_path,
         format!(
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:CTest-RRULE\nDTSTART:{}\nRRULE:FREQ=DAILY\nEND:VEVENT\nEND:VCALENDAR\n",
-            ics_stamp(event_ms)
+            ics_stamp(event_ms - 86_400_000)
         ),
     )
     .unwrap();
     chat.send("/calendar today");
     chat.expect("CTest-RRULE", Duration::from_secs(30));
-    chat.expect("1 recurring event(s) not expanded", Duration::from_secs(10));
+    assert!(!chat.transcript().contains("does not expand"), "{}", chat.transcript());
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }

@@ -1,11 +1,12 @@
 //! Calendar digest (M11): a no-agent cron handler. Reads an ICS source
-//! (local path or granted URL) and renders the events of the next 24 h as
-//! plain text — no LLM, no engine.
+//! (local path or granted URL) and renders today's events in the
+//! operator's zone as plain text — no LLM, no engine.
 //!
-//! Minimal by design (documented in `docs/contract/cron-and-refs.md`):
-//! no `RRULE` expansion (recurring events are counted and noted), and times
-//! are shown exactly as the ICS states them (`Z` suffix kept, no timezone
-//! conversion).
+//! Times: `…Z` is UTC, `TZID=Area/City` is that zone, a bare time is
+//! floating (the operator's zone); all are shown in the operator's zone.
+//! Recurrence: `RRULE` FREQ=DAILY|WEEKLY|MONTHLY with INTERVAL, BYDAY
+//! (weekly), COUNT and UNTIL is expanded inside the day window, `EXDATE`
+//! honoured; anything else is listed once and noted.
 
 use ka_agent_store::Store;
 
@@ -31,36 +32,47 @@ pub fn digest_in(source: &str, store: &Store, tz: &jiff::tz::TimeZone) -> Result
 /// ICS body → digest lines for the local `[today 00:00, tomorrow 00:00)`
 /// window, times in `now`'s zone.
 fn render(raw: &str, now: &jiff::Zoned) -> String {
+    let tz = now.time_zone().clone();
     let day_start = now
-        .with()
-        .date(now.date())
-        .time(jiff::civil::time(0, 0, 0, 0))
-        .build()
-        .unwrap_or_else(|_| {
-            now.with()
-                .time(jiff::civil::time(0, 0, 0, 0))
-                .build()
-                .unwrap_or_else(|_| now.clone())
-        });
-    let window_start = day_start.timestamp().as_millisecond();
-    let window_end = window_start + 86_400_000;
-    let (mut events, recurring) = parse_events(raw);
-    events.retain(|e| e.start_ms >= window_start && e.start_ms < window_end);
-    events.sort_by_key(|e| e.start_ms);
-    let mut out: Vec<String> = events
-        .iter()
-        .map(|ev| match (&ev.start, &ev.end) {
-            (Some(s), Some(e)) => format!("{}-{} {}", label(s, now), label(e, now), ev.summary),
-            (Some(s), None) => format!("{} {}", label(s, now), ev.summary),
-            (None, _) => format!("(all day) {}", ev.summary),
-        })
-        .collect();
+        .date()
+        .to_zoned(tz.clone())
+        .unwrap_or_else(|_| now.clone());
+    let day_end = now
+        .date()
+        .tomorrow()
+        .ok()
+        .and_then(|d| d.to_zoned(tz.clone()).ok())
+        .unwrap_or_else(|| day_start.clone());
+    let (events, unexpanded) = parse_events(raw, &tz);
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for ev in &events {
+        for start in occurrences(ev, &day_start, &day_end) {
+            let line = if ev.all_day {
+                format!("(all day) {}", ev.summary)
+            } else {
+                let local = start.with_time_zone(tz.clone());
+                let hhmm = |z: &jiff::Zoned| format!("{:02}:{:02}", z.hour(), z.minute());
+                match ev.duration {
+                    Some(d) => match local.checked_add(d) {
+                        Ok(end) => format!("{}-{} {}", hhmm(&local), hhmm(&end), ev.summary),
+                        Err(_) => format!("{} {}", hhmm(&local), ev.summary),
+                    },
+                    None => format!("{} {}", hhmm(&local), ev.summary),
+                }
+            };
+            rows.push((start.timestamp().as_millisecond(), line));
+        }
+    }
+    rows.sort_by_key(|(at, _)| *at);
+    let mut out: Vec<String> = rows.into_iter().map(|(_, l)| l).collect();
     if out.is_empty() {
-        out.push("no events in the next 24h".to_string());
+        out.push("no events today".to_string());
     }
     let mut text = out.join("\n");
-    if recurring > 0 {
-        text.push_str(&format!("\n{recurring} recurring event(s) not expanded"));
+    if unexpanded > 0 {
+        text.push_str(&format!(
+            "\n{unexpanded} recurring event(s) with rules this digest does not expand"
+        ));
     }
     text
 }
@@ -84,85 +96,213 @@ fn load(source: &str, store: &Store) -> Result<String, String> {
     }
 }
 
-/// Displayed time inside a digest line.
-#[derive(Debug, Clone)]
-struct Time {
-    /// `HH:MM` as stated in the ICS (no zone conversion).
-    hhmm: String,
-    /// The ICS carried a trailing `Z`.
-    zulu: bool,
-}
-
-/// The event's wall-clock time. A `Z` time is converted into `now`'s zone
-/// (a local time keeps its zone's wall clock as stated).
-fn label(t: &Time, now: &jiff::Zoned) -> String {
-    if !t.zulu {
-        return t.hhmm.clone();
-    }
-    let Some((h, m)) = t.hhmm.split_once(':') else {
-        return format!("{}Z", t.hhmm);
-    };
-    let (h, m): (i8, i8) = (h.parse().unwrap_or(0), m.parse().unwrap_or(0));
-    let Ok(at) = now
-        .with()
-        .hour(h.clamp(0, 23))
-        .minute(m.clamp(0, 59))
-        .build()
-    else {
-        return format!("{}Z", t.hhmm);
-    };
-    format!("{:02}:{:02}", at.hour(), at.minute())
-}
-
 #[derive(Debug, Clone)]
 struct Event {
     summary: String,
-    start_ms: i64,
-    /// `None` for DATE-only (all-day) starts.
-    start: Option<Time>,
-    end: Option<Time>,
+    /// First occurrence, in the event's own zone (DST-correct stepping).
+    start: jiff::Zoned,
+    all_day: bool,
+    duration: Option<jiff::Span>,
+    rule: Option<Rule>,
+    exdates: Vec<jiff::Timestamp>,
 }
 
-/// Parse VEVENTs → (events, recurring RRULE count). Line folding
-/// (continuation lines start with a space/tab) is unfolded first.
-fn parse_events(raw: &str) -> (Vec<Event>, usize) {
+/// The `RRULE` subset this digest expands.
+#[derive(Debug, Clone)]
+struct Rule {
+    freq: Freq,
+    interval: i64,
+    by_day: Vec<jiff::civil::Weekday>,
+    count: Option<usize>,
+    until: Option<jiff::Timestamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Freq {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+/// Occurrence starts of `ev` inside `[from, to)`.
+fn occurrences(ev: &Event, from: &jiff::Zoned, to: &jiff::Zoned) -> Vec<jiff::Zoned> {
+    let (lo, hi) = (from.timestamp(), to.timestamp());
+    let keep = |z: &jiff::Zoned| {
+        let t = z.timestamp();
+        // All-day events cover their whole date: overlap, not start.
+        let inside = if ev.all_day {
+            z.date() == from.date()
+        } else {
+            t >= lo && t < hi
+        };
+        inside && !ev.exdates.contains(&t)
+    };
+    let Some(rule) = &ev.rule else {
+        return if keep(&ev.start) {
+            vec![ev.start.clone()]
+        } else {
+            Vec::new()
+        };
+    };
+    let mut out = Vec::new();
+    let mut emitted = 0usize;
+    let step = |k: i64| -> jiff::Span {
+        match rule.freq {
+            Freq::Daily => jiff::Span::new().days(k * rule.interval),
+            Freq::Weekly => jiff::Span::new().weeks(k * rule.interval),
+            Freq::Monthly => jiff::Span::new().months(k * rule.interval),
+        }
+    };
+    // Periods from the first one; ten years of daily events is the cap.
+    for k in 0..3_700i64 {
+        let Ok(base) = ev.start.checked_add(step(k)) else {
+            break;
+        };
+        // Weekly + BYDAY: every listed day of that week, in order.
+        let mut candidates = if rule.freq == Freq::Weekly && !rule.by_day.is_empty() {
+            let monday_offset = i64::from(base.weekday().to_monday_zero_offset());
+            let mut days: Vec<jiff::Zoned> = rule
+                .by_day
+                .iter()
+                .filter_map(|d| {
+                    let delta = i64::from(d.to_monday_zero_offset()) - monday_offset;
+                    base.checked_add(jiff::Span::new().days(delta)).ok()
+                })
+                .filter(|z| z.timestamp() >= ev.start.timestamp())
+                .collect();
+            days.sort_by_key(|z| z.timestamp());
+            days
+        } else {
+            vec![base.clone()]
+        };
+        candidates.retain(|z| rule.until.is_none_or(|u| z.timestamp() <= u));
+        if candidates.is_empty() && rule.until.is_some_and(|u| base.timestamp() > u) {
+            break;
+        }
+        for z in candidates {
+            if rule.count.is_some_and(|c| emitted >= c) {
+                return out;
+            }
+            emitted += 1;
+            if keep(&z) {
+                out.push(z.clone());
+            }
+        }
+        if base.timestamp() >= hi {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse VEVENTs → (events, events whose rules are not expanded).
+fn parse_events(raw: &str, tz: &jiff::tz::TimeZone) -> (Vec<Event>, usize) {
     let mut events = Vec::new();
-    let mut recurring = 0usize;
+    let mut unexpanded = 0usize;
     let mut in_event = false;
     let mut summary = String::new();
-    let mut start: Option<(i64, Option<Time>)> = None;
-    let mut end: Option<Time> = None;
+    let mut start: Option<(jiff::Zoned, bool)> = None;
+    let mut end: Option<jiff::Zoned> = None;
+    let mut rule: Option<Rule> = None;
+    let mut exdates: Vec<jiff::Timestamp> = Vec::new();
     for line in unfold(raw) {
-        let (name, value) = split_prop(&line);
+        let (name, params, value) = split_prop(&line);
         match (name.as_str(), in_event) {
             ("BEGIN", _) if value == "VEVENT" => {
                 in_event = true;
                 summary.clear();
                 start = None;
                 end = None;
+                rule = None;
+                exdates.clear();
             }
             ("END", true) if value == "VEVENT" => {
-                if let Some((start_ms, start_time)) = start.take() {
+                if let Some((s, all_day)) = start.take() {
+                    let duration = end
+                        .take()
+                        .and_then(|e| s.until(&e).ok())
+                        .filter(|_| !all_day);
                     events.push(Event {
                         summary: std::mem::take(&mut summary),
-                        start_ms,
-                        start: start_time,
-                        end: end.take(),
+                        start: s,
+                        all_day,
+                        duration,
+                        rule: rule.take(),
+                        exdates: std::mem::take(&mut exdates),
                     });
                 }
                 in_event = false;
             }
             (_, true) => match name.as_str() {
                 "SUMMARY" => summary = value,
-                "DTSTART" => start = parse_dt(&value),
-                "DTEND" => end = parse_dt(&value).and_then(|(_, t)| t),
-                "RRULE" => recurring += 1,
+                "DTSTART" => start = parse_dt(&value, &params, tz),
+                "DTEND" => end = parse_dt(&value, &params, tz).map(|(z, _)| z),
+                "EXDATE" => exdates.extend(
+                    value
+                        .split(',')
+                        .filter_map(|v| parse_dt(v, &params, tz))
+                        .map(|(z, _)| z.timestamp()),
+                ),
+                "RRULE" => match parse_rule(&value, &params, tz) {
+                    Some(r) => rule = Some(r),
+                    None => unexpanded += 1,
+                },
                 _ => {}
             },
             _ => {}
         }
     }
-    (events, recurring)
+    (events, unexpanded)
+}
+
+/// `FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=…;COUNT=…` (the subset above).
+fn parse_rule(v: &str, params: &str, tz: &jiff::tz::TimeZone) -> Option<Rule> {
+    let mut freq = None;
+    let mut rule = Rule {
+        freq: Freq::Daily,
+        interval: 1,
+        by_day: Vec::new(),
+        count: None,
+        until: None,
+    };
+    for part in v.split(';') {
+        let (k, val) = part.split_once('=')?;
+        match k.to_ascii_uppercase().as_str() {
+            "FREQ" => {
+                freq = Some(match val.to_ascii_uppercase().as_str() {
+                    "DAILY" => Freq::Daily,
+                    "WEEKLY" => Freq::Weekly,
+                    "MONTHLY" => Freq::Monthly,
+                    _ => return None,
+                })
+            }
+            "INTERVAL" => rule.interval = val.parse().ok().filter(|n: &i64| *n >= 1)?,
+            "COUNT" => rule.count = Some(val.parse().ok()?),
+            "UNTIL" => rule.until = Some(parse_dt(val, params, tz)?.0.timestamp()),
+            "BYDAY" => {
+                for d in val.split(',') {
+                    rule.by_day.push(match d.to_ascii_uppercase().as_str() {
+                        "MO" => jiff::civil::Weekday::Monday,
+                        "TU" => jiff::civil::Weekday::Tuesday,
+                        "WE" => jiff::civil::Weekday::Wednesday,
+                        "TH" => jiff::civil::Weekday::Thursday,
+                        "FR" => jiff::civil::Weekday::Friday,
+                        "SA" => jiff::civil::Weekday::Saturday,
+                        "SU" => jiff::civil::Weekday::Sunday,
+                        // `1MO`, `-1FR`: positional days are not expanded.
+                        _ => return None,
+                    });
+                }
+            }
+            "WKST" => {}
+            _ => return None,
+        }
+    }
+    rule.freq = freq?;
+    if !rule.by_day.is_empty() && rule.freq != Freq::Weekly {
+        return None;
+    }
+    Some(rule)
 }
 
 /// RFC 5545 §3.1: a CRLF followed by one WSP is a fold — join by dropping
@@ -182,66 +322,55 @@ fn unfold(raw: &str) -> Vec<String> {
     lines
 }
 
-/// `DTSTART;VALUE=DATE:20260120` → (`DTSTART`, `20260120`).
-fn split_prop(line: &str) -> (String, String) {
+/// `DTSTART;TZID=Europe/Madrid:20260120T090000` →
+/// (`DTSTART`, `TZID=Europe/Madrid`, `20260120T090000`).
+fn split_prop(line: &str) -> (String, String, String) {
     let Some((name_part, value)) = line.split_once(':') else {
-        return (line.to_string(), String::new());
+        return (line.to_string(), String::new(), String::new());
     };
-    let name = name_part
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_uppercase();
-    (name, value.to_string())
+    let (name, params) = name_part.split_once(';').unwrap_or((name_part, ""));
+    (
+        name.trim().to_ascii_uppercase(),
+        params.to_string(),
+        value.to_string(),
+    )
 }
 
-/// `YYYYMMDD[T?HHMMSS[Z]]` → (epoch ms, display time). DATE-only values
-/// yield `None` time (all-day).
-fn parse_dt(v: &str) -> Option<(i64, Option<Time>)> {
+/// `YYYYMMDD` (all day), `YYYYMMDDTHHMMSSZ` (UTC), `…;TZID=Zone:` (that
+/// zone) or a floating `YYYYMMDDTHHMMSS` (the operator's zone) → the
+/// instant in its own zone, and whether it is all-day.
+fn parse_dt(v: &str, params: &str, tz: &jiff::tz::TimeZone) -> Option<(jiff::Zoned, bool)> {
     let v = v.trim();
-    if v.len() != 8 && v.len() != 15 && v.len() != 16 {
-        return None;
-    }
-    let y: i64 = v.get(0..4)?.parse().ok()?;
-    let m: i64 = v.get(4..6)?.parse().ok()?;
-    let d: i64 = v.get(6..8)?.parse().ok()?;
-    let days = days_from_civil(y, m, d);
+    let date = jiff::civil::Date::new(
+        v.get(0..4)?.parse().ok()?,
+        v.get(4..6)?.parse().ok()?,
+        v.get(6..8)?.parse().ok()?,
+    )
+    .ok()?;
+    let zone = params
+        .split(';')
+        .find_map(|p| p.strip_prefix("TZID="))
+        .and_then(|name| jiff::tz::TimeZone::get(name.trim_matches('"')).ok())
+        .unwrap_or_else(|| tz.clone());
     if v.len() == 8 {
-        return Some((days * 86_400_000, None));
+        return Some((date.to_zoned(zone).ok()?, true));
     }
     if v.as_bytes().get(8) != Some(&b'T') {
         return None;
     }
-    let hh: i64 = v.get(9..11)?.parse().ok()?;
-    let mi: i64 = v.get(11..13)?.parse().ok()?;
-    let _ss: i64 = v.get(13..15)?.parse().ok()?;
-    let zulu = v.len() == 16;
-    if !zulu && v.len() == 16 {
-        return None;
+    let time = jiff::civil::Time::new(
+        v.get(9..11)?.parse().ok()?,
+        v.get(11..13)?.parse().ok()?,
+        v.get(13..15)?.parse().ok()?,
+        0,
+    )
+    .ok()?;
+    let dt = date.to_datetime(time);
+    match &v[15..] {
+        "Z" => Some((dt.to_zoned(jiff::tz::TimeZone::UTC).ok()?, false)),
+        "" => Some((dt.to_zoned(zone).ok()?, false)),
+        _ => None,
     }
-    if zulu && !v.ends_with('Z') {
-        return None;
-    }
-    let secs = days * 86_400 + hh * 3_600 + mi * 60;
-    Some((
-        secs * 1_000,
-        Some(Time {
-            hhmm: format!("{hh:02}:{mi:02}"),
-            zulu,
-        }),
-    ))
-}
-
-/// Civil date → days since the Unix epoch (Howard Hinnant).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -261,169 +390,116 @@ mod tests {
         Store::open(&dir.join("state.db")).unwrap()
     }
 
-    /// An event time inside the digest window (the local day): half an
-    /// hour out, clamped to 23:58 so a test running near midnight stays
-    /// inside today.
-    fn day_safe(now_ms: i64) -> i64 {
-        let now = jiff::Timestamp::from_millisecond(now_ms)
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        let end = now
-            .with()
-            .time(jiff::civil::time(23, 58, 0, 0))
-            .build()
-            .unwrap();
-        let candidate = now + jiff::Span::new().minutes(30);
-        if candidate <= end {
-            candidate.timestamp().as_millisecond()
-        } else {
-            end.timestamp().as_millisecond()
-        }
+    /// Wednesday 15 July 2026, 07:00 in Madrid (CEST, UTC+2).
+    fn madrid_wed() -> jiff::Zoned {
+        "2026-07-15T07:00:00+02:00[Europe/Madrid]".parse().unwrap()
     }
 
-    /// `YYYYMMDDTHHMMSSZ` for `now + offset_ms`, and its `HH:MM`.
-    fn stamp(now: i64, offset_ms: i64) -> (String, String) {
-        let t = now + offset_ms;
-        let secs = t.div_euclid(1000);
-        let days = secs.div_euclid(86_400);
-        let rem = secs.rem_euclid(86_400);
-        let (h, m) = (rem / 3600, (rem % 3600) / 60);
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = if month <= 2 { y + 1 } else { y };
-        (
-            format!("{year:04}{month:02}{d:02}T{h:02}{m:02}00Z"),
-            format!("{h:02}:{m:02}"),
-        )
+    fn cal(events: &str) -> String {
+        format!("BEGIN:VCALENDAR\n{events}END:VCALENDAR\n")
+    }
+
+    fn ev(body: &str) -> String {
+        format!("BEGIN:VEVENT\n{body}END:VEVENT\n")
     }
 
     #[test]
-    fn event_inside_window_is_listed_in_operator_zone() {
-        let now_ms = ka_agent_core::now_ms();
-        let now = jiff::Timestamp::from_millisecond(now_ms)
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        let (start, hhmm) = stamp(day_safe(now_ms), 0);
-        let (end, _) = stamp(day_safe(now_ms) + 1_800_000, 0);
-        let ics = format!(
-            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:CTest-XYZ\nDTSTART:{start}\nDTEND:{end}\nEND:VEVENT\nEND:VCALENDAR\n"
+    fn utc_zone_and_floating_times_render_in_the_operator_zone() {
+        let out = render(
+            &cal(
+                &(ev("SUMMARY:Zulu\nDTSTART:20260715T150000Z\nDTEND:20260715T153000Z\n")
+                    + &ev("SUMMARY:NewYork\nDTSTART;TZID=America/New_York:20260715T090000\n")
+                    + &ev("SUMMARY:Floating\nDTSTART:20260715T080000\n")),
+            ),
+            &madrid_wed(),
         );
-        let out = render(&ics, &now);
-        // The ICS time is `Z`; the digest labels it in the operator zone.
-        assert!(!out.contains(&format!("{hhmm}Z")), "no zulu suffix: {out}");
-        assert!(out.contains(&hhmm), "{out}");
-        assert!(out.contains("CTest-XYZ"), "{out}");
+        assert!(out.contains("17:00-17:30 Zulu"), "{out}");
+        assert!(out.contains("15:00 NewYork"), "{out}");
+        assert!(out.contains("08:00 Floating"), "{out}");
+        // Sorted by start.
+        let pos = |s: &str| out.find(s).unwrap();
+        assert!(
+            pos("Floating") < pos("NewYork") && pos("NewYork") < pos("Zulu"),
+            "{out}"
+        );
     }
 
     #[test]
-    fn event_outside_window_is_not_listed() {
-        let now_ms = ka_agent_core::now_ms();
-        let now = jiff::Timestamp::from_millisecond(now_ms)
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        let (start, _) = stamp(now_ms + 3 * 86_400_000, 0); // +3 days: outside today
-        let ics = format!(
-            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Far\nDTSTART:{start}\nEND:VEVENT\nEND:VCALENDAR\n"
+    fn weekly_byday_rules_expand_and_exdates_are_skipped() {
+        let weekly =
+            ev("SUMMARY:Standup\nDTSTART:20260706T093000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE\n");
+        assert!(render(&cal(&weekly), &madrid_wed()).contains("09:30 Standup"));
+        let thursday: jiff::Zoned = "2026-07-16T07:00:00+02:00[Europe/Madrid]".parse().unwrap();
+        assert!(!render(&cal(&weekly), &thursday).contains("Standup"));
+        let skipped = ev(
+            "SUMMARY:Standup\nDTSTART:20260706T093000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE\nEXDATE:20260715T093000\n",
         );
-        let out = render(&ics, &now);
-        assert!(out.contains("no events in the next 24h"), "{out}");
+        assert!(!render(&cal(&skipped), &madrid_wed()).contains("Standup"));
+        let fortnightly =
+            ev("SUMMARY:Retro\nDTSTART:20260701T160000\nRRULE:FREQ=WEEKLY;INTERVAL=2\n");
+        assert!(render(&cal(&fortnightly), &madrid_wed()).contains("16:00 Retro"));
+        let off_week = ev("SUMMARY:Retro\nDTSTART:20260708T160000\nRRULE:FREQ=WEEKLY;INTERVAL=2\n");
+        assert!(!render(&cal(&off_week), &madrid_wed()).contains("Retro"));
     }
 
     #[test]
-    fn date_only_event_is_all_day() {
-        let now_ms = ka_agent_core::now_ms();
-        let now = jiff::Timestamp::from_millisecond(now_ms)
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        // Next UTC midnight (or `now` itself at an exact boundary): always
-        // inside the local day window.
-        // Noon of the local day: always inside [today 00:00, tomorrow 00:00).
-        let noon = now
-            .with()
-            .time(jiff::civil::time(12, 0, 0, 0))
-            .build()
-            .unwrap()
-            .timestamp()
-            .as_millisecond();
-        let (stamp_str, _) = stamp(noon, 0);
-        let date_only = &stamp_str[..8];
-        let ics = format!(
-            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:WholeDay\nDTSTART;VALUE=DATE:{date_only}\nEND:VEVENT\nEND:VCALENDAR\n"
+    fn daily_count_until_and_monthly_rules() {
+        let three = ev("SUMMARY:Course\nDTSTART:20260713T180000\nRRULE:FREQ=DAILY;COUNT=3\n");
+        assert!(
+            render(&cal(&three), &madrid_wed()).contains("18:00 Course"),
+            "third of three"
         );
-        let out = render(&ics, &now);
-        assert!(out.contains("(all day) WholeDay"), "{out}");
+        let thursday: jiff::Zoned = "2026-07-16T07:00:00+02:00[Europe/Madrid]".parse().unwrap();
+        assert!(
+            !render(&cal(&three), &thursday).contains("Course"),
+            "COUNT exhausted"
+        );
+        let until = ev(
+            "SUMMARY:Sprint\nDTSTART:20260710T100000\nRRULE:FREQ=DAILY;UNTIL=20260714T235959Z\n",
+        );
+        assert!(!render(&cal(&until), &madrid_wed()).contains("Sprint"));
+        let rent = ev("SUMMARY:Rent\nDTSTART;VALUE=DATE:20260115\nRRULE:FREQ=MONTHLY\n");
+        assert!(render(&cal(&rent), &madrid_wed()).contains("(all day) Rent"));
     }
 
     #[test]
-    fn folded_summary_lines_are_unfolded() {
-        let now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        let (start, _) = stamp(day_safe(ka_agent_core::now_ms()), 0);
-        let ics = format!(
-            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Folded\n PartTwo\nDTSTART:{start}\nEND:VEVENT\nEND:VCALENDAR\n"
+    fn unsupported_rules_are_noted_and_the_rest_still_renders() {
+        let out = render(
+            &cal(&(ev(
+                "SUMMARY:FirstMonday\nDTSTART:20260706T100000\nRRULE:FREQ=MONTHLY;BYDAY=1MO\n",
+            ) + &ev("SUMMARY:Folded\n PartTwo\nDTSTART:20260715T120000\n"))),
+            &madrid_wed(),
         );
-        let out = render(&ics, &now);
-        assert!(out.contains("FoldedPartTwo"), "{out}");
+        assert!(out.contains("12:00 FoldedPartTwo"), "{out}");
+        assert!(
+            out.contains("1 recurring event(s) with rules this digest does not expand"),
+            "{out}"
+        );
     }
 
     #[test]
-    fn rrule_events_are_counted_not_expanded() {
-        let now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        let (start, _) = stamp(day_safe(ka_agent_core::now_ms()), 0);
-        let ics = format!(
-            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Daily\nDTSTART:{start}\nRRULE:FREQ=DAILY\nEND:VEVENT\nEND:VCALENDAR\n"
+    fn empty_day_says_so() {
+        let out = render(
+            &cal(&ev("SUMMARY:Far\nDTSTART:20260720T100000Z\n")),
+            &madrid_wed(),
         );
-        let out = render(&ics, &now);
-        assert!(out.contains("Daily"), "{out}");
-        assert!(out.contains("1 recurring event(s) not expanded"), "{out}");
-    }
-
-    #[test]
-    fn events_are_sorted_by_start() {
-        let now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        // Both inside today: the clamped slot and half an hour before it.
-        let safe = day_safe(ka_agent_core::now_ms());
-        let (late, _) = stamp(safe, 0);
-        let (early, _) = stamp(safe - 1_800_000, 0);
-        let ics = format!(
-            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Late\nDTSTART:{late}\nEND:VEVENT\nBEGIN:VEVENT\nSUMMARY:Early\nDTSTART:{early}\nEND:VEVENT\nEND:VCALENDAR\n"
-        );
-        let out = render(&ics, &now);
-        let early_at = out.find("Early").expect("Early listed");
-        let late_at = out.find("Late").expect("Late listed");
-        assert!(early_at < late_at, "{out}");
+        assert_eq!(out, "no events today");
     }
 
     #[test]
     fn local_path_source_is_read() {
         let root = temp_root("path");
         let store = store_at(&root.join("data"));
-        let _now = jiff::Timestamp::from_millisecond(ka_agent_core::now_ms())
-            .unwrap()
-            .to_zoned(jiff::tz::TimeZone::system());
-        let (start, _) = stamp(day_safe(ka_agent_core::now_ms()), 0);
+        let today = jiff::Zoned::now().with_time_zone(jiff::tz::TimeZone::UTC);
+        let stamp = format!("{}T120000Z", today.strftime("%Y%m%d"));
         let ics = root.join("cal.ics");
         std::fs::write(
             &ics,
-            format!(
-                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:FromFile\nDTSTART:{start}\nEND:VEVENT\nEND:VCALENDAR\n"
-            ),
+            cal(&ev(&format!("SUMMARY:FromFile\nDTSTART:{stamp}\n"))),
         )
         .unwrap();
-        let out = digest(ics.to_str().unwrap(), &store).unwrap();
-        assert!(out.contains("FromFile"), "{out}");
+        let out = digest_in(ics.to_str().unwrap(), &store, &jiff::tz::TimeZone::UTC).unwrap();
+        assert!(out.contains("12:00 FromFile"), "{out}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
