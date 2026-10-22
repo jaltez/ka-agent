@@ -302,10 +302,20 @@ fn update_downloads_verifies_and_swaps() {
     let serve = move |good_checksum: bool| -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        // The asset name the updater asks for on THIS machine.
+        let triple = format!(
+            "{}-{}",
+            std::env::consts::ARCH,
+            match std::env::consts::OS {
+                "linux" => "unknown-linux-gnu",
+                "macos" => "apple-darwin",
+                other => other,
+            }
+        );
         let index = serde_json::json!({
             "tag_name": "v9.9.9",
             "assets": [{
-                "name": "ka-agent-x86_64-unknown-linux-gnu.tar.gz",
+                "name": format!("ka-agent-{triple}.tar.gz"),
                 "browser_download_url": format!("http://127.0.0.1:{port}/t.tar.gz")
             }]
         });
