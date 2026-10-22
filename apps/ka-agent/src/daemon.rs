@@ -508,7 +508,12 @@ async fn serve_attach(
     };
     match ctx.runtime.status_report() {
         Ok(report) => {
-            send(&tx, &SurfaceEvent::Hello { report });
+            send(
+                &tx,
+                &SurfaceEvent::Hello {
+                    report: Box::new(report),
+                },
+            );
         }
         Err(e) => {
             send(
@@ -547,7 +552,12 @@ async fn serve_attach(
         // everything it said before (a piped chat waits for idle with it).
         if req.get("op").and_then(|o| o.as_str()) == Some("status") {
             if let Ok(report) = ctx.runtime.status_report() {
-                send(&tx, &SurfaceEvent::Hello { report });
+                send(
+                    &tx,
+                    &SurfaceEvent::Hello {
+                        report: Box::new(report),
+                    },
+                );
             }
             continue;
         }

@@ -18,7 +18,9 @@ const CAPACITY: usize = 1024;
 pub enum SurfaceEvent {
     /// First event on an attach connection (sent only by attach servers).
     Hello {
-        report: StatusReport,
+        /// Boxed: the report dwarfs every other variant (the wire format is
+        /// unchanged — serde serializes the box transparently).
+        report: Box<StatusReport>,
     },
     /// A router reply for one client; never broadcast.
     Reply {

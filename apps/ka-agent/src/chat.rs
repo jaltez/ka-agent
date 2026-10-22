@@ -209,7 +209,9 @@ impl Backend {
                 runtime, pending, ..
             } => {
                 match runtime.status_report() {
-                    Ok(report) => pending.push_back(SurfaceEvent::Hello { report }),
+                    Ok(report) => pending.push_back(SurfaceEvent::Hello {
+                        report: Box::new(report),
+                    }),
                     Err(e) => return Err(e.to_string()),
                 }
                 Ok(())
