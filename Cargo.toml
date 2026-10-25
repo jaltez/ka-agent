@@ -25,13 +25,16 @@ repository = "https://github.com/jaltez/ka-agent"
 [workspace.dependencies]
 # Ka engine crates, pinned to the exact released version (SEED.md §3.4:
 # exact pin, upgraded deliberately with the contract suite green).
-# Pinned to engine-0.3.x (v0.3.0 + pattern-safe MCP wire names, 7099a52)
-# until an engine patch ships on crates.io; all four from one source so
-# the dialect/strand types crossing into ka-engine stay unified.
-ka-protocol = { git = "https://github.com/jaltez/ka-harness.git", rev = "7099a52" }
-ka-engine = { git = "https://github.com/jaltez/ka-harness.git", rev = "7099a52" }
-ka-dialect = { git = "https://github.com/jaltez/ka-harness.git", rev = "7099a52" }
-ka-strand = { git = "https://github.com/jaltez/ka-harness.git", rev = "7099a52" }
+# v0.4.1 (193ad5d): [prompt] identity_file, live steers at tool-batch
+# boundaries, anthropic consecutive-user merge, embedder-hosted landlock
+# trampoline (ka-sandbox), native opencode-go provider with
+# x-opencode-session routing. All from one source so the dialect/strand
+# types crossing into ka-engine stay unified.
+ka-protocol = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
+ka-engine = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
+ka-dialect = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
+ka-strand = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
+ka-sandbox = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
 
 ka-agent-core = { path = "crates/ka-agent-core" }
 ka-agent-port = { path = "crates/ka-agent-port" }

@@ -972,6 +972,7 @@ dependencies = [
  "ka-agent-runtime",
  "ka-agent-store",
  "ka-agent-web",
+ "ka-sandbox",
  "reqwest",
  "rpassword",
  "rusqlite",
@@ -1054,6 +1055,7 @@ dependencies = [
  "ka-dialect",
  "ka-engine",
  "ka-protocol",
+ "ka-sandbox",
  "ka-strand",
  "reqwest",
  "serde",
@@ -1114,8 +1116,8 @@ dependencies = [
 
 [[package]]
 name = "ka-dialect"
-version = "0.3.0"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
+version = "0.4.1"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
 dependencies = [
  "futures-util",
  "ka-protocol",
@@ -1129,8 +1131,8 @@ dependencies = [
 
 [[package]]
 name = "ka-engine"
-version = "0.3.0"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
+version = "0.4.1"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
 dependencies = [
  "ignore",
  "ka-dialect",
@@ -1156,8 +1158,8 @@ dependencies = [
 
 [[package]]
 name = "ka-protocol"
-version = "0.3.0"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
+version = "0.4.1"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
 dependencies = [
  "schemars",
  "serde",
@@ -1166,8 +1168,8 @@ dependencies = [
 
 [[package]]
 name = "ka-sandbox"
-version = "0.3.0"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
+version = "0.4.1"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
 dependencies = [
  "landlock",
  "serde",
@@ -1176,8 +1178,8 @@ dependencies = [
 
 [[package]]
 name = "ka-strand"
-version = "0.3.0"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=7099a52#7099a5297b8980aa987aedfa304c3222fc6af7b0"
+version = "0.4.1"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
 dependencies = [
  "ka-protocol",
  "serde",

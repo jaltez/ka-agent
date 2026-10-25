@@ -390,6 +390,7 @@ mod tests {
             cache_key: None,
             schema: None,
             native_search: false,
+            session_id: None,
         }
     }
 

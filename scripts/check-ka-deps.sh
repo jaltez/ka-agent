@@ -20,7 +20,7 @@ while read -r member; do
     [[ $allowed -eq 1 ]] && continue
 
     offenders=$(cargo tree -p "$member" --edges normal 2>/dev/null \
-        | grep -oE '^ka-(engine|protocol|dialect|strand) v[0-9]' \
+        | grep -oE '^ka-(engine|protocol|dialect|strand|sandbox) v[0-9]' \
         | awk '{print $1}' | sort -u || true)
     if [[ -n "$offenders" ]]; then
         echo "FAIL: workspace member '$member' depends on ka crate(s):" >&2

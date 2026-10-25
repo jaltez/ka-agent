@@ -14,7 +14,6 @@
 
 pub mod catalog;
 pub mod engine_layer;
-pub mod opencode_proxy;
 pub mod port;
 pub mod proto;
 pub mod scenario;
@@ -30,7 +29,8 @@ pub use scenario::{Scenario, ScenarioSpeaker, Step};
 pub use worker::{WorkerRun, run_worker};
 
 /// The ka-harness content this build is pinned to (`Cargo.toml`): the
-/// `engine-0.3.x` rev `7099a52` — v0.3.0 plus pattern-safe MCP wire
-/// names. `doctor` reports it and backups record it;
-/// `scripts/check-ka-deps.sh` verifies it matches the manifest.
-pub const KA_PIN: &str = "7099a52";
+/// `v0.4.1` rev `193ad5d` — identity_file, live steers, anthropic
+/// user-merge, the embedder trampoline, native opencode-go. `doctor`
+/// reports it and backups record it; `scripts/check-ka-deps.sh`
+/// verifies it matches the manifest.
+pub const KA_PIN: &str = "193ad5d";
