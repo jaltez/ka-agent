@@ -86,6 +86,16 @@ impl Backoff {
         let ms = self.start_ms.saturating_mul(1u64 << a).min(self.max_ms);
         Duration::from_millis(ms)
     }
+
+    /// Delay before spawn attempt `n`: a cold start (attempt 0) spawns
+    /// immediately; restart attempts back off exponentially.
+    pub fn spawn_delay(&self, attempt: u32) -> Duration {
+        if attempt == 0 {
+            Duration::ZERO
+        } else {
+            self.delay(attempt - 1)
+        }
+    }
 }
 
 /// Split a final answer into channel chunks at paragraph boundaries,
@@ -213,6 +223,17 @@ struct Shared {
     /// No-agent cron handlers, registered by kind (e.g. "calendar").
     /// Registered by the app binary; the runtime only dispatches (M11).
     no_agent: Mutex<HashMap<String, NoAgentFn>>,
+    /// Preflight cache: the validated selector per model string (a
+    /// config reload swaps the key; validation then runs once more).
+    selector_cache: Mutex<Option<(String, ka_agent_port::catalog::SelectorInfo)>>,
+    /// The engine `.env` map, keyed by the file's mtime — re-read only
+    /// when the file changed (key set / rotate touches it).
+    env_cache: Mutex<
+        Option<(
+            std::time::SystemTime,
+            std::collections::BTreeMap<String, String>,
+        )>,
+    >,
     /// Wakes the scheduler when a task is scheduled sooner than its sleep.
     scheduler_tick: tokio::sync::Notify,
 }
@@ -379,6 +400,8 @@ impl Runtime {
                 port,
                 surface,
                 no_agent: Mutex::new(HashMap::new()),
+                selector_cache: Mutex::new(None),
+                env_cache: Mutex::new(None),
                 scheduler_tick: tokio::sync::Notify::new(),
                 inner: Mutex::new(Inner {
                     session,
@@ -1901,10 +1924,48 @@ impl Runtime {
             );
         }
         if let Some(model) = &cfg.model {
-            let sel = ka_agent_port::catalog::validate_selector(model)?;
-            let env = ka_agent_port::catalog::read_env_file(
-                &ka_agent_port::catalog::engine_env_path(&self.sh.paths.engine_home()),
-            );
+            // Validate once per model string; re-read the .env file only
+            // when its mtime moved (preflight runs on every submit).
+            let sel = {
+                let mut cache = self
+                    .sh
+                    .selector_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some((cached_model, sel)) = cache.as_ref() {
+                    if cached_model == model {
+                        sel.clone()
+                    } else {
+                        let sel = ka_agent_port::catalog::validate_selector(model)?;
+                        *cache = Some((model.clone(), sel.clone()));
+                        sel
+                    }
+                } else {
+                    let sel = ka_agent_port::catalog::validate_selector(model)?;
+                    *cache = Some((model.clone(), sel.clone()));
+                    sel
+                }
+            };
+            let env_path = ka_agent_port::catalog::engine_env_path(&self.sh.paths.engine_home());
+            let mtime = std::fs::metadata(&env_path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let env = {
+                let mut cache = self.sh.env_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((cached_mtime, env)) = cache.as_ref() {
+                    if *cached_mtime == mtime {
+                        env.clone()
+                    } else {
+                        let env = ka_agent_port::catalog::read_env_file(&env_path);
+                        *cache = Some((mtime, env.clone()));
+                        env
+                    }
+                } else {
+                    let env = ka_agent_port::catalog::read_env_file(&env_path);
+                    *cache = Some((mtime, env.clone()));
+                    env
+                }
+            };
             if let ka_agent_port::catalog::KeyState::Missing(name) =
                 ka_agent_port::catalog::key_state(&sel, &env)
             {
@@ -2011,7 +2072,7 @@ impl Runtime {
             cfg.worker_restart.backoff_start_ms,
             cfg.worker_restart.backoff_max_ms,
         )
-        .delay(self.lock().restart_attempt);
+        .spawn_delay(self.lock().restart_attempt);
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
@@ -2739,6 +2800,15 @@ mod tests {
     fn backoff_min_one_ms() {
         let b = Backoff::new(0, 0);
         assert_eq!(b.delay(0), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn spawn_delay_zero_on_cold_start_then_backs_off() {
+        let b = Backoff::new(1000, 60_000);
+        assert_eq!(b.spawn_delay(0), Duration::ZERO, "cold start is immediate");
+        assert_eq!(b.spawn_delay(1), Duration::from_millis(1000));
+        assert_eq!(b.spawn_delay(2), Duration::from_millis(2000));
+        assert_eq!(b.spawn_delay(7), Duration::from_millis(60_000));
     }
 
     #[test]

@@ -814,6 +814,7 @@ fn main() -> std::process::ExitCode {
         }
         Command::Chat { config, scenario } => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             else {
@@ -828,6 +829,7 @@ fn main() -> std::process::ExitCode {
             web_port,
         } => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             else {

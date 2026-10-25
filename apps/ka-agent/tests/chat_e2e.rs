@@ -139,6 +139,35 @@ fn scenario_file(root: &std::path::Path, name: &str, body: &str) -> std::path::P
     p
 }
 
+impl Chat {
+    /// Byte offset of the transcript so far — pass to [`Self::expect_from`]
+    /// to wait for output that must arrive after the mark (scenario
+    /// workers replay their steps, so plain `contains` can match stale
+    /// turn-1 output).
+    fn mark(&self) -> usize {
+        self.seen.borrow().len()
+    }
+
+    /// Wait until output appended after `from` contains `needle`.
+    fn expect_from(&mut self, needle: &str, from: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            while let Ok(line) = self.rx.try_recv() {
+                self.seen.borrow_mut().push_str(&line);
+                self.seen.borrow_mut().push('\n');
+            }
+            if self.seen.borrow().len() > from && self.seen.borrow()[from..].contains(needle) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for fresh {needle:?}; output so far:\n{}",
+            self.seen.borrow()
+        );
+    }
+}
+
 fn temp_root(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ka-agent-e2e-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -190,9 +219,21 @@ fn idle_worker_is_stopped_then_restarted_on_demand() {
     chat.expect("worker: stopped", Duration::from_secs(5));
 
     // The next message works exactly as before: a fresh worker on the
-    // resumed strand, with zero crash bookkeeping.
+    // resumed strand, with zero crash bookkeeping — and the cold spawn
+    // is immediate (Backoff::spawn_delay: no flat backoff on attempt 0).
+    // The scenario worker replays its steps from the top, so the fresh
+    // "first-alive" after the mark is the new turn's first delta: its
+    // arrival time bounds submit → spawn → TurnStarted.
+    let mark = chat.mark();
+    let t0 = Instant::now();
     chat.send("second message");
-    chat.expect("second-alive", Duration::from_secs(30));
+    chat.expect_from("first-alive", mark, Duration::from_secs(30));
+    let cold = t0.elapsed();
+    eprintln!("cold restart: {cold:?}");
+    assert!(
+        cold < Duration::from_millis(500),
+        "cold restart took {cold:?} (flat backoff regression?)"
+    );
     chat.expect("turn done", Duration::from_secs(10));
     chat.send("/status");
     chat.expect("crashes 0", Duration::from_secs(10));
