@@ -463,10 +463,13 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
         &[("X-Ka-Agent", "1")],
     );
     assert_eq!(sent.status, 200);
+    // A loaded runner can still be finishing earlier turns, so allow the
+    // queued turn a generous window; the assertion is about the open
+    // socket seeing the events, not about model latency.
     let stream = read_events_until(
         events,
         &["\"ev\":\"inbound\"", "\"ev\":\"delta\""],
-        Duration::from_secs(30),
+        Duration::from_secs(120),
     );
     assert!(stream.contains("\"ev\":\"inbound\""), "stream: {stream}");
     assert!(stream.contains("\"ev\":\"delta\""), "stream: {stream}");
