@@ -17,9 +17,13 @@ pub use surface::TelegramSurface;
 
 use std::time::Duration;
 
+use serde_json::Value;
 use thiserror::Error;
 const POLL_TIMEOUT_SECS: u64 = 25;
 const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(40);
+/// Media uploads (`sendPhoto`/`sendDocument`) get their own timeout: the
+/// tool cap is 50 MB, which does not fit 40 s over a slow upstream link.
+const MEDIA_HTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 const NOTE_EDIT_INTERVAL_MS: i64 = 3_000;
 const SEND_SPACING_MS: i64 = 1_000;
@@ -31,7 +35,14 @@ const START_REPLY: &str = "This is a private assistant. If you are its owner, ru
 #[derive(Debug, Error)]
 pub(crate) enum ChannelError {
     #[error("telegram api: {description}")]
-    Api { description: String },
+    Api {
+        description: String,
+        /// Bot API `error_code`: 429 is flood control (retry), 400/404 mean
+        /// the method itself is unavailable.
+        error_code: Option<i64>,
+        /// `parameters.retry_after` (seconds) on a 429 answer.
+        retry_after: Option<i64>,
+    },
     #[error("telegram http: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -40,14 +51,34 @@ impl ChannelError {
     fn api(description: impl Into<String>) -> Self {
         Self::Api {
             description: description.into(),
+            error_code: None,
+            retry_after: None,
+        }
+    }
+
+    /// One Bot API `{ok:false,…}` answer, keeping the fields a caller needs
+    /// to tell a transient refusal (429) from a missing method (404).
+    fn from_api_answer(v: &Value) -> Self {
+        Self::Api {
+            description: v["description"]
+                .as_str()
+                .unwrap_or("unknown api error")
+                .to_string(),
+            error_code: v["error_code"].as_i64(),
+            retry_after: v["parameters"]["retry_after"].as_i64(),
         }
     }
 
     /// Bad-token failures: Telegram answers 401/404 with these descriptions.
     pub(crate) fn is_auth_failure(&self) -> bool {
         match self {
-            Self::Api { description } => {
-                description.contains("Unauthorized")
+            Self::Api {
+                description,
+                error_code,
+                ..
+            } => {
+                matches!(error_code, Some(401) | Some(404))
+                    || description.contains("Unauthorized")
                     || description.contains("Not Found")
                     || description.contains("401")
                     || description.contains("404")
@@ -95,6 +126,35 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::balance_fences;
+    use super::{ChannelError, MEDIA_HTTP_TIMEOUT, POLL_HTTP_TIMEOUT};
+
+    #[test]
+    fn media_uploads_get_a_longer_timeout() {
+        // A 50 MB `sendDocument` does not fit the polling timeout.
+        assert_eq!(MEDIA_HTTP_TIMEOUT, std::time::Duration::from_secs(600));
+        assert!(MEDIA_HTTP_TIMEOUT > POLL_HTTP_TIMEOUT);
+    }
+
+    #[test]
+    fn api_errors_keep_the_code_and_retry_after() {
+        let err = ChannelError::from_api_answer(&serde_json::json!({
+            "ok": false,
+            "error_code": 429,
+            "description": "Too Many Requests: retry after 7",
+            "parameters": { "retry_after": 7 },
+        }));
+        match err {
+            ChannelError::Api {
+                error_code,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(error_code, Some(429));
+                assert_eq!(retry_after, Some(7));
+            }
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn fence_balancing() {

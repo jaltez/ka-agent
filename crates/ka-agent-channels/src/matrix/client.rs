@@ -243,6 +243,10 @@ impl Client {
 
     /// Upload a file and post it as `m.image` (image extensions) or
     /// `m.file`, with `caption` as the body text.
+    ///
+    /// The size limit and the caption cap are applied before the bytes are
+    /// read: an oversized file is refused from its metadata, and the
+    /// caption is cut to one message body (it cannot be split like a reply).
     pub(super) async fn send_file(
         &self,
         room: &str,
@@ -251,6 +255,7 @@ impl Client {
         caption: &str,
     ) -> Result<(), String> {
         const MAX_UPLOAD: u64 = 50 * 1024 * 1024;
+        let caption = ka_agent_core::truncate_at_char(caption, REPLY_CAP);
         let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if !meta.is_file() {
             return Err(format!("{} is not a file", path.display()));
@@ -259,15 +264,16 @@ impl Client {
             return Err(format!("{} is larger than 50 MB", path.display()));
         }
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let size = bytes.len();
         let (msgtype, mime) = media_kind(name);
-        let url = self.upload(name, mime, bytes.clone()).await?;
+        let url = self.upload(name, mime, bytes).await?;
         let body = if caption.is_empty() { name } else { caption };
         let content = json!({
             "msgtype": msgtype,
             "body": body,
             "filename": name,
             "url": url,
-            "info": { "size": bytes.len(), "mimetype": mime },
+            "info": { "size": size, "mimetype": mime },
         });
         self.send_event(room, "m.room.message", &content)
             .await

@@ -56,6 +56,8 @@ pub(super) struct SurfaceInner {
     /// Stream replies with `sendMessageDraft`; cleared for good the first
     /// time the API refuses a draft (older Bot API servers).
     drafts: AtomicBool,
+    /// Set after a 429: no draft request before this instant (`retry_after`).
+    draft_blocked_until_ms: AtomicI64,
     /// One draft request at a time: a slow one is never overtaken by an
     /// older snapshot.
     draft_in_flight: AtomicBool,
@@ -82,6 +84,15 @@ struct Draft {
 const DRAFT_MIN_INTERVAL_MS: i64 = 1000;
 const DRAFT_MIN_GROWTH: usize = 40;
 
+/// The text one `sendMessageDraft` carries, plus the length the throttle
+/// compares: plain text, at most `MAX_MESSAGE_CHARS - 1` characters (the
+/// Bot API cap is 4096, drafts stay one under it).
+fn draft_text(full: &str) -> (String, usize) {
+    let text: String = full.chars().take(MAX_MESSAGE_CHARS - 1).collect();
+    let len = text.chars().count();
+    (text, len)
+}
+
 /// Telegram caps an uploaded photo at 10 MB; bigger images go as documents.
 const PHOTO_MAX_BYTES: usize = 10 * 1024 * 1024;
 
@@ -98,6 +109,7 @@ impl SurfaceInner {
             last_send_ms: AsyncMutex::new(0),
             typing: Mutex::new(None),
             drafts: AtomicBool::new(true),
+            draft_blocked_until_ms: AtomicI64::new(0),
             draft_in_flight: AtomicBool::new(false),
             draft: Mutex::new(Draft::default()),
         }
@@ -142,7 +154,7 @@ impl SurfaceInner {
         if html.chars().count() <= MAX_MESSAGE_CHARS {
             match self.client.send_message_html(chat, &html, None).await {
                 Ok(_) => fallback = false,
-                Err(ChannelError::Api { description }) => {
+                Err(ChannelError::Api { description, .. }) => {
                     eprintln!("telegram: HTML refused ({description}); sending plain text");
                 }
                 Err(e) => {
@@ -204,31 +216,38 @@ impl SurfaceInner {
             if d.id == 0 {
                 return;
             }
+            let now = now_ms();
+            // Flood control: no request before the wait Telegram asked for
+            // has elapsed; streaming itself stays on.
+            if now < self.draft_blocked_until_ms.load(Ordering::Acquire) {
+                return;
+            }
             // Drafts are plain text (a half-written reply has unbalanced
             // Markdown); Telegram caps a message at 4096 characters.
-            let (text, activity) = if d.text.is_empty() {
-                (None, d.activity.clone())
+            let (text, len, activity) = if d.text.is_empty() {
+                (None, 0, d.activity.clone())
             } else {
-                let text: String = d.text.chars().take(MAX_MESSAGE_CHARS - 1).collect();
-                (Some(text), None)
+                let (text, len) = draft_text(&d.text);
+                (Some(text), len, None)
             };
             let content = match (&text, &activity) {
                 (Some(text), _) => text.clone(),
                 (None, Some(activity)) => activity.clone(),
                 (None, None) => return,
             };
-            let now = now_ms();
             let due = now - d.pushed_ms >= DRAFT_MIN_INTERVAL_MS;
-            // Streamed text has to grow; an activity label replaces the
-            // previous one wholesale, so any change is worth a request.
+            // Streamed text has to grow; the comparison uses the truncated
+            // length, so text past the cap never re-sends an identical
+            // draft. An activity label replaces the previous one wholesale,
+            // so any change is worth a request.
             let worth = match &text {
-                Some(_) => d.text.len().saturating_sub(d.pushed_len) >= DRAFT_MIN_GROWTH,
+                Some(_) => len.saturating_sub(d.pushed_len) >= DRAFT_MIN_GROWTH,
                 None => d.pushed_activity.as_deref() != Some(content.as_str()),
             };
             if !(due && worth) || self.draft_in_flight.swap(true, Ordering::AcqRel) {
                 return;
             }
-            d.pushed_len = d.text.len();
+            d.pushed_len = len;
             d.pushed_activity = activity;
             d.pushed_ms = now;
             (d.id, content)
@@ -238,12 +257,49 @@ impl SurfaceInner {
             let (id, text) = snapshot;
             match inner.client.send_message_draft(chat, id, &text).await {
                 Ok(()) => {}
-                Err(ChannelError::Api { description }) => {
+                // 429 = flood control: transient. Wait what Telegram asks
+                // for and keep streaming; the refused text was not shown, so
+                // the next flush may resend it.
+                Err(ChannelError::Api {
+                    description,
+                    error_code: Some(429),
+                    retry_after,
+                }) => {
+                    let wait = retry_after.unwrap_or(1).clamp(1, 86_400);
+                    inner
+                        .draft_blocked_until_ms
+                        .store(now_ms() + wait * 1000, Ordering::Release);
+                    {
+                        let mut d = inner.draft.lock().unwrap_or_else(|e| e.into_inner());
+                        // Only rewind the draft this request belonged to: a
+                        // newer turn may already have pushed its own text.
+                        if d.id == id {
+                            d.pushed_len = 0;
+                            d.pushed_activity = None;
+                        }
+                    }
+                    eprintln!("telegram: draft flood control ({description}); retrying in {wait}s");
+                }
+                // 400/404: the method itself is not there (a Bot API server
+                // that predates drafts). Streaming stays off for the process.
+                Err(ChannelError::Api {
+                    description,
+                    error_code: Some(400 | 404),
+                    ..
+                }) => {
                     if inner.drafts.swap(false, Ordering::AcqRel) {
                         eprintln!(
                             "telegram: streaming off ({description}); replies arrive when finished"
                         );
                     }
+                }
+                // Any other code: log it and leave the flag unchanged.
+                Err(ChannelError::Api {
+                    description,
+                    error_code,
+                    ..
+                }) => {
+                    eprintln!("telegram: draft refused ({error_code:?}): {description}");
                 }
                 Err(e) => eprintln!("telegram: draft: {e}"),
             }
@@ -623,9 +679,10 @@ impl Surface for TelegramSurface {
             | AgentEvent::Compacting { .. }
             | AgentEvent::Inbound { .. }
             | AgentEvent::Session { .. } => {}
+            // A fired reminder is its own notification, never a model turn.
+            AgentEvent::Reminder { text, .. } => self.inner.spawn_send(format!("⏰ {text}")),
             // Later steps wire these to real deliveries.
-            AgentEvent::Reminder { .. }
-            | AgentEvent::CronFinished { .. }
+            AgentEvent::CronFinished { .. }
             | AgentEvent::Queue { .. }
             | AgentEvent::Settings { .. } => {}
             // Per-connection events never reach a broadcast surface.
@@ -667,5 +724,33 @@ fn photo_mime(name: &str) -> Option<&'static str> {
         "png" => Some("image/png"),
         "webp" => Some("image/webp"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{MAX_MESSAGE_CHARS, draft_text};
+
+    #[test]
+    fn draft_length_stops_growing_at_the_cap() {
+        assert_eq!(draft_text("short"), ("short".to_string(), 5));
+
+        let full = "a".repeat(MAX_MESSAGE_CHARS + 400);
+        let (text, len) = draft_text(&full);
+        assert_eq!(len, MAX_MESSAGE_CHARS - 1);
+        assert_eq!(text.chars().count(), len);
+
+        // Growing only past the cap leaves the compared length alone, so
+        // the throttle sees no growth and sends nothing.
+        let (_, longer) = draft_text(&format!("{full}bbbb"));
+        assert_eq!(longer, len);
+
+        // Characters, not bytes: multi-byte text never splits a glyph.
+        let wide = "🙂".repeat(MAX_MESSAGE_CHARS + 5);
+        let (text, len) = draft_text(&wide);
+        assert_eq!(len, MAX_MESSAGE_CHARS - 1);
+        assert_eq!(text.chars().count(), len);
     }
 }

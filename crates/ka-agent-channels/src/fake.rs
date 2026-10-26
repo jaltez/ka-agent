@@ -33,6 +33,9 @@ struct State {
     /// When set, `sendMessageDraft` fails like a Bot API server that
     /// predates it.
     reject_drafts: bool,
+    /// Scripted refusals: `(method, error_code, retry_after, remaining)`.
+    /// The first matching entry answers `ok:false` and is consumed.
+    failures: Vec<(String, i64, Option<i64>, u32)>,
 }
 
 /// A fake `api.telegram.org`. Spawn on an ephemeral local port and point
@@ -286,6 +289,17 @@ impl FakeBotServer {
             .unwrap_or_else(|e| e.into_inner())
             .reject_drafts = on;
     }
+
+    /// Refuse the next `times` calls to `method` with a Bot API
+    /// `{ok:false, error_code, description}` answer; `retry_after` also sets
+    /// `parameters.retry_after` (the 429 flood-control shape).
+    pub fn fail_method(&self, method: &str, error_code: i64, retry_after: Option<i64>, times: u32) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failures
+            .push((method.to_string(), error_code, retry_after, times));
+    }
 }
 
 /// Read one request: request line + headers, then Content-Length body.
@@ -371,7 +385,48 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<Strin
             body: body.clone(),
             raw,
         });
-        return json!({ "ok": false, "description": "Not Found: method not found" }).to_string();
+        return json!({
+            "ok": false,
+            "error_code": 404,
+            "description": "Not Found: method not found",
+        })
+        .to_string();
+    }
+    let failure = {
+        let idx = st
+            .failures
+            .iter()
+            .position(|(m, _, _, left)| m == &method && *left > 0);
+        idx.map(|i| {
+            let (_, code, retry_after, left) = &mut st.failures[i];
+            *left -= 1;
+            (*code, *retry_after)
+        })
+    };
+    if let Some((error_code, retry_after)) = failure {
+        st.captured.push(CapturedRequest {
+            method,
+            body: body.clone(),
+            raw,
+        });
+        let description = match error_code {
+            429 => match retry_after {
+                Some(secs) => format!("Too Many Requests: retry after {secs}"),
+                None => "Too Many Requests: retry later".to_string(),
+            },
+            404 => "Not Found: method not found".to_string(),
+            400 => "Bad Request: bad request".to_string(),
+            other => format!("error {other}"),
+        };
+        let mut answer = json!({
+            "ok": false,
+            "error_code": error_code,
+            "description": description,
+        });
+        if let Some(secs) = retry_after {
+            answer["parameters"] = json!({ "retry_after": secs });
+        }
+        return answer.to_string();
     }
     let result = match method.as_str() {
         "getUpdates" => {
@@ -442,6 +497,19 @@ struct MatrixState {
     joins: Vec<String>,
     /// `/sync` requests currently held open (long-poll).
     syncs_pending: usize,
+    /// Outbound `/send` requests to hold before answering:
+    /// `(body needle, delay)`; the first matching request consumes one.
+    send_delays: Vec<(String, Duration)>,
+    /// `/send` requests currently held by a [`MatrixState::send_delays`]
+    /// entry, so a test can wait for a send to be in flight.
+    sends_in_flight: usize,
+    /// Every `/send` request seen (refused ones and retries included).
+    send_attempts: usize,
+    /// Refuse `m.replace` edits with `500`, as a homeserver that rejects
+    /// edits would.
+    reject_edits: bool,
+    /// Refuse the next `n` plain messages with `500`.
+    fail_plain_sends: u32,
 }
 
 /// One outbound Matrix event recorded by the fake homeserver.
@@ -584,15 +652,41 @@ impl FakeHomeserver {
                 let state = Arc::clone(&rt_state);
                 tokio::spawn(async move {
                     if let Some((path, body, raw)) = read_request(&mut socket).await {
-                        let response = if path.starts_with("/_matrix/client/v3/sync") {
-                            matrix_sync(&state, &path).await
+                        // An outbound send a test asked to hold: the client
+                        // stays in flight while the test drives the stream.
+                        let held = if path.contains("/send/") {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.send_attempts += 1;
+                            let idx = st.send_delays.iter().position(|(needle, _)| {
+                                body["body"]
+                                    .as_str()
+                                    .is_some_and(|b| b.contains(needle.as_str()))
+                            });
+                            idx.map(|i| st.send_delays.remove(i).1)
+                        } else {
+                            None
+                        };
+                        if let Some(delay) = held {
+                            state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .sends_in_flight += 1;
+                            tokio::time::sleep(delay).await;
+                            state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .sends_in_flight -= 1;
+                        }
+                        let (code, response) = if path.starts_with("/_matrix/client/v3/sync") {
+                            (200, matrix_sync(&state, &path).await)
                         } else {
                             matrix_handle(&state, &path, &body, raw.as_deref())
                         };
+                        let reason = if code == 200 { "OK" } else { "Server Error" };
                         let _ = socket
                             .write_all(
                                 format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                                    "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                                     response.len()
                                 )
                                 .as_bytes(),
@@ -681,6 +775,51 @@ impl FakeHomeserver {
             .unwrap_or_else(|e| e.into_inner())
             .syncs_pending
             > 0
+    }
+
+    /// Hold the next outbound `/send` whose body contains `needle` for
+    /// `delay` before answering: the client's request stays in flight
+    /// meanwhile (a slow homeserver).
+    pub fn delay_next_send(&self, needle: &str, delay: Duration) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send_delays
+            .push((needle.to_string(), delay));
+    }
+
+    /// `/send` requests currently held by [`Self::delay_next_send`].
+    pub fn sends_in_flight(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sends_in_flight
+    }
+
+    /// Every `/send` request the server saw: refused attempts and retries
+    /// included.
+    pub fn send_attempts(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send_attempts
+    }
+
+    /// Refuse `m.replace` edits with `500`, as a homeserver that rejects
+    /// edits would.
+    pub fn reject_edits(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reject_edits = true;
+    }
+
+    /// Refuse the next `n` plain messages with `500`.
+    pub fn fail_plain_sends(&self, n: u32) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fail_plain_sends = n;
     }
 
     /// Wait until the homeserver saw a send with this text fragment.
@@ -809,24 +948,26 @@ impl FakeHomeserver {
     }
 }
 
+/// `(status code, response body)` for one fake homeserver request.
 fn matrix_handle(
     state: &Arc<Mutex<MatrixState>>,
     path: &str,
     body: &Value,
     raw: Option<&str>,
-) -> String {
+) -> (u16, String) {
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(key) = path
         .strip_prefix("/_matrix/client/v1/media/download/")
         .or_else(|| path.strip_prefix("/_matrix/media/v3/download/"))
     {
         // Test media is ASCII; the JSON-only writer sends it verbatim.
-        return st
+        let bytes = st
             .media
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
+        return (200, bytes);
     }
     if path.starts_with("/_matrix/media/v3/upload") {
         let name = query_param(path, "filename").unwrap_or_default();
@@ -835,11 +976,30 @@ fn matrix_handle(
         let key = format!("fake/{id}");
         st.uploads.push((name, bytes.clone()));
         st.media.push((key.clone(), bytes));
-        return serde_json::json!({ "content_uri": format!("mxc://{key}") }).to_string();
+        return (
+            200,
+            serde_json::json!({ "content_uri": format!("mxc://{key}") }).to_string(),
+        );
     }
     if let Some(rest) = path.strip_prefix("/_matrix/client/v3/rooms/") {
         if let Some((room, tail)) = rest.split_once("/send/") {
             let event_type = tail.split('/').next().unwrap_or("").to_string();
+            let is_edit = body["m.relates_to"]["rel_type"].as_str() == Some("m.replace");
+            if st.reject_edits && is_edit {
+                return (
+                    500,
+                    serde_json::json!({"errcode": "M_UNKNOWN", "error": "edits refused"})
+                        .to_string(),
+                );
+            }
+            if !is_edit && event_type == "m.room.message" && st.fail_plain_sends > 0 {
+                st.fail_plain_sends -= 1;
+                return (
+                    500,
+                    serde_json::json!({"errcode": "M_UNKNOWN", "error": "send refused"})
+                        .to_string(),
+                );
+            }
             st.sent.push(CapturedRequest {
                 method: event_type.clone(),
                 body: body.clone(),
@@ -853,17 +1013,20 @@ fn matrix_handle(
                 body: body.clone(),
                 event_id: event_id.clone(),
             });
-            return serde_json::json!({ "event_id": event_id }).to_string();
+            return (200, serde_json::json!({ "event_id": event_id }).to_string());
         }
         if let Some(room) = rest.strip_suffix("/join") {
             st.joins.push(percent_decode(room));
-            return serde_json::json!({ "room_id": percent_decode(room) }).to_string();
+            return (
+                200,
+                serde_json::json!({ "room_id": percent_decode(room) }).to_string(),
+            );
         }
         if let Some((room, _)) = rest.split_once("/typing/") {
             st.typing.push((percent_decode(room), body.clone()));
         }
     }
-    serde_json::json!({}).to_string()
+    (200, serde_json::json!({}).to_string())
 }
 
 // ---------------------------------------------------------------------------

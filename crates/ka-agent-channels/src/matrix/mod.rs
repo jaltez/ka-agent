@@ -8,9 +8,10 @@
 //! `/pair <code>` message which redeems a one-time pairing code (§5.2).
 //!
 //! Outbound: operator turns stream as one message edited with `m.replace`
-//! (first draft after 80 characters or 2 s, then one edit every 2 s with
-//! 80 new characters), with `m.typing` while the turn runs; scheduled turns
-//! (`cron`/`briefing`) arrive as one message at the end. Approval cards stay
+//! (first draft after 80 bytes or 2 s, then one edit every 2 s with
+//! 80 new bytes), with `m.typing` while the turn runs; scheduled turns
+//! (`cron`/`briefing`) arrive as one message at the end. A fired reminder
+//! is posted as `⏰ <text>`. Approval cards stay
 //! text (`/y`/`/n`) and also accept a ✅/❌ `m.annotation` reaction. Inbound
 //! `m.image`/`m.file`/`m.video` land in `<workspace>/attachments`, and
 //! `AgentEvent::File` is uploaded and posted as media.

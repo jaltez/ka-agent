@@ -4,6 +4,21 @@ use super::*;
 
 use serde_json::{Value, json};
 
+/// Telegram's caption limit for `sendPhoto`/`sendDocument`, in characters
+/// (the limit counts characters, not bytes).
+const MAX_CAPTION_CHARS: usize = 1024;
+
+/// Truncate a caption to [`MAX_CAPTION_CHARS`]: an over-long one keeps
+/// 1023 characters plus `…`, so the field still fits the limit.
+fn capped_caption(caption: &str) -> String {
+    if caption.chars().count() <= MAX_CAPTION_CHARS {
+        return caption.to_string();
+    }
+    let mut out: String = caption.chars().take(MAX_CAPTION_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Bot API client
 // ---------------------------------------------------------------------------
@@ -36,9 +51,7 @@ impl TelegramClient {
         if v["ok"].as_bool() == Some(true) {
             Ok(v["result"].clone())
         } else {
-            Err(ChannelError::api(
-                v["description"].as_str().unwrap_or("unknown api error"),
-            ))
+            Err(ChannelError::from_api_answer(&v))
         }
     }
 
@@ -112,7 +125,10 @@ impl TelegramClient {
 
     /// Upload one file as `sendPhoto`/`sendDocument` (`field` is `photo`
     /// or `document`). `mime` lets Telegram accept a photo without
-    /// sniffing; the caption is omitted when empty.
+    /// sniffing; the caption is omitted when empty and truncated to
+    /// Telegram's 1024-character cap (with `…`) when longer. Uploads get
+    /// [`MEDIA_HTTP_TIMEOUT`] instead of the polling timeout: a 50 MB file
+    /// does not fit 40 s.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_media(
         &self,
@@ -125,8 +141,9 @@ impl TelegramClient {
         caption: &str,
     ) -> Result<i64, ChannelError> {
         let mut form = reqwest::multipart::Form::new().text("chat_id", chat_id.to_string());
+        let caption = capped_caption(caption);
         if !caption.is_empty() {
-            form = form.text("caption", caption.to_string());
+            form = form.text("caption", caption);
         }
         let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
         if let Some(mime) = mime {
@@ -135,7 +152,7 @@ impl TelegramClient {
         let resp = self
             .http
             .post(format!("{}/{method}", self.base))
-            .timeout(POLL_HTTP_TIMEOUT)
+            .timeout(MEDIA_HTTP_TIMEOUT)
             .multipart(form.part(field.to_string(), part))
             .send()
             .await?;
@@ -143,9 +160,7 @@ impl TelegramClient {
         if v["ok"].as_bool() == Some(true) {
             Ok(v["result"]["message_id"].as_i64().unwrap_or(0))
         } else {
-            Err(ChannelError::api(
-                v["description"].as_str().unwrap_or("unknown api error"),
-            ))
+            Err(ChannelError::from_api_answer(&v))
         }
     }
 
@@ -278,4 +293,28 @@ pub async fn telegram_get_me(api_base: &str, token: &str) -> Result<String, Stri
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| "telegram getMe: no username in the answer".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{MAX_CAPTION_CHARS, capped_caption};
+
+    #[test]
+    fn captions_over_the_limit_are_truncated_with_an_ellipsis() {
+        assert_eq!(capped_caption(""), "");
+        assert_eq!(capped_caption("a caption"), "a caption");
+        let exact = "x".repeat(MAX_CAPTION_CHARS);
+        assert_eq!(capped_caption(&exact), exact);
+        let long = "y".repeat(MAX_CAPTION_CHARS + 500);
+        let capped = capped_caption(&long);
+        assert_eq!(capped.chars().count(), MAX_CAPTION_CHARS);
+        assert!(capped.ends_with('…'));
+        // characters, not bytes: a multi-byte caption is never split mid-glyph
+        let wide = "🙂".repeat(MAX_CAPTION_CHARS + 10);
+        let capped = capped_caption(&wide);
+        assert_eq!(capped.chars().count(), MAX_CAPTION_CHARS);
+        assert!(capped.ends_with("🙂…"), "whole last glyph kept");
+    }
 }

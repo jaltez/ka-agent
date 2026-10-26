@@ -216,6 +216,37 @@ async fn commands_route_locally() {
     stop(&mut stack).await;
 }
 
+/// M7: a Telegram deep link (`/start <payload>`) answers the command list,
+/// never `unknown command /<payload>`.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_deep_link_lists_commands() {
+    let mut stack = spawn_channel(vec![42], "tok-start").await;
+    stack.server.push_text_message(1, 7, 42, "/start abc123");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Tip: just talk to me")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("the command list answers a deep link");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let unknown = stack.server.captured().into_iter().any(|c| {
+        c.method == "sendMessage"
+            && c.body["text"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("unknown command /abc123")
+    });
+    assert!(!unknown, "the payload is not treated as a help topic");
+    stop(&mut stack).await;
+}
+
 /// File inbox (SEED.md §5.4): a photo is downloaded into the workspace's
 /// attachments dir and answered with a usable `@attachments/…` reference;
 /// the bytes on disk are exactly what the fake served.
@@ -485,6 +516,49 @@ async fn approval_card_and_callback_settle() {
         .unwrap();
 }
 
+/// M3: every callback query is answered exactly once. Data this build does
+/// not understand closes the spinner with an empty answer and changes
+/// nothing (no card edit, no other traffic).
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_callback_prefix_is_answered_once_and_changes_nothing() {
+    let mut stack = spawn_channel(vec![42], "tok-cb").await;
+    // Learn the chat first so the callback takes the normal dispatch path.
+    stack.server.push_text_message(1, 7, 42, "/status");
+    stack
+        .server
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .expect("status reply");
+    let before = stack.server.captured().len();
+    stack.server.push_callback(2, 7, 42, "zz:bogus:data");
+    let answered = stack
+        .server
+        .await_capture(
+            |c| c.method == "answerCallbackQuery",
+            Duration::from_secs(5),
+        )
+        .expect("callback answered");
+    assert_eq!(
+        answered.body["text"].as_str(),
+        Some(""),
+        "an empty answer still closes the spinner"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after: Vec<_> = stack.server.captured()[before..].to_vec();
+    assert_eq!(
+        after
+            .iter()
+            .filter(|c| c.method == "answerCallbackQuery")
+            .count(),
+        1,
+        "answered exactly once: {after:?}"
+    );
+    assert!(
+        after.iter().all(|c| c.method != "editMessageText"),
+        "no card is touched: {after:?}"
+    );
+    stop(&mut stack).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn surface_noops_until_chat_is_known() {
     let (server, base) = FakeBotServer::spawn();
@@ -573,8 +647,9 @@ async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
     assert!(final_msg.body["text"].as_str().unwrap().contains("word"));
 }
 
-/// D1 fallback: a Bot API server without drafts — the first refusal turns
-/// streaming off and the answer still arrives as a normal message.
+/// D1 fallback: a Bot API server without drafts — the first 404 refusal
+/// turns streaming off once and the answer still arrives as a normal
+/// message.
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_drafts_fall_back_to_the_finished_message() {
     let (server, base) = FakeBotServer::spawn();
@@ -617,6 +692,116 @@ async fn refused_drafts_fall_back_to_the_finished_message() {
         .filter(|c| c.method == "sendMessageDraft")
         .count();
     assert_eq!(drafts, 1, "one refusal, then streaming stays off");
+}
+
+/// M1: a 429 is flood control, not a server without drafts. The surface
+/// waits `retry_after` and keeps streaming (only 400/404 disable it).
+#[tokio::test(flavor = "multi_thread")]
+async fn flood_control_keeps_drafts_streaming() {
+    let (server, base) = FakeBotServer::spawn();
+    server.fail_method("sendMessageDraft", 429, Some(1), 1);
+    let surface = TelegramSurface::new(base, "tok-429".to_string(), Some(7));
+    surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: String::new(),
+        },
+    ));
+    let chunk = "word ".repeat(12); // 60 chars
+    surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: chunk.clone(),
+        },
+    ));
+    server
+        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(5))
+        .expect("first draft attempted (and refused with 429)");
+    // Wait out `retry_after` (1 s) plus the 1 s draft spacing, then grow
+    // the text: a second draft proves streaming was never turned off.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    surface.emit(&env(
+        3,
+        AgentEvent::Delta {
+            text: chunk.repeat(2),
+        },
+    ));
+    let retried = server
+        .await_capture(
+            |c| {
+                c.method == "sendMessageDraft"
+                    && c.body["text"].as_str().is_some_and(|t| t.len() > 60)
+            },
+            Duration::from_secs(5),
+        )
+        .expect("draft retried after retry_after; streaming stayed on");
+    assert_eq!(
+        retried.body["text"].as_str().unwrap().chars().count(),
+        180,
+        "the refused text was not shown, so it is resent whole"
+    );
+    // The flag is still on: the turn ends with the final message as usual.
+    surface.emit(&env(
+        4,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: "done".into(),
+        },
+    ));
+    surface.emit(&finished(5));
+    server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["text"].as_str() == Some("done"),
+            Duration::from_secs(5),
+        )
+        .expect("final message");
+}
+
+/// M2: the throttle compares the truncated draft (4095 chars), so text
+/// growing only past the cap never re-sends an identical draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn draft_throttle_ignores_growth_past_the_cap() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-cap".to_string(), Some(7));
+    surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: String::new(),
+        },
+    ));
+    surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: "a".repeat(5000),
+        },
+    ));
+    let first = server
+        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(5))
+        .expect("first draft");
+    assert_eq!(
+        first.body["text"].as_str().unwrap().chars().count(),
+        4095,
+        "the draft carries the capped prefix"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Only content beyond the cap grows: the draft text is identical, so
+    // the throttle must not fire.
+    surface.emit(&env(
+        3,
+        AgentEvent::Delta {
+            text: "b".repeat(300),
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drafts = server
+        .captured()
+        .iter()
+        .filter(|c| c.method == "sendMessageDraft")
+        .count();
+    assert_eq!(drafts, 1, "no re-send of an identical truncated draft");
+    surface.emit(&finished(4));
 }
 
 /// D3: an accepted free-text message gets a 👀 receipt; commands and
@@ -850,6 +1035,41 @@ async fn files_go_out_as_photo_or_document_with_caption() {
     );
 }
 
+/// M5: Telegram caps captions at 1024 characters; a longer one is
+/// truncated (with `…`) before the request and the file still goes out.
+#[tokio::test(flavor = "multi_thread")]
+async fn over_long_caption_is_capped_and_the_file_still_goes_out() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-caption".to_string(), Some(7));
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("chart.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+    surface.emit(&env(
+        1,
+        AgentEvent::File {
+            path: png.to_string_lossy().into_owned(),
+            name: "chart.png".into(),
+            caption: "c".repeat(3000),
+        },
+    ));
+    let photo = server
+        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(5))
+        .expect("the file still goes out");
+    let raw = photo.raw.as_deref().unwrap_or("");
+    let marker = "name=\"caption\"\r\n\r\n";
+    let start = raw.find(marker).expect("caption field present") + marker.len();
+    let rest = &raw[start..];
+    let end = rest.find("\r\n--").expect("caption field terminator");
+    let caption = &rest[..end];
+    assert_eq!(
+        caption.chars().count(),
+        1024,
+        "capped at Telegram's caption limit"
+    );
+    assert!(caption.ends_with('…'), "ellipsis marks the truncation");
+}
+
 /// 3.3: while tools run and no answer text has streamed, the draft shows
 /// `⋯ tool label`; scheduled turns (cron/briefing) never open a draft.
 #[tokio::test(flavor = "multi_thread")]
@@ -1054,5 +1274,36 @@ async fn skill_proposal_accept_body() {
         )
         .unwrap();
     assert_eq!(status, "accepted");
+
+    // M4: a double tap is a no-op — the second press answers "already
+    // installed" instead of rewriting the card's installed outcome.
+    stack.server.push_callback(3, 7, 42, &accept);
+    let second = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "answerCallbackQuery"
+                    && c.body["text"].as_str() == Some("already installed")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("second press answered as already installed");
+    assert!(second.body["callback_query_id"].as_str().is_some());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let edits = stack
+        .server
+        .captured()
+        .iter()
+        .filter(|c| c.method == "editMessageText")
+        .count();
+    assert_eq!(edits, 1, "the card keeps its installed outcome");
+    let accepted: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM skill_candidates WHERE status = 'accepted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 1, "one install, not two");
     stop(&mut stack).await;
 }

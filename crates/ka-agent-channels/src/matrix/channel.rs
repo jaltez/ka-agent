@@ -226,20 +226,7 @@ impl MatrixChannel {
             .filter(|u| !u.is_empty())
             .or_else(|| content["file"]["url"].as_str())
             .ok_or_else(|| "message has no media url".to_string())?;
-        let mime = content["info"]["mimetype"].as_str().unwrap_or("");
-        let name =
-            crate::attachments::sanitize_attachment_name(content["body"].as_str().unwrap_or(""))
-                .unwrap_or_else(|| {
-                    let kind = content["msgtype"]
-                        .as_str()
-                        .unwrap_or("m.file")
-                        .trim_start_matches("m.");
-                    format!(
-                        "{kind}-{}.{}",
-                        ka_agent_core::ids::short_id(mxc),
-                        media_ext(mime)
-                    )
-                });
+        let name = attachment_name(content, mxc);
         let bytes = self.surface.client.download_media(mxc).await?;
         crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
     }
@@ -397,6 +384,28 @@ impl Channel for MatrixChannel {
     }
 }
 
+/// The filename for inbound Matrix media: the operator's `body` when it is
+/// usable, else `{kind}-{id tail}.{ext}`. Either way the result is
+/// sanitized — an mxc id tail can carry `/` or `..`, and the name decides
+/// where the bytes land.
+fn attachment_name(content: &Value, mxc: &str) -> String {
+    let mime = content["info"]["mimetype"].as_str().unwrap_or("");
+    crate::attachments::sanitize_attachment_name(content["body"].as_str().unwrap_or(""))
+        .or_else(|| {
+            let kind = content["msgtype"]
+                .as_str()
+                .unwrap_or("m.file")
+                .trim_start_matches("m.");
+            let minted = format!(
+                "{kind}-{}.{}",
+                ka_agent_core::ids::short_id(mxc),
+                media_ext(mime)
+            );
+            crate::attachments::sanitize_attachment_name(&minted)
+        })
+        .unwrap_or_else(|| format!("file.{}", media_ext(mime)))
+}
+
 /// A filename extension for an inbound media type, for unnamed files.
 fn media_ext(mime: &str) -> &'static str {
     match mime {
@@ -415,5 +424,43 @@ fn media_ext(mime: &str) -> &'static str {
         "text/csv" => "csv",
         "application/zip" => "zip",
         _ => "bin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::attachment_name;
+    use serde_json::json;
+
+    #[test]
+    fn the_operator_name_wins_when_usable() {
+        let content = json!({"msgtype": "m.file", "body": "report.txt"});
+        assert_eq!(
+            attachment_name(&content, "mxc://example.org/abc"),
+            "report.txt"
+        );
+    }
+
+    #[test]
+    fn a_minted_fallback_name_is_sanitized() {
+        // The tail of this id is `/../../x`: unsanitized it is a path.
+        let content = json!({"msgtype": "m.file", "body": ""});
+        let name = attachment_name(&content, "mxc://example.org/../../x");
+        assert!(name.starts_with("file-"), "{name}");
+        assert!(!name.contains('/') && !name.contains(".."), "{name}");
+        assert_eq!(name, "file-_._._x.bin");
+    }
+
+    #[test]
+    fn an_unusable_operator_name_falls_back() {
+        let content =
+            json!({"msgtype": "m.image", "body": "..", "info": {"mimetype": "image/png"}});
+        let name = attachment_name(&content, "mxc://example.org/abc");
+        assert!(
+            name.starts_with("image-") && name.ends_with(".png"),
+            "{name}"
+        );
     }
 }

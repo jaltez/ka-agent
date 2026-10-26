@@ -51,6 +51,32 @@ pub struct TelegramChannel {
     undelivered: Mutex<Vec<OutboxChunk>>,
 }
 
+/// What one callback press produced: the toast for
+/// `answerCallbackQuery` (empty = just close the spinner) and, when the
+/// card must change, its new text.
+struct CallbackReply {
+    toast: String,
+    edit: Option<String>,
+}
+
+impl CallbackReply {
+    /// Answer with no toast and leave the card alone.
+    fn none() -> Self {
+        Self {
+            toast: String::new(),
+            edit: None,
+        }
+    }
+
+    /// Answer with `text` and leave the card alone.
+    fn toast(text: &str) -> Self {
+        Self {
+            toast: text.to_string(),
+            edit: None,
+        }
+    }
+}
+
 impl crate::channel::Channel for TelegramChannel {
     fn name(&self) -> &'static str {
         "telegram"
@@ -422,9 +448,9 @@ impl TelegramChannel {
 
     /// ✅ / ✖ on a memory proposal: accept or reject, then turn the card
     /// into its outcome (buttons removed) so it cannot be pressed twice.
-    async fn memory_callback(&self, cb: &Value, rest: &str, chat_id: i64, client: &TelegramClient) {
+    async fn memory_callback(&self, cb: &Value, rest: &str) -> CallbackReply {
         let Some((short, verdict)) = rest.rsplit_once(':') else {
-            return;
+            return CallbackReply::none();
         };
         let text = cb["message"]["text"]
             .as_str()
@@ -443,106 +469,104 @@ impl TelegramChannel {
                 Ok(false) => (format!("(already decided) {text}"), "already decided"),
                 Err(e) => (format!("! [memory] {e}"), "error"),
             },
-            _ => return,
+            _ => return CallbackReply::none(),
         };
-        let _ = client
-            .answer_callback_query(cb["id"].as_str().unwrap_or(""), toast)
-            .await;
-        if let Some(message_id) = cb["message"]["message_id"].as_i64() {
-            let _ = client
-                .edit_message_text(
-                    chat_id,
-                    message_id,
-                    &outcome,
-                    Some(json!({ "inline_keyboard": [] })),
-                )
-                .await;
+        CallbackReply {
+            toast: toast.to_string(),
+            edit: Some(outcome),
         }
     }
 
     /// ✅ / ✖ on a skill proposal: accept (install + enable) or reject it
     /// through the very command path `/skills accept|reject <id>` takes,
-    /// then turn the card into its outcome.
-    async fn skill_callback(&self, cb: &Value, rest: &str, chat_id: i64, client: &TelegramClient) {
+    /// then turn the card into its outcome. A second press of a double-tap
+    /// finds no pending proposal (the first press decided it) and only
+    /// answers, leaving the card's outcome untouched.
+    async fn skill_callback(&self, cb: &Value, rest: &str) -> CallbackReply {
+        use ka_agent_core::ids::id_matches;
         let Some((verdict, id)) = rest.split_once(':') else {
-            return;
+            return CallbackReply::none();
         };
         let verb = match verdict {
             "a" => "accept",
             "r" => "reject",
-            _ => return,
+            _ => return CallbackReply::none(),
+        };
+        let pending = self.store.pending_skill_candidates().unwrap_or_default();
+        let hits: Vec<_> = pending
+            .into_iter()
+            .filter(|c| id_matches(&c.id, id))
+            .collect();
+        let id = match hits.as_slice() {
+            // Use the full id: the command path then matches exactly one row.
+            [one] => one.id.clone(),
+            // No pending proposal: the first press already decided it (a
+            // double tap), so only answer and leave the card's outcome be.
+            [] => {
+                return CallbackReply::toast(if verdict == "a" {
+                    "already installed"
+                } else {
+                    "already rejected"
+                });
+            }
+            // Ambiguous query (never produced by a card, which carries the
+            // full id): let the command path report it.
+            _ => id.to_string(),
         };
         let uid = cb["from"]["id"].as_i64().unwrap_or(0);
         let command = format!("/skills {verb} {id}");
-        let outcome =
+        let (outcome, toast) =
             match crate::commands::route(&self.runtime, &format!("telegram:{uid}"), &command).await
             {
-                crate::commands::Outcome::Reply(reply) => reply,
+                crate::commands::Outcome::Reply(reply) if !reply.starts_with('!') => {
+                    let toast = if verdict == "a" {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    };
+                    (reply, toast)
+                }
+                crate::commands::Outcome::Reply(reply) => (reply, "error"),
                 crate::commands::Outcome::Silent | crate::commands::Outcome::NotACommand => {
-                    format!("! [skills] no outcome for {id}")
+                    (format!("! [skills] no outcome for {id}"), "error")
                 }
             };
-        let toast = if outcome.starts_with('!') {
-            "error"
-        } else if verdict == "a" {
-            "accepted"
-        } else {
-            "rejected"
-        };
-        let _ = client
-            .answer_callback_query(cb["id"].as_str().unwrap_or(""), toast)
-            .await;
-        if let Some(message_id) = cb["message"]["message_id"].as_i64() {
-            let _ = client
-                .edit_message_text(
-                    chat_id,
-                    message_id,
-                    &outcome,
-                    Some(json!({ "inline_keyboard": [] })),
-                )
-                .await;
+        CallbackReply {
+            toast: toast.to_string(),
+            edit: Some(outcome),
         }
     }
 
-    async fn dispatch_callback(
+    /// Resolve one callback press: the toast for `answerCallbackQuery` and,
+    /// when the card changes, its new text. Every path returns a reply (an
+    /// empty toast for data this build does not understand), so
+    /// [`Self::dispatch_callback`] can answer the query exactly once.
+    async fn callback_action(
         &self,
         cb: &Value,
-        _allow: &[i64],
+        data: Option<&str>,
         surface: &Arc<SurfaceInner>,
-        unauthorized_last: &mut HashMap<i64, i64>,
-    ) {
-        let Some(uid) = cb["from"]["id"].as_i64() else {
-            return;
-        };
-        let chat_type = cb["message"]["chat"]["type"].as_str().unwrap_or("");
-        if !self.gate(uid, chat_type, unauthorized_last).await {
-            return;
-        }
-        let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
-        self.adopt_chat(surface, chat_id).await;
-        let client = surface.client.clone();
-        let Some(data) = cb["data"].as_str() else {
-            return;
+    ) -> CallbackReply {
+        let Some(data) = data else {
+            return CallbackReply::none();
         };
         // `m:<short>:y|n` — a memory proposal card.
         if let Some(rest) = data.strip_prefix("m:") {
-            self.memory_callback(cb, rest, chat_id, &client).await;
-            return;
+            return self.memory_callback(cb, rest).await;
         }
         // `sk:a|r:<id>` — a skill proposal card.
         if let Some(rest) = data.strip_prefix("sk:") {
-            self.skill_callback(cb, rest, chat_id, &client).await;
-            return;
+            return self.skill_callback(cb, rest).await;
         }
         // `a:<short>:y|n`
         let Some(rest) = data.strip_prefix("a:") else {
-            return;
+            return CallbackReply::none();
         };
         let Some((short, verdict)) = rest.rsplit_once(':') else {
-            return;
+            return CallbackReply::none();
         };
         if !matches!(verdict, "y" | "n") {
-            return;
+            return CallbackReply::none();
         }
         let full = {
             let cards = surface.cards.lock().unwrap_or_else(|e| e.into_inner());
@@ -564,10 +588,7 @@ impl TelegramChannel {
                 })
         };
         let Some(full) = full else {
-            let _ = client
-                .answer_callback_query(cb["id"].as_str().unwrap_or(""), "expired")
-                .await;
-            return;
+            return CallbackReply::toast("expired");
         };
         let decision = if verdict == "y" {
             ApprovalDecision::Allow
@@ -575,30 +596,65 @@ impl TelegramChannel {
             ApprovalDecision::Deny
         };
         match self.runtime.decide(&full, decision).await {
-            Ok(()) => {
-                let _ = client
-                    .answer_callback_query(
-                        cb["id"].as_str().unwrap_or(""),
-                        if verdict == "y" {
-                            "✔ approved"
-                        } else {
-                            "✖ denied"
-                        },
-                    )
-                    .await;
-            }
+            Ok(()) => CallbackReply::toast(if verdict == "y" {
+                "✔ approved"
+            } else {
+                "✖ denied"
+            }),
             Err(RtError::UnknownApproval(_)) => {
                 surface.settle_card(short, ApprovalStatus::Expired);
-                let _ = client
-                    .answer_callback_query(cb["id"].as_str().unwrap_or(""), "expired")
-                    .await;
+                CallbackReply::toast("expired")
             }
             Err(e) => {
                 eprintln!("telegram: decide {full}: {e}");
-                let _ = client
-                    .answer_callback_query(cb["id"].as_str().unwrap_or(""), "error")
-                    .await;
+                CallbackReply::toast("error")
             }
+        }
+    }
+
+    async fn dispatch_callback(
+        &self,
+        cb: &Value,
+        _allow: &[i64],
+        surface: &Arc<SurfaceInner>,
+        unauthorized_last: &mut HashMap<i64, i64>,
+    ) {
+        let client = surface.client.clone();
+        let Some(uid) = cb["from"]["id"].as_i64() else {
+            // Close the spinner anyway: every callback query is answered.
+            if let Some(id) = cb["id"].as_str() {
+                let _ = client.answer_callback_query(id, "").await;
+            }
+            return;
+        };
+        let chat_type = cb["message"]["chat"]["type"].as_str().unwrap_or("");
+        if !self.gate(uid, chat_type, unauthorized_last).await {
+            // No text for unauthorized traffic (the audit row is the
+            // record), but the spinner still closes: every callback query
+            // is answered exactly once.
+            if let Some(id) = cb["id"].as_str() {
+                let _ = client.answer_callback_query(id, "").await;
+            }
+            return;
+        }
+        let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
+        self.adopt_chat(surface, chat_id).await;
+        let reply = self.callback_action(cb, cb["data"].as_str(), surface).await;
+        // Exactly one answer per callback query, on every path.
+        if let Some(id) = cb["id"].as_str() {
+            let _ = client.answer_callback_query(id, &reply.toast).await;
+        }
+        if let Some(text) = reply.edit
+            && let Some(message_id) = cb["message"]["message_id"].as_i64()
+        {
+            let _ = client
+                .edit_message_text(
+                    chat_id,
+                    message_id,
+                    &text,
+                    Some(json!({ "inline_keyboard": [] })),
+                )
+                .await;
         }
     }
 }

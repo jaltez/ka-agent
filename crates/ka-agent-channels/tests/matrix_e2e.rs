@@ -27,6 +27,7 @@ use tokio::sync::watch;
 const OPERATOR: &str = "@javier:example.org";
 const STRANGER: &str = "@stranger:example.org";
 const ROOM: &str = "!room1:example.org";
+const ROOM2: &str = "!room2:example.org";
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -758,6 +759,390 @@ async fn outbound_file_is_uploaded_and_posted() {
         "{:?}",
         sent.body
     );
+    stack.stop().await;
+}
+
+/// Learn the delivery room first (commands answer through the sender task).
+async fn learn_room(stack: &Stack) {
+    stack.fake.push_room_message(ROOM, OPERATOR, "/status");
+    stack
+        .fake
+        .await_sent("queue", Duration::from_secs(10))
+        .expect("no /status reply");
+}
+
+fn turn_started(turn: &str) -> AgentEvent {
+    AgentEvent::TurnStarted {
+        turn: turn.into(),
+        source: format!("matrix:{OPERATOR}"),
+    }
+}
+
+/// M3: `FinalChunk` can land while the first draft is still in flight. The
+/// settlement must wait for that send's event id and edit the draft — never
+/// enqueue the answer as a second message, leaving a partial draft behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn final_chunk_during_the_first_send_edits_the_draft() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    let first = "a".repeat(100);
+    let full = format!("**final** {first}");
+    stack
+        .fake
+        .delay_next_send(&first, Duration::from_millis(800));
+    stack.surface.emit(&env(1, turn_started("t1")));
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: first.clone(),
+        },
+    ));
+    wait_until("draft send in flight", Duration::from_secs(5), || {
+        stack.fake.sends_in_flight() == 1
+    })
+    .await;
+
+    // No event id exists yet: this is the race.
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: full.clone(),
+        },
+    ));
+
+    let edit = wait_for_event(&stack.fake, Duration::from_secs(6), |e| {
+        e.event_type == "m.room.message"
+            && e.body["m.relates_to"]["rel_type"] == json!("m.replace")
+            && e.body["m.new_content"]["body"].as_str() == Some(full.as_str())
+    })
+    .await
+    .expect("the final chunk was not edited into the draft");
+
+    let drafts: Vec<_> = stack
+        .fake
+        .sent_events()
+        .into_iter()
+        .filter(|e| {
+            e.event_type == "m.room.message" && e.body["body"].as_str() == Some(first.as_str())
+        })
+        .collect();
+    assert_eq!(drafts.len(), 1, "exactly one draft: {drafts:?}");
+    assert_eq!(
+        edit.body["m.relates_to"]["event_id"].as_str(),
+        Some(drafts[0].event_id.as_str()),
+        "the final edit must target the draft"
+    );
+    assert_eq!(edit.room, ROOM);
+    // No duplicate answer as its own message.
+    assert!(
+        !stack
+            .fake
+            .sent_events()
+            .iter()
+            .any(|e| e.event_type == "m.room.message"
+                && e.body.get("m.relates_to").is_none()
+                && e.body["body"].as_str() == Some(full.as_str())),
+        "the answer was delivered twice"
+    );
+    stack.stop().await;
+}
+
+/// M4: when the homeserver refuses `m.replace`, the answer still reaches
+/// the operator as a visible fallback message instead of staying truncated.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_final_edit_posts_the_answer_as_a_message() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    let first = "a".repeat(100);
+    stack.surface.emit(&env(1, turn_started("t1")));
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: first.clone(),
+        },
+    ));
+    wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message" && e.body["body"].as_str() == Some(first.as_str())
+    })
+    .await
+    .expect("no streamed draft");
+    // Let the draft's write-back record its id, then refuse edits.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stack.fake.reject_edits();
+
+    let full = format!("**final** {first}");
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: full.clone(),
+        },
+    ));
+    let fallback = wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message"
+            && e.body.get("m.relates_to").is_none()
+            && e.body["body"].as_str() == Some(full.as_str())
+    })
+    .await
+    .expect("a refused edit left the answer truncated");
+    assert_eq!(fallback.room, ROOM);
+    stack.stop().await;
+}
+
+/// M5: a turn is pinned to the room its first draft went to; a message from
+/// another linked room does not move its edits or typing.
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_and_typing_stay_in_the_room_the_turn_started_in() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    stack.surface.emit(&env(1, turn_started("t1")));
+    let first = "a".repeat(100);
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: first.clone(),
+        },
+    ));
+    wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message" && e.body["body"].as_str() == Some(first.as_str())
+    })
+    .await
+    .expect("no streamed draft");
+
+    // The operator writes from another room; delivery now points there.
+    stack.fake.push_room_message(ROOM2, OPERATOR, "/status");
+    wait_until("room moved", Duration::from_secs(5), || {
+        stack.store.meta_get("matrix.room_id").unwrap().as_deref() == Some(ROOM2)
+    })
+    .await;
+
+    // The next edit of the running turn still targets the draft's room.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::Delta {
+            text: "b".repeat(100),
+        },
+    ));
+    let edit = wait_for_event(&stack.fake, Duration::from_secs(6), |e| {
+        e.body["m.relates_to"]["rel_type"] == json!("m.replace")
+            && e.body["m.new_content"]["body"]
+                .as_str()
+                .is_some_and(|b| b.contains("bbbb"))
+    })
+    .await
+    .expect("no edit");
+    assert_eq!(edit.room, ROOM, "an edit left the turn's room");
+
+    let full = "**final** answer".to_string();
+    stack.surface.emit(&env(
+        4,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: full.clone(),
+        },
+    ));
+    let final_edit = wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.body["m.relates_to"]["rel_type"] == json!("m.replace")
+            && e.body["m.new_content"]["body"].as_str() == Some(full.as_str())
+    })
+    .await
+    .expect("no final edit");
+    assert_eq!(final_edit.room, ROOM, "the final edit left the turn's room");
+
+    wait_until(
+        "typing stop in the turn's room",
+        Duration::from_secs(5),
+        || {
+            stack
+                .fake
+                .typing_events()
+                .iter()
+                .any(|(room, body)| room == ROOM && body["timeout"] == json!(0))
+        },
+    )
+    .await;
+    stack.stop().await;
+}
+
+/// 5a: a send from a replaced turn must not write its event id into the
+/// next turn's stream (which would make that turn edit the old draft).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_send_does_not_seed_the_next_turn() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    let first = "a".repeat(100);
+    stack
+        .fake
+        .delay_next_send(&first, Duration::from_millis(800));
+    stack.surface.emit(&env(1, turn_started("t1")));
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: first.clone(),
+        },
+    ));
+    wait_until("first send in flight", Duration::from_secs(5), || {
+        stack.fake.sends_in_flight() == 1
+    })
+    .await;
+    // The turn is replaced while its first send is still in flight.
+    stack.surface.emit(&env(3, turn_started("t2")));
+    wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message" && e.body["body"].as_str() == Some(first.as_str())
+    })
+    .await
+    .expect("the delayed draft was never sent");
+    // Let the stale send's write-back land, then give turn 2 a short answer.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stack.surface.emit(&env(
+        4,
+        AgentEvent::Delta {
+            text: "short turn two text".into(),
+        },
+    ));
+    let answer = "turn two answer";
+    stack.surface.emit(&env(
+        5,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: answer.into(),
+        },
+    ));
+
+    let sent = wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message" && e.body["body"].as_str() == Some(answer)
+    })
+    .await
+    .expect("turn 2's answer was never posted");
+    assert!(
+        sent.body.get("m.relates_to").is_none(),
+        "turn 2's answer became an edit of turn 1's draft: {:?}",
+        sent.body
+    );
+    assert!(
+        !stack
+            .fake
+            .sent_events()
+            .iter()
+            .any(|e| e.body["m.relates_to"]["rel_type"] == json!("m.replace")
+                && e.body["m.new_content"]["body"].as_str() == Some(answer)),
+        "a stale send seeded turn 2's draft"
+    );
+    stack.stop().await;
+}
+
+/// 5b: a failed first-draft send backs off (one attempt per interval), not
+/// a tight retry loop; the retry then becomes the turn's draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_draft_send_backs_off() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    let base = stack.fake.send_attempts();
+    stack.fake.fail_plain_sends(1);
+    let first = "a".repeat(100);
+    stack.surface.emit(&env(1, turn_started("t1")));
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: first.clone(),
+        },
+    ));
+    wait_until("first draft attempt", Duration::from_secs(5), || {
+        stack.fake.send_attempts() > base
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        stack.fake.send_attempts(),
+        base + 1,
+        "a failed draft must back off instead of spinning"
+    );
+
+    wait_until("retry after the backoff", Duration::from_secs(6), || {
+        stack.fake.send_attempts() > base + 1
+    })
+    .await;
+    let full = format!("**final** {first}");
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: full.clone(),
+        },
+    ));
+    let edit = wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.body["m.relates_to"]["rel_type"] == json!("m.replace")
+            && e.body["m.new_content"]["body"].as_str() == Some(full.as_str())
+    })
+    .await
+    .expect("the retried draft was not finalized");
+    assert_eq!(edit.room, ROOM);
+    stack.stop().await;
+}
+
+/// 5c: finishing a turn clears the typing indicator (not just the local
+/// heartbeat, which leaves the indicator up until the homeserver timeout).
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_stops_when_the_turn_finishes() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    stack.surface.emit(&env(1, turn_started("t1")));
+    wait_until("typing start", Duration::from_secs(5), || {
+        stack
+            .fake
+            .typing_events()
+            .iter()
+            .any(|(room, body)| room == ROOM && body["typing"] == json!(true))
+    })
+    .await;
+
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::TurnFinished {
+            stop: "done".into(),
+            cost_usd: 0.0,
+            tokens: 0,
+            ms: 1,
+            text: "done".into(),
+        },
+    ));
+    wait_until("typing stop", Duration::from_secs(5), || {
+        stack
+            .fake
+            .typing_events()
+            .iter()
+            .any(|(room, body)| room == ROOM && body["timeout"] == json!(0))
+    })
+    .await;
+    stack.stop().await;
+}
+
+/// M9: a fired reminder reaches the operator on Matrix as its own message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fired_reminder_is_delivered() {
+    let (stack, _dir) = spawn_stack(true).await;
+    learn_room(&stack).await;
+
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::Reminder {
+            id: "task_1".into(),
+            text: "call mom".into(),
+        },
+    ));
+    let sent = stack
+        .fake
+        .await_sent("⏰ call mom", Duration::from_secs(5))
+        .expect("the reminder was not delivered");
+    assert_eq!(sent.body["body"].as_str(), Some("⏰ call mom"));
     stack.stop().await;
 }
 

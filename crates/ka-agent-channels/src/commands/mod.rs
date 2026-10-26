@@ -396,6 +396,14 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
         .split_once(char::is_whitespace)
         .map(|(_, rest)| rest.trim())
         .unwrap_or("");
+    // Telegram deep links arrive as `/start <payload>`. The alias never
+    // takes a topic, so the payload is ignored and the command list answers
+    // (it used to be read as `/help <topic>` and answered "unknown command").
+    let args = if spec.name == "help" && name != spec.name {
+        ""
+    } else {
+        args
+    };
     (spec.run)(Ctx {
         runtime,
         source,
@@ -508,6 +516,25 @@ mod tests {
         assert_eq!(
             route(&runtime, "console", "/bogus one two").await,
             Outcome::Reply("unknown command /bogus — /help lists them".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn start_deep_link_payload_is_ignored() {
+        let runtime = test_runtime();
+        // Telegram deep links append a payload: `/start <payload>` answers
+        // the command list like a bare `/start`, never "unknown command".
+        assert_eq!(
+            route(&runtime, "telegram:1", "/start abc123").await,
+            Outcome::Reply(help_text())
+        );
+        assert_eq!(
+            route(&runtime, "telegram:1", "/start@my_bot abc123").await,
+            Outcome::Reply(help_text())
+        );
+        // `/help <topic>` still resolves the topic.
+        assert!(
+            matches!(route(&runtime, "telegram:1", "/help remind").await, Outcome::Reply(r) if r.contains("/remind <when>"))
         );
     }
 

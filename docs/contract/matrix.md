@@ -49,31 +49,51 @@ token_secret = "matrix.access_token"   # KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN
                                         # or <data>/secrets/matrix.access_token
 ```
 
-- **Inbound**: `GET /_matrix/client/v3/sync?timeout=25s&since=…` long-poll;
+- **Inbound**: `GET /_matrix/client/v3/sync?timeout=25000&since=…` long-poll
+  (milliseconds, matching `SYNC_TIMEOUT_SECS = 25`);
   `m.room.message` events from joined rooms. `next_batch` persists to
   `meta["matrix.next_batch"]` **after** dispatch — at-least-once with
   token dedupe, mirroring the Telegram offset. A crash between the two
   replays the event.
 - **Outbound**: `PUT …/rooms/<id>/send/m.room.message/<txn>`; replies go to
-  the room the operator last wrote from; bodies over 3500 chars split on
+  the room the operator last wrote from; bodies over 3500 bytes split on
   newline boundaries.
 - **Streaming**: on an operator turn the reply streams as one message
-  edited in place. The first draft is sent once 80 characters accumulated
-  or 2 s passed since the first delta; further `m.replace` edits
+  edited in place. All thresholds count **bytes** (`String::len`), not
+  characters. The first draft is sent once 80 bytes accumulated or 2 s
+  passed since the first delta; further `m.replace` edits
   (`m.new_content` + `m.relates_to: {rel_type: "m.replace", event_id}`)
-  follow every 2 s with at least 80 new characters. The final edit carries
-  the shared renderer's `formatted_body` (HTML). Scheduled turns (`cron`,
+  follow every 2 s with at least 80 new bytes. The final edit carries the
+  shared renderer's `formatted_body` (HTML). Scheduled turns (`cron`,
   `briefing`) are not streamed: their text arrives once, at the end.
+  A failed draft send backs off one interval instead of retrying in a
+  tight loop. If the final chunk lands while the first draft is still in
+  flight, settlement waits for that send's event id and edits the draft
+  (never a second message); if the homeserver refuses the final edit, the
+  full text is posted as its own message so the answer is not truncated.
+- **Room pinning**: the first send pins the turn to one room; its edits,
+  final edit and typing stay there even if the operator writes from another
+  linked room meanwhile.
 - **Typing**: `PUT …/rooms/<id>/typing/<user>` with `timeout: 30000` when an
-  operator turn starts, refreshed while it runs; the final edit clears it
-  (`timeout: 0`).
+  operator turn starts, refreshed while it runs; finishing the turn
+  (`TurnFinished`) and the final delivery clear it (`timeout: 0`) in the
+  pinned room.
+- **Reminders**: `AgentEvent::Reminder` is posted as its own message,
+  `⏰ <text>` (the same prefix the console and terminal use).
 - **Attachments in**: `m.image`/`m.file`/`m.video` download through
   `/_matrix/client/v1/media/download/<server>/<id>` (falling back to
   `/_matrix/media/v3/download/…` on 404) into `<workspace>/attachments/`,
   and the room gets the `@attachments/<file>` reference to paste back.
+  The operator's `body` is the filename when usable; otherwise one is
+  minted from the message type and mxc id. Both are sanitized
+  (`[A-Za-z0-9._-]`, no leading dot, ≤ 64 bytes), so an mxc id tail cannot
+  steer the write outside the inbox; collisions get a `-N` suffix and are
+  created exclusively (never overwrite, even for concurrent saves).
 - **Attachments out**: `AgentEvent::File` uploads via
   `POST /_matrix/media/v3/upload` and posts `m.image`/`m.file` with the
-  caption as the body.
+  caption as the body. The 50 MB size limit is checked from the file's
+  metadata before it is read; the caption is capped to one message body
+  (3500 bytes — media bodies cannot split like a reply).
 - **HTTP**: the client speaks plain HTTP/1.1 — point `homeserver` at a local
   homeserver or your TLS-terminating reverse proxy; it does not do TLS
   itself.
