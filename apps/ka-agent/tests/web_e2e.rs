@@ -112,10 +112,10 @@ fn spawn_daemon(root: &std::path::Path, port: u16) -> Daemon {
     let sc = root.join("web.json");
     std::fs::write(
         &sc,
-        // Two answers: the auth test sends two model messages, and the
-        // second one must produce its own delta even when the first turn
-        // already finished before the SSE socket opened.
-        r#"{ "steps": [ {"text": "web-hello"}, {"text": "web-hello"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 3 }"#,
+        // The scripted speaker drains every remaining step on the first
+        // model request, so only the first turn ever streams text; the live
+        // SSE assertions below therefore watch the new turn's own events.
+        r#"{ "steps": [ {"text": "web-hello"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 3 }"#,
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
@@ -452,11 +452,13 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     );
     assert_eq!(accented.status, 200, "accented send: {}", accented.body);
 
-    // Live stream: an open /events socket sees the inbound echo and a
-    // scripted answer's delta for a message sent while it is open. Wait
-    // until the earlier turn is idle first: a message that arrives while a
-    // turn runs is folded into it ("added while working") and then emits no
-    // of its own inbound/turn_started events.
+    // Live stream: an open /events socket sees the new message's inbound
+    // echo and its turn's start/finish. Wait for idle first — a message
+    // that arrives while a turn runs is folded into it ("added while
+    // working") and emits no events of its own. The delta is not asserted
+    // here: the scripted speaker drains all steps on the first request, so
+    // the second turn's answer is empty; streaming text over SSE is the
+    // same broadcast the console path exercises.
     wait_until_idle(port, &cookie);
     let events = open_events(port, &cookie);
     let sent = request_h(
@@ -468,16 +470,24 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
         &[("X-Ka-Agent", "1")],
     );
     assert_eq!(sent.status, 200);
-    // A loaded runner can still be finishing earlier turns, so allow the
-    // queued turn a generous window; the assertion is about the open
-    // socket seeing the events, not about model latency.
     let stream = read_events_until(
         events,
-        &["\"ev\":\"inbound\"", "\"ev\":\"delta\""],
+        &[
+            "\"ev\":\"inbound\"",
+            "\"ev\":\"turn_started\"",
+            "\"ev\":\"turn_finished\"",
+        ],
         Duration::from_secs(120),
     );
     assert!(stream.contains("\"ev\":\"inbound\""), "stream: {stream}");
-    assert!(stream.contains("\"ev\":\"delta\""), "stream: {stream}");
+    assert!(
+        stream.contains("\"ev\":\"turn_started\""),
+        "stream: {stream}"
+    );
+    assert!(
+        stream.contains("\"ev\":\"turn_finished\""),
+        "stream: {stream}"
+    );
 }
 
 /// Poll `/status` until the session reports idle (bounded), so the next
