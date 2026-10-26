@@ -7,12 +7,9 @@
 use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ka_agent_runtime::{
-    EventBus, InstanceLock, LockError, Runtime, Surface, SurfaceEvent, paths::Paths,
-};
+use ka_agent_runtime::{SurfaceEvent, paths::Paths};
 use ka_agent_store::Store;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
@@ -25,17 +22,25 @@ const EOF_WAIT: Duration = Duration::from_secs(120);
 /// One event source + sink: a local runtime or the attached daemon.
 enum Backend {
     Local {
-        runtime: Runtime,
-        store: Arc<Store>,
+        host: crate::host::Host,
         rx: broadcast::Receiver<SurfaceEvent>,
         /// Router replies and status answers, delivered before bus events.
         pending: VecDeque<SurfaceEvent>,
-        _lock: InstanceLock,
     },
     Attached {
         lines: admin::AttachLines,
         w: tokio::net::unix::OwnedWriteHalf,
     },
+}
+
+impl Backend {
+    /// Stop a local host cleanly (tasks down, admin socket removed).
+    fn close(self) {
+        match self {
+            Self::Local { host, .. } => host.shutdown(),
+            Self::Attached { .. } => {}
+        }
+    }
 }
 
 enum Incoming {
@@ -45,76 +50,31 @@ enum Incoming {
 }
 
 impl Backend {
-    /// Build a local runtime over the data root (the daemon is not running).
+    /// Build a local runtime over the data root (the daemon is not running):
+    /// a host without phone channels or web, serving the admin socket so a
+    /// second terminal's `ka-agent status` answers while the chat runs.
     fn local(
-        paths: &Paths,
+        _paths: &Paths,
         config: &Path,
         scenario: Option<PathBuf>,
     ) -> Result<Self, std::process::ExitCode> {
-        // Strict, like the daemon: a console running on silently-defaulted
-        // config would write to the real data root with a workspace the
-        // operator never chose.
-        let cfg = ka_agent_core::DaemonConfig::load(config).map_err(|e| {
-            eprintln!("{}", crate::config_problem(config, &e));
-            std::process::ExitCode::FAILURE
-        })?;
-        let lock = match InstanceLock::acquire(paths) {
-            Ok(l) => l,
-            Err(LockError::Held(root)) => {
-                crate::daemon::print_lock_held(&root);
-                return Err(std::process::ExitCode::FAILURE);
-            }
-            Err(LockError::Io(e)) => {
-                eprintln!(
-                    "ka-agent: cannot lock {}: {e}",
-                    paths.instance_lock().display()
-                );
-                return Err(std::process::ExitCode::FAILURE);
-            }
-        };
-        let store = Store::open(&paths.state_db()).map(Arc::new).map_err(|e| {
-            eprintln!("ka-agent: cannot open {}: {e}", paths.state_db().display());
-            std::process::ExitCode::FAILURE
-        })?;
-        let bus = Arc::new(EventBus::new());
-        // Subscribe before the runtime exists: its recovery notices count.
-        let rx = bus.subscribe();
-        let mut port = ka_agent_port::WorkerPort::with_current_exe();
-        if let Some(sc) = scenario {
-            port.scenario_override = Some(sc);
-        }
-        let runtime = Runtime::new(
-            cfg,
-            paths.clone(),
-            Arc::clone(&store),
-            port,
-            bus as Arc<dyn Surface>,
+        let mut host = crate::host::Host::start(
+            config,
+            crate::host::HostOptions {
+                channels: false,
+                web_port: None,
+                scenario,
+            },
         )
         .map_err(|e| {
-            eprintln!("ka-agent: runtime init failed: {e}");
+            eprintln!("{e}");
             std::process::ExitCode::FAILURE
         })?;
-        runtime.set_config_path(config.to_path_buf());
-        // No-agent cron handlers (M11): the calendar digest runs without the
-        // engine. Registered right after the runtime exists, before any tick.
-        {
-            let st = Arc::clone(&store);
-            let tz = runtime.config().time_zone();
-            runtime.set_no_agent_handler(
-                "calendar",
-                Arc::new(move |src| ka_agent_channels::calendar::digest_in(src, &st, &tz)),
-            );
-        }
-        let maintenance = runtime.clone();
-        tokio::spawn(async move {
-            maintenance.run_maintenance(Duration::from_secs(15)).await;
-        });
+        let rx = host.take_early_rx().unwrap_or_else(|| host.bus.subscribe());
         Ok(Self::Local {
-            runtime,
-            store,
+            host,
             rx,
             pending: VecDeque::new(),
-            _lock: lock,
         })
     }
 
@@ -166,12 +126,8 @@ impl Backend {
     /// Send one operator line through the shared router.
     async fn say(&mut self, text: &str) -> Result<(), String> {
         match self {
-            Self::Local {
-                runtime,
-                store,
-                pending,
-                ..
-            } => {
+            Self::Local { host, pending, .. } => {
+                let (runtime, store) = (&host.runtime, &host.store);
                 match ka_agent_channels::commands::route(runtime, "console", text).await {
                     ka_agent_channels::commands::Outcome::Reply(r) => {
                         pending.push_back(SurfaceEvent::Reply { text: r });
@@ -202,10 +158,8 @@ impl Backend {
     /// everything said before it.
     async fn request_status(&mut self) -> Result<(), String> {
         match self {
-            Self::Local {
-                runtime, pending, ..
-            } => {
-                match runtime.status_report() {
+            Self::Local { host, pending, .. } => {
+                match host.runtime.status_report() {
                     Ok(report) => pending.push_back(SurfaceEvent::Hello {
                         report: Box::new(report),
                     }),
@@ -495,8 +449,8 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
     } else {
         match Backend::local(&paths, &config, scenario) {
             Ok(b) => {
-                if let Backend::Local { runtime, .. } = &b {
-                    banner(runtime.config().model.as_deref(), false, &[]);
+                if let Backend::Local { host, .. } = &b {
+                    banner(host.runtime.config().model.as_deref(), false, &[]);
                 }
                 b
             }
@@ -613,6 +567,7 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
             _ = tokio::time::sleep_until(wait_until), if eof_deadline.is_some() => break,
         }
     }
+    backend.close();
     std::process::ExitCode::SUCCESS
 }
 
@@ -631,6 +586,18 @@ pub async fn run_once(
             .map_err(|_| "could not start a local session".to_string())?
     };
     let deadline = tokio::time::Instant::now() + timeout;
+    let outcome = run_once_turn(&mut backend, text, deadline, timeout).await;
+    backend.close();
+    outcome
+}
+
+/// The turn itself, on a backend the caller closes afterwards.
+async fn run_once_turn(
+    backend: &mut Backend,
+    text: &str,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+) -> Result<String, String> {
     backend.say(text).await?;
     // Ask for a status after the submit: an idle session with no turn means
     // the message never started one (a pre-flight refusal).

@@ -183,6 +183,22 @@ fn simple_turn_and_status() {
         r#"{ "steps": [ {"text": "Hello from scripted"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 42 }"#,
     );
     let mut chat = spawn_chat(&root, &sc);
+    // A local chat hosts the IPC admin endpoint: a second terminal's
+    // `ka-agent status` answers while the chat runs.
+    {
+        let sock = root.join("data/admin.sock");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sock.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sock.exists(), "local chat did not bind the admin socket");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        stream.write_all(b"{\"op\":\"status\"}\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+    }
     chat.send("hi there");
     chat.expect("Hello from scripted", Duration::from_secs(30));
     chat.expect("turn done", Duration::from_secs(10));

@@ -176,8 +176,12 @@ pub fn restore_from(dir: PathBuf, force: bool) -> std::process::ExitCode {
         eprintln!("ka-agent: a daemon or chat is running — stop it first");
         return std::process::ExitCode::FAILURE;
     }
-    let sock = root.join("admin.sock");
+    let sock = crate::ipc::socket_path(&paths);
     if sock.exists() {
+        if crate::ipc::is_running(&paths) {
+            eprintln!("ka-agent: a daemon or chat is running — stop it first");
+            return std::process::ExitCode::FAILURE;
+        }
         println!("removing stale admin socket (no daemon holds the data root)");
         let _ = std::fs::remove_file(&sock);
     }

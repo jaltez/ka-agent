@@ -1,4 +1,4 @@
-//! Client side of the daemon's admin socket (`<data>/admin.sock`): one-shot
+//! Client side of the host's admin socket (`<data>/admin.sock`): one-shot
 //! JSON requests (`status`, `shutdown`, `reload`) and the long-lived
 //! `attach` stream used by `ka-agent chat`.
 
@@ -6,7 +6,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
 
 use ka_agent_runtime::paths::Paths;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt};
+
+use crate::ipc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
@@ -23,14 +25,14 @@ pub enum AdminError {
 }
 
 fn sock_path(paths: &Paths) -> std::path::PathBuf {
-    paths.root().join("admin.sock")
+    ipc::socket_path(paths)
 }
 
 /// Send one request, read one reply line. A reply carrying `"error"`
 /// becomes [`AdminError::Daemon`].
 pub fn request(paths: &Paths, req: &serde_json::Value) -> Result<serde_json::Value, AdminError> {
     let sock = sock_path(paths);
-    let mut stream = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| {
+    let mut stream = ipc::connect_blocking(paths).map_err(|e| {
         if matches!(
             e.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
@@ -58,20 +60,21 @@ pub fn request(paths: &Paths, req: &serde_json::Value) -> Result<serde_json::Val
     Ok(v)
 }
 
-/// Whether a daemon answers on the admin socket right now.
+/// Whether a host (daemon or local chat) answers on the admin socket right
+/// now.
 pub fn is_running(paths: &Paths) -> bool {
-    request(paths, &serde_json::json!({"op": "status"})).is_ok()
+    ipc::is_running(paths)
 }
 
 pub type AttachLines = tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>;
 
-/// Open an attach stream: the daemon answers with a `hello` event, then
+/// Open an attach stream: the host answers with a `hello` event, then
 /// every surface event; the client writes `{"op":"say","text":…}` lines.
 pub async fn attach(
     paths: &Paths,
 ) -> Result<(AttachLines, tokio::net::unix::OwnedWriteHalf), AdminError> {
     let sock = sock_path(paths);
-    let stream = tokio::net::UnixStream::connect(&sock)
+    let stream = ipc::connect(paths)
         .await
         .map_err(|_| AdminError::NotRunning(sock.display().to_string()))?;
     let (r, mut w) = stream.into_split();
