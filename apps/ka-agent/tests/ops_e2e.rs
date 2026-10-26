@@ -367,6 +367,40 @@ fn backup_then_restore_drill() {
     let _ = std::fs::remove_dir_all(&b);
 }
 
+/// A minimal host at `data`: the `kagent__*` tools run in the daemon and
+/// `__mcp` is a thin relay, so bridge tests need something to relay to.
+struct Host(std::process::Child);
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_host(data: &std::path::Path, cfg: &std::path::Path) -> Host {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .env("KA_AGENT_DATA_DIR", data)
+        .arg("run")
+        .arg("--config")
+        .arg(cfg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sock = data.join("admin.sock");
+    for _ in 0..200 {
+        if sock.exists() {
+            return Host(child);
+        }
+        if !child.try_wait().unwrap().is_none() {
+            panic!("host exited before the socket appeared");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("host never came up at {}", data.display());
+}
+
 /// F13 (review): the GitHub connector's token must be resolvable. The
 /// worker's env sanitizer strips anything matching TOKEN/KEY/…, so the
 /// bridge could never see a token from the environment; the worker now
@@ -388,7 +422,8 @@ fn github_tools_see_the_secret_store_token() {
 
     // Drive the bridge directly: initialize + tools/call.
     use std::io::Write as _;
-    let _cfg_holder = write_config(&root);
+    let cfg = write_config(&root);
+    let _host = start_host(&data, &cfg);
     let mut child = ka(&data)
         .arg("__mcp")
         .stdin(Stdio::piped())
@@ -429,7 +464,8 @@ fn cron_manage_tool_schedules_and_lists() {
     let root = temp_root("cron-bridge");
     let data = root.join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let _cfg = write_config(&root);
+    let cfg = write_config(&root);
+    let _host = start_host(&data, &cfg);
 
     use std::io::Write as _;
     let mut child = ka(&data)
@@ -443,7 +479,7 @@ fn cron_manage_tool_schedules_and_lists() {
     for msg in [
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#,
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"list"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cron_list","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"1h","text":"bridge smoke"}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":""}}}"#,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"remove","id":"nosuchprefix"}}}"#,
@@ -669,56 +705,6 @@ fn backup_default_path_prunes_to_keep() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// G5: a turn started by a cron cannot schedule more crons (loop guard);
-/// any other turn can.
-#[test]
-fn cron_started_turn_cannot_schedule_crons() {
-    use std::io::Write as _;
-    let root = temp_root("cron-loop");
-    let data = root.join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let _cfg = write_config(&root);
-    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
-    let schedule = |source: &str| {
-        store.meta_set("turn.source", source).unwrap();
-        let mut child = ka(&data)
-            .arg("__mcp")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.as_mut().unwrap();
-        for msg in [
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cron_manage","arguments":{"action":"schedule","every":"1h","text":"spawned"}}}"#,
-        ] {
-            stdin.write_all(msg.as_bytes()).unwrap();
-            stdin.write_all(b"\n").unwrap();
-        }
-        drop(child.stdin.take());
-        let out = child.wait_with_output().unwrap();
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find(|l| l.contains("\"id\":2"))
-            .unwrap_or("")
-            .to_string()
-    };
-    let refused = schedule("cron");
-    assert!(
-        refused.contains("isError") && refused.contains("scheduled job"),
-        "{refused}"
-    );
-    assert!(store.cron_tasks().unwrap().is_empty());
-    let allowed = schedule("telegram:42");
-    assert!(
-        allowed.contains("scheduled") && !allowed.contains("isError"),
-        "{allowed}"
-    );
-    assert_eq!(store.cron_tasks().unwrap().len(), 1);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// E5: the model can recall past conversations — search, then show.
 #[test]
 fn bridge_history_tools_find_and_show_past_turns() {
@@ -726,7 +712,7 @@ fn bridge_history_tools_find_and_show_past_turns() {
     let root = temp_root("history-tools");
     let data = root.join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let _cfg = write_config(&root);
+    let cfg = write_config(&root);
     let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
     let session = ka_agent_core::Session::new(root.join("ws"));
     store.insert_session(&session).unwrap();
@@ -751,6 +737,7 @@ fn bridge_history_tools_find_and_show_past_turns() {
         )
         .unwrap();
     let short = ka_agent_core::ids::short_id(turn.id.as_str()).to_string();
+    let _host = start_host(&data, &cfg);
 
     let mut child = ka(&data)
         .arg("__mcp")

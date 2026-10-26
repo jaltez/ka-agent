@@ -211,6 +211,39 @@ fn simple_turn_and_status() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The cron loop guard: a turn started by a scheduled job may not schedule
+/// more jobs (the handler reads the live turn source). The scenario's only
+/// turn is the cron's, so its `cron_manage` call is the one under test.
+#[test]
+fn cron_started_turn_cannot_schedule_crons() {
+    let root = temp_root("cron-loop");
+    let sc = scenario_file(
+        &root,
+        "loop.json",
+        r#"{ "steps": [
+            {"call": {"tool": "cron_manage", "args": {"action": "schedule", "every": "1h", "text": "nested"}}},
+            {"text": "refused as expected"}
+        ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("/cron add in 3s run the guard check");
+    chat.expect("cron ", Duration::from_secs(10));
+    // The cron's turn calls cron_manage; the guard refuses and the model
+    // answers with the scenario's closing text.
+    chat.expect("refused as expected", Duration::from_secs(60));
+    // No nested job was created: exactly the operator's one cron.
+    let conn = rusqlite::Connection::open(root.join("data/state.db")).unwrap();
+    let crons: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks WHERE kind = 'cron'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(crons, 1, "the nested schedule must be refused");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 2.2: every turn reaches the engine with one `<ctx .../>` first line
 /// (local time, weekday, zone, channel); the stored turn keeps the raw
 /// operator text, so history and search never show the marker.
@@ -780,11 +813,16 @@ fn operator_mcp_server_tools_are_callable() {
             {"text": "noted"}
         ], "stop": "done" }"#,
     );
+    // The operator server is our own `__mcp` relay pointed at the CHAT's
+    // data root: this proves the whole path — operator-declared server,
+    // approval card naming the tool, /y, the relayed call running in the
+    // host, and the effect landing.
     let extra_cfg = format!(
         "[[mcp]]\nname = \"extra\"\ncommand = {:?}\nargs = [\"__mcp\"]\nenv = {{ KA_AGENT_DATA_DIR = {:?}, PROBE = \"secret:probe.token\" }}\n",
         env!("CARGO_BIN_EXE_ka-agent"),
-        extra.display().to_string()
+        root.join("data").display().to_string()
     );
+    let _ = extra;
     let secrets = root.join("data/secrets");
     std::fs::create_dir_all(&secrets).unwrap();
     std::fs::write(secrets.join("probe.token"), "s3cret\n").unwrap();
@@ -795,7 +833,7 @@ fn operator_mcp_server_tools_are_callable() {
     chat.expect("use `extra__notes_append`", Duration::from_secs(60));
     chat.send("/y");
     chat.expect("noted", Duration::from_secs(60));
-    let note = extra.join("notes/from-mcp.md");
+    let note = root.join("data/notes/from-mcp.md");
     for _ in 0..50 {
         if note.exists() {
             break;

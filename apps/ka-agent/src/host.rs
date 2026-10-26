@@ -338,6 +338,7 @@ impl Host {
             bus: Arc::clone(&bus),
             shutdown: shutdown_tx.clone(),
             config: config.to_path_buf(),
+            paths_root: paths.root().to_path_buf(),
         };
         tasks.push(tokio::spawn(async move {
             loop {

@@ -11,7 +11,7 @@
 use ka_agent_store::Store;
 
 use crate::grants;
-use crate::mcp;
+use crate::tools::http as http_tools;
 
 /// Render the digest for one ICS source now. `Ok(text)` is always a
 /// presentable answer; `Err` is a visible failure (bad source, refused
@@ -87,10 +87,10 @@ fn load(source: &str, store: &Store) -> Result<String, String> {
         if !g.check(&scope) {
             return Err(format!("no grant for {scope}"));
         }
-        if !g.check("http:get:private") && mcp::http_target_is_private(&host) {
+        if !g.check("http:get:private") && http_tools::http_target_is_private(&host) {
             return Err("private target needs http:get:private".into());
         }
-        mcp::http_get_no_redirect(&parsed, 15, &g)
+        http_tools::http_get_no_redirect(&parsed, 15, &g)
     } else {
         std::fs::read_to_string(source).map_err(|e| format!("read {source}: {e}"))
     }

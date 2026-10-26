@@ -328,9 +328,9 @@ impl Setup {
 
     pub(super) fn live_card(&self, paired: bool) -> String {
         let name = self.name();
-        let mut out = String::from(format!(
+        let mut out = format!(
             "\n☥ {name} is awake.\n\nTalk to {name}:\n  ka-agent             in this terminal\n"
-        ));
+        );
         if paired && let Some(u) = &self.telegram_user {
             out.push_str(&format!("  @{u}  on Telegram\n"));
         }

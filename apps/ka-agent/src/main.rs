@@ -3,6 +3,7 @@
 //! hidden `__worker` / `__mcp` subcommands the runtime and engine supervise.
 
 mod admin;
+mod bridge;
 mod briefing_cli;
 mod chat;
 mod cli;
@@ -199,7 +200,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        Command::McpBridge => match ka_agent_channels::run_mcp() {
+        Command::McpBridge => match bridge::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("ka-agent mcp: {e}");

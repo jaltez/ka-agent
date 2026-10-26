@@ -532,6 +532,16 @@ impl Runtime {
         }
     }
 
+    /// The source of the turn currently running (`console`, `cron:<id>`,
+    /// `briefing`, …); `None` when idle. Read by the tool handlers' loop
+    /// guards instead of a store meta row.
+    pub fn current_turn_source(&self) -> Option<String> {
+        self.lock()
+            .live
+            .as_ref()
+            .and_then(|l| l.current_turn_source.clone())
+    }
+
     /// Sequence and fan out one event to every surface.
     pub fn emit(&self, ev: AgentEvent) {
         self.sh.emit(ev);

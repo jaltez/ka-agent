@@ -20,6 +20,18 @@ pub(crate) struct AdminCtx {
     pub(crate) shutdown: tokio::sync::watch::Sender<bool>,
     /// The config file the host loaded (re-read by `reload`).
     pub(crate) config: PathBuf,
+    /// The instance data root (tool calls build their Paths from it).
+    pub(crate) paths_root: PathBuf,
+}
+
+/// The tool context for one relayed call: the daemon's own runtime, store
+/// and paths (no second store reader, no env-based data root).
+fn tool_ctx(ctx: &AdminCtx) -> ka_agent_channels::tools::ToolCtx {
+    ka_agent_channels::tools::ToolCtx {
+        runtime: ctx.runtime.clone(),
+        store: Arc::clone(&ctx.store),
+        paths: ka_agent_runtime::paths::Paths::new(ctx.paths_root.clone()),
+    }
 }
 
 /// First request line ceiling: anything bigger is not one of ours, and an
@@ -103,6 +115,19 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
                         serde_json::json!({"error": "not a command"})
                     }
                 }
+            }
+            // The `__mcp` relay: list the daemon's tools, or run one.
+            (Some(_), Some("tool_list")) => {
+                let tool_ctx = tool_ctx(&ctx);
+                let tools = ka_agent_channels::tools::list(&tool_ctx).await;
+                serde_json::json!({"ok": true, "tools": tools})
+            }
+            (Some(req), Some("tool_call")) => {
+                let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                let tool_ctx = tool_ctx(&ctx);
+                let (text, is_error) = ka_agent_channels::tools::call(&tool_ctx, name, args).await;
+                serde_json::json!({"ok": true, "text": text, "is_error": is_error})
             }
             (Some(req), Some("attach")) => {
                 let since = req.get("since").and_then(|v| v.as_u64()).unwrap_or(0);

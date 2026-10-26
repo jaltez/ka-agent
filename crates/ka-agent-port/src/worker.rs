@@ -332,12 +332,8 @@ async fn open_engine(
     // Spawned as this same binary with `__mcp`; it inherits the worker's
     // sanitized env, including KA_AGENT_DATA_DIR for the store.
     //
-    // First-party connector secrets are re-injected explicitly: the worker's
-    // env sanitizer strips anything matching KEY/TOKEN/SECRET/…, so the
-    // GitHub tools could never see a token that arrived via the environment.
-    // The secret-store file tier (`<data>/secrets/github.token`) is the
-    // durable path; the env tier works when the daemon itself was started
-    // with it (the sanitizer runs below, in sanitize_env).
+    // The bridge only needs the data root: the tool calls themselves run
+    // in the daemon, which reads secrets from its own store.
     if let Ok(exe) = std::env::current_exe() {
         let mut mcp_env = std::collections::HashMap::new();
         let data_dir = std::env::var_os("KA_AGENT_DATA_DIR")
@@ -347,15 +343,6 @@ async fn open_engine(
             "KA_AGENT_DATA_DIR".to_string(),
             data_dir.to_string_lossy().into_owned(),
         );
-        // github.token → KA_AGENT_GITHUB_TOKEN for the bridge.
-        let github_file = data_dir.join("secrets/github.token");
-        let token = std::fs::read_to_string(&github_file)
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
-        if let Some(token) = token {
-            mcp_env.insert("KA_AGENT_GITHUB_TOKEN".to_string(), token);
-        }
         cfg.mcp.push(ka_engine::mcp::McpServerConfig {
             name: "kagent".to_string(),
             command: Some(exe.to_string_lossy().into_owned()),

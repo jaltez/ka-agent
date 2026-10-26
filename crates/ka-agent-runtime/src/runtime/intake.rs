@@ -106,7 +106,7 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
             live.live_text.clear();
         }
     }
-    let wire = format!("{}\n{}", context_line(&sh, &item.source), item.text);
+    let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
     match port.submit(wire, Vec::new(), Vec::new()).await {
         Ok(()) => {
             turn.transition(TurnStatus::Running)

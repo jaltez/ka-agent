@@ -191,14 +191,15 @@ async fn url_ref(store: &Store, token: &str) -> String {
     if !grants.check(&scope) {
         return format!("[ref {token} refused: no grant for {scope}]");
     }
-    if !grants.check("http:get:private") && crate::mcp::http_target_is_private(&host) {
+    if !grants.check("http:get:private") && crate::tools::http::http_target_is_private(&host) {
         return format!("[ref {token} refused: private target needs http:get:private]");
     }
     // Blocking fetch off the async executor.
-    let fetched =
-        tokio::task::spawn_blocking(move || crate::mcp::http_get_no_redirect(&parsed, 10, &grants))
-            .await
-            .unwrap_or_else(|e| Err(format!("join: {e}")));
+    let fetched = tokio::task::spawn_blocking(move || {
+        crate::tools::http::http_get_no_redirect(&parsed, 10, &grants)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("join: {e}")));
     match fetched {
         Ok(body) => {
             let cut = ka_agent_core::truncate_at_char(&body, REF_ITEM_MAX);
