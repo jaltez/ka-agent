@@ -385,6 +385,7 @@ impl Runtime {
                     .surface
                     .on_error("internal", &format!("memory proposals: {e}"));
             }
+            self.maybe_prune().await;
             let wait = match self.sh.store.next_due_ms() {
                 Ok(Some(next)) => {
                     let now = ka_agent_core::now_ms();
@@ -402,6 +403,44 @@ impl Runtime {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = self.sh.scheduler_tick.notified() => {}
+            }
+        }
+    }
+
+    /// Store retention: prune terminal rows every 6 h (meta-keyed so a
+    /// restarted daemon does not re-prune immediately).
+    async fn maybe_prune(&self) {
+        const INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+        let now = ka_agent_core::now_ms();
+        let due = self
+            .sh
+            .store
+            .meta_get("prune.last_ms")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .is_none_or(|last| now - last >= INTERVAL_MS);
+        if !due {
+            return;
+        }
+        match self.sh.store.prune(now) {
+            Ok(report) => {
+                let _ = self.sh.store.meta_set("prune.last_ms", &now.to_string());
+                let pruned = report.runs
+                    + report.approvals
+                    + report.intents
+                    + report.memory_candidates
+                    + report.queue
+                    + report.outbox
+                    + report.tasks;
+                if pruned > 0 {
+                    self.sh.surface.on_notice(&format!(
+                        "state pruned: {pruned} old row(s) (runs, approvals, queue, outbox)"
+                    ));
+                }
+            }
+            Err(e) => {
+                self.sh.surface.on_error("internal", &format!("prune: {e}"));
             }
         }
     }

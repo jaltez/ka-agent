@@ -23,9 +23,12 @@ mod identities;
 mod intents;
 mod outbox;
 mod queue;
+mod retention;
 mod sessions;
 mod tasks;
 mod turns;
+
+pub use retention::PruneReport;
 
 use std::path::Path;
 
