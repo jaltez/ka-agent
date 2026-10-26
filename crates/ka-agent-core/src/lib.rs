@@ -11,6 +11,7 @@ pub mod audit;
 pub mod budget;
 pub mod config;
 pub mod config_file;
+pub mod config_keys;
 pub mod ids;
 pub mod layout;
 pub mod markdown;
@@ -38,6 +39,17 @@ pub use task::{CronMode, CronSpec, Task, TaskStatus};
 pub use time::{fmt_interval, parse_duration};
 pub use turn::{Turn, TurnStatus};
 pub use when::When;
+
+/// True when `source` names a local surface — the terminal (`console`),
+/// CLI, web panel or loopback API — exactly (`"console"`) or with a suffix
+/// (`"cli:…"`, `"web:…"`). Phone channels and scheduled sources are false.
+pub fn is_local_source(source: &str) -> bool {
+    ["console", "cli", "web", "api"].iter().any(|name| {
+        source
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    })
+}
 
 /// Milliseconds since the Unix epoch (UTC). All timestamps in Ka Agent state
 /// are stored as this integer; rendering to a human format is a surface
