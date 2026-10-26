@@ -1,6 +1,7 @@
 //! Channel adapters. M2: Telegram (Bot API long polling in, throttled
 //! messages + approval keyboards out). M4: the MCP bridge.
 
+pub(crate) mod attachments;
 pub mod calendar;
 pub mod channel;
 pub mod commands;
