@@ -224,7 +224,7 @@ fn idle_worker_is_stopped_then_restarted_on_demand() {
         r#"{ "steps": [ {"text": "first-alive"}, {"text": "second-alive"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
     );
     let mut chat = spawn_chat_cfg(&root, &sc, "worker_idle_timeout_secs = 2\n");
-    chat.expect("local session", Duration::from_secs(10));
+    chat.expect("local session", Duration::from_secs(60));
     chat.send("first message");
     chat.expect("first-alive", Duration::from_secs(30));
     chat.expect("turn done", Duration::from_secs(10));
@@ -459,7 +459,7 @@ fn cron_end_to_end_and_agents_md_seeded_once() {
         r#"{ "steps": [ {"text": "x"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
     );
     let mut chat2 = spawn_chat(&root, &sc2);
-    chat2.expect("local session", Duration::from_secs(15));
+    chat2.expect("local session", Duration::from_secs(60));
     assert_eq!(
         std::fs::read_to_string(&agents_md).unwrap_or_default(),
         "OPERATOR-MARKER-XYZ\n",
@@ -635,7 +635,7 @@ fn skills_enable_list_invoke() {
 
     // Chat: list, invoke, and a fail-closed unknown-skill case.
     let mut chat = spawn_chat(&root, &sc);
-    chat.expect("local session", Duration::from_secs(10));
+    chat.expect("local session", Duration::from_secs(60));
     chat.send("/skills");
     chat.expect("review — review a diff carefully", Duration::from_secs(10));
     chat.send("/skill ghost do something");

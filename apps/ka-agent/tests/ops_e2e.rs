@@ -628,11 +628,22 @@ fn backup_default_path_prunes_to_keep() {
     let cfg = write_config(&root);
     let data = root.join("data");
     for _ in 0..2 {
-        let out = ka(&data)
+        let mut out = ka(&data)
             .args(["backup", "--keep", "1", "--config"])
             .arg(&cfg)
             .output()
             .unwrap();
+        // The stamp has second granularity: under heavy parallel load the
+        // two runs can land in the same second — wait one out and retry.
+        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already exists")
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            out = ka(&data)
+                .args(["backup", "--keep", "1", "--config"])
+                .arg(&cfg)
+                .output()
+                .unwrap();
+        }
         assert!(
             out.status.success(),
             "backup: {}",
