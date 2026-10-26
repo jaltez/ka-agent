@@ -211,6 +211,60 @@ fn simple_turn_and_status() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 2.2: every turn reaches the engine with one `<ctx .../>` first line
+/// (local time, weekday, zone, channel); the stored turn keeps the raw
+/// operator text, so history and search never show the marker.
+#[test]
+fn turn_carries_the_context_line_on_the_wire_only() {
+    let root = temp_root("ctx-line");
+    let sc = scenario_file(
+        &root,
+        "ctx.json",
+        r#"{ "steps": [ {"text": "noted"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("remember the milk");
+    chat.expect("noted", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(10));
+
+    // The engine's strand holds the wire text: ctx line first.
+    let strands = root.join("data/ka/strands");
+    let mut strand = None;
+    for entry in std::fs::read_dir(&strands).unwrap().flatten() {
+        for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+            if file.path().extension().is_some_and(|e| e == "jsonl") {
+                strand = Some(file.path());
+            }
+        }
+    }
+    let strand = strand.expect("a strand file");
+    let jsonl = std::fs::read_to_string(&strand).unwrap();
+    let user = jsonl
+        .lines()
+        .find_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            (v["role"] == "user").then(|| v["content"].as_str().unwrap_or("").to_string())
+        })
+        .expect("a user record");
+    assert!(user.starts_with("<ctx "), "{user}");
+    assert!(user.contains("via=\"terminal\""), "{user}");
+    assert!(user.ends_with("remember the milk"), "{user}");
+
+    // The stored turn is raw: no marker in the transcript or its index.
+    let conn = rusqlite::Connection::open(root.join("data/state.db")).unwrap();
+    let inbound: String = conn
+        .query_row(
+            "SELECT inbound_text FROM turns ORDER BY created_ms DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(inbound, "remember the milk");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Idle reap (minimal-footprint contract): with `worker_idle_timeout_secs`
 /// set low, a settled session loses its worker after the timeout — noted
 /// as a deliberate stop, not a crash — and the next message restarts it

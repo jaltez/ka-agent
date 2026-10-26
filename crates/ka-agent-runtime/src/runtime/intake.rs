@@ -10,6 +10,49 @@ fn publish_turn_source(store: &Store, source: &str) {
 
 /// Submit the next queued message, if any. Returns true when a new cycle is
 /// running (session stays `running`).
+/// The per-turn context line the model sees first: local clock, weekday,
+/// zone and channel; scheduled turns name their origin. `turns.inbound_text`
+/// and the FTS index keep the raw text.
+fn context_line(sh: &Shared, source: &str) -> String {
+    let now = jiff::Timestamp::now().to_zoned(cfg_of(sh).time_zone());
+    ctx_line(&now, source)
+}
+
+/// The pure form (unit-tested): one `<ctx .../>` line for `now` + source.
+fn ctx_line(now: &jiff::Zoned, source: &str) -> String {
+    let tz = now.time_zone().iana_name().unwrap_or("UTC").to_string();
+    let day = match now.weekday() {
+        jiff::civil::Weekday::Monday => "Mon",
+        jiff::civil::Weekday::Tuesday => "Tue",
+        jiff::civil::Weekday::Wednesday => "Wed",
+        jiff::civil::Weekday::Thursday => "Thu",
+        jiff::civil::Weekday::Friday => "Fri",
+        jiff::civil::Weekday::Saturday => "Sat",
+        jiff::civil::Weekday::Sunday => "Sun",
+    };
+    // console -> terminal; "-bg" background asks speak as their channel;
+    // a cron:<id> source names the task in `scheduled`.
+    let (via, scheduled) = if let Some(rest) = source.strip_prefix("cron:") {
+        ("cron", Some(format!("cron:{rest}")))
+    } else if source == "cron" {
+        ("cron", Some("cron".to_string()))
+    } else if source == "briefing" {
+        ("briefing", Some("briefing".to_string()))
+    } else {
+        let bare = source.strip_suffix("-bg").unwrap_or(source);
+        let bare = bare.split(':').next().unwrap_or(bare);
+        let via = if bare == "console" { "terminal" } else { bare };
+        (via, None)
+    };
+    let scheduled = scheduled
+        .map(|s| format!(" scheduled=\"{s}\""))
+        .unwrap_or_default();
+    format!(
+        "<ctx now=\"{}\" day=\"{day}\" tz=\"{tz}\" via=\"{via}\"{scheduled}/>",
+        now.strftime("%Y-%m-%dT%H:%M:%S%:z")
+    )
+}
+
 pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
     let sid = {
         sh.inner
@@ -63,7 +106,8 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
             live.live_text.clear();
         }
     }
-    match port.submit(item.text.clone(), Vec::new(), Vec::new()).await {
+    let wire = format!("{}\n{}", context_line(&sh, &item.source), item.text);
+    match port.submit(wire, Vec::new(), Vec::new()).await {
         Ok(()) => {
             turn.transition(TurnStatus::Running)
                 .map_err(|t| illegal_turn(turn.status, t))
@@ -380,7 +424,11 @@ impl Runtime {
                 live.live_text.clear();
             }
         }
-        match port.submit(text.to_string(), Vec::new(), skills).await {
+        let wire = format!(
+            "{}\n{text}",
+            context_line(&self.sh, source.unwrap_or("console"))
+        );
+        match port.submit(wire, Vec::new(), skills).await {
             Ok(()) => {}
             Err(PortError::EngineClosed) => {
                 turn.transition(TurnStatus::Interrupted)
@@ -476,5 +524,40 @@ impl Runtime {
     /// Skills the engine currently discovers (for `/skills` and doctor).
     pub fn skills_enabled(&self) -> Vec<crate::skills::SkillInfo> {
         crate::skills::Skills::new(&self.sh.paths.engine_home()).enabled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn now() -> jiff::Zoned {
+        "2026-07-14T23:14:05+02:00[Europe/Madrid]".parse().unwrap()
+    }
+
+    #[test]
+    fn ctx_line_names_time_zone_and_channel() {
+        let line = ctx_line(&now(), "console");
+        assert_eq!(
+            line,
+            "<ctx now=\"2026-07-14T23:14:05+02:00\" day=\"Tue\" tz=\"Europe/Madrid\" via=\"terminal\"/>"
+        );
+        assert!(ctx_line(&now(), "telegram:42").contains("via=\"telegram\""));
+        assert!(ctx_line(&now(), "matrix:!room").contains("via=\"matrix\""));
+        assert!(ctx_line(&now(), "cli-bg").contains("via=\"cli\""));
+        assert!(ctx_line(&now(), "web").contains("via=\"web\""));
+        assert!(ctx_line(&now(), "api-bg").contains("via=\"api\""));
+    }
+
+    #[test]
+    fn scheduled_turns_name_their_origin() {
+        let cron = ctx_line(&now(), "cron:task_abc");
+        assert!(cron.contains("via=\"cron\""), "{cron}");
+        assert!(cron.contains("scheduled=\"cron:task_abc\""), "{cron}");
+        let brief = ctx_line(&now(), "briefing");
+        assert!(brief.contains("via=\"briefing\""), "{brief}");
+        assert!(brief.contains("scheduled=\"briefing\""), "{brief}");
+        assert!(!ctx_line(&now(), "console").contains("scheduled="));
     }
 }
