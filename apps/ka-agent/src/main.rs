@@ -32,6 +32,7 @@ mod secrets_cli;
 mod service;
 mod setup;
 mod skills_cli;
+mod triggers_cli;
 mod update_cli;
 mod usage_cli;
 
@@ -305,6 +306,14 @@ fn main() -> std::process::ExitCode {
             rt.block_on(daemon::run_daemon(config_path(&config), scenario, web_port))
         }
         Command::Persona { action, config } => persona_cli::persona(action, config_path(&config)),
+        Command::Notify { text, config } => triggers_cli::notify(&text, config_path(&config)),
+        Command::Ask {
+            text,
+            wait,
+            background,
+            config,
+        } => triggers_cli::ask(&text, wait, background, config_path(&config)),
+        Command::Hooks { action, config } => triggers_cli::hooks(action, config_path(&config)),
         Command::Restart => daemon::restart_client(),
         Command::Status { json } => daemon::status_client(json),
         Command::Completions { shell } => completions(shell),

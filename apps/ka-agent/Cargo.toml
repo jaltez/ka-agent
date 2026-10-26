@@ -20,6 +20,7 @@ ka-agent-channels = { workspace = true }
 ka-agent-plugins = { workspace = true }
 ka-agent-web = { workspace = true }
 ka-sandbox = { workspace = true }
+rand_core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

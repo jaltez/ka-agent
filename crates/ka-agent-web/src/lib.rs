@@ -463,6 +463,12 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
         }
         return Response::unauthorized();
     }
+    // Local triggers (plan 2.7): POST /api/notify and POST /api/ask take
+    // `Authorization: Bearer <web.api_token>` instead of the panel cookie.
+    // No secret configured → 404 (the API is off, not forbidden).
+    if req.path.starts_with("/api/") {
+        return api_route(req, runtime, store).await;
+    }
     if !auth.is_valid(&req.cookies) {
         return Response::unauthorized();
     }
@@ -634,4 +640,101 @@ pub fn escape_html(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+/// `POST /api/notify {"text"}` / `POST /api/ask {"text","background"}`.
+/// Bearer-only; 404 when no token is configured; 16 KiB bodies; a small
+/// per-process token bucket (30/min).
+async fn api_route(req: &Request, runtime: &Runtime, _store: &Arc<Store>) -> Response {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if req.method != "POST" {
+        return Response::base(405, "application/json", "{}".into());
+    }
+    let secret = match ka_agent_core::secret::resolve(
+        "web.api_token",
+        &ka_agent_core::layout::default_root().join("secrets"),
+    ) {
+        Ok(t) => t,
+        Err(_) => return Response::base(404, "application/json", "{}".into()),
+    };
+    let token = req
+        .headers_get("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_time_eq(token.as_bytes(), secret.trim().as_bytes()) {
+        return Response::base(
+            401,
+            "application/json",
+            "{\"error\":\"unauthorized\"}".into(),
+        );
+    }
+    // 30 requests/min token bucket (process-wide).
+    static WINDOW: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let now_s = ka_agent_core::now_ms() as u64 / 1000;
+    let window = WINDOW.load(Ordering::Relaxed);
+    if now_s / 60 != window / 60 || window == 0 {
+        WINDOW.store(now_s, Ordering::Relaxed);
+        COUNT.store(0, Ordering::Relaxed);
+    }
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 30 {
+        return Response::base(429, "application/json", "{\"error\":\"slow down\"}".into());
+    }
+    if req.body.len() > 16 * 1024 {
+        return Response::base(413, "application/json", "{}".into());
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+    let text = body
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim();
+    if text.is_empty() {
+        return Response::base(
+            400,
+            "application/json",
+            "{\"error\":\"text required\"}".into(),
+        );
+    }
+    match req.path.as_str() {
+        "/api/notify" => {
+            runtime.emit(ka_agent_runtime::AgentEvent::Notice {
+                text: text.to_string(),
+            });
+            Response::base(200, "application/json", "{\"ok\":true}".into())
+        }
+        "/api/ask" => {
+            let background = body
+                .get("background")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let source = if background { "api-bg" } else { "api" };
+            match runtime.handle_message(text, source).await {
+                Ok(()) => Response::base(
+                    200,
+                    "application/json",
+                    "{\"ok\":true,\"queued\":true}".into(),
+                ),
+                Err(e) => Response::base(
+                    500,
+                    "application/json",
+                    format!("{{\"error\":{}}}", serde_json::Value::String(e.to_string())),
+                ),
+            }
+        }
+        _ => Response::base(404, "application/json", "{}".into()),
+    }
+}
+
+/// Length-independent comparison for the bearer token.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

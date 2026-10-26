@@ -149,6 +149,28 @@ pub fn secret_action(action: SecretAction) -> std::process::ExitCode {
                 }
             }
         }
+        SecretAction::Generate { name } => {
+            if !valid_secret_name(&name) {
+                eprintln!("ka-agent: secret name {name:?}: [a-z0-9._-] only");
+                return std::process::ExitCode::FAILURE;
+            }
+            // 32 bytes from the OS, hex; printed once so a script can
+            // capture it (the store keeps it for the daemon).
+            let mut bytes = [0u8; 32];
+            use rand_core::RngCore as _;
+            rand_core::OsRng.fill_bytes(&mut bytes);
+            let value: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            match ka_agent_core::secret::store(&name, &value, &dir) {
+                Ok(_) => {
+                    println!("{value}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("ka-agent: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
         SecretAction::List => match std::fs::read_dir(&dir) {
             Ok(entries) => {
                 let mut names: Vec<String> = entries

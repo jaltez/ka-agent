@@ -182,6 +182,14 @@ impl Host {
             surfaces.push(s.clone());
             s
         });
+        // Operator hooks ride the fan-out (agent events only; engine
+        // events were composed into the engine layer).
+        if !cfg.hooks.is_empty() {
+            surfaces.push(ka_agent_runtime::hooks::HookSurface::start(
+                cfg.hooks.clone(),
+                cfg.workspace_path(),
+            ));
+        }
         let surface: Arc<dyn Surface> = Arc::new(ka_agent_channels::MultiSurface::new(surfaces));
 
         let mut port = ka_agent_port::WorkerPort::with_current_exe();

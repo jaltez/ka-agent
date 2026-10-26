@@ -281,6 +281,39 @@ fn simple_turn_and_status() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 2.7: a `[[hooks]]` entry on `turn_finished` runs after a turn with the
+/// envelope JSON on stdin.
+#[test]
+fn turn_finished_hook_receives_the_envelope() {
+    let root = temp_root("hook");
+    let out = root.join("hook.json");
+    let sc = scenario_file(
+        &root,
+        "hook.json.sc",
+        r#"{ "steps": [ {"text": "hooked"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let extra = format!(
+        "[[hooks]]\non = \"turn_finished\"\ncommand = \"cat > {}\"\n",
+        out.display()
+    );
+    let mut chat = spawn_chat_cfg(&root, &sc, &extra);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("run the hook");
+    chat.expect("hooked", Duration::from_secs(60));
+    chat.expect("turn done", Duration::from_secs(10));
+    // The hook runs out of band; give it a moment.
+    for _ in 0..50 {
+        if out.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(body.contains("\"ev\":\"turn_finished\""), "{body}");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 2.6: a scheduled turn that answers `[SILENT]` delivers nothing — no
 /// final chunk, no outbox row — while an operator turn with the same text
 /// is delivered verbatim.

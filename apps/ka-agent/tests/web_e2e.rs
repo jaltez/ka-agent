@@ -1023,3 +1023,49 @@ fn settings_form_and_usage_page() {
     daemon.child.wait().ok();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 2.7 loopback API: /api/notify and /api/ask answer only with the right
+/// bearer token — 404 while `web.api_token` is unset, 401 for a wrong
+/// token, 200 (empty ok) for the right one. No cookie involved.
+#[test]
+fn api_requires_the_bearer_token() {
+    let root = temp_root("api");
+    let port = free_port();
+    let daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(15));
+    let body = "{\"text\":\"ping\"}";
+
+    // No token configured: the API does not exist.
+    let r = request_h(port, "POST", "/api/notify", None, body, &[]);
+    assert_eq!(r.status, 404, "unset api_token must 404: {}", r.body);
+
+    // Configure one (written where the daemon reads secrets).
+    let secrets = daemon.data.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join("web.api_token"), "test-token-123").unwrap();
+
+    let r = request_h(port, "POST", "/api/notify", None, body, &[]);
+    assert_eq!(r.status, 401, "{}", r.body);
+    let r = request_h(
+        port,
+        "POST",
+        "/api/notify",
+        None,
+        body,
+        &[("Authorization", "Bearer wrong-token")],
+    );
+    assert_eq!(r.status, 401, "{}", r.body);
+    let r = request_h(
+        port,
+        "POST",
+        "/api/notify",
+        None,
+        body,
+        &[("Authorization", "Bearer test-token-123")],
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("\"ok\":true"), "{}", r.body);
+    // Dropping the daemon kills it.
+    drop(daemon);
+    std::fs::remove_dir_all(&root).ok();
+}

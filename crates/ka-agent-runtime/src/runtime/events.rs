@@ -559,6 +559,7 @@ pub(super) async fn drive(
                 };
                 if let Some(tid) = &turn_id
                     && !silent
+                    && !text.trim().is_empty()
                 {
                     if scheduled {
                         // Its streamed deltas were suppressed while it

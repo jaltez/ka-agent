@@ -186,8 +186,8 @@ fn help_lists_the_everyday_commands_and_hides_the_rest() {
         .lines()
         .filter(|l| l.starts_with("  ") && !l.trim().is_empty())
         .count();
-    // 16 everyday commands + `persona` (show/edit/reset the assistant).
-    assert!(n <= 17, "{n} commands listed:\n{t}");
+    // Everyday commands: the core set + persona/notify/ask/hooks.
+    assert!(n <= 21, "{n} commands listed:\n{t}");
     assert!(!t.contains("SEED.md"), "{t}");
     assert!(t.contains("More commands:"), "{t}");
     for hidden in ["grant", "plugin", "purge", "identity", "run"] {

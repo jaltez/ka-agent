@@ -973,6 +973,7 @@ dependencies = [
  "ka-agent-store",
  "ka-agent-web",
  "ka-sandbox",
+ "rand_core 0.6.4",
  "reqwest",
  "rpassword",
  "rusqlite",

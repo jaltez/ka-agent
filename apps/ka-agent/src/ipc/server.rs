@@ -116,6 +116,35 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
                     }
                 }
             }
+            // Local triggers (plan 2.7): a notice without a model, or a
+            // message through the normal ingest path.
+            (Some(req), Some("notify")) => {
+                let text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if text.trim().is_empty() {
+                    serde_json::json!({"error": "notify needs a text"})
+                } else {
+                    ctx.runtime.emit(ka_agent_runtime::AgentEvent::Notice {
+                        text: text.to_string(),
+                    });
+                    serde_json::json!({"ok": true})
+                }
+            }
+            (Some(req), Some("ask")) => {
+                let text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let background = req
+                    .get("background")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                if text.trim().is_empty() {
+                    serde_json::json!({"error": "ask needs a text"})
+                } else {
+                    let source = if background { "cli-bg" } else { "cli" };
+                    match ctx.runtime.handle_message(text, source).await {
+                        Ok(()) => serde_json::json!({"ok": true, "queued": false}),
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    }
+                }
+            }
             // The `__mcp` relay: list the daemon's tools, or run one.
             (Some(_), Some("tool_list")) => {
                 let tool_ctx = tool_ctx(&ctx);

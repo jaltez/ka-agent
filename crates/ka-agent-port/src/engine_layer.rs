@@ -29,7 +29,11 @@ pub fn compose(
         || cfg.approvals.auto_review
         || cfg.effort.is_some()
         || sandbox_on
-        || cfg.budgets.daily_usd.is_some();
+        || cfg.budgets.daily_usd.is_some()
+        || cfg
+            .hooks
+            .iter()
+            .any(|h| ka_agent_core::config::ENGINE_HOOK_EVENTS.contains(&h.on.as_str()));
     if !has_extras {
         return Ok(user_layer.map(str::to_string));
     }
@@ -64,6 +68,34 @@ pub fn compose(
             .or_insert_with(|| toml::Table::new().into());
         if let Some(g) = guards.as_table_mut() {
             g.insert("auto_review".into(), true.into());
+        }
+    }
+
+    // Engine hooks: the engine runs them with its own semantics (sh -c,
+    // 30 s cap, exit 2 blocks, stdout steers). Agent-event hooks are the
+    // runtime's (HookSurface), never the engine's.
+    {
+        let engine_hooks: Vec<&ka_agent_core::config::HookSpec> = cfg
+            .hooks
+            .iter()
+            .filter(|h| ka_agent_core::config::ENGINE_HOOK_EVENTS.contains(&h.on.as_str()))
+            .collect();
+        if !engine_hooks.is_empty() {
+            let mut rows = match doc.remove("hooks") {
+                Some(toml::Value::Array(a)) => a,
+                Some(_) => return Err("engine layer: `hooks` must be an array of tables".into()),
+                None => Vec::new(),
+            };
+            for h in engine_hooks {
+                let mut row = toml::Table::new();
+                row.insert("event".into(), h.on.clone().into());
+                if let Some(tool) = &h.tool {
+                    row.insert("tool".into(), tool.clone().into());
+                }
+                row.insert("command".into(), h.command.clone().into());
+                rows.push(row.into());
+            }
+            doc.insert("hooks".into(), toml::Value::Array(rows));
         }
     }
 

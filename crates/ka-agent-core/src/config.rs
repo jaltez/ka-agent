@@ -65,6 +65,51 @@ pub struct Ka {
     pub engine_layer: Option<PathBuf>,
 }
 
+/// One operator hook (`[[hooks]]`, plan 2.7).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HookSpec {
+    /// The event to react to: an agent event (`message_received`,
+    /// `turn_finished`, `approval_requested`, `approval_settled`,
+    /// `reminder_fired`, `cron_finished`, `session_paused`,
+    /// `memory_proposed`) or an engine event (`pre_tool_use`,
+    /// `post_tool_use`, `user_prompt_submit`, `session_start`,
+    /// `session_end`, `stop`, `turn_end`, `pre_compact`).
+    pub on: String,
+    /// `sh -c <command>` (agent events) / the engine's own hook contract
+    /// (engine events).
+    pub command: String,
+    /// Only this tool (engine tool-call events only).
+    pub tool: Option<String>,
+    /// Agent-event timeout (1–60 s; default 10). Engine events use the
+    /// engine's own 30 s ceiling.
+    pub timeout_secs: Option<u64>,
+}
+
+/// The agent-event names a `[[hooks]]` entry may use.
+pub const AGENT_HOOK_EVENTS: &[&str] = &[
+    "message_received",
+    "turn_finished",
+    "approval_requested",
+    "approval_settled",
+    "reminder_fired",
+    "cron_finished",
+    "session_paused",
+    "memory_proposed",
+];
+
+/// The engine-event names a `[[hooks]]` entry may use.
+pub const ENGINE_HOOK_EVENTS: &[&str] = &[
+    "pre_tool_use",
+    "post_tool_use",
+    "user_prompt_submit",
+    "session_start",
+    "session_end",
+    "stop",
+    "turn_end",
+    "pre_compact",
+];
+
 /// The Matrix channel (Phase 6): strict `[matrix]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -349,6 +394,9 @@ pub struct DaemonConfig {
     pub voice: Option<Voice>,
     pub notify: Notify,
     pub approvals: Approvals,
+    /// Operator hooks ([[hooks]]).
+    #[serde(default)]
+    pub hooks: Vec<HookSpec>,
 }
 
 impl Default for DaemonConfig {
@@ -378,6 +426,7 @@ impl Default for DaemonConfig {
             voice: None,
             notify: Notify::default(),
             approvals: Approvals::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -411,6 +460,41 @@ impl DaemonConfig {
             "guarded" | "accept_edits" | "free" | "plan"
         ) {
             return Err(Error::Validate(format!("unknown mode {:?}", self.mode)));
+        }
+        for h in &self.hooks {
+            if !AGENT_HOOK_EVENTS.contains(&h.on.as_str())
+                && !ENGINE_HOOK_EVENTS.contains(&h.on.as_str())
+            {
+                let near = AGENT_HOOK_EVENTS
+                    .iter()
+                    .chain(ENGINE_HOOK_EVENTS)
+                    .min_by_key(|e| e.chars().zip(h.on.chars()).filter(|(a, b)| a != b).count());
+                return Err(Error::Validate(format!(
+                    "unknown hook event {:?} (did you mean {:?}?)",
+                    h.on,
+                    near.unwrap_or(&"turn_finished")
+                )));
+            }
+            if h.command.trim().is_empty() {
+                return Err(Error::Validate(format!(
+                    "hook {:?}: command must not be empty",
+                    h.on
+                )));
+            }
+            if h.on != "pre_tool_use" && h.on != "post_tool_use" && h.tool.is_some() {
+                return Err(Error::Validate(format!(
+                    "hook {:?}: `tool` only applies to pre_tool_use/post_tool_use",
+                    h.on
+                )));
+            }
+            if let Some(t) = h.timeout_secs
+                && !(1..=60).contains(&t)
+            {
+                return Err(Error::Validate(format!(
+                    "hook {:?}: timeout_secs must be in 1..=60",
+                    h.on
+                )));
+            }
         }
         if let Some(effort) = &self.effort
             && !matches!(effort.as_str(), "off" | "low" | "medium" | "high" | "max")

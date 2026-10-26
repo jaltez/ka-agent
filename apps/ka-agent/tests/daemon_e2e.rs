@@ -469,3 +469,38 @@ fn cron_and_approvals_cli() {
     daemon.sigterm_wait(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 2.7 local triggers: `notify` reaches an attached client as a Notice,
+/// and `ask` enqueues a turn through the normal path.
+#[test]
+fn notify_and_ask_reach_the_running_agent() {
+    let root = temp_root("triggers");
+    let mut daemon = spawn_daemon(&root);
+    daemon.wait_sock(Duration::from_secs(10));
+
+    let mut stream = std::os::unix::net::UnixStream::connect(daemon.sock()).unwrap();
+    stream
+        .write_all(b"{\"op\":\"notify\",\"text\":\"hello from a script\"}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(v["ok"], serde_json::json!(true));
+
+    // The CLI asks through the same op; the turn lands in the store queue
+    // (no model here, so the preflight refuses and the session stays
+    // consistent — what matters is the trigger path answered).
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["ask", "what changed today?"])
+        .env("KA_AGENT_DATA_DIR", &daemon.data)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    daemon.sigterm_wait(Duration::from_secs(10));
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -369,6 +369,14 @@ pub static KEYS: &[KeySpec] = &[
         doc: "operator-declared MCP servers ([[mcp]] array)",
     },
     KeySpec {
+        path: "hooks",
+        kind: Kind::Table,
+        default: "[]",
+        apply: Apply::Worker,
+        web: false,
+        doc: "operator hooks ([[hooks]]: on, command, optional tool/timeout_secs)",
+    },
+    KeySpec {
         path: "voice.provider",
         kind: Kind::Enum(&["openai", "groq", "local"]),
         default: "unset (voice off)",

@@ -25,6 +25,36 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Post a notice to the running agent's surfaces (no model turn).
+    Notify {
+        /// The text (`-` reads stdin).
+        #[arg(required = true)]
+        text: Vec<String>,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Ask the agent a question through the normal message path.
+    Ask {
+        /// The text (`-` reads stdin).
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+        /// Wait for the turn to finish (streaming envelopes until then).
+        #[arg(long)]
+        wait: bool,
+        /// Run the turn on the background model.
+        #[arg(long)]
+        background: bool,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Operator hooks: list them, or run the matching ones against a
+    /// synthetic event.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     /// Show, edit or reset the assistant's persona.
     Persona {
         #[command(subcommand)]
@@ -461,6 +491,15 @@ pub(crate) enum ConfigAction {
 }
 
 #[derive(clap::Subcommand)]
+pub(crate) enum HooksAction {
+    /// Every configured hook: event, command, and whether it is an engine
+    /// or an agent hook.
+    List,
+    /// Run the agent hooks matching <event> with a synthetic envelope.
+    Test { event: String },
+}
+
+#[derive(clap::Subcommand)]
 pub(crate) enum PersonaAction {
     /// Print the persona.
     Show,
@@ -561,6 +600,11 @@ pub(crate) enum SecretAction {
         name: String,
         /// The value (omit to read one line from stdin).
         value: Option<String>,
+    },
+    /// Generate a random secret (32 bytes, hex) and print it once.
+    Generate {
+        /// Secret name, as referenced from ka-agent.toml.
+        name: String,
     },
     /// List secret names (values are never printed).
     List,
