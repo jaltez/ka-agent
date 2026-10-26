@@ -112,7 +112,10 @@ fn spawn_daemon(root: &std::path::Path, port: u16) -> Daemon {
     let sc = root.join("web.json");
     std::fs::write(
         &sc,
-        r#"{ "steps": [ {"text": "web-hello"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 3 }"#,
+        // Two answers: the auth test sends two model messages, and the
+        // second one must produce its own delta even when the first turn
+        // already finished before the SSE socket opened.
+        r#"{ "steps": [ {"text": "web-hello"}, {"text": "web-hello"} ], "stop": "done", "cost_usd": 0.0001, "tokens": 3 }"#,
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
@@ -449,10 +452,10 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     );
     assert_eq!(accented.status, 200, "accented send: {}", accented.body);
 
-    // Live stream: an open /events socket sees the inbound echo and the
-    // scripted answer's delta for a message sent while it is open. Slow
-    // runners may still be finishing the previous turn (this one queues),
-    // so read until both markers arrive, not for a fixed window.
+    // Live stream: an open /events socket sees the inbound echo and a
+    // scripted answer's delta for a message sent while it is open. The
+    // scenario carries an answer per message, so this does not depend on
+    // the previous turn still running.
     let events = open_events(port, &cookie);
     let sent = request_h(
         port,
