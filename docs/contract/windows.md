@@ -11,14 +11,14 @@ safe crate (`rustix` on Unix, `crossterm` for the console on Windows).
 
 | Area | Unix | Windows |
 |---|---|---|
-| Admin endpoint | Unix socket `<root>/admin.sock`, 0600, `SO_PEERCRED` uid check | Named pipe `\\.\pipe\ka-agent-<sha256(root)[..16]>`, created with the default DACL (creator + SYSTEM + administrators); `first_pipe_instance` makes a second daemon on the same root fail instead of stealing clients |
+| Admin endpoint | Unix socket `<root>/admin.sock`, 0600, `SO_PEERCRED` uid check | Named pipe `\\.\pipe\ka-agent-<sha256(canonical, lowercased root)[..16]>` — `.`/`..`, symlink and case variants of one existing root share the name, so `status` finds the daemon `run` started; created with the default DACL (creating user + SYSTEM + administrators) and no peer-credential check, so the DACL is the guarantee: other users cannot connect, administrators can, just as root can reach the Unix socket despite its 0600 + `SO_PEERCRED`; a busy pipe is retried for at most 30 s, then `connect` names the pipe and fails; `first_pipe_instance` makes a second daemon on the same root fail instead of stealing clients |
 | Worker kill | `/bin/kill -s KILL -- -<pgid>` (the worker is its own process group) | `taskkill /T /F /PID <pid>` (the whole child tree) |
 | Raw mode | `rustix` termios, `OPOST` kept, bracketed paste + focus reports | `crossterm` raw mode and console events; the drawing layer emits console commands instead of ANSI (see `term/paint.rs`) |
-| Service | systemd user units / launchd plists | Task Scheduler entries `\KaAgent` (default profile) and `\KaAgent-<profile>`, `/SC ONLOGON /RL LIMITED`, run as `ka-agent -p <profile> run`; start/stop/status through `schtasks.exe` |
+| Service | systemd user units / launchd plists | Task Scheduler tasks `KaAgent` (default profile) and `KaAgent-<profile>`, in the root folder under one bare name used by every call (install, query, run, end, delete), `/SC ONLOGON /RL LIMITED`, running `cmd /C ""<exe>" [-p <profile>] run >> "<root>\logs\daemon.log" 2>&1"`; `schtasks /TR` allows 261 characters, so `install` rejects a longer command instead of letting it truncate; installs from 0.12 and earlier used a `\KaAgent\<name>` folder task, which install and uninstall delete on the way through |
 | Permissions | 0700 data dirs, 0600 secrets | No POSIX modes: the data tree lives under `%USERPROFILE%\.ka-agent` and inherits the profile's ACL; `restrict_dir` is a no-op and doctor does not report modes |
 | Home | `$HOME` | `$HOME` when set, else `%USERPROFILE%` (config `~` expansion and the data root agree) |
 | Plugins | bubblewrap sandbox (Linux only) | `plugin install`/`enable` refuse with "plugins need Linux"; doctor says the same |
-| Logs | `journalctl --user` (Linux), `<root>/logs/daemon.log` (macOS) | `<root>/logs/daemon.log` (`ka-agent logs [-f]`) |
+| Logs | `journalctl --user` (Linux), `<root>/logs/daemon.log` (macOS, launchd `StandardOutPath`) | `<root>/logs/daemon.log`, written by the task's `cmd /C` redirection (stdout and stderr) and read by `ka-agent logs [-f]`; the daemon runs the same 5 MB rotation as on macOS, but whether Windows lets it rename a log still held open by `cmd` is unverified (see Verification) |
 | Shells | `sh -c` for hooks and cron gates | `cmd /C` (already in the runtime) |
 
 `ka-agent run`, `chat`, `status`, `doctor`, `service …`, `logs`, the web
@@ -50,6 +50,14 @@ raw mode, the line reader takes over exactly as it does on Unix.
   `cargo check --workspace --target x86_64-pc-windows-gnu`,
   `cargo clippy --workspace --lib --bins --target x86_64-pc-windows-gnu`,
   `cargo build --release -p ka-agent --target x86_64-pc-windows-gnu`.
-- The named-pipe name derivation, the scheduled-task naming and the paint
-  op list are unit-tested; the console backend itself needs a Windows host
-  to exercise (the release job is the first real run).
+- The named-pipe name derivation (including `.`/symlink spellings of one
+  root), the scheduled-task name/command builders (bare name used by every
+  `schtasks` call, `cmd /C` log redirection, 261-character `/TR` bound) and
+  the update image swap's rename ordering are unit-tested on Linux; the
+  console backend itself needs a Windows host to exercise (the release job
+  is the first real run).
+- Unverified on this host: everything that talks to the real Task
+  Scheduler and pipe objects — `schtasks.exe` accepting the generated
+  command, the DACL on the created pipe, the 30 s busy-pipe timeout, the
+  swap against a locked, running image, and log rotation while the task's
+  `cmd` holds the file open. Those run only on `windows-latest`.

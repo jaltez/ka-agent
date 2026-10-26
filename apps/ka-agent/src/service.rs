@@ -29,13 +29,89 @@ pub enum ServiceAction {
 const UNSUPPORTED: &str =
     "background service install isn't supported on this OS yet — run `ka-agent run`";
 
-/// The Windows scheduled task that carries the daemon (plan 4.5).
+/// The Windows scheduled task that carries the daemon (plan 4.5). One bare
+/// name in the Task Scheduler root folder: every `schtasks.exe` call
+/// (install, query, run, end, delete) uses this exact name, so `uninstall`
+/// and `update` reach the task `install` created.
 #[cfg(any(target_os = "windows", test))]
 pub fn windows_task_name(profile: &str) -> String {
     if profile == "default" {
         "KaAgent".to_string()
     } else {
         format!("KaAgent-{profile}")
+    }
+}
+
+/// Windows scheduled-task plumbing: pure text and argument vectors, so the
+/// task name and the command line are testable on every platform. Only the
+/// Windows `imp` below runs `schtasks.exe`.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod win_task {
+    use std::path::Path;
+
+    /// `schtasks /TR` accepts at most 261 characters (`schtasks /?`); a
+    /// longer command is rejected here instead of being truncated there.
+    pub(crate) const TASK_COMMAND_MAX: usize = 261;
+
+    /// The command line Task Scheduler runs for the daemon.
+    ///
+    /// Task Scheduler does not go through a shell, so the log redirection
+    /// needs `cmd /C`. The quoting is the shape cmd reduces (it strips the
+    /// first and last quote when the line holds more than two) to
+    /// `"<exe>" [-p <profile>] run >> "<root>\logs\daemon.log" 2>&1` — the
+    /// file `ka-agent logs` tails. Absolute paths only: the task starts
+    /// without the install shell's cwd or environment.
+    pub(crate) fn task_command(exe: &Path, root: &Path, profile: &str) -> String {
+        let mut run = format!("\"{}\"", exe.display());
+        if profile != "default" {
+            run.push_str(&format!(" -p {profile}"));
+        }
+        run.push_str(" run");
+        // A Windows command line uses `\`, and spelling it keeps the string
+        // this function produces (and its Linux unit test asserts) the same
+        // one Task Scheduler stores.
+        let root = root.display().to_string();
+        let root = root.trim_end_matches(['\\', '/']);
+        format!("cmd /C \"{run} >> \"{root}\\logs\\daemon.log\" 2>&1\"")
+    }
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// `/Create`: the ONLOGON task, no elevation (`/RL LIMITED`).
+    pub(crate) fn task_create_args(name: &str, command: &str) -> Vec<String> {
+        args(&[
+            "/Create", "/F", "/TN", name, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", command,
+        ])
+    }
+
+    pub(crate) fn task_query_args(name: &str) -> Vec<String> {
+        args(&["/Query", "/TN", name])
+    }
+
+    pub(crate) fn task_state_args(name: &str) -> Vec<String> {
+        args(&["/Query", "/TN", name, "/FO", "LIST", "/V"])
+    }
+
+    pub(crate) fn task_run_args(name: &str) -> Vec<String> {
+        args(&["/Run", "/TN", name])
+    }
+
+    pub(crate) fn task_end_args(name: &str) -> Vec<String> {
+        args(&["/End", "/TN", name])
+    }
+
+    pub(crate) fn task_delete_args(name: &str) -> Vec<String> {
+        args(&["/Delete", "/F", "/TN", name])
+    }
+
+    /// 0.12 and earlier created the task inside a `\KaAgent` folder; the
+    /// fix keeps one bare name in the root folder. Install and uninstall
+    /// delete the old entry best-effort — an upgrade must not leave a second
+    /// ONLOGON task behind that relaunches the daemon.
+    pub(crate) fn legacy_task_name(name: &str) -> String {
+        format!("\\KaAgent\\{name}")
     }
 }
 
@@ -608,40 +684,30 @@ fn file_logs(root: &Path, follow: bool, n: usize) -> ExitCode {
 
 #[cfg(target_os = "windows")]
 mod imp {
+    use super::win_task::{
+        TASK_COMMAND_MAX, legacy_task_name, task_command, task_create_args, task_delete_args,
+        task_end_args, task_query_args, task_run_args, task_state_args,
+    };
     use super::*;
 
     const NO_SCHTASKS: &str =
         "schtasks.exe isn't available — the Task Scheduler service must be running";
-    const TASK_DIR: &str = "\\KaAgent";
 
-    fn task_name_full(profile: &str) -> String {
-        format!("{TASK_DIR}\\{}.", windows_task_name(profile))
-            .trim_end_matches('.')
-            .to_string()
-    }
     fn task_name() -> String {
-        task_name_full(&ka_agent_core::layout::profile_name())
+        windows_task_name(&ka_agent_core::layout::profile_name())
     }
 
     fn schtasks(args: &[&str]) -> Result<String, String> {
         run_quiet("schtasks.exe", args)
     }
 
-    /// The command line Task Scheduler runs: the binary in the right
-    /// profile, so it resolves the same data root and config the shell
-    /// used (`-p <profile>`), no environment variables needed.
-    fn daemon_command(c: &Ctx) -> String {
-        let profile = ka_agent_core::layout::profile_name();
-        let mut cmd = format!("\"{}\"", c.exe.display());
-        if profile != "default" {
-            cmd.push_str(&format!(" -p {profile}"));
-        }
-        cmd.push_str(" run");
-        cmd
+    fn schtasks_args(args: Vec<String>) -> Result<String, String> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        schtasks(&refs)
     }
 
     pub fn is_installed_for(profile: &str) -> bool {
-        schtasks(&["/Query", "/TN", &task_name_full(profile)]).is_ok()
+        schtasks_args(task_query_args(&windows_task_name(profile))).is_ok()
     }
 
     pub fn is_active() -> bool {
@@ -649,7 +715,7 @@ mod imp {
     }
 
     fn task_state() -> Option<String> {
-        let out = schtasks(&["/Query", "/TN", &task_name(), "/FO", "LIST", "/V"]).ok()?;
+        let out = schtasks_args(task_state_args(&task_name())).ok()?;
         out.lines()
             .find_map(|l| l.trim().strip_prefix("Status:"))
             .map(|s| s.trim().to_string())
@@ -666,13 +732,18 @@ mod imp {
         }
         std::fs::create_dir_all(c.root.join("logs"))
             .map_err(|e| format!("{}: {e}", c.root.display()))?;
-        let name = task_name();
-        let tr = format!("\"{}\"", daemon_command(c));
-        let create = [
-            "/Create", "/F", "/TN", &name, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", &tr,
-        ];
+        let profile = ka_agent_core::layout::profile_name();
+        let name = windows_task_name(&profile);
+        let command = task_command(&c.exe, &c.root, &profile);
+        if command.chars().count() > TASK_COMMAND_MAX {
+            return Err(format!(
+                "the scheduled-task command is {} characters; schtasks allows {TASK_COMMAND_MAX} — \
+                 point KA_AGENT_DATA_DIR or the install path at a shorter directory",
+                command.chars().count()
+            ));
+        }
         let mut lines = Vec::new();
-        match schtasks(&create) {
+        match schtasks_args(task_create_args(&name, &command)) {
             Ok(_) => lines.push(format!("created scheduled task {name}")),
             Err(e) => {
                 return Err(format!(
@@ -680,7 +751,10 @@ mod imp {
                 ));
             }
         }
-        let _ = schtasks(&["/Run", "/TN", &name]);
+        let _ = schtasks_args(task_run_args(&name));
+        // 0.12 and older kept the task in a `\KaAgent` folder; drop that
+        // entry so an upgrade does not leave a second ONLOGON task.
+        let _ = schtasks_args(task_delete_args(&legacy_task_name(&name)));
         lines.push("✓ Ka Agent runs in the background and starts at logon".into());
         lines.push("  logs: ka-agent logs -f · status: ka-agent service status".into());
         Ok(lines)
@@ -691,7 +765,6 @@ mod imp {
     }
 
     pub fn uninstall_by_names(n: &ServiceNames) -> Result<Vec<String>, String> {
-        let _ = schtasks(&["/End", "/TN", &task_name()]);
         let mut lines = Vec::new();
         // `daemon` is `ka-agent` or `ka-agent-<profile>`; the task name is
         // derived from the profile it stands for.
@@ -706,20 +779,29 @@ mod imp {
             profile
         };
         let name = windows_task_name(profile);
-        if schtasks(&["/Query", "/TN", &name]).is_ok() {
-            schtasks(&["/Delete", "/F", "/TN", &name])?;
+        let _ = schtasks_args(task_end_args(&name));
+        if schtasks_args(task_query_args(&name)).is_ok() {
+            schtasks_args(task_delete_args(&name))?;
             lines.push(format!("removed scheduled task {name}"));
+        }
+        // The folder task installs from 0.12 and older left behind: it
+        // would relaunch the daemon after this "remove".
+        let legacy = legacy_task_name(&name);
+        if schtasks_args(task_query_args(&legacy)).is_ok() {
+            let _ = schtasks_args(task_end_args(&legacy));
+            let _ = schtasks_args(task_delete_args(&legacy));
+            lines.push(format!("removed legacy scheduled task {legacy}"));
         }
         lines.push("background service removed".into());
         Ok(lines)
     }
 
     pub fn start() -> Result<(), String> {
-        schtasks(&["/Run", "/TN", &task_name()]).map(|_| ())
+        schtasks_args(task_run_args(&task_name())).map(|_| ())
     }
 
     pub fn stop() -> Result<(), String> {
-        schtasks(&["/End", "/TN", &task_name()]).map(|_| ())
+        schtasks_args(task_end_args(&task_name())).map(|_| ())
     }
 
     pub fn state() -> String {
@@ -730,12 +812,19 @@ mod imp {
     }
 
     pub fn print(c: &Ctx) {
-        let name = task_name();
+        let profile = ka_agent_core::layout::profile_name();
+        let name = windows_task_name(&profile);
+        let command = task_command(&c.exe, &c.root, &profile);
         println!("# scheduled task {name}");
         println!(
-            "schtasks.exe /Create /F /TN \"{name}\" /SC ONLOGON /RL LIMITED /TR '\"{}\"'",
-            daemon_command(c)
+            "schtasks.exe /Create /F /TN \"{name}\" /SC ONLOGON /RL LIMITED /TR \"{command}\""
         );
+        if command.chars().count() > TASK_COMMAND_MAX {
+            println!(
+                "# warning: {} characters; schtasks allows {TASK_COMMAND_MAX}",
+                command.chars().count()
+            );
+        }
     }
 
     pub fn logs(root: &Path, follow: bool, n: usize) -> ExitCode {
@@ -921,6 +1010,65 @@ mod tests {
         // The unit/label naming stays as it was for the Unix managers.
         assert_eq!(unit_names("default").daemon, "ka-agent");
         assert_eq!(unit_names("work").daemon, "ka-agent-work");
+    }
+
+    /// The `/TN` value of one schtasks argument vector.
+    fn tn(args: &[String]) -> &str {
+        let i = args.iter().position(|a| a == "/TN").expect("a /TN flag");
+        &args[i + 1]
+    }
+
+    #[test]
+    fn every_schtasks_call_uses_the_same_bare_task_name() {
+        let name = windows_task_name("work");
+        let command = win_task::task_command(
+            Path::new(r"C:\Users\ka\bin\ka-agent.exe"),
+            Path::new(r"C:\Users\ka\.ka-agent"),
+            "work",
+        );
+        let vectors = [
+            win_task::task_create_args(&name, &command),
+            win_task::task_query_args(&name),
+            win_task::task_state_args(&name),
+            win_task::task_run_args(&name),
+            win_task::task_end_args(&name),
+            win_task::task_delete_args(&name),
+        ];
+        for args in &vectors {
+            assert_eq!(tn(args), name, "{args:?}");
+            assert!(
+                args.iter().all(|a| !a.starts_with('\\')),
+                "the task stays in the root folder: {args:?}"
+            );
+        }
+        // Only the migration cleanup names the pre-0.13 folder.
+        assert_eq!(win_task::legacy_task_name(&name), r"\KaAgent\KaAgent-work");
+        assert_eq!(
+            win_task::legacy_task_name(&windows_task_name("default")),
+            r"\KaAgent\KaAgent"
+        );
+    }
+
+    #[test]
+    fn task_command_redirects_the_daemon_log() {
+        let exe = Path::new(r"C:\Users\ka\bin\ka-agent.exe");
+        let root = Path::new(r"C:\Users\ka\.ka-agent");
+        assert_eq!(
+            win_task::task_command(exe, root, "default"),
+            r#"cmd /C ""C:\Users\ka\bin\ka-agent.exe" run >> "C:\Users\ka\.ka-agent\logs\daemon.log" 2>&1""#,
+            "cmd strips the outer quotes back to `\"<exe>\" run >> \"<log>\"`"
+        );
+        let work = win_task::task_command(exe, root, "work");
+        assert_eq!(
+            work,
+            r#"cmd /C ""C:\Users\ka\bin\ka-agent.exe" -p work run >> "C:\Users\ka\.ka-agent\logs\daemon.log" 2>&1""#
+        );
+        assert!(
+            work.chars().count() < win_task::TASK_COMMAND_MAX,
+            "{} characters, schtasks allows {}",
+            work.chars().count(),
+            win_task::TASK_COMMAND_MAX
+        );
     }
 
     #[test]

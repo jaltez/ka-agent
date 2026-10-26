@@ -103,6 +103,37 @@ fn sha256_of(bytes: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Move the running image aside and put the new one at `exe`. Windows
+/// refuses to replace a running image but allows renaming it (the image
+/// stays mapped under the old name until the process exits).
+///
+/// If the second rename fails the old name is restored, so a failed swap
+/// leaves a runnable install instead of a missing binary. `rename` is a
+/// parameter so the ordering is unit-testable on Linux.
+#[cfg(any(windows, test))]
+fn swap_image<R>(
+    exe: &std::path::Path,
+    new_bin: &std::path::Path,
+    old: &std::path::Path,
+    mut rename: R,
+) -> Result<(), String>
+where
+    R: FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+{
+    rename(exe, old).map_err(|e| format!("cannot set {} aside — {e}", exe.display()))?;
+    if let Err(e) = rename(new_bin, exe) {
+        let hint = "Stop the service first: ka-agent service stop";
+        return Err(match rename(old, exe) {
+            Ok(()) => format!("cannot replace {} — {e}. {hint}", exe.display()),
+            Err(re) => format!(
+                "cannot replace {} — {e}; restoring the old image also failed — {re}. {hint}",
+                exe.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn update(action: UpdateAction) -> ExitCode {
     let paths = Paths::new(Paths::default_root());
     let _ = paths.ensure_dirs();
@@ -191,11 +222,12 @@ pub fn update(action: UpdateAction) -> ExitCode {
     {
         let old = exe.with_extension("old.exe");
         let _ = std::fs::remove_file(&old);
-        if let Err(e) = std::fs::rename(&exe, &old) {
+        if let Err(e) = swap_image(&exe, &new_bin, &old, |from, to| std::fs::rename(from, to)) {
             let _ = std::fs::remove_file(&staging);
-            return fail(format!("cannot set {} aside — {e}", exe.display()));
+            return fail(e);
         }
     }
+    #[cfg(not(windows))]
     if let Err(e) = std::fs::rename(&new_bin, &exe) {
         let _ = std::fs::remove_file(&staging);
         return fail(format!(
@@ -228,11 +260,12 @@ pub fn update(action: UpdateAction) -> ExitCode {
             }
             #[cfg(windows)]
             {
-                // schtasks needs the profile in the environment of the call
-                // for `names()`; the per-profile task name is enough.
+                // The same bare task name `service install` created — the
+                // argument builder is shared, so the two cannot drift.
                 let name = crate::service::windows_task_name(&p);
+                let args = crate::service::win_task::task_run_args(&name);
                 if std::process::Command::new("schtasks.exe")
-                    .args(["/Run", "/TN", &name])
+                    .args(&args)
                     .output()
                     .is_ok_and(|o| o.status.success())
                 {
@@ -310,4 +343,103 @@ pub fn last_check(paths: &Paths) -> Option<(String, i64)> {
     let raw = store.meta_get(CHECK_META).ok().flatten()?;
     let (v, at) = raw.split_once('|')?;
     Some((v.to_string(), at.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn swap_puts_the_old_image_back_when_the_new_one_cannot_land() {
+        let mut calls: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut rename = |from: &Path, to: &Path| -> std::io::Result<()> {
+            calls.push((from.to_path_buf(), to.to_path_buf()));
+            if calls.len() == 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "still locked",
+                ));
+            }
+            Ok(())
+        };
+        let err = swap_image(
+            Path::new("/opt/ka-agent/ka-agent"),
+            Path::new("/opt/ka-agent/.ka-agent-update/ka-agent"),
+            Path::new("/opt/ka-agent/ka-agent.old.exe"),
+            &mut rename,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot replace"), "{err}");
+        assert!(err.contains("still locked"), "{err}");
+        assert!(!err.contains("also failed"), "the restore worked: {err}");
+        assert_eq!(
+            calls,
+            [
+                (
+                    PathBuf::from("/opt/ka-agent/ka-agent"),
+                    PathBuf::from("/opt/ka-agent/ka-agent.old.exe"),
+                ),
+                (
+                    PathBuf::from("/opt/ka-agent/.ka-agent-update/ka-agent"),
+                    PathBuf::from("/opt/ka-agent/ka-agent"),
+                ),
+                (
+                    PathBuf::from("/opt/ka-agent/ka-agent.old.exe"),
+                    PathBuf::from("/opt/ka-agent/ka-agent"),
+                ),
+            ],
+            "aside, new-in, old-back"
+        );
+    }
+
+    #[test]
+    fn swap_reports_a_failed_restore_too() {
+        let mut calls = 0;
+        let mut rename = |_: &Path, _: &Path| -> std::io::Result<()> {
+            calls += 1;
+            if calls >= 2 {
+                return Err(std::io::Error::other("denied"));
+            }
+            Ok(())
+        };
+        let err = swap_image(
+            Path::new("/a/ka-agent"),
+            Path::new("/a/new/ka-agent"),
+            Path::new("/a/ka-agent.old.exe"),
+            &mut rename,
+        )
+        .unwrap_err();
+        assert!(err.contains("restoring the old image also failed"), "{err}");
+        assert_eq!(calls, 3, "the restore is still attempted");
+    }
+
+    #[test]
+    fn swap_succeeds_with_two_renames() {
+        let mut calls: Vec<(PathBuf, PathBuf)> = Vec::new();
+        swap_image(
+            Path::new("/b/ka-agent"),
+            Path::new("/b/new/ka-agent"),
+            Path::new("/b/ka-agent.old.exe"),
+            |from: &Path, to: &Path| -> std::io::Result<()> {
+                calls.push((from.to_path_buf(), to.to_path_buf()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            [
+                (
+                    PathBuf::from("/b/ka-agent"),
+                    PathBuf::from("/b/ka-agent.old.exe"),
+                ),
+                (
+                    PathBuf::from("/b/new/ka-agent"),
+                    PathBuf::from("/b/ka-agent"),
+                ),
+            ]
+        );
+    }
 }

@@ -138,10 +138,17 @@ impl AsyncWrite for IpcStream {
     }
 }
 
+/// How long [`connect`] retries a busy pipe before giving up. The host
+/// re-creates its single pipe instance right after every accept, so busy
+/// is a race, not a state — but an unbounded loop turns a wedged host into
+/// a hung CLI.
+const PIPE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Connect to the host's admin pipe (async), waiting while every instance
-/// is busy (`ERROR_PIPE_BUSY` = 231).
+/// is busy (`ERROR_PIPE_BUSY` = 231) for at most [`PIPE_BUSY_TIMEOUT`].
 pub async fn connect(paths: &Paths) -> io::Result<IpcStream> {
     let name = socket_path(paths).to_string_lossy().to_string();
+    let deadline = tokio::time::Instant::now() + PIPE_BUSY_TIMEOUT;
     loop {
         match ClientOptions::new().open(&name) {
             Ok(pipe) => {
@@ -150,7 +157,17 @@ pub async fn connect(paths: &Paths) -> io::Result<IpcStream> {
                 });
             }
             Err(e) if e.raw_os_error() == Some(231) => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "admin pipe {name} stayed busy for {}s — the host is not accepting",
+                            PIPE_BUSY_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20).min(deadline - now)).await;
             }
             Err(e) => return Err(e),
         }

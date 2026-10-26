@@ -23,13 +23,21 @@ pub use windows::{
 
 pub(crate) use server::{AdminCtx, serve_admin};
 
-/// The Windows pipe name for a data root: pure, so it is testable on every
-/// platform (`\\.\pipe\ka-agent-<sha256(root)[..16]>`).
+/// The Windows pipe name for a data root: deterministic per directory, so
+/// it is testable on every platform
+/// (`\\.\pipe\ka-agent-<sha256(root)[..16]>`).
+///
+/// The root is canonicalized first when it exists (`.`/`..` and symlink
+/// spellings of one directory then agree) and the text is lowercased,
+/// because Windows compares paths case-insensitively. Only the Windows
+/// backend consumes this name — Unix uses a socket path — so the
+/// normalization is right on every build.
 #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows backend
 pub fn pipe_name_for(root: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut hasher = Sha256::new();
-    hasher.update(root.as_os_str().to_string_lossy().as_bytes());
+    hasher.update(root.as_os_str().to_string_lossy().to_lowercase().as_bytes());
     let digest = hasher.finalize();
     let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     format!(r"\\.\pipe\ka-agent-{hex}")
@@ -59,5 +67,33 @@ mod tests {
         let hex = a.rsplit('-').next().unwrap();
         assert_eq!(hex.len(), 16, "16 hex chars: {hex}");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{hex}");
+    }
+
+    #[test]
+    fn pipe_names_fold_windows_case() {
+        assert_eq!(
+            pipe_name_for(std::path::Path::new(r"C:\Users\KA\Data-A")),
+            pipe_name_for(std::path::Path::new(r"C:\Users\ka\data-a")),
+            "Windows compares paths case-insensitively"
+        );
+    }
+
+    #[test]
+    fn pipe_names_resolve_path_spellings() {
+        let dir = std::env::temp_dir().join(format!(
+            "ka-agent-pipe-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = pipe_name_for(&dir);
+        let dotted = pipe_name_for(&dir.join("."));
+        let updown = pipe_name_for(&dir.join("..").join(dir.file_name().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(plain, dotted, "one directory, one pipe");
+        assert_eq!(plain, updown, "`..` and back is the same directory");
     }
 }
