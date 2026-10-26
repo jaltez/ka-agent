@@ -67,14 +67,10 @@ impl IpcStream {
         self.stream.peer_cred().map(|c| c.uid()).unwrap_or(u32::MAX) == self.own_uid
     }
 
-    /// Split into owned halves (the attach stream's reader/writer).
-    pub fn into_split(
-        self,
-    ) -> (
-        tokio::net::unix::OwnedReadHalf,
-        tokio::net::unix::OwnedWriteHalf,
-    ) {
-        self.stream.into_split()
+    /// Split into halves (the attach stream's reader/writer). The platform-
+    /// neutral aliases hide the concrete halves from callers.
+    pub fn split(self) -> (super::IpcRead, super::IpcWrite) {
+        tokio::io::split(self)
     }
 }
 
@@ -115,8 +111,56 @@ pub async fn connect(paths: &Paths) -> io::Result<IpcStream> {
 }
 
 /// Connect from blocking code (one-shot clients such as `ka-agent status`).
-pub fn connect_blocking(paths: &Paths) -> io::Result<std::os::unix::net::UnixStream> {
-    std::os::unix::net::UnixStream::connect(socket_path(paths))
+pub fn connect_blocking(paths: &Paths) -> io::Result<BlockingStream> {
+    let stream = std::os::unix::net::UnixStream::connect(socket_path(paths))?;
+    Ok(BlockingStream { stream })
+}
+
+/// A blocking admin stream: one request line out, one reply line in.
+pub struct BlockingStream {
+    stream: std::os::unix::net::UnixStream,
+}
+
+impl BlockingStream {
+    pub fn set_read_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(t)
+    }
+
+    pub fn set_write_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(t)
+    }
+}
+
+impl io::Read for BlockingStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl io::Write for BlockingStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl io::Read for &BlockingStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&self.stream).read(buf)
+    }
+}
+
+impl io::Write for &BlockingStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&self.stream).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&self.stream).flush()
+    }
 }
 
 /// Whether a host answers on the admin socket right now. A stale socket

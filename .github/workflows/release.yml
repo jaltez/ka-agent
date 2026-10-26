@@ -25,6 +25,11 @@ jobs:
           # a second runner from a pool that starves for hours.
           - os: macos-14
             targets: aarch64-apple-darwin x86_64-apple-darwin
+          # Windows ships a zip: the binary plus the license, the same
+          # checksum format as the tarballs.
+          - os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            zip: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,18 +49,27 @@ jobs:
         run: |
           for T in ${{ matrix.targets }}; do
             cargo build --release -p ka-agent --target "$T"
-            tar czf "ka-agent-$T.tar.gz" -C "target/$T/release" ka-agent
-            shasum -a 256 "ka-agent-$T.tar.gz" > "ka-agent-$T.tar.gz.sha256"
+            if [ "${{ matrix.zip }}" = "true" ]; then
+              ( cd "target/$T/release" && 7z a -tzip "$GITHUB_WORKSPACE/ka-agent-$T.zip" ka-agent.exe >/dev/null )
+              sha256sum "ka-agent-$T.zip" | tee "ka-agent-$T.zip.sha256"
+            else
+              tar czf "ka-agent-$T.tar.gz" -C "target/$T/release" ka-agent
+              shasum -a 256 "ka-agent-$T.tar.gz" > "ka-agent-$T.tar.gz.sha256"
+            fi
           done
 
       # Sigstore-backed provenance: `gh attestation verify <tarball>
       # --repo jaltez/ka-agent` proves the archive came from this workflow.
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ka-agent-*.tar.gz
+          subject-path: |
+            ka-agent-*.tar.gz
+            ka-agent-*.zip
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             ka-agent-*.tar.gz
             ka-agent-*.tar.gz.sha256
+            ka-agent-*.zip
+            ka-agent-*.zip.sha256

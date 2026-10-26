@@ -269,10 +269,11 @@ Details: `docs/contract/web-ui.md`.
 ## Platforms
 
 Linux first-class (plugins use bubblewrap; services use systemd user units)
-and macOS (launchd; plugins need Linux). **Windows is a goal, not there yet:**
-the library crates compile for Windows, but the binary still needs a
-named-pipe admin transport — `run`/`chat`/`status` are Unix/macOS-only today
-(CI keeps the Windows build state visible).
+and macOS (launchd; plugins need Linux). Windows x86_64 builds and runs:
+the admin endpoint is a named pipe, workers are killed with `taskkill /T`,
+the service is a Task Scheduler entry, and the terminal chat uses the console
+API (line mode where raw mode is unavailable); plugins stay Linux-only.
+Details: `docs/contract/windows.md`.
 
 ---
 
@@ -304,11 +305,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The workspace denies `unwrap`/`expect`/`todo`/`unimplemented`/`dbg` and
 forbids `unsafe`; CI runs fmt, clippy, tests and the dependency gate on
-Linux and macOS, plus a non-blocking Windows compile check
+Linux and macOS, and builds the binary on Windows
 (`.github/workflows/ci.yml`); `release.yml` cuts tarballs for four targets
-on `v*` tags, each with a SHA-256 file and a Sigstore build-provenance
-attestation (`gh attestation verify ka-agent-<target>.tar.gz --repo
-jaltez/ka-agent`).
+plus a Windows zip on `v*` tags, each with a SHA-256 file and a Sigstore
+build-provenance attestation (`gh attestation verify ka-agent-<target>.tar.gz
+--repo jaltez/ka-agent`). Windows installs with
+`irm https://raw.githubusercontent.com/jaltez/ka-agent/main/scripts/install.ps1 | iex`.
 
 **Further reading.** `SEED.md` (architecture seed),
 `docs/contract/` (subsystem contracts), `docs/adr/0001-instance-per-user.md`,

@@ -66,7 +66,7 @@ pub fn is_running(paths: &Paths) -> bool {
     ipc::is_running(paths)
 }
 
-pub type AttachLines = tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>;
+pub type AttachLines = tokio::io::Lines<tokio::io::BufReader<ipc::IpcRead>>;
 
 /// Open an attach stream: the host answers with a `hello` event, then
 /// every envelope; the client writes `{"op":"say","text":…}` lines.
@@ -74,12 +74,12 @@ pub type AttachLines = tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::O
 pub async fn attach_since(
     paths: &Paths,
     since: u64,
-) -> Result<(AttachLines, tokio::net::unix::OwnedWriteHalf), AdminError> {
+) -> Result<(AttachLines, ipc::IpcWrite), AdminError> {
     let sock = sock_path(paths);
     let stream = ipc::connect(paths)
         .await
         .map_err(|_| AdminError::NotRunning(sock.display().to_string()))?;
-    let (r, mut w) = stream.into_split();
+    let (r, mut w) = stream.split();
     let hello = serde_json::json!({"op": "attach", "since": since});
     w.write_all(format!("{hello}\n").as_bytes()).await?;
     w.flush().await?;
@@ -87,8 +87,6 @@ pub async fn attach_since(
 }
 
 /// Live-only attach (the common chat client).
-pub async fn attach(
-    paths: &Paths,
-) -> Result<(AttachLines, tokio::net::unix::OwnedWriteHalf), AdminError> {
+pub async fn attach(paths: &Paths) -> Result<(AttachLines, ipc::IpcWrite), AdminError> {
     attach_since(paths, 0).await
 }

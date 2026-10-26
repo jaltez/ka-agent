@@ -298,6 +298,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crossterm"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
+dependencies = [
+ "bitflags 2.13.2",
+ "crossterm_winapi",
+ "mio",
+ "parking_lot",
+ "rustix 0.38.44",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm_winapi"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -959,10 +984,11 @@ dependencies = [
 
 [[package]]
 name = "ka-agent"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "clap_complete",
+ "crossterm",
  "jiff",
  "ka-agent-channels",
  "ka-agent-core",
@@ -977,7 +1003,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "rusqlite",
- "rustix",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "sha2",
@@ -991,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-channels"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "jiff",
  "ka-agent-core",
@@ -1013,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "jiff",
  "serde",
@@ -1025,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-memory"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ka-agent-core",
  "thiserror",
@@ -1033,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-plugins"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ed25519-dalek",
  "ka-agent-core",
@@ -1050,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-port"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "fs2",
  "ka-agent-core",
@@ -1071,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-runtime"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "jiff",
  "ka-agent-core",
@@ -1088,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-store"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ka-agent-core",
  "parking_lot",
@@ -1102,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "ka-agent-web"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "jiff",
  "ka-agent-channels",
@@ -1245,6 +1271,12 @@ dependencies = [
 
 [[package]]
 name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
@@ -1305,6 +1337,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1668,6 +1701,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags 2.13.2",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
@@ -1675,7 +1721,7 @@ dependencies = [
  "bitflags 2.13.2",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -1901,6 +1947,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2017,7 +2084,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix",
+ "rustix 1.1.5",
  "windows-sys 0.61.2",
 ]
 
@@ -2027,7 +2094,7 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
- "rustix",
+ "rustix 1.1.5",
  "windows-sys 0.61.2",
 ]
 

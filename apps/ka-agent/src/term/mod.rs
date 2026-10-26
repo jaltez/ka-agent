@@ -6,6 +6,7 @@ pub mod cards;
 pub mod complete;
 pub mod editor;
 pub mod keys;
+pub mod paint;
 pub mod raw;
 pub mod view;
 
@@ -346,16 +347,7 @@ impl Terminal {
 
 /// Terminal width (falls back to 80).
 fn terminal_size_width() -> usize {
-    #[cfg(unix)]
-    {
-        use rustix::termios::tcgetwinsize;
-        if let Ok(ws) = tcgetwinsize(rustix::stdio::stdout())
-            && ws.ws_col > 0
-        {
-            return ws.ws_col as usize;
-        }
-    }
-    80
+    raw::width()
 }
 
 /// Feed one envelope into the view and print its permanent lines above the

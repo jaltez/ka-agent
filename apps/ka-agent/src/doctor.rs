@@ -455,6 +455,27 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
     }
     #[cfg(not(target_os = "linux"))]
     rep.info("plugins need Linux");
+    // Windows prerequisites (plan 4.6): the service is a Task Scheduler
+    // entry and the console is driven through the Windows API.
+    #[cfg(target_os = "windows")]
+    match std::process::Command::new("schtasks.exe")
+        .args(["/Query", "/?"])
+        .output()
+    {
+        Ok(out) if out.status.success() => rep.ok("task scheduler available (service install)".into()),
+        _ => rep.warn(
+            "schtasks.exe not available — `ka-agent service install` cannot create the logon task; run `ka-agent run` instead",
+        ),
+    }
+    #[cfg(target_os = "windows")]
+    rep.info(&format!(
+        "terminal chat: {} console",
+        if crate::term::raw::is_tty() {
+            "raw-mode"
+        } else {
+            "line-mode"
+        }
+    ));
 
     // Instance state (only when the store exists; doctor creates nothing).
     if paths.state_db().exists()

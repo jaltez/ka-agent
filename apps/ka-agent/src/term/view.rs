@@ -120,44 +120,59 @@ impl View {
     /// was (`cursor_up`), clear down, print activity + status + the draft,
     /// and leave the cursor on the editor row. Returns the new `cursor_up`.
     pub fn redraw(&self, editor: &Editor, cursor_up: usize) -> usize {
-        use std::io::Write as _;
-        let mut out = String::new();
-        out.push_str("\x1b[?2026h"); // begin synchronized output
-        for _ in 0..cursor_up {
-            out.push_str("\x1b[1A");
+        let ops = self.redraw_ops(editor, cursor_up);
+        super::paint::emit(&ops);
+        self.cursor_up(editor, cursor_up)
+    }
+
+    /// The redraw as drawing commands (platform-neutral; tested on Unix as
+    /// the exact ANSI bytes the console has always printed).
+    pub fn redraw_ops(&self, editor: &Editor, cursor_up: usize) -> Vec<super::paint::Op> {
+        use super::paint::Op;
+        let mut ops = vec![Op::SyncBegin];
+        if cursor_up > 0 {
+            ops.push(Op::Up(cursor_up));
         }
-        out.push_str("\r\x1b[J");
+        ops.push(Op::Cr);
+        ops.push(Op::ClearDown);
         let activity = self.activity_line();
         if !activity.is_empty() {
-            out.push_str(&format!("\x1b[2m{activity}\x1b[0m\r\n"));
+            ops.push(Op::Dim(activity));
+            ops.push(Op::Text("\r\n".into()));
         }
         // The status line is always present (spinner only while running).
-        out.push_str(&format!("\x1b[2m{}\x1b[0m\r\n", self.status_line()));
+        ops.push(Op::Dim(self.status_line()));
+        ops.push(Op::Text("\r\n".into()));
         // The draft, soft-wrapped; the last row holds the cursor.
         let (rows, (crow, ccol)) = editor.layout(self.width);
         for (i, (s, e)) in rows.iter().enumerate() {
             let text: String = editor_text_range(editor, *s, *e);
             if i == rows.len() - 1 {
-                out.push_str(&format!("\x1b[1m»\x1b[0m {text}"));
+                ops.push(Op::Bold("»".into()));
+                ops.push(Op::Text(format!(" {text}")));
             } else {
-                out.push_str(&format!("  {text}\r\n"));
+                ops.push(Op::Text(format!("  {text}\r\n")));
             }
         }
         // From the last printed row up to the cursor's row (they differ only
-        // when the draft wraps); the returned index adds the rows above the
-        // editor (activity + status) so the next redraw starts at the top.
+        // when the draft wraps).
         let up = rows.len().saturating_sub(1 + crow);
-        for _ in 0..up {
-            out.push_str("\x1b[1A");
+        if up > 0 {
+            ops.push(Op::Up(up));
         }
-        out.push('\r');
-        let col = 2 + ccol;
-        out.push_str(&format!("\x1b[{col}C"));
-        out.push_str("\x1b[?2026l"); // end synchronized output
-        let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(out.as_bytes());
-        let _ = stdout.flush();
-        up + usize::from(!activity.is_empty()) + 1
+        ops.push(Op::Cr);
+        ops.push(Op::Right(2 + ccol));
+        ops.push(Op::SyncEnd);
+        ops
+    }
+
+    /// Rows between the live area's first row and the cursor: the editor
+    /// rows above the cursor's row plus the activity and status rows, so
+    /// the next redraw starts at the top.
+    pub fn cursor_up(&self, editor: &Editor, _cursor_up: usize) -> usize {
+        let (rows, (crow, _)) = editor.layout(self.width);
+        let above = rows.len().saturating_sub(1 + crow);
+        above + usize::from(!self.activity_line().is_empty()) + 1
     }
 }
 

@@ -67,13 +67,15 @@ pub fn day_key(now_ms: i64) -> i64 {
     now_ms.div_euclid(86_400_000)
 }
 
-/// Expand a leading `~` to `$HOME`. Untouched otherwise (relative paths stay
-/// relative to the daemon's working directory).
+/// Expand a leading `~` to the home directory (`$HOME`, else
+/// `%USERPROFILE%`). Untouched otherwise (relative paths stay relative to
+/// the daemon's working directory).
 pub fn expand_home(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return std::path::Path::new(&home).join(rest);
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = layout::home();
+        if !home.as_os_str().is_empty() {
+            return home.join(rest);
+        }
     }
     std::path::PathBuf::from(path)
 }

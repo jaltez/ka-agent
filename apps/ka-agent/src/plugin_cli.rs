@@ -87,6 +87,15 @@ pub fn plugin_action(action: PluginAction) -> std::process::ExitCode {
             }
         }
         PluginAction::Install { archive } => {
+            // Plugins run under bubblewrap, which is Linux-only (plan 4.6):
+            // refuse here rather than fail later with a spawn error.
+            if !cfg!(target_os = "linux") {
+                eprintln!(
+                    "ka-agent: plugins need Linux (the bubblewrap sandbox) — this is {}",
+                    std::env::consts::OS
+                );
+                return std::process::ExitCode::FAILURE;
+            }
             let trust = match ka_agent_plugins::load_trust(&plugins) {
                 Ok(t) => t,
                 Err(e) => return show(e),
@@ -143,6 +152,13 @@ pub fn plugin_action(action: PluginAction) -> std::process::ExitCode {
             }
             Err(e) => show(e),
         },
+        PluginAction::Enable { .. } if !cfg!(target_os = "linux") => {
+            eprintln!(
+                "ka-agent: plugins need Linux (the bubblewrap sandbox) — this is {}",
+                std::env::consts::OS
+            );
+            std::process::ExitCode::FAILURE
+        }
         PluginAction::Enable { id } => plugin_toggle(id, true),
         PluginAction::Disable { id } => plugin_toggle(id, false),
         PluginAction::Rm { id } => plugin_rm(id),

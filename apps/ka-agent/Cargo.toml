@@ -41,3 +41,9 @@ terminal_size = { workspace = true }
 
 [lints]
 workspace = true
+
+# Windows console support for the inline terminal client (plan 4.4): the
+# safe API for raw mode, key events and console drawing, so the workspace's
+# `unsafe_code = "forbid"` holds. Unix keeps rustix termios.
+[target.'cfg(windows)'.dependencies]
+crossterm = { version = "0.28", default-features = false, features = ["windows", "events", "bracketed-paste"] }

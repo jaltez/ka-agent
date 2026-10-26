@@ -1,13 +1,18 @@
-//! Raw terminal mode (Unix): a guard that puts stdin in raw mode with
-//! output post-processing kept on, enables bracketed paste + focus
+//! Raw terminal mode: a guard that puts the console in raw mode with
+//! output post-processing kept on (Unix), enables bracketed paste + focus
 //! reports, and restores everything on drop, panic and common signals.
-//! Windows reaches this module in phase 4 (a line-mode fallback exists
-//! until then).
+//!
+//! Unix: `rustix` termios, exactly as before. Windows (plan 4.4): the safe
+//! `crossterm` API (the workspace forbids `unsafe`), which sets the console
+//! mode and drives key events; the drawing layer writes console commands,
+//! not raw ANSI (see [`super::paint`]).
 
+#[cfg(unix)]
 use std::sync::OnceLock;
 
 /// The original termios, captured once so a panic hook or a signal handler
 /// can restore it even after a `Terminal` was forgotten.
+#[cfg(unix)]
 static ORIGINAL: OnceLock<rustix::termios::Termios> = OnceLock::new();
 
 #[cfg(unix)]
@@ -16,9 +21,10 @@ pub fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn is_tty() -> bool {
-    false
+    use crossterm::tty::IsTty as _;
+    std::io::stdin().is_tty() && std::io::stdout().is_tty()
 }
 
 /// Enter raw mode. Returns `None` when the platform/terminal cannot (the
@@ -43,16 +49,28 @@ pub fn enter() -> Option<RawMode> {
     Some(RawMode { _priv: () })
 }
 
-#[cfg(not(unix))]
+/// Enter raw mode on Windows: the console mode via `crossterm`, plus the
+/// bracketed-paste and focus-report events the Unix path enables.
+#[cfg(windows)]
 pub fn enter() -> Option<RawMode> {
-    None
+    crossterm::terminal::enable_raw_mode().ok()?;
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange
+    );
+    install_panic_hook();
+    Some(RawMode { _priv: () })
 }
 
+#[cfg(any(unix, windows))]
 fn flush() {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 }
 
+#[cfg(any(unix, windows))]
 fn install_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -73,6 +91,17 @@ pub fn restore() {
             let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Flush, original);
         }
         print!("\x1b[?1004l\x1b[?2004l");
+        flush();
+    }
+    #[cfg(windows)]
+    {
+        let mut stdout = std::io::stdout();
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::DisableBracketedPaste
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
         flush();
     }
 }
@@ -111,5 +140,48 @@ impl Suspended {
                 flush();
             }
         }
+        #[cfg(windows)]
+        {
+            let _ = crossterm::terminal::enable_raw_mode();
+            let mut stdout = std::io::stdout();
+            let _ = crossterm::execute!(
+                stdout,
+                crossterm::event::EnableBracketedPaste,
+                crossterm::event::EnableFocusChange
+            );
+            flush();
+        }
+    }
+}
+
+/// Console width: the terminal's columns, else 80.
+pub fn width() -> usize {
+    #[cfg(unix)]
+    {
+        use rustix::termios::tcgetwinsize;
+        if let Ok(ws) = tcgetwinsize(rustix::stdio::stdout())
+            && ws.ws_col > 0
+        {
+            return ws.ws_col as usize;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok((cols, _)) = crossterm::terminal::size()
+            && cols > 0
+        {
+            return cols as usize;
+        }
+    }
+    80
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn width_is_positive() {
+        assert!(super::width() > 0);
     }
 }

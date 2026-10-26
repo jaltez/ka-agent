@@ -436,16 +436,32 @@ async fn stderr_task(
 
 /// SIGKILL a worker's process group. `unsafe_code` is forbidden in this
 /// workspace, so `libc::kill(2)` is out; `/bin/kill` signals the group
-/// via `-<pgid>` (the worker is its own group leader, pgid == pid).
+/// via `-<pgid>` (the worker is its own group leader, pgid == pid) and
+/// Windows' `taskkill /T` walks the child tree the same way (plan 4.3).
 async fn kill_process_group(pid: Option<u32>) {
-    if let Some(pid) = pid {
-        let _ = Command::new("/bin/kill")
-            .args(["-s", "KILL", "--", &format!("-{pid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-    }
+    let Some(pid) = pid else {
+        return;
+    };
+    #[cfg(unix)]
+    let args: Vec<String> = vec!["-s".into(), "KILL".into(), "--".into(), format!("-{pid}")];
+    #[cfg(windows)]
+    let args: Vec<String> = vec![
+        "/T".into(), // the whole tree
+        "/F".into(),
+        "/PID".into(),
+        pid.to_string(),
+    ];
+    let exe = if cfg!(windows) {
+        "taskkill"
+    } else {
+        "/bin/kill"
+    };
+    let _ = Command::new(exe)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
 }
 
 #[cfg(test)]

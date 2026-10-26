@@ -24,8 +24,16 @@ pub fn base_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    Path::new(&home).join(".ka-agent")
+    home().join(".ka-agent")
+}
+
+/// The user's home directory: `$HOME`, else `%USERPROFILE%` (Windows sets
+/// only the latter), else empty (relative paths keep working).
+pub(crate) fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 /// Store meta key where the daemon publishes the operator's IANA zone, for
@@ -183,10 +191,7 @@ pub fn default_root() -> PathBuf {
 pub fn legacy_data_root() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            Path::new(&home).join(".local/share")
-        });
+        .unwrap_or_else(|| home().join(".local/share"));
     base.join("ka-agent")
 }
 
@@ -194,10 +199,7 @@ pub fn legacy_data_root() -> PathBuf {
 pub fn legacy_config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            Path::new(&home).join(".config")
-        });
+        .unwrap_or_else(|| home().join(".config"));
     base.join("ka-agent/ka-agent.toml")
 }
 

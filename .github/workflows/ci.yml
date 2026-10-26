@@ -57,18 +57,24 @@ jobs:
       - name: Tests
         run: cargo test --workspace --quiet
 
-  # Windows is a goal, not a supported platform yet: the library crates
-  # build, but the binary still needs a named-pipe admin transport (the
-  # daemon/chat/status path is Unix-socket based). Keep the state visible
-  # without failing CI.
-  windows-check:
+  # Windows (plan 4.x): the whole workspace builds — the admin transport is
+  # a named pipe there, the worker tree dies with taskkill /T, the service
+  # is a Task Scheduler entry, and the chat falls back to line mode when the
+  # console is not a TTY. Tests stay on Unix (they drive Unix paths and
+  # signals); the Windows job proves the build.
+  windows:
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows
-      - name: Library crates compile for Windows
-        run: cargo check --workspace --exclude ka-agent --target x86_64-pc-windows-msvc
+      - name: Format
+        run: cargo fmt --all -- --check
+      # Library and binary targets only: the integration tests drive Unix
+      # paths, signals and the admin socket, and stay on the Unix jobs.
+      - name: Clippy
+        run: cargo clippy --workspace --lib --bins --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Build the binary for Windows
+        run: cargo build --release -p ka-agent --target x86_64-pc-windows-msvc

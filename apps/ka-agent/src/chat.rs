@@ -30,7 +30,7 @@ enum Backend {
     },
     Attached {
         lines: admin::AttachLines,
-        w: tokio::net::unix::OwnedWriteHalf,
+        w: crate::ipc::IpcWrite,
     },
 }
 
@@ -179,10 +179,7 @@ impl Backend {
     }
 }
 
-async fn write_line(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
-    v: &serde_json::Value,
-) -> Result<(), String> {
+async fn write_line(w: &mut crate::ipc::IpcWrite, v: &serde_json::Value) -> Result<(), String> {
     w.write_all(format!("{v}\n").as_bytes())
         .await
         .map_err(|e| e.to_string())?;

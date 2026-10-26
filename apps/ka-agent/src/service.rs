@@ -25,15 +25,29 @@ pub enum ServiceAction {
     Print,
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 const UNSUPPORTED: &str =
     "background service install isn't supported on this OS yet — run `ka-agent run`";
+
+/// The Windows scheduled task that carries the daemon (plan 4.5).
+#[cfg(any(target_os = "windows", test))]
+pub fn windows_task_name(profile: &str) -> String {
+    if profile == "default" {
+        "KaAgent".to_string()
+    } else {
+        format!("KaAgent-{profile}")
+    }
+}
 
 const FOREGROUND_RUNNING: &str = "a foreground Ka Agent (ka-agent run or a local chat) is running — stop it first, then run ka-agent service install";
 
 /// Whether this OS has a supported user service manager.
 pub fn supported() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
 }
 
 // ---------------------------------------------------------------- pure text
@@ -241,6 +255,7 @@ fn ctx(paths: &Paths, config: &Path) -> Result<Ctx, String> {
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
@@ -257,6 +272,7 @@ fn run_quiet(cmd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_file(path: &Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -534,54 +550,202 @@ mod imp {
         }
     }
 
-    fn tail(path: &Path, n: usize) -> (Vec<String>, u64) {
-        let bytes = std::fs::read(path).unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<String> = text.lines().map(str::to_string).collect();
-        let start = lines.len().saturating_sub(n);
-        (lines[start..].to_vec(), bytes.len() as u64)
+    pub fn logs(root: &Path, follow: bool, n: usize) -> ExitCode {
+        file_logs(root, follow, n)
+    }
+}
+
+/// The last `n` lines of a log file plus its length (the follow offset).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn tail(path: &Path, n: usize) -> (Vec<String>, u64) {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let start = lines.len().saturating_sub(n);
+    (lines[start..].to_vec(), bytes.len() as u64)
+}
+
+/// Tail the daemon's file log (`<root>/logs/daemon.log`), optionally
+/// following it — the macOS and Windows service implementations.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn file_logs(root: &Path, follow: bool, n: usize) -> ExitCode {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let path = root.join("logs/daemon.log");
+    if !path.exists() && !follow {
+        eprintln!("ka-agent: no log yet at {}", path.display());
+        return ExitCode::FAILURE;
+    }
+    let (lines, mut pos) = tail(&path, n);
+    for l in lines {
+        println!("{l}");
+    }
+    if !follow {
+        return ExitCode::SUCCESS;
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < pos {
+            pos = 0; // truncated/rotated
+        }
+        if len == pos || f.seek(SeekFrom::Start(pos)).is_err() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_ok() {
+            pos += buf.len() as u64;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&buf);
+            let _ = out.flush();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- windows
+
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::*;
+
+    const NO_SCHTASKS: &str =
+        "schtasks.exe isn't available — the Task Scheduler service must be running";
+    const TASK_DIR: &str = "\\KaAgent";
+
+    fn task_name_full(profile: &str) -> String {
+        format!("{TASK_DIR}\\{}.", windows_task_name(profile))
+            .trim_end_matches('.')
+            .to_string()
+    }
+    fn task_name() -> String {
+        task_name_full(&ka_agent_core::layout::profile_name())
+    }
+
+    fn schtasks(args: &[&str]) -> Result<String, String> {
+        run_quiet("schtasks.exe", args)
+    }
+
+    /// The command line Task Scheduler runs: the binary in the right
+    /// profile, so it resolves the same data root and config the shell
+    /// used (`-p <profile>`), no environment variables needed.
+    fn daemon_command(c: &Ctx) -> String {
+        let profile = ka_agent_core::layout::profile_name();
+        let mut cmd = format!("\"{}\"", c.exe.display());
+        if profile != "default" {
+            cmd.push_str(&format!(" -p {profile}"));
+        }
+        cmd.push_str(" run");
+        cmd
+    }
+
+    pub fn is_installed_for(profile: &str) -> bool {
+        schtasks(&["/Query", "/TN", &task_name_full(profile)]).is_ok()
+    }
+
+    pub fn is_active() -> bool {
+        task_state().is_some_and(|s| s == "Running")
+    }
+
+    fn task_state() -> Option<String> {
+        let out = schtasks(&["/Query", "/TN", &task_name(), "/FO", "LIST", "/V"]).ok()?;
+        out.lines()
+            .find_map(|l| l.trim().strip_prefix("Status:"))
+            .map(|s| s.trim().to_string())
+    }
+
+    pub fn install(c: &Ctx) -> Result<Vec<String>, String> {
+        // The task runs at logon; no elevation is requested (/RL LIMITED).
+        schtasks(&["/Query", "/?"]).map_err(|_| NO_SCHTASKS.to_string())?;
+        for dir in [&c.root, &c.workspace] {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        if let Some(d) = c.config.parent() {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+        std::fs::create_dir_all(c.root.join("logs"))
+            .map_err(|e| format!("{}: {e}", c.root.display()))?;
+        let name = task_name();
+        let tr = format!("\"{}\"", daemon_command(c));
+        let create = [
+            "/Create", "/F", "/TN", &name, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", &tr,
+        ];
+        let mut lines = Vec::new();
+        match schtasks(&create) {
+            Ok(_) => lines.push(format!("created scheduled task {name}")),
+            Err(e) => {
+                return Err(format!(
+                    "{e}\nhint: run the shell as this user and try again"
+                ));
+            }
+        }
+        let _ = schtasks(&["/Run", "/TN", &name]);
+        lines.push("✓ Ka Agent runs in the background and starts at logon".into());
+        lines.push("  logs: ka-agent logs -f · status: ka-agent service status".into());
+        Ok(lines)
+    }
+
+    pub fn uninstall() -> Result<Vec<String>, String> {
+        uninstall_by_names(&names())
+    }
+
+    pub fn uninstall_by_names(n: &ServiceNames) -> Result<Vec<String>, String> {
+        let _ = schtasks(&["/End", "/TN", &task_name()]);
+        let mut lines = Vec::new();
+        // `daemon` is `ka-agent` or `ka-agent-<profile>`; the task name is
+        // derived from the profile it stands for.
+        let profile = n
+            .daemon
+            .strip_prefix("ka-agent")
+            .unwrap_or("")
+            .trim_start_matches('-');
+        let profile = if profile.is_empty() {
+            "default"
+        } else {
+            profile
+        };
+        let name = windows_task_name(profile);
+        if schtasks(&["/Query", "/TN", &name]).is_ok() {
+            schtasks(&["/Delete", "/F", "/TN", &name])?;
+            lines.push(format!("removed scheduled task {name}"));
+        }
+        lines.push("background service removed".into());
+        Ok(lines)
+    }
+
+    pub fn start() -> Result<(), String> {
+        schtasks(&["/Run", "/TN", &task_name()]).map(|_| ())
+    }
+
+    pub fn stop() -> Result<(), String> {
+        schtasks(&["/End", "/TN", &task_name()]).map(|_| ())
+    }
+
+    pub fn state() -> String {
+        if !is_installed() {
+            return "not installed".into();
+        }
+        task_state().unwrap_or_else(|| "unknown".into())
+    }
+
+    pub fn print(c: &Ctx) {
+        let name = task_name();
+        println!("# scheduled task {name}");
+        println!(
+            "schtasks.exe /Create /F /TN \"{name}\" /SC ONLOGON /RL LIMITED /TR '\"{}\"'",
+            daemon_command(c)
+        );
     }
 
     pub fn logs(root: &Path, follow: bool, n: usize) -> ExitCode {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let path = root.join("logs/daemon.log");
-        if !path.exists() && !follow {
-            eprintln!("ka-agent: no log yet at {}", path.display());
-            return ExitCode::FAILURE;
-        }
-        let (lines, mut pos) = tail(&path, n);
-        for l in lines {
-            println!("{l}");
-        }
-        if !follow {
-            return ExitCode::SUCCESS;
-        }
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let Ok(mut f) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < pos {
-                pos = 0; // truncated/rotated
-            }
-            if len == pos || f.seek(SeekFrom::Start(pos)).is_err() {
-                continue;
-            }
-            let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() {
-                pos += buf.len() as u64;
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(&buf);
-                let _ = out.flush();
-            }
-        }
+        super::file_logs(root, follow, n)
     }
 }
 
 // ---------------------------------------------------------------- other OS
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod imp {
     use super::*;
 
@@ -665,13 +829,13 @@ fn fail(msg: &str) -> ExitCode {
 
 pub fn service_action(action: ServiceAction, config: PathBuf) -> ExitCode {
     let paths = Paths::new(Paths::default_root());
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (action, config, paths);
         eprintln!("{UNSUPPORTED}");
         ExitCode::FAILURE
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     match action {
         ServiceAction::Install => match install(&paths, &config) {
             Ok(lines) => {
@@ -747,7 +911,17 @@ pub fn logs(follow: bool, n: usize) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn windows_task_names_follow_the_profile() {
+        assert_eq!(windows_task_name("default"), "KaAgent");
+        assert_eq!(windows_task_name("work"), "KaAgent-work");
+        // The unit/label naming stays as it was for the Unix managers.
+        assert_eq!(unit_names("default").daemon, "ka-agent");
+        assert_eq!(unit_names("work").daemon, "ka-agent-work");
+    }
 
     #[test]
     fn unit_names_scope_per_profile() {

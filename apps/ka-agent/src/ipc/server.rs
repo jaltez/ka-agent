@@ -9,7 +9,7 @@ use ka_agent_core::DaemonConfig;
 use ka_agent_runtime::event::AgentEvent;
 use ka_agent_runtime::{Envelope, EventBus, Runtime};
 
-use super::IpcStream;
+use super::{IpcRead, IpcStream, IpcWrite};
 
 /// Everything an admin connection needs.
 #[derive(Clone)]
@@ -58,7 +58,7 @@ where
 pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let peer_ok = stream.peer_ok();
-    let (r, mut w) = stream.into_split();
+    let (r, mut w) = stream.split();
     let mut reader = tokio::io::BufReader::new(r);
     let Some(line) = read_bounded_line(&mut reader, MAX_REQUEST).await? else {
         return Ok(());
@@ -176,8 +176,8 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
 /// `seq` included. The client sends `say` lines that go through the shared
 /// command router exactly like a channel message.
 async fn serve_attach(
-    mut reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
-    mut w: tokio::net::unix::OwnedWriteHalf,
+    mut reader: tokio::io::BufReader<IpcRead>,
+    mut w: IpcWrite,
     ctx: AdminCtx,
     since: u64,
 ) -> std::io::Result<()> {

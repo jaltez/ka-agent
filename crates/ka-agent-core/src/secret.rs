@@ -113,6 +113,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // the mode bits are a Unix property
     fn file_fallback_with_trim_and_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp("file");

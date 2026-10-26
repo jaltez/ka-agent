@@ -22,7 +22,9 @@ fn relay(paths: &ka_agent_runtime::paths::Paths, request: Value) -> Result<Value
         .set_read_timeout(Some(std::time::Duration::from_secs(120)))
         .map_err(|e| format!("ipc timeout: {e}"))?;
     {
-        let mut w = stream.try_clone().map_err(|e| format!("ipc: {e}"))?;
+        // One line out on the same stream, then read the reply from it; the
+        // writer borrow ends before the BufReader takes over.
+        let mut w = &stream;
         w.write_all(format!("{request}\n").as_bytes())
             .map_err(|e| format!("ipc write: {e}"))?;
         w.flush().map_err(|e| format!("ipc flush: {e}"))?;

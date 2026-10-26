@@ -66,8 +66,9 @@ pub async fn run_daemon(
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| eprintln!("ka-agent: cannot watch SIGTERM: {e}"))
         .ok();
-    #[cfg(not(unix))]
-    let term: Option<()> = None;
+    // Windows has no SIGTERM; the SCM/Task Scheduler stops it with
+    // Ctrl-C or a process kill, and `restart` uses the admin pipe.
+
     let ctrl_c = tokio::signal::ctrl_c();
 
     let host = match Host::start(
@@ -92,12 +93,15 @@ pub async fn run_daemon(
     tokio::select! {
         _ = ctrl_c => {}
         _ = async {
-            match term.as_mut() {
-                Some(s) => {
+            #[cfg(unix)]
+            {
+                if let Some(s) = term.as_mut() {
                     let _ = s.recv().await;
+                    return;
                 }
-                None => std::future::pending::<()>().await,
             }
+            // Windows: no SIGTERM; Ctrl-C and the admin pipe cover it.
+            std::future::pending::<()>().await
         } => {}
         _ = shutdown_rx.changed() => {}
     }

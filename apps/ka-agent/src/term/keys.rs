@@ -37,8 +37,113 @@ pub enum Key {
     Focus(bool),
 }
 
+/// Decode console input until EOF; every complete key is sent. The
+/// channel closes when the input ends.
+#[cfg(windows)]
+pub fn spawn_reader() -> mpsc::Receiver<Key> {
+    use crossterm::event::{Event, KeyEvent, KeyEventKind};
+    let (tx, rx) = mpsc::channel(256);
+    std::thread::spawn(move || {
+        loop {
+            let event = match crossterm::event::read() {
+                Ok(event) => event,
+                Err(_) => return,
+            };
+            let key = match event {
+                Event::Paste(text) => Some(Key::Paste(text)),
+                Event::FocusGained => Some(Key::Focus(true)),
+                Event::FocusLost => Some(Key::Focus(false)),
+                Event::Key(KeyEvent {
+                    code,
+                    modifiers,
+                    kind,
+                    ..
+                }) => {
+                    if kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    Some(map_key(code, modifiers))
+                }
+                _ => None,
+            };
+            if let Some(key) = key
+                && tx.blocking_send(key).is_err()
+            {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// A Windows console key event → the shared [`Key`] vocabulary.
+#[cfg(windows)]
+fn map_key(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> Key {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    match code {
+        KeyCode::Enter => {
+            if alt || shift {
+                Key::Newline
+            } else {
+                Key::Enter
+            }
+        }
+        KeyCode::Char(c) if ctrl => {
+            if alt {
+                match c.to_ascii_lowercase() {
+                    'b' => Key::WordLeft,
+                    'f' => Key::WordRight,
+                    _ => Key::Ctrl(c),
+                }
+            } else {
+                let lower = c.to_ascii_lowercase();
+                match lower {
+                    'c' => Key::Interrupt,
+                    'd' => Key::Eof,
+                    'j' => Key::Newline,
+                    other => Key::Ctrl(other),
+                }
+            }
+        }
+        KeyCode::Char(c) if alt => match c.to_ascii_lowercase() {
+            'b' => Key::WordLeft,
+            'f' => Key::WordRight,
+            _ => Key::Char(c),
+        },
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Left => {
+            if ctrl {
+                Key::WordLeft
+            } else {
+                Key::Left
+            }
+        }
+        KeyCode::Right => {
+            if ctrl {
+                Key::WordRight
+            } else {
+                Key::Right
+            }
+        }
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Esc => Key::Esc,
+        _ => Key::Esc,
+    }
+}
+
 /// Decode stdin until EOF; every complete key is sent. `None` payload means
 /// the stream closed.
+#[cfg(unix)]
 pub fn spawn_reader() -> mpsc::Receiver<Key> {
     let (tx, rx) = mpsc::channel(256);
     std::thread::spawn(move || {
@@ -77,12 +182,14 @@ pub fn spawn_reader() -> mpsc::Receiver<Key> {
     rx
 }
 
+#[cfg(unix)]
 enum Decoded {
     Key(Key, usize),
     NeedMore,
 }
 
 /// Decode one key at the head of `bytes`.
+#[cfg(unix)]
 fn decode_one(bytes: &[u8]) -> Decoded {
     let b = bytes[0];
     match b {
@@ -117,6 +224,7 @@ fn decode_one(bytes: &[u8]) -> Decoded {
 
 /// ESC-prefixed sequences: arrows, Home/End, Delete, word moves, Alt-Enter,
 /// Shift-Enter, bracketed paste, focus in/out, Alt-b/Alt-f.
+#[cfg(unix)]
 fn decode_escape(bytes: &[u8]) -> Decoded {
     if bytes.len() == 1 {
         return Decoded::NeedMore;
@@ -145,6 +253,7 @@ fn decode_escape(bytes: &[u8]) -> Decoded {
     }
 }
 
+#[cfg(unix)]
 fn decode_csi(bytes: &[u8]) -> Decoded {
     // ESC [ … <final byte in 0x40..=0x7e>
     let mut i = 2;
@@ -185,6 +294,7 @@ fn decode_csi(bytes: &[u8]) -> Decoded {
 }
 
 /// `ESC [ 200 ~ <payload> ESC [ 201 ~`: accumulate until the end marker.
+#[cfg(unix)]
 fn decode_paste(bytes: &[u8], start: usize) -> Decoded {
     const END: &[u8] = b"\x1b[201~";
     let hay = &bytes[start..];
