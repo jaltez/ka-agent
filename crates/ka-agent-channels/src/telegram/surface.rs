@@ -65,9 +65,15 @@ pub(super) struct SurfaceInner {
 /// The reply being streamed in the current turn.
 #[derive(Default)]
 struct Draft {
+    /// Non-zero while the turn has a draft; scheduled turns (cron, the
+    /// briefing) keep it at zero and never open one.
     id: i64,
+    /// Streamed answer text; once any arrived it is what the draft shows.
     text: String,
+    /// Newest tool activity (`⋯ label`) while no answer text has streamed.
+    activity: Option<String>,
     pushed_len: usize,
+    pushed_activity: Option<String>,
     pushed_ms: i64,
 }
 
@@ -75,6 +81,9 @@ struct Draft {
 /// the text grew enough to be worth a request.
 const DRAFT_MIN_INTERVAL_MS: i64 = 1000;
 const DRAFT_MIN_GROWTH: usize = 40;
+
+/// Telegram caps an uploaded photo at 10 MB; bigger images go as documents.
+const PHOTO_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 impl SurfaceInner {
     fn new(client: TelegramClient) -> Self {
@@ -154,24 +163,75 @@ impl SurfaceInner {
             return;
         }
         let Some(chat) = self.chat() else { return };
+        {
+            let mut d = self.draft.lock().unwrap_or_else(|e| e.into_inner());
+            if d.id == 0 {
+                return; // no draft for this turn (none started, or scheduled)
+            }
+            d.text.push_str(delta);
+        }
+        self.flush_draft(chat);
+    }
+
+    /// Show `⋯ label` for the newest tool call while no answer text has
+    /// streamed; the answer text replaces it once it arrives.
+    fn show_activity(self: &Arc<Self>, label: &str) {
+        if !self.drafts.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(chat) = self.chat() else { return };
+        {
+            let mut d = self.draft.lock().unwrap_or_else(|e| e.into_inner());
+            if d.id == 0 || !d.text.is_empty() {
+                return;
+            }
+            d.activity = Some(format!("⋯ {label}"));
+        }
+        self.flush_draft(chat);
+    }
+
+    /// A tool finished: the next tool or the answer text replaces the label.
+    fn clear_activity(&self) {
+        let mut d = self.draft.lock().unwrap_or_else(|e| e.into_inner());
+        d.activity = None;
+    }
+
+    /// Send the draft when the throttle allows: at most one request per
+    /// second, and only when it changed enough to be worth it.
+    fn flush_draft(self: &Arc<Self>, chat: i64) {
         let snapshot = {
             let mut d = self.draft.lock().unwrap_or_else(|e| e.into_inner());
             if d.id == 0 {
-                return; // no turn started on this surface
+                return;
             }
-            d.text.push_str(delta);
+            // Drafts are plain text (a half-written reply has unbalanced
+            // Markdown); Telegram caps a message at 4096 characters.
+            let (text, activity) = if d.text.is_empty() {
+                (None, d.activity.clone())
+            } else {
+                let text: String = d.text.chars().take(MAX_MESSAGE_CHARS - 1).collect();
+                (Some(text), None)
+            };
+            let content = match (&text, &activity) {
+                (Some(text), _) => text.clone(),
+                (None, Some(activity)) => activity.clone(),
+                (None, None) => return,
+            };
             let now = now_ms();
-            let grew = d.text.len().saturating_sub(d.pushed_len) >= DRAFT_MIN_GROWTH;
             let due = now - d.pushed_ms >= DRAFT_MIN_INTERVAL_MS;
-            if !(grew && due) || self.draft_in_flight.swap(true, Ordering::AcqRel) {
+            // Streamed text has to grow; an activity label replaces the
+            // previous one wholesale, so any change is worth a request.
+            let worth = match &text {
+                Some(_) => d.text.len().saturating_sub(d.pushed_len) >= DRAFT_MIN_GROWTH,
+                None => d.pushed_activity.as_deref() != Some(content.as_str()),
+            };
+            if !(due && worth) || self.draft_in_flight.swap(true, Ordering::AcqRel) {
                 return;
             }
             d.pushed_len = d.text.len();
+            d.pushed_activity = activity;
             d.pushed_ms = now;
-            // Drafts are plain text (a half-written reply has unbalanced
-            // Markdown); Telegram caps a message at 4096 characters.
-            let text: String = d.text.chars().take(MAX_MESSAGE_CHARS - 1).collect();
-            (d.id, text)
+            (d.id, content)
         };
         let inner = Arc::clone(self);
         tokio::spawn(async move {
@@ -256,13 +316,20 @@ impl Surface for TelegramSurface {
         match &env.ev {
             // Typing indicator only; a progress message appears with the
             // first note.
-            AgentEvent::TurnStarted { .. } => {
+            AgentEvent::TurnStarted { source, .. } => {
                 self.inner.turn_active.store(true, Ordering::Release);
                 // A fresh draft per turn: a non-zero id the API keys the
-                // bubble by.
-                *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft {
-                    id: (now_ms() & 0x7fff_ffff).max(1),
-                    ..Draft::default()
+                // bubble by. Scheduled turns (cron, the briefing) get no
+                // draft at all — their output arrives as notices, and the
+                // runtime already suppresses their deltas.
+                let scheduled = source == "briefing" || source.starts_with("cron");
+                *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = if scheduled {
+                    Draft::default()
+                } else {
+                    Draft {
+                        id: (now_ms() & 0x7fff_ffff).max(1),
+                        ..Draft::default()
+                    }
                 };
                 *self
                     .inner
@@ -427,6 +494,57 @@ impl Surface for TelegramSurface {
                     let _ = client.send_message(chat, &body, Some(markup)).await;
                 });
             }
+            // A model-proposed skill: one tap installs (same path as
+            // `/skills accept <id>`) or rejects it.
+            AgentEvent::SkillProposal {
+                id,
+                name,
+                description,
+            } => {
+                let Some(chat) = self.inner.chat() else {
+                    return;
+                };
+                // `sk:<verdict>:<id>` must fit the 64-byte callback cap;
+                // ids are short (`skill_xxxx`) but a long one falls back to
+                // its suffix, which `id_matches` accepts.
+                let target = if id.len() <= 59 {
+                    id.clone()
+                } else {
+                    ka_agent_core::ids::short_id(id).to_string()
+                };
+                let markup = json!({
+                    "inline_keyboard": [[
+                        { "text": "✅ Accept", "callback_data": format!("sk:a:{target}") },
+                        { "text": "✖ Reject", "callback_data": format!("sk:r:{target}") }
+                    ]]
+                });
+                let body = format!("🧩 Proposed skill: {name}\n\n{description}");
+                let client = self.inner.client.clone();
+                tokio::spawn(async move {
+                    let _ = client.send_message(chat, &body, Some(markup)).await;
+                });
+            }
+            // A file for the operator: a photo when Telegram can take it as
+            // one, else a document. A refusal falls back to a notice with
+            // the absolute path, so the file is never lost silently.
+            AgentEvent::File {
+                path,
+                name,
+                caption,
+            } => {
+                let Some(chat) = self.inner.chat() else {
+                    return;
+                };
+                let client = self.inner.client.clone();
+                let (path, name, caption) = (path.clone(), name.clone(), caption.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = deliver_file(&client, chat, &path, &name, &caption).await {
+                        eprintln!("telegram: file {name}: {e}");
+                        let notice = format!("! [file] {name}: {e}\n{path}");
+                        let _ = client.send_message(chat, &notice, None).await;
+                    }
+                });
+            }
             AgentEvent::Approval {
                 id,
                 question,
@@ -485,11 +603,21 @@ impl Surface for TelegramSurface {
             AgentEvent::Error { class, message } => {
                 self.inner.spawn_send(format!("! [{class}] {message}"));
             }
-            // Reasoning, tool structure, plans and status are not drawn on
-            // the phone (today's behavior).
+            // While tools run and no answer text has streamed, the draft
+            // shows the newest tool call; the text replaces it later.
+            AgentEvent::ToolStarted { tool, detail, .. } => {
+                if !self.inner.turn_active.load(Ordering::Acquire) {
+                    return;
+                }
+                let label = ka_agent_core::labels::tool_label(tool, detail);
+                self.inner.show_activity(&label);
+            }
+            // The activity is cleared: the next tool or the answer text
+            // replaces it (no extra request).
+            AgentEvent::ToolFinished { .. } => self.inner.clear_activity(),
+            // Reasoning, plans and status are not drawn on the phone
+            // (today's behavior).
             AgentEvent::Thought { .. }
-            | AgentEvent::ToolStarted { .. }
-            | AgentEvent::ToolFinished { .. }
             | AgentEvent::Plan { .. }
             | AgentEvent::Context { .. }
             | AgentEvent::Compacting { .. }
@@ -497,13 +625,47 @@ impl Surface for TelegramSurface {
             | AgentEvent::Session { .. } => {}
             // Later steps wire these to real deliveries.
             AgentEvent::Reminder { .. }
-            | AgentEvent::File { .. }
             | AgentEvent::CronFinished { .. }
             | AgentEvent::Queue { .. }
-            | AgentEvent::Settings { .. }
-            | AgentEvent::SkillProposal { .. } => {}
+            | AgentEvent::Settings { .. } => {}
             // Per-connection events never reach a broadcast surface.
             AgentEvent::Hello { .. } | AgentEvent::Reply { .. } => {}
         }
+    }
+}
+
+/// Send one event file: `sendPhoto` for an image Telegram accepts (jpg,
+/// jpeg, png, webp ≤ 10 MB), `sendDocument` otherwise. The caption rides
+/// along when non-empty.
+async fn deliver_file(
+    client: &TelegramClient,
+    chat: i64,
+    path: &str,
+    name: &str,
+    caption: &str,
+) -> Result<(), ChannelError> {
+    let read = path.to_string();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&read))
+        .await
+        .map_err(|e| ChannelError::api(format!("read task: {e}")))?
+        .map_err(|e| ChannelError::api(format!("{path}: {e}")))?;
+    let (method, field, mime) = match photo_mime(name) {
+        Some(mime) if bytes.len() <= PHOTO_MAX_BYTES => ("sendPhoto", "photo", Some(mime)),
+        _ => ("sendDocument", "document", None),
+    };
+    client
+        .send_media(chat, method, field, name, mime, bytes, caption)
+        .await
+        .map(|_| ())
+}
+
+/// The image MIME type Telegram accepts for `sendPhoto`, by extension.
+fn photo_mime(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        _ => None,
     }
 }

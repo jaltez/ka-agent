@@ -460,6 +460,50 @@ impl TelegramChannel {
         }
     }
 
+    /// ✅ / ✖ on a skill proposal: accept (install + enable) or reject it
+    /// through the very command path `/skills accept|reject <id>` takes,
+    /// then turn the card into its outcome.
+    async fn skill_callback(&self, cb: &Value, rest: &str, chat_id: i64, client: &TelegramClient) {
+        let Some((verdict, id)) = rest.split_once(':') else {
+            return;
+        };
+        let verb = match verdict {
+            "a" => "accept",
+            "r" => "reject",
+            _ => return,
+        };
+        let uid = cb["from"]["id"].as_i64().unwrap_or(0);
+        let command = format!("/skills {verb} {id}");
+        let outcome =
+            match crate::commands::route(&self.runtime, &format!("telegram:{uid}"), &command).await
+            {
+                crate::commands::Outcome::Reply(reply) => reply,
+                crate::commands::Outcome::Silent | crate::commands::Outcome::NotACommand => {
+                    format!("! [skills] no outcome for {id}")
+                }
+            };
+        let toast = if outcome.starts_with('!') {
+            "error"
+        } else if verdict == "a" {
+            "accepted"
+        } else {
+            "rejected"
+        };
+        let _ = client
+            .answer_callback_query(cb["id"].as_str().unwrap_or(""), toast)
+            .await;
+        if let Some(message_id) = cb["message"]["message_id"].as_i64() {
+            let _ = client
+                .edit_message_text(
+                    chat_id,
+                    message_id,
+                    &outcome,
+                    Some(json!({ "inline_keyboard": [] })),
+                )
+                .await;
+        }
+    }
+
     async fn dispatch_callback(
         &self,
         cb: &Value,
@@ -483,6 +527,11 @@ impl TelegramChannel {
         // `m:<short>:y|n` — a memory proposal card.
         if let Some(rest) = data.strip_prefix("m:") {
             self.memory_callback(cb, rest, chat_id, &client).await;
+            return;
+        }
+        // `sk:a|r:<id>` — a skill proposal card.
+        if let Some(rest) = data.strip_prefix("sk:") {
+            self.skill_callback(cb, rest, chat_id, &client).await;
             return;
         }
         // `a:<short>:y|n`

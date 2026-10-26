@@ -76,6 +76,19 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   posted with `✅ Remember` / `✖ Discard` (`callback_data =
   m:<short-id>:y|n`); the press accepts/rejects it and edits the card to
   its outcome with the keyboard removed.
+- Draft labels (plan 3.3): while tools run and no answer text has streamed,
+  the draft shows `⋯ <tool label>` (the same `tool_label` wording every
+  surface uses) through the same 1 s / growth throttle as answer text; the
+  first streamed delta replaces it. Scheduled turns (`cron`, `cron:*`,
+  `briefing`) never open a draft.
+- Files the operator asks for (`AgentEvent::File`): jpg/jpeg/png/webp up to
+  10 MB go out as `sendPhoto` (multipart with the caption), everything else
+  as `sendDocument`; a read error or a refused send falls back to a notice
+  carrying the file's absolute path.
+- Skill proposals: `skill_propose` posts a card with `✅ Accept` /
+  `✖ Reject` (`callback_data = sk:<short-id>:y|n`), routed through the same
+  `/skills accept|reject <id>` command path as the console; the press
+  installs (or discards) and edits the card to the outcome.
 
 ## Secrets
 

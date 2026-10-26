@@ -110,6 +110,45 @@ impl TelegramClient {
         .map(|_| ())
     }
 
+    /// Upload one file as `sendPhoto`/`sendDocument` (`field` is `photo`
+    /// or `document`). `mime` lets Telegram accept a photo without
+    /// sniffing; the caption is omitted when empty.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_media(
+        &self,
+        chat_id: i64,
+        method: &str,
+        field: &str,
+        file_name: &str,
+        mime: Option<&str>,
+        bytes: Vec<u8>,
+        caption: &str,
+    ) -> Result<i64, ChannelError> {
+        let mut form = reqwest::multipart::Form::new().text("chat_id", chat_id.to_string());
+        if !caption.is_empty() {
+            form = form.text("caption", caption.to_string());
+        }
+        let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
+        if let Some(mime) = mime {
+            part = part.mime_str(mime)?;
+        }
+        let resp = self
+            .http
+            .post(format!("{}/{method}", self.base))
+            .timeout(POLL_HTTP_TIMEOUT)
+            .multipart(form.part(field.to_string(), part))
+            .send()
+            .await?;
+        let v: Value = resp.json().await?;
+        if v["ok"].as_bool() == Some(true) {
+            Ok(v["result"]["message_id"].as_i64().unwrap_or(0))
+        } else {
+            Err(ChannelError::api(
+                v["description"].as_str().unwrap_or("unknown api error"),
+            ))
+        }
+    }
+
     /// React to a message with one emoji (the receipt acknowledgement).
     pub(crate) async fn set_message_reaction(
         &self,

@@ -768,3 +768,291 @@ async fn phone_cannot_allow_for_the_session() {
         .expect("refused on the phone");
     stop(&mut stack).await;
 }
+
+/// 3.3: files leave as `sendPhoto` (jpg/jpeg/png/webp ≤ 10 MB) or
+/// `sendDocument`, with the caption; a file that cannot be sent falls back
+/// to a notice carrying the absolute path.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_go_out_as_photo_or_document_with_caption() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-files".to_string(), Some(7));
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let png_path = dir.join("pixel.png");
+    std::fs::write(&png_path, b"\x89PNG\r\n\x1a\nfake image").unwrap();
+    surface.emit(&env(
+        1,
+        AgentEvent::File {
+            path: png_path.to_string_lossy().into_owned(),
+            name: "pixel.png".into(),
+            caption: "the chart".into(),
+        },
+    ));
+    let photo = server
+        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(5))
+        .expect("image uploaded as a photo");
+    let raw = photo.raw.as_deref().unwrap_or("");
+    assert!(
+        raw.contains("name=\"photo\"; filename=\"pixel.png\""),
+        "multipart carries the photo filename: {raw}"
+    );
+    assert!(raw.contains("the chart"), "caption rides along: {raw}");
+    assert!(raw.contains("image/png"), "photo content type: {raw}");
+
+    let txt_path = dir.join("notes.txt");
+    std::fs::write(&txt_path, b"plain words").unwrap();
+    surface.emit(&env(
+        2,
+        AgentEvent::File {
+            path: txt_path.to_string_lossy().into_owned(),
+            name: "notes.txt".into(),
+            caption: String::new(),
+        },
+    ));
+    let doc = server
+        .await_capture(|c| c.method == "sendDocument", Duration::from_secs(5))
+        .expect("non-image uploaded as a document");
+    let raw = doc.raw.as_deref().unwrap_or("");
+    assert!(
+        raw.contains("name=\"document\"; filename=\"notes.txt\""),
+        "multipart carries the document filename: {raw}"
+    );
+    assert!(
+        !raw.contains("name=\"caption\""),
+        "no empty caption field: {raw}"
+    );
+
+    // A vanished file must not disappear silently: a notice carries the
+    // absolute path.
+    let ghost = dir.join("ghost.bin");
+    surface.emit(&env(
+        3,
+        AgentEvent::File {
+            path: ghost.to_string_lossy().into_owned(),
+            name: "ghost.bin".into(),
+            caption: String::new(),
+        },
+    ));
+    let notice = server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").contains("! [file]")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("failure notice");
+    let text = notice.body["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains(&ghost.to_string_lossy().into_owned()),
+        "absolute path in the notice: {text}"
+    );
+}
+
+/// 3.3: while tools run and no answer text has streamed, the draft shows
+/// `⋯ tool label`; scheduled turns (cron/briefing) never open a draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn draft_shows_tool_progress_and_skips_scheduled_turns() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-activity".to_string(), Some(7));
+    surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: "telegram:42".into(),
+        },
+    ));
+    surface.emit(&env(
+        2,
+        AgentEvent::ToolStarted {
+            id: "t1".into(),
+            tool: "bash".into(),
+            detail: "ls".into(),
+        },
+    ));
+    let first = server
+        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(5))
+        .expect("activity draft");
+    assert_eq!(first.body["text"].as_str(), Some("⋯ running a command"));
+    let draft_id = first.body["draft_id"].as_i64().unwrap();
+
+    // ToolFinished clears the label; the newest tool replaces it under the
+    // same draft id once the throttle window elapsed.
+    surface.emit(&env(
+        3,
+        AgentEvent::ToolFinished {
+            id: "t1".into(),
+            tool: "bash".into(),
+            ok: true,
+            ms: 3,
+            error: None,
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    surface.emit(&env(
+        4,
+        AgentEvent::ToolStarted {
+            id: "t2".into(),
+            tool: "web_search".into(),
+            detail: "rust news".into(),
+        },
+    ));
+    let next = server
+        .await_capture(
+            |c| {
+                c.method == "sendMessageDraft"
+                    && c.body["text"].as_str() == Some("⋯ searching the web")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("newest tool label");
+    assert_eq!(next.body["draft_id"].as_i64(), Some(draft_id));
+
+    // Scheduled turns: no draft for tool progress or streamed text.
+    let (cron_server, cron_base) = FakeBotServer::spawn();
+    let cron = TelegramSurface::new(cron_base, "tok-cron".to_string(), Some(7));
+    cron.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: "cron:task_1".into(),
+        },
+    ));
+    cron.emit(&env(
+        2,
+        AgentEvent::ToolStarted {
+            id: "t1".into(),
+            tool: "bash".into(),
+            detail: "ls".into(),
+        },
+    ));
+    cron.emit(&env(
+        3,
+        AgentEvent::Delta {
+            text: "scheduled text ".repeat(6),
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        cron_server
+            .captured()
+            .iter()
+            .all(|c| c.method != "sendMessageDraft"),
+        "no drafts for scheduled turns: {:?}",
+        cron_server.captured()
+    );
+}
+
+/// 3.3: the skill-proposal card's Accept runs the same path as
+/// `/skills accept <id>` — the SKILL.md lands under
+/// `$KA_AGENT_HOME/skills/<name>/` and the store row turns accepted.
+/// `std::env::set_var` is unsafe (forbidden crate-wide), so the body
+/// re-executes this test with `KA_AGENT_HOME` pointed at a temp dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_proposal_card_accepts_and_installs() {
+    if std::env::var_os("KA_TG_SKILL_CHILD").is_some() {
+        skill_proposal_accept_body().await;
+        return;
+    }
+    let home = temp_dir();
+    std::fs::create_dir_all(&home).unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "skill_proposal_card_accepts_and_installs",
+            "--nocapture",
+        ])
+        .env("KA_TG_SKILL_CHILD", "1")
+        .env("KA_AGENT_HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let installed = home.join("skills/review-helper/SKILL.md");
+    let body = std::fs::read_to_string(&installed)
+        .unwrap_or_else(|e| panic!("{} must exist after accept: {e}", installed.display()));
+    assert!(body.contains("name: review-helper"), "{body}");
+    assert!(body.contains("Read the diff first."), "{body}");
+}
+
+async fn skill_proposal_accept_body() {
+    let mut stack = spawn_channel(vec![42], "tok-skill").await;
+    // The operator's chat is known once they wrote.
+    stack.server.push_text_message(1, 7, 42, "/status");
+    stack
+        .server
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .expect("status reply");
+
+    let id = "skill_ab12cd34";
+    stack
+        .store
+        .add_skill_candidate(
+            id,
+            "review-helper",
+            "Helps with code review",
+            "Read the diff first.",
+        )
+        .unwrap();
+    stack.runtime.emit(AgentEvent::SkillProposal {
+        id: id.into(),
+        name: "review-helper".into(),
+        description: "Helps with code review".into(),
+    });
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Proposed skill: review-helper")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("skill card");
+    let keyboard = &card.body["reply_markup"]["inline_keyboard"][0];
+    let accept = keyboard[0]["callback_data"].as_str().unwrap().to_string();
+    let reject = keyboard[1]["callback_data"].as_str().unwrap().to_string();
+    assert_eq!(accept, format!("sk:a:{id}"));
+    assert_eq!(reject, format!("sk:r:{id}"));
+    assert!(accept.len() <= 64 && reject.len() <= 64);
+
+    stack.server.push_callback(2, 7, 42, &accept);
+    let answered = stack
+        .server
+        .await_capture(
+            |c| c.method == "answerCallbackQuery",
+            Duration::from_secs(5),
+        )
+        .expect("callback answered");
+    assert_eq!(answered.body["text"].as_str(), Some("accepted"));
+    let edited = stack
+        .server
+        .await_capture(|c| c.method == "editMessageText", Duration::from_secs(5))
+        .expect("card outcome");
+    let text = edited.body["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("installed and enabled skill review-helper"),
+        "outcome text: {text}"
+    );
+    // The store row is accepted (no longer pending).
+    assert!(stack.store.pending_skill_candidates().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(&stack.db_path).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM skill_candidates WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "accepted");
+    stop(&mut stack).await;
+}
