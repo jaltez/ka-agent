@@ -513,7 +513,28 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
     };
     let attached = backend.is_attached();
     let mut term = Term::new();
-    let mut input = spawn_input(std::io::stdin().is_terminal());
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // The inline client (plan 3.1) takes over the same loop when both ends
+    // are TTYs; the piped path keeps the line reader untouched.
+    let mut terminal = if interactive {
+        let ws = match &backend {
+            Backend::Local { host, .. } => host.runtime.workspace(),
+            Backend::Attached { .. } => ka_agent_core::DaemonConfig::load(&config)
+                .map(|c| c.workspace_path())
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        };
+        crate::term::Terminal::start(ws, persona_name(), String::new())
+    } else {
+        None
+    };
+    // A pending card the draft's `y`/`n`/`s` keys may answer.
+    let mut pending_card: Option<(String, String)> = None;
+    // One reader only: the terminal owns stdin when it is active.
+    let mut input = if interactive {
+        None
+    } else {
+        Some(spawn_input(std::io::stdin().is_terminal()))
+    };
     let mut greeted = !attached;
     let mut busy = false;
     let mut eof_deadline: Option<tokio::time::Instant> = None;
@@ -568,7 +589,29 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                         }
                         _ => {}
                     }
-                    render(&env, &mut term);
+                    match &env.ev {
+                        AgentEvent::Approval { id, .. } => {
+                            pending_card = Some(("approval".into(), id.clone()))
+                        }
+                        AgentEvent::ApprovalSettled { id, .. }
+                            if pending_card.as_ref().is_some_and(|(_, c)| c == id) =>
+                        {
+                            pending_card = None;
+                        }
+                        AgentEvent::MemoryProposal { id, .. } => {
+                            pending_card = Some(("memory".into(), id.clone()))
+                        }
+                        AgentEvent::SkillProposal { id, .. } => {
+                            pending_card = Some(("skill".into(), id.clone()))
+                        }
+                        _ => {}
+                    }
+                    if let Some(t) = terminal.as_mut() {
+                        crate::term::show_event(t, &env);
+                        crate::term::cards::print_card(&env);
+                    } else {
+                        render(&env, &mut term);
+                    }
                 }
                 Incoming::Lagged(n) => println!("· (missed {n} events)"),
                 Incoming::Closed => {
@@ -578,7 +621,49 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                     break;
                 }
             },
-            line = input.recv() => match line {
+            action = async {
+                match terminal.as_mut() {
+                    Some(t) => t.next_action(busy).await,
+                    None => std::future::pending().await,
+                }
+            } => match action {
+                Some(crate::term::Action::Submit(mut text)) => {
+                    let bare = text.trim().to_string();
+                    if matches!(bare.as_str(), "y" | "n" | "s")
+                        && let Some((kind, id)) = pending_card.clone()
+                    {
+                        text = match (bare.as_str(), kind.as_str()) {
+                            ("y", "memory") => format!("/memory accept {id}"),
+                            ("n", "memory") => format!("/memory reject {id}"),
+                            ("y", "skill") => format!("/skills accept {id}"),
+                            ("n", "skill") => format!("/skills reject {id}"),
+                            ("s", _) => format!("/y {id} session"),
+                            (verb, _) => format!("/{verb} {id}"),
+                        };
+                    }
+                    if matches!(text.as_str(), "/quit" | "/q" | "/exit") {
+                        break;
+                    }
+                    if !text.starts_with('/') {
+                        busy = true;
+                    }
+                    if let Err(e) = backend.say(&text).await {
+                        println!("! {e}");
+                        break;
+                    }
+                }
+                Some(crate::term::Action::Interrupt) => {
+                    let _ = backend.say("/stop").await;
+                    busy = false;
+                }
+                Some(crate::term::Action::Eof) | None => break,
+            },
+            line = async {
+                match input.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match line {
                 Some(Some(text)) => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
@@ -606,7 +691,7 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                     }
                 }
             },
-            _ = tokio::signal::ctrl_c() => {
+            _ = tokio::signal::ctrl_c(), if terminal.is_none() => {
                 let now = Instant::now();
                 if last_ctrl_c.is_some_and(|t| now.duration_since(t) < Duration::from_secs(2)) {
                     break;

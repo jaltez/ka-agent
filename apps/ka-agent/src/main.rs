@@ -32,6 +32,7 @@ mod secrets_cli;
 mod service;
 mod setup;
 mod skills_cli;
+mod term;
 mod triggers_cli;
 mod update_cli;
 mod usage_cli;

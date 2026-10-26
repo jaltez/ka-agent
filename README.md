@@ -74,7 +74,12 @@ Scheduling times are always your local time:
 /cron add every mon at 09:00 plan the week
 ```
 
-`Ctrl-C` stops a running reply, twice quits; `/quit` leaves the terminal chat.
+In a terminal the chat is a live client: the transcript scrolls above while
+the status line (spinner, context, spend, plan), tool rows and the draft stay
+in place below; `Tab` completes commands and `@paths`, `Ctrl-R` searches the
+history, `Ctrl-G` opens your editor on the draft, and `y`/`n`/`s` answer a
+pending approval card. `Ctrl-C` stops a running reply, twice quits; `/quit`
+leaves. Details: `docs/contract/terminal.md`.
 
 ## What it can do
 
