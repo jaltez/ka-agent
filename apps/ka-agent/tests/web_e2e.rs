@@ -453,9 +453,11 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     assert_eq!(accented.status, 200, "accented send: {}", accented.body);
 
     // Live stream: an open /events socket sees the inbound echo and a
-    // scripted answer's delta for a message sent while it is open. The
-    // scenario carries an answer per message, so this does not depend on
-    // the previous turn still running.
+    // scripted answer's delta for a message sent while it is open. Wait
+    // until the earlier turn is idle first: a message that arrives while a
+    // turn runs is folded into it ("added while working") and then emits no
+    // of its own inbound/turn_started events.
+    wait_until_idle(port, &cookie);
     let events = open_events(port, &cookie);
     let sent = request_h(
         port,
@@ -476,6 +478,20 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     );
     assert!(stream.contains("\"ev\":\"inbound\""), "stream: {stream}");
     assert!(stream.contains("\"ev\":\"delta\""), "stream: {stream}");
+}
+
+/// Poll `/status` until the session reports idle (bounded), so the next
+/// message starts its own turn instead of folding into a running one.
+fn wait_until_idle(port: u16, cookie: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let page = request(port, "GET", "/status", Some(cookie), "");
+        if page.body.contains("● idle") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "session never went idle");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Open a raw SSE connection (blocking socket, read timeout 60 s).
