@@ -460,7 +460,7 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     // the second turn's answer is empty; streaming text over SSE is the
     // same broadcast the console path exercises.
     wait_until_idle(port, &cookie);
-    let events = open_events(port, &cookie);
+    let (events, ready) = open_events(port, &cookie);
     let sent = request_h(
         port,
         "POST",
@@ -472,6 +472,7 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     assert_eq!(sent.status, 200);
     let stream = read_events_until(
         events,
+        ready,
         &[
             "\"ev\":\"inbound\"",
             "\"ev\":\"turn_started\"",
@@ -504,8 +505,11 @@ fn wait_until_idle(port: u16, cookie: &str) {
     }
 }
 
-/// Open a raw SSE connection (blocking socket, read timeout 60 s).
-fn open_events(port: u16, cookie: &str) -> std::net::TcpStream {
+/// Open a raw SSE connection and wait for the response head: the server
+/// subscribes before it flushes the head, so once the head is read no event
+/// can be missed by a later POST (read timeout 60 s).
+fn open_events(port: u16, cookie: &str) -> (std::net::TcpStream, String) {
+    use std::io::Read as _;
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
@@ -514,19 +518,30 @@ fn open_events(port: u16, cookie: &str) -> std::net::TcpStream {
         "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).unwrap();
-    stream
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while !String::from_utf8_lossy(&buf).contains("\r\n\r\n") {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+    }
+    (stream, String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Read the SSE stream until every marker is seen (or `timeout` passes);
 /// returns everything received.
 fn read_events_until(
     mut stream: std::net::TcpStream,
+    mut seen: String,
     markers: &[&str],
     timeout: Duration,
 ) -> String {
     use std::io::Read as _;
     let deadline = Instant::now() + timeout;
-    let mut buf = Vec::new();
+    let mut buf: Vec<u8> = seen.clone().into_bytes();
+    seen.clear();
     let mut tmp = [0u8; 4096];
     loop {
         let text = String::from_utf8_lossy(&buf).into_owned();
