@@ -1016,6 +1016,47 @@ fn settings_form_and_usage_page() {
             .unwrap()
             .contains("nonsense")
     );
+    // The form is built from the key registry: a web-editable key the old
+    // hand-written form never offered is present, with its apply timing.
+    let page = request(port, "GET", "/status", Some(&cookie), "");
+    for key in [
+        "search.provider",
+        "notify.quiet_hours",
+        "approvals.auto_review",
+    ] {
+        assert!(page.body.contains(key), "form missing {key}");
+    }
+    assert!(
+        page.body.contains("name='notify_quiet_hours'"),
+        "field name: {}",
+        page.body
+    );
+    // A POST of such a registry key writes it (string → quoted TOML).
+    let resp = request_h(
+        port,
+        "POST",
+        "/settings",
+        Some(&cookie),
+        "search_provider=brave",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let cfg = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
+    assert!(cfg.contains("provider = \"brave\""), "{cfg}");
+    // A key outside the registry is ignored, not written.
+    request_h(
+        port,
+        "POST",
+        "/settings",
+        Some(&cookie),
+        "not_a_key=1",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert!(
+        !std::fs::read_to_string(root.join("ka-agent.toml"))
+            .unwrap()
+            .contains("not_a_key")
+    );
     // Usage page lists both days.
     let usage = request(port, "GET", "/usage", Some(&cookie), "");
     assert!(usage.body.contains("0.0456"), "usage: {}", usage.body);

@@ -40,7 +40,7 @@ th{color:var(--muted);font-weight:600}\
 .bubble.system{align-self:center;background:none;color:var(--muted);font-size:.85rem;max-width:100%}\
 .bubble.approval{align-self:flex-start;background:var(--surface);border:1px solid var(--warn);max-width:100%}\
 #log{display:flex;flex-direction:column}\
-.bubble code{background:var(--bg)}\
+.bubble .tool{font-size:.85rem;color:var(--muted);white-space:pre-wrap}\
 .bubble.user code{background:rgba(255,255,255,.2)}\
 form#send{display:flex;gap:.5rem;padding:.6rem 0}\
 #text{flex:1;font:inherit;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);padding:.55rem .8rem}\
@@ -53,10 +53,23 @@ form#send{display:flex;gap:.5rem;padding:.6rem 0}\
 /// The viewport-aware head + sidebar layout (top bar on narrow screens).
 fn html_page(title: &str, body: String) -> String {
     format!(
-        "<!DOCTYPE html>\n<html><head><title>{title} — Ka Agent</title>\
+        "<!DOCTYPE html>\n<html><head><title>{title} — {}</title>\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{STYLE}</head><body>\
-         {body}</body></html>"
+         {body}</body></html>",
+        persona_name()
     )
+}
+
+/// The assistant's display name (`Ka` by default) from the profile's
+/// persona file — the same source every other surface reads.
+pub fn persona_name() -> String {
+    let path = ka_agent_core::layout::base_dir()
+        .join("memory")
+        .join("persona.md");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| ka_agent_memory::persona::persona_name(&t))
+        .unwrap_or_else(|| "Ka".to_string())
 }
 
 /// A page with the shared sidebar navigation. Badges: approvals waiting,
@@ -95,8 +108,9 @@ fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Respo
     Response::html(html_page(
         title,
         format!(
-            "<div class=\"layout\"><aside><div class=\"brand\">ka-agent</div>{nav}</aside>\
-             <main><h1>{title}</h1>{body}</main></div>"
+            "<div class=\"layout\"><aside><div class=\"brand\">{}</div>{nav}</aside>\
+             <main><h1>{title}</h1>{body}</main></div>",
+            escape_html(&persona_name())
         ),
     ))
 }
@@ -142,17 +156,13 @@ pub fn status(runtime: &Runtime) -> crate::Response {
         Some(cap) => format!("${:.4} / ${cap:.2}", report.spent_usd),
         None => format!("${:.4}", report.spent_usd),
     };
+    let settings = settings_form(runtime);
     let body = format!(
         "<div class='statgrid'>\
          {}{}{}{}{}{}\
          </div>\
          <h2>settings</h2>\
-         <form method='post' action='/settings'><table>\
-         <tr><td>model</td><td colspan='2'><input name='model' value='{}' placeholder='provider/model'></td></tr>\
-         <tr><td>mode</td><td colspan='2'><select name='mode'>{}</select></td></tr>\
-         <tr><td>timezone</td><td colspan='2'><input name='timezone' value='{}' placeholder='Europe/Madrid'></td></tr>\
-         <tr><td>daily budget $</td><td colspan='2'><input name='budgets_daily_usd' value='{}' placeholder='(none)'></td></tr>\
-         </table><button class='primary'>save</button> <span class='muted'>applied live; workspace <code>{}</code> and web port {} need a restart</span></form>\
+         {settings}\
          <h2>channels</h2><ul>{channels}</ul>",
         card("state", escape_html(&report_line(0))),
         card(
@@ -180,23 +190,76 @@ pub fn status(runtime: &Runtime) -> crate::Response {
                 "stopped (starts with your next message)".into()
             }
         ),
-        escape_html(cfg.model.as_deref().unwrap_or("")),
-        ["guarded", "accept_edits", "plan", "free"]
-            .iter()
-            .map(|m| format!(
-                "<option value='{m}'{}>{m}</option>",
-                if *m == cfg.mode { " selected" } else { "" }
-            ))
-            .collect::<String>(),
-        escape_html(&report.timezone),
-        cfg.budgets
-            .daily_usd
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        escape_html(&cfg.workspace.display().to_string()),
-        cfg.web.port,
     );
     nav_page(runtime, "/status", "Status", body)
+}
+
+/// The settings form: every `KEYS` entry marked `web`, its control chosen
+/// by kind, the current value read from the config file, and the key's
+/// apply timing beside it (plan 3.2: one registry, one form).
+fn settings_form(runtime: &Runtime) -> String {
+    use ka_agent_core::config_keys::{KEYS, Kind};
+    let Some(path) = runtime.config_path() else {
+        return "<p class='muted'>no config file to edit</p>".into();
+    };
+    let mut rows = String::new();
+    for spec in KEYS.iter().filter(|k| k.web) {
+        let current = ka_agent_core::config_file::get(&path, spec.path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let field = spec.path.replace('.', "_");
+        let control = match spec.kind {
+            Kind::Bool => format!(
+                "<select name='{field}'><option value=''>—</option>{}</select>",
+                ["true", "false"]
+                    .iter()
+                    .map(|v| format!(
+                        "<option value='{v}'{}{}>{v}</option>",
+                        if current == *v { " selected" } else { "" },
+                        ""
+                    ))
+                    .collect::<String>()
+            ),
+            Kind::Enum(options) => format!(
+                "<select name='{field}'><option value=''>—</option>{}</select>",
+                options
+                    .iter()
+                    .map(|v| format!(
+                        "<option value='{v}'{}>{v}</option>",
+                        if current == *v { " selected" } else { "" }
+                    ))
+                    .collect::<String>()
+            ),
+            Kind::Int { .. } | Kind::Float { .. } => format!(
+                "<input name='{field}' value='{}' inputmode='decimal' placeholder='{}'>",
+                escape_html(&current),
+                escape_html(spec.default)
+            ),
+            Kind::List => format!(
+                "<input name='{field}' value='{}' placeholder='{}'>",
+                escape_html(&current),
+                escape_html(spec.default)
+            ),
+            Kind::Str | Kind::Table => format!(
+                "<input name='{field}' value='{}' placeholder='{}'>",
+                escape_html(&current),
+                escape_html(spec.default)
+            ),
+        };
+        rows.push_str(&format!(
+            "<tr><td><code>{}</code><div class='muted'>{}</div></td>\
+             <td>{control}</td><td class='muted'>{}</td></tr>",
+            escape_html(spec.path),
+            escape_html(spec.doc),
+            spec.apply.label()
+        ));
+    }
+    format!(
+        "<form method='post' action='/settings'><table>{rows}</table>\
+         <button class='primary'>save</button>\
+         <span class='muted'>empty fields are left alone; each key shows when it applies</span></form>"
+    )
 }
 
 /// `GET /`: the chat page (last 20 turns, live updates via /events).
@@ -914,23 +977,39 @@ pub async fn settings_apply(runtime: &Runtime, body: &str) -> crate::Response {
     let Some(path) = runtime.config_path() else {
         return Response::see_other("/status");
     };
+    use ka_agent_core::config_keys::{KEYS, Kind};
     let mut applied: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for (key, field, quote) in [
-        ("model", "model", true),
-        ("mode", "mode", false),
-        ("timezone", "timezone", true),
-        ("budgets.daily_usd", "budgets_daily_usd", false),
-    ] {
-        let raw = form_field_url(body, field);
+    for spec in KEYS.iter().filter(|k| k.web) {
+        let field = spec.path.replace('.', "_");
+        let raw = form_field_url(body, &field);
         if raw.trim().is_empty() {
             continue;
         }
         let v = crate::url_decode(&raw.replace('+', " ")).trim().to_string();
-        let rendered = if quote { format!("{v:?}") } else { v.clone() };
-        match ka_agent_core::config_file::set(&path, key, &rendered) {
-            Ok(_) => applied.push(format!("{key} = {rendered}")),
-            Err(e) => errors.push(format!("{key}: {e}")),
+        // Render as the TOML value of the registered kind; lists accept
+        // comma-separated words (or a ready TOML array).
+        let rendered = match spec.kind {
+            Kind::Bool | Kind::Int { .. } | Kind::Float { .. } => v.clone(),
+            Kind::Str | Kind::Enum(_) => format!("{v:?}"),
+            Kind::List => {
+                if v.starts_with('[') {
+                    v.clone()
+                } else {
+                    let items: Vec<String> = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("{s:?}"))
+                        .collect();
+                    format!("[{}]", items.join(", "))
+                }
+            }
+            Kind::Table => v.clone(),
+        };
+        match ka_agent_core::config_file::set(&path, spec.path, &rendered) {
+            Ok(_) => applied.push(format!("{} = {rendered}", spec.path)),
+            Err(e) => errors.push(format!("{}: {e}", spec.path)),
         }
     }
     let mut flash = String::new();

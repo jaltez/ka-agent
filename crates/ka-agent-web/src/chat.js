@@ -160,6 +160,32 @@
         currentText += ev.text;
         current.appendChild(document.createTextNode(ev.text));
         break;
+      case "tool_started":
+        if (!current) current = bubble("assistant");
+        var pending0 = current.querySelector(".pending");
+        if (pending0) pending0.remove();
+        line(current, "\u25b8 " + ev.tool + " " + (ev.detail || ""), "tool muted");
+        break;
+      case "tool_finished":
+        if (!current) current = bubble("assistant");
+        // Replace this tool's running row (same tool name, last one).
+        var rows = current.querySelectorAll(".tool");
+        var row = null;
+        for (var k = rows.length - 1; k >= 0; k--) {
+          if (rows[k].textContent.indexOf("\u25b8 " + ev.tool + " ") === 0) {
+            row = rows[k];
+            break;
+          }
+        }
+        var done = ev.ok
+          ? "\u2713 " + ev.tool + " " + (ev.ms || 0) + "ms"
+          : "\u2717 " + ev.tool + " " + (ev.error || "failed");
+        if (row) {
+          row.textContent = done;
+        } else {
+          line(current, done, "tool muted");
+        }
+        break;
       case "note":
         notes.push(ev.text);
         var p = current && current.querySelector(".pending .muted");

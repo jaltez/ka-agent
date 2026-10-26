@@ -39,7 +39,7 @@ daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 | GET | `/auth?token=…` | login, sets the cookie |
 | GET | `/` | chat: bubbles (last 20 turns), SSE live updates, Markdown rendered |
 | GET | `/usage` | spend per day (30 d), CSS bars, today vs the cap |
-| POST | `/settings` | the status page form (model, mode, timezone, daily budget): format-preserving writes + live reload; invalid values are refused |
+| POST | `/settings` | the status page form, one control per `config_keys::KEYS` entry marked `web` (model, fallback, effort, background model, sandbox, busy messages, mode, daily budget, timezone, briefing time, search provider, quiet hours, auto review): format-preserving writes + live reload; each key shows when it applies; unknown keys are ignored; invalid values are refused |
 | GET | `/history` | search form; `?q=` runs FTS over episodes |
 | GET | `/history/show/<turn>` | one turn: inbound text + the outbound answer |
 | GET | `/memory` | report (bytes/budget), proposal form, the review inbox (candidates with diffs), accepted entries, compiled text |
@@ -52,6 +52,22 @@ daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 
 Anything else is `404` — including `GET` on a mutation path, so no page can
 be triggered by a link.
+
+## Settings and live rows (v0.11)
+
+The settings form is generated from the config key registry (`plan 1.5`):
+the label is the TOML path, the control follows the key's kind (enum and
+bool become selects, numbers and strings inputs, lists accept
+comma-separated words), the value is the file's current value, and the
+apply column says `now` / `next turn` / `restart`. A POST is applied with
+`config_file::set` and then the live-reload path, so a saved key takes
+effect without a restart when its registered timing allows it.
+
+The chat stream renders tool activity as muted rows inside the turn's
+bubble — `▸ <tool> <detail>` while the call runs, replaced by
+`✓ <tool> <ms>ms` (or `✗ <tool> <error>`) when it finishes — matching the
+terminal client's wording. Rows are built with DOM nodes, never
+`innerHTML`.
 
 ## Security checklist (SEED §10 exit criteria)
 
