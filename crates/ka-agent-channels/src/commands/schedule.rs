@@ -59,13 +59,30 @@ pub fn cron_list_text(tasks: &[ka_agent_core::Task], now: &jiff::Zoned) -> Strin
 
 /// `/cron add …` → reply text. Shared by the router and the console.
 pub fn cron_add(runtime: &Runtime, args: &str) -> String {
+    cron_add_for(runtime, args, "operator", true)
+}
+
+/// Shared by `/cron add` and `ka-agent cron add`. `allow_gate` false is the
+/// remote-source path (a gate is a shell command only the operator's own
+/// surface may create).
+pub fn cron_add_for(runtime: &Runtime, args: &str, source: &str, allow_gate: bool) -> String {
     let now = runtime.now_zoned();
+    // `--if '<shell command>'` may appear anywhere; pull it out first so
+    // the schedule words parse exactly as before.
+    let (args, gate) = match split_gate(args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if gate.is_some() && !allow_gate {
+        return "gates can only be added from the terminal, CLI or web panel".to_string();
+    }
     let words: Vec<&str> = args.split_whitespace().collect();
-    let (spec, first_at) = match ka_agent_core::CronSpec::from_words(&words, "operator", &now) {
+    let (mut spec, first_at) = match ka_agent_core::CronSpec::from_words(&words, source, &now) {
         Ok(v) => v,
         Err(e) if e.starts_with("usage:") => return cron_add_usage(),
         Err(e) => return e,
     };
+    spec.gate = gate;
     match runtime.add_cron(spec, first_at) {
         Ok(id) => format!(
             "cron {} scheduled — {}",
@@ -74,6 +91,36 @@ pub fn cron_add(runtime: &Runtime, args: &str) -> String {
         ),
         Err(e) => format!("! [cron] {e}"),
     }
+}
+
+/// Split a `--if '<command>'` flag out of the cron arguments.
+fn split_gate(args: &str) -> Result<(String, Option<String>), String> {
+    let Some(pos) = args.find(" --if ") else {
+        return Ok((args.to_string(), None));
+    };
+    let (head, tail) = args.split_at(pos);
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix("--if").unwrap_or(tail).trim_start();
+    // Quoted or bare: the command runs to the end (it is the last flag
+    // before the text in the documented form).
+    let (command, rest) = if let Some(q) = tail.chars().next().filter(|c| *c == '\'' || *c == '"') {
+        match tail[1..].find(q) {
+            Some(end) => (tail[1..1 + end].to_string(), &tail[2 + end..]),
+            None => return Err("unterminated --if quote".into()),
+        }
+    } else {
+        match tail.split_once(' ') {
+            Some((cmd, rest)) => (cmd.to_string(), rest),
+            None => (tail.to_string(), ""),
+        }
+    };
+    if command.trim().is_empty() {
+        return Err("--if needs a shell command".into());
+    }
+    Ok((
+        format!("{head} {}", rest.trim()).trim().to_string(),
+        Some(command),
+    ))
 }
 
 fn cron_add_usage() -> String {
@@ -181,7 +228,10 @@ pub(super) fn run_cron<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 Err(e) => format!("! [cron] {e}"),
             },
             other => match other.split_once(' ') {
-                Some(("add", args)) => cron_add(runtime, args),
+                Some(("add", args)) => {
+                    let local = ka_agent_core::is_local_source(ctx.source);
+                    cron_add_for(runtime, args, "operator", local)
+                }
                 Some(("rm", id)) => {
                     return cancel_by_prefix(runtime, id).await;
                 }
@@ -264,6 +314,7 @@ async fn calendar_command(runtime: &Runtime, rest: &str) -> Outcome {
                 at_local: Some(digest_time.clone()),
                 weekdays: Vec::new(),
                 month_day: None,
+                gate: None,
             };
             let first_at =
                 ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, &now);
@@ -311,10 +362,12 @@ mod tests {
             at_local: Some("08:00".into()),
             weekdays: Vec::new(),
             month_day: None,
+            gate: None,
         };
         let weekly = ka_agent_core::CronSpec {
             weekdays: vec![0],
             month_day: None,
+            gate: None,
             at_local: Some("09:00".into()),
             ..anchored.clone()
         };

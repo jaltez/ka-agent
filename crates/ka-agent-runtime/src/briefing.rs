@@ -16,8 +16,8 @@ pub const SOURCE: &str = "briefing";
 pub const PROMPT: &str = "Daily briefing for the operator. In at most 12 short lines: \
 the day's calendar, reminders due today, anything waiting for them (approvals, memory \
 to review), and — only if you can search the web and know their interests — up to 3 \
-relevant headlines with links. Lead with what needs action. If nothing is notable, \
-reply exactly: Nothing notable today. Do not ask questions.";
+relevant headlines with links. Lead with what needs action. If nothing needs the \
+operator today, reply exactly [SILENT]. Do not ask questions.";
 
 fn is_briefing(t: &Task) -> bool {
     t.payload
@@ -45,6 +45,7 @@ pub fn enable(store: &Store, at_local: &str, now: &jiff::Zoned) -> Result<(TaskI
         at_local: Some(format!("{hh:02}:{mm:02}")),
         weekdays: Vec::new(),
         month_day: None,
+        gate: None,
     };
     let first_at =
         ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, now);

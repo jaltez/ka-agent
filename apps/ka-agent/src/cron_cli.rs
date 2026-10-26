@@ -70,12 +70,20 @@ pub fn cron_action(action: Option<CronAction>, json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         CronAction::Add { words } => {
-            let words: Vec<&str> = words.iter().map(String::as_str).collect();
-            let (spec, first_at) =
+            // `--if '<shell command>'` anywhere in the words (CLI form of
+            // the /cron gate).
+            let joined = words.join(" ");
+            let (args, gate) = match split_gate(&joined) {
+                Ok(v) => v,
+                Err(e) => return fail(e),
+            };
+            let words: Vec<&str> = args.split_whitespace().collect();
+            let (mut spec, first_at) =
                 match ka_agent_core::CronSpec::from_words(&words, "operator", &now) {
                     Ok(v) => v,
                     Err(e) => return fail(e),
                 };
+            spec.gate = gate;
             let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
             task.scheduled_at_ms = Some(first_at);
             task.payload = Some(spec.to_payload());
@@ -183,4 +191,32 @@ pub fn approvals_action(action: Option<ApprovalsAction>) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+/// Split a `--if '<command>'` flag out of the words.
+fn split_gate(args: &str) -> Result<(String, Option<String>), String> {
+    let Some(pos) = args.find(" --if ") else {
+        return Ok((args.to_string(), None));
+    };
+    let (head, tail) = args.split_at(pos);
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix("--if").unwrap_or(tail).trim_start();
+    let (command, rest) = if let Some(q) = tail.chars().next().filter(|c| *c == '\'' || *c == '"') {
+        match tail[1..].find(q) {
+            Some(end) => (tail[1..1 + end].to_string(), &tail[2 + end..]),
+            None => return Err("unterminated --if quote".into()),
+        }
+    } else {
+        match tail.split_once(' ') {
+            Some((cmd, rest)) => (cmd.to_string(), rest),
+            None => (tail.to_string(), ""),
+        }
+    };
+    if command.trim().is_empty() {
+        return Err("--if needs a shell command".into());
+    }
+    Ok((
+        format!("{head} {}", rest.trim()).trim().to_string(),
+        Some(command),
+    ))
 }

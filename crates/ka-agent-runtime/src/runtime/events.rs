@@ -13,6 +13,11 @@ pub const FINAL_CHUNK_MAX: usize = 3800;
 
 /// Split a final answer into channel chunks at paragraph boundaries,
 /// hard-splitting pathological single paragraphs.
+/// Is this turn one a schedule started (cron / briefing)?
+fn is_scheduled(source: Option<&str>) -> bool {
+    source.is_some_and(|s| s == "cron" || s.starts_with("cron:") || s == "briefing")
+}
+
 pub fn split_final_text(text: &str, max: usize) -> Vec<String> {
     let max = max.max(1);
     if text.chars().count() <= max {
@@ -212,14 +217,34 @@ pub(super) async fn drive(
                 sh.emit(AgentEvent::TurnStarted { turn, source });
             }
             PortEvent::DeltaText(t) => {
-                let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(live) = g.live.as_mut() {
-                    live.live_text.push_str(&t);
+                let (scheduled, _) = {
+                    let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut scheduled = false;
+                    if let Some(live) = g.live.as_mut() {
+                        live.live_text.push_str(&t);
+                        scheduled = is_scheduled(live.current_turn_source.as_deref());
+                    }
+                    (scheduled, ())
+                };
+                // Scheduled turns stay silent while running: the answer is
+                // delivered as one chunk at the boundary (or not at all,
+                // when it is `[SILENT]`). Tool events still flow.
+                if !scheduled {
+                    sh.emit(AgentEvent::Delta { text: t });
                 }
-                drop(g);
-                sh.emit(AgentEvent::Delta { text: t });
             }
-            PortEvent::DeltaThought(t) => sh.emit(AgentEvent::Thought { text: t }),
+            PortEvent::DeltaThought(t) => {
+                let scheduled = sh
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| is_scheduled(l.current_turn_source.as_deref()));
+                if !scheduled {
+                    sh.emit(AgentEvent::Thought { text: t });
+                }
+            }
             PortEvent::CallStarted { tool, id, detail } => {
                 let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(live) = g.live.as_mut() {
@@ -523,7 +548,30 @@ pub(super) async fn drive(
                     }
                     (text, turn_id, g.session.id.clone())
                 };
-                if let Some(tid) = &turn_id {
+                // `[SILENT]`: a scheduled turn with nothing to say
+                // delivers nothing (the turn still finishes).
+                let silent = text.trim_start().starts_with("[SILENT]");
+                let scheduled = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.live
+                        .as_ref()
+                        .is_some_and(|l| is_scheduled(l.current_turn_source.as_deref()))
+                };
+                if let Some(tid) = &turn_id
+                    && !silent
+                {
+                    if scheduled {
+                        // Its streamed deltas were suppressed while it
+                        // ran: deliver the whole answer once, here. A
+                        // trailing newline lets line-based surfaces (the
+                        // console) finish the line without waiting for
+                        // more output.
+                        let mut whole = text.clone();
+                        if !whole.ends_with('\n') {
+                            whole.push('\n');
+                        }
+                        sh.emit(AgentEvent::Delta { text: whole });
+                    }
                     let parts = split_final_text(&text, FINAL_CHUNK_MAX);
                     for (i, chunk) in parts.iter().enumerate() {
                         let mut oc = OutboxChunk::new(tid.clone(), i as u32, chunk.clone());

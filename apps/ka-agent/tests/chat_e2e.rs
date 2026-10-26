@@ -281,6 +281,40 @@ fn simple_turn_and_status() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 2.6: a scheduled turn that answers `[SILENT]` delivers nothing — no
+/// final chunk, no outbox row — while an operator turn with the same text
+/// is delivered verbatim.
+#[test]
+fn scheduled_silent_reply_delivers_nothing() {
+    let root = temp_root("silent");
+    let sc = scenario_file(
+        &root,
+        "silent.json",
+        r#"{ "steps": [ {"text": "[SILENT]"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let data = root.join("data");
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("/cron add in 3s quiet check");
+    chat.expect("cron ", Duration::from_secs(10));
+    // The cron fires; its answer is [SILENT] and must not surface.
+    chat.expect("· cron: quiet check", Duration::from_secs(60));
+    // Let the turn finish, then assert nothing was delivered.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !chat.transcript().contains("[SILENT]"),
+        "a silent scheduled answer must not be delivered:\n{}",
+        chat.transcript()
+    );
+    let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    let outbox: i64 = conn
+        .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(outbox, 0, "no outbox row for a silent turn");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 2.4: the model sets a reminder, it lists it, and it fires as ⏰ with no
 /// model turn.
 #[test]

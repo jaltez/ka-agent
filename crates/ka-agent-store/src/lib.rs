@@ -565,6 +565,7 @@ mod tests {
             at_local: None,
             weekdays: Vec::new(),
             month_day: None,
+            gate: None,
         };
         let mut task = ka_agent_core::Task::new("cron".into(), "cron", false);
         task.scheduled_at_ms = Some(ka_agent_core::now_ms() + 60_000);

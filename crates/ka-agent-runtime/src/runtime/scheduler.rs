@@ -280,6 +280,42 @@ impl Runtime {
                             continue;
                         }
                     }
+                    // Zero-token gate: a shell check decides whether this
+                    // occurrence deserves a turn at all.
+                    let mut gate_output = String::new();
+                    if let Some(gate) = &spec.gate {
+                        match run_gate(gate, &self.workspace()) {
+                            GateOutcome::Pass(out) => {
+                                gate_output = out;
+                            }
+                            GateOutcome::Skip => {
+                                // Zero tokens: the occurrence is skipped.
+                                // A recurring job re-arms (like the
+                                // missed-occurrence path); a one-shot
+                                // settles as succeeded with no run.
+                                if recurring
+                                    && let Some(next) =
+                                        next_for(&spec, task.scheduled_at_ms.unwrap_or(now))
+                                    && self.sh.store.rearm_task(&task.id, next).unwrap_or(false)
+                                {
+                                    record(&task, "skipped", Some("gate"));
+                                } else {
+                                    let _ = self.sh.store.settle_task(&task.id, "succeeded");
+                                    record(&task, "skipped", Some("gate"));
+                                }
+                                continue;
+                            }
+                            GateOutcome::Fail(why) => {
+                                self.sh.emit(AgentEvent::Error {
+                                    class: "cron".into(),
+                                    message: format!("{}: gate `{gate}`: {why}", task.id.as_str()),
+                                });
+                                record(&task, "failed", Some("gate"));
+                                let _ = self.sh.store.settle_task(&task.id, "failed");
+                                continue;
+                            }
+                        }
+                    }
                     let ok = match &spec.mode {
                         ka_agent_core::CronMode::Agent => {
                             let (prompt, label) = if spec.source == crate::briefing::SOURCE {
@@ -293,6 +329,14 @@ impl Runtime {
                                 )
                             } else {
                                 (spec.text.clone(), format!("cron: {}", spec.text))
+                            };
+                            let prompt = if gate_output.trim().is_empty() {
+                                prompt
+                            } else {
+                                format!(
+                                    "{prompt}\n<gate-output>\n{}\n</gate-output>",
+                                    gate_output.trim_end()
+                                )
                             };
                             self.sh.emit(AgentEvent::Notice {
                                 text: format!("{label}{}", late_suffix(this_late_by)),
@@ -558,6 +602,76 @@ impl Runtime {
         match handler {
             Some(f) => f(arg).map_err(Error::Refused),
             None => Err(Error::Refused(format!("no handler for kind {kind:?}"))),
+        }
+    }
+}
+
+/// Outcome of one cron gate run.
+enum GateOutcome {
+    /// Exit 0 with (capped) stdout.
+    Pass(String),
+    /// Exit non-zero: this occurrence is skipped, zero tokens.
+    Skip,
+    /// Could not run (spawn error, timeout).
+    Fail(String),
+}
+
+/// Run a cron gate: `sh -c <gate>` (Windows `cmd /C`) in the workspace,
+/// 30 s ceiling, stdout capped at 4 KiB.
+fn run_gate(gate: &str, workspace: &std::path::Path) -> GateOutcome {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", gate]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", gate]);
+        c
+    };
+    // Gates run in the workspace; a workspace that does not exist yet
+    // (a fresh instance, or a test harness) falls back to the process cwd
+    // rather than failing the gate with ENOENT.
+    let cwd = if workspace.is_dir() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+    };
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return GateOutcome::Fail(format!("spawn: {e}")),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let mut buf = Vec::new();
+                    let _ = stdout.read_to_end(&mut buf);
+                    let text = String::from_utf8_lossy(&buf).into_owned();
+                    out = text.chars().take(4096).collect();
+                }
+                return if status.success() {
+                    GateOutcome::Pass(out)
+                } else {
+                    GateOutcome::Skip
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return GateOutcome::Fail("timed out after 30s".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return GateOutcome::Fail(format!("wait: {e}")),
         }
     }
 }

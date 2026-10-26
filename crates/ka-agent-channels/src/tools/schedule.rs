@@ -156,6 +156,7 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                         .map(|(_, (hh, mm))| format!("{hh:02}:{mm:02}")),
                     weekdays: Vec::new(),
                     month_day: None,
+                    gate: None,
                 };
                 if let Some((rule, _)) = &anchored {
                     spec.set_day_rule(rule);

@@ -206,6 +206,11 @@ pub struct CronSpec {
     /// With `at_local`: this day of the month (1–31, clamped to month end).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub month_day: Option<u8>,
+    /// A zero-token gate: `sh -c <gate>` runs first; exit non-zero skips
+    /// the occurrence (no turn, no spend), exit 0 runs it with the
+    /// output appended as context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
 }
 
 impl CronSpec {
@@ -270,6 +275,7 @@ impl CronSpec {
             at_local: None,
             weekdays: Vec::new(),
             month_day: None,
+            gate: None,
         };
         let now_ms = now.timestamp().as_millisecond();
         let (first_at, used) = match words {
@@ -350,6 +356,7 @@ mod cron_tests {
             at_local: None,
             weekdays: Vec::new(),
             month_day: None,
+            gate: None,
         };
         assert_eq!(
             CronSpec::from_payload(&one_shot.to_payload()),
@@ -364,6 +371,7 @@ mod cron_tests {
             at_local: Some("08:00".into()),
             weekdays: Vec::new(),
             month_day: None,
+            gate: None,
         };
         let payload = recurring.to_payload();
         assert!(payload.contains(r#""mode":"no_agent""#), "{payload}");
