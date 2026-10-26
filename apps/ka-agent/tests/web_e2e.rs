@@ -1030,6 +1030,80 @@ fn settings_form_and_usage_page() {
             .unwrap()
             .contains("nonsense")
     );
+    // Registry bounds are enforced server-side, not just by HTML: the
+    // registry declares approval_ttl_secs min 30, so 1 is refused — and the
+    // valid key submitted alongside it is not written either.
+    let refused = request_h(
+        port,
+        "POST",
+        "/settings",
+        Some(&cookie),
+        "approval_ttl_secs=1&budgets_daily_usd=9",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(refused.status, 200, "{}", refused.body);
+    assert!(
+        refused.body.contains("nothing was written"),
+        "refusal must say nothing was written: {}",
+        refused.body
+    );
+    assert!(
+        refused.body.contains("approval_ttl_secs"),
+        "refusal must name the key: {}",
+        refused.body
+    );
+    let cfg = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
+    assert!(
+        !cfg.contains("approval_ttl_secs = 1"),
+        "out-of-range value written: {cfg}"
+    );
+    assert!(
+        cfg.contains("daily_usd = 3") && !cfg.contains("daily_usd = 9"),
+        "a refused form must not write its other fields: {cfg}"
+    );
+    // Model selectors are checked against the catalog, like the CLI's
+    // `config set`; an unknown vendor/model is refused before any write.
+    let bad_model = request_h(
+        port,
+        "POST",
+        "/settings",
+        Some(&cookie),
+        "model=nope/zzz",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(bad_model.status, 200, "{}", bad_model.body);
+    assert!(
+        bad_model.body.contains("nothing was written") && bad_model.body.contains("model"),
+        "selector refusal: {}",
+        bad_model.body
+    );
+    assert!(
+        !std::fs::read_to_string(root.join("ka-agent.toml"))
+            .unwrap()
+            .contains("nope/zzz"),
+        "an unknown selector must not be persisted"
+    );
+    // The persona name in the page title is user-influenced and escaped.
+    std::fs::create_dir_all(daemon.data.join("memory")).unwrap();
+    std::fs::write(
+        daemon.data.join("memory/persona.md"),
+        "# Ka <b>bold</b>\nbody\n",
+    )
+    .unwrap();
+    let titled = request(port, "GET", "/", Some(&cookie), "");
+    assert_eq!(titled.status, 200);
+    assert!(
+        titled
+            .body
+            .contains("<title>Chat — Ka &lt;b&gt;bold&lt;/b&gt;</title>"),
+        "persona title must be escaped: {}",
+        titled.body
+    );
+    assert!(
+        !titled.body.contains("<title>Chat — Ka <b>bold</b></title>"),
+        "raw persona markup leaked into the title: {}",
+        titled.body
+    );
     // The form is built from the key registry: a web-editable key the old
     // hand-written form never offered is present, with its apply timing.
     let page = request(port, "GET", "/status", Some(&cookie), "");

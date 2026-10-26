@@ -1133,7 +1133,7 @@ dependencies = [
  "jiff",
  "ka-agent-channels",
  "ka-agent-core",
- "ka-agent-memory",
+ "ka-agent-port",
  "ka-agent-runtime",
  "ka-agent-store",
  "rand_core 0.6.4",

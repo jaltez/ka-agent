@@ -515,7 +515,7 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
         ("GET", "/history") => pages::history(runtime, req.query.get("q").map(String::as_str)),
         ("GET", p) if p.starts_with("/history/show/") => {
             let turn_id = p.strip_prefix("/history/show/").unwrap_or("");
-            pages::history_show(store, turn_id)
+            pages::history_show(runtime, store, turn_id)
         }
         ("GET", "/memory") => pages::memory(runtime),
         ("POST", "/memory/edit") => {
@@ -536,7 +536,7 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             }
         }
         ("GET", "/audit") => pages::audit(runtime, store),
-        ("GET", "/intents") => pages::intents(store),
+        ("GET", "/intents") => pages::intents(runtime, store),
         _ => Response::not_found(),
     }
 }

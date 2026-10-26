@@ -51,25 +51,21 @@ form#send{display:flex;gap:.5rem;padding:.6rem 0}\
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}</style>";
 
 /// The viewport-aware head + sidebar layout (top bar on narrow screens).
-fn html_page(title: &str, body: String) -> String {
+/// Both the page title and the persona name are user-derived and escaped.
+fn html_page(persona: &str, title: &str, body: String) -> String {
     format!(
-        "<!DOCTYPE html>\n<html><head><title>{title} — {}</title>\
+        "<!DOCTYPE html>\n<html><head><title>{} — {}</title>\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{STYLE}</head><body>\
          {body}</body></html>",
-        persona_name()
+        escape_html(title),
+        escape_html(persona)
     )
 }
 
-/// The assistant's display name (`Ka` by default) from the profile's
-/// persona file — the same source every other surface reads.
-pub fn persona_name() -> String {
-    let path = ka_agent_core::layout::base_dir()
-        .join("memory")
-        .join("persona.md");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|t| ka_agent_memory::persona::persona_name(&t))
-        .unwrap_or_else(|| "Ka".to_string())
+/// A page head using the display name of the profile the runtime serves
+/// (`runtime.persona_name()` reads `<data root>/memory/persona.md`).
+fn runtime_page(runtime: &Runtime, title: &str, body: String) -> String {
+    html_page(&runtime.persona_name(), title, body)
 }
 
 /// A page with the shared sidebar navigation. Badges: approvals waiting,
@@ -105,12 +101,13 @@ fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Respo
         })
         .collect::<Vec<_>>()
         .join("");
-    Response::html(html_page(
+    Response::html(runtime_page(
+        runtime,
         title,
         format!(
             "<div class=\"layout\"><aside><div class=\"brand\">{}</div>{nav}</aside>\
              <main><h1>{title}</h1>{body}</main></div>",
-            escape_html(&persona_name())
+            escape_html(&runtime.persona_name())
         ),
     ))
 }
@@ -231,8 +228,13 @@ fn settings_form(runtime: &Runtime) -> String {
                     ))
                     .collect::<String>()
             ),
-            Kind::Int { .. } | Kind::Float { .. } => format!(
-                "<input name='{field}' value='{}' inputmode='decimal' placeholder='{}'>",
+            Kind::Int { min, max } => format!(
+                "<input name='{field}' type='number' min='{min}' max='{max}' value='{}' placeholder='{}'>",
+                escape_html(&current),
+                escape_html(spec.default)
+            ),
+            Kind::Float { min } => format!(
+                "<input name='{field}' type='number' step='any' min='{min}' value='{}' placeholder='{}'>",
                 escape_html(&current),
                 escape_html(spec.default)
             ),
@@ -560,13 +562,13 @@ pub async fn approvals_decide_json(runtime: &Runtime, body: &str) -> crate::Resp
 pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
     let Some(q) = query.filter(|q| !q.is_empty()) else {
         let body = "<form method=get action=/history><input name=q placeholder='search…'><button>search</button></form>".into();
-        return Response::html(html_page("History", body));
+        return Response::html(runtime_page(runtime, "History", body));
     };
     // FTS search is available on the runtime
     match runtime.history_search(q, 20) {
         Ok(hits) if hits.is_empty() => {
             let body = format!("<p>no results for {}</p>", escape_html(q));
-            Response::html(html_page("History search", body))
+            Response::html(runtime_page(runtime, "History search", body))
         }
         Ok(hits) => {
             let rows: Vec<String> = hits
@@ -588,16 +590,17 @@ pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
 "
                 )
             );
-            Response::html(html_page("History search", body))
+            Response::html(runtime_page(runtime, "History search", body))
         }
-        Err(e) => Response::html(html_page(
+        Err(e) => Response::html(runtime_page(
+            runtime,
             "Error",
             format!("<p>{}</p>", escape_html(&e.to_string())),
         )),
     }
 }
 
-pub fn history_show(store: &Store, turn_id: &str) -> crate::Response {
+pub fn history_show(runtime: &Runtime, store: &Store, turn_id: &str) -> crate::Response {
     let Some(turn) = store
         .get_turn(&ka_agent_core::TurnId(turn_id.into()))
         .ok()
@@ -612,7 +615,7 @@ pub fn history_show(store: &Store, turn_id: &str) -> crate::Response {
         escape_html(&turn.inbound_text),
         escape_html(&answer)
     );
-    Response::html(html_page("Turn", body))
+    Response::html(runtime_page(runtime, "Turn", body))
 }
 
 pub fn memory(runtime: &Runtime) -> crate::Response {
@@ -677,7 +680,8 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
 pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
     let text = form_field(body, "text");
     if text.trim().is_empty() {
-        return Response::html(html_page(
+        return Response::html(runtime_page(
+            runtime,
             "Memory",
             "<p>nothing to remember (empty text)</p><p><a href=\"/memory\">back</a></p>".into(),
         ));
@@ -689,7 +693,8 @@ pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
             resp.status = 303;
             resp
         }
-        Err(e) => Response::html(html_page(
+        Err(e) => Response::html(runtime_page(
+            runtime,
             "Error",
             format!("<p>{}</p>", escape_html(&e.to_string())),
         )),
@@ -760,7 +765,8 @@ pub fn memory_candidate(runtime: &Runtime, body: &str) -> crate::Response {
             resp.status = 303;
             resp
         }
-        Ok(false) => Response::html(html_page(
+        Ok(false) => Response::html(runtime_page(
+            runtime,
             "Memory",
             format!(
                 "<p>no pending candidate {}: it may already be settled</p>\
@@ -768,7 +774,8 @@ pub fn memory_candidate(runtime: &Runtime, body: &str) -> crate::Response {
                 escape_html(&id)
             ),
         )),
-        Err(e) => Response::html(html_page(
+        Err(e) => Response::html(runtime_page(
+            runtime,
             "Memory",
             format!(
                 "<p>decision not applied: {}</p><p><a href=\"/memory\">back</a></p>",
@@ -842,7 +849,8 @@ pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response 
     };
     match runtime.decide(&id, decision).await {
         Ok(()) => Response::redirect("/approvals"),
-        Err(e) => Response::html(html_page(
+        Err(e) => Response::html(runtime_page(
+            runtime,
             "Approvals",
             format!(
                 "<p>decision not applied: {}</p><p><a href=\"/approvals\">back</a></p>",
@@ -855,7 +863,11 @@ pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response 
 pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
     let records = store.recent_audit(50).unwrap_or_default();
     if records.is_empty() {
-        return Response::html(html_page("Audit", "<p>no audit records</p>".into()));
+        return Response::html(runtime_page(
+            runtime,
+            "Audit",
+            "<p>no audit records</p>".into(),
+        ));
     }
     let rows: Vec<String> = records
         .iter()
@@ -887,10 +899,10 @@ pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
         "<table><tr><th>seq</th><th>at</th><th>actor</th><th>action</th><th>subject</th></tr>{}</table>",
         rows.join("")
     );
-    Response::html(html_page("Audit", body))
+    Response::html(runtime_page(runtime, "Audit", body))
 }
 
-pub fn intents(store: &Store) -> crate::Response {
+pub fn intents(runtime: &Runtime, store: &Store) -> crate::Response {
     let intents = store.recent_intents(20).unwrap_or_default();
     let rows: Vec<String> = intents
         .iter()
@@ -908,7 +920,7 @@ pub fn intents(store: &Store) -> crate::Response {
         "<table><tr><th>id</th><th>tool</th><th>status</th><th>summary</th></tr>{}</table>",
         rows.join("")
     );
-    Response::html(html_page("Intents", body))
+    Response::html(runtime_page(runtime, "Intents", body))
 }
 
 /// `GET /usage`: spend per day, CSS bars, today against the budget.
@@ -970,15 +982,93 @@ pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
     nav_page(runtime, "/usage", "Usage", body)
 }
 
-/// `POST /settings`: format-preserving writes, then a live apply. Keys that
-/// would need a restart are not offered here.
+/// A list field's items: a comma-separated list, optionally wrapped in
+/// `[ ]` with per-item quotes.
+fn list_values(v: &str) -> Vec<String> {
+    let inner = v
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(v);
+    inner
+        .split(',')
+        .map(str::trim)
+        .map(|s| s.trim_matches(|c| c == '"' || c == '\'').trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Render one submitted value as TOML, refusing anything the registry's
+/// declared kind does not allow. The error names the key; the caller writes
+/// nothing at all when any key is refused.
+fn render_setting(spec: &ka_agent_core::config_keys::KeySpec, v: &str) -> Result<String, String> {
+    use ka_agent_core::config_keys::Kind;
+    let refuse = |msg: String| -> Result<String, String> { Err(format!("{}: {msg}", spec.path)) };
+    match spec.kind {
+        Kind::Bool => match v {
+            "true" | "false" => Ok(v.to_string()),
+            _ => refuse("must be true or false".into()),
+        },
+        Kind::Int { min, max } => match v.parse::<i64>() {
+            Ok(n) if (min..=max).contains(&n) => Ok(n.to_string()),
+            _ => refuse(format!("must be an integer in {min}..={max}")),
+        },
+        Kind::Float { min } => match v.parse::<f64>() {
+            Ok(n) if n.is_finite() && n >= min => Ok(n.to_string()),
+            _ => refuse(format!("must be a number >= {min}")),
+        },
+        Kind::Enum(options) => {
+            if options.contains(&v) {
+                Ok(format!("{v:?}"))
+            } else {
+                refuse(format!("must be one of: {}", options.join(", ")))
+            }
+        }
+        // Model selectors go through the same catalog check the CLI uses.
+        Kind::Str => match spec.path {
+            "model" | "background_model" => ka_agent_port::catalog::validate_selector(v)
+                .map(|info| format!("{:?}", info.id))
+                .map_err(|e| format!("{}: {e}", spec.path)),
+            _ => Ok(format!("{v:?}")),
+        },
+        Kind::List => {
+            let mut items = Vec::new();
+            for item in list_values(v) {
+                if spec.path == "fallback" {
+                    let id = ka_agent_port::catalog::validate_selector(&item)
+                        .map_err(|e| format!("{}: {e}", spec.path))?;
+                    items.push(format!("{:?}", id.id));
+                } else {
+                    items.push(format!("{item:?}"));
+                }
+            }
+            Ok(format!("[{}]", items.join(", ")))
+        }
+        Kind::Table => Ok(v.to_string()),
+    }
+}
+
+/// The status page with a flash paragraph under its heading (the POST answer:
+/// a redirect would drop the message).
+fn status_with_flash(runtime: &Runtime, flash: &str) -> crate::Response {
+    let mut page = status(runtime);
+    if let Some(body_start) = page.body.find("<h1>Status</h1>") {
+        let at = body_start + "<h1>Status</h1>".len();
+        page.body.insert_str(at, flash);
+    }
+    page
+}
+
+/// `POST /settings`: validate every submitted value against the registry
+/// kind, then format-preserving writes and a live apply. Keys that would
+/// need a restart are not offered here.
 pub async fn settings_apply(runtime: &Runtime, body: &str) -> crate::Response {
     use std::fmt::Write as _;
     let Some(path) = runtime.config_path() else {
         return Response::see_other("/status");
     };
-    use ka_agent_core::config_keys::{KEYS, Kind};
-    let mut applied: Vec<String> = Vec::new();
+    use ka_agent_core::config_keys::{KEYS, KeySpec};
+    let mut pending: Vec<(&'static KeySpec, String)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for spec in KEYS.iter().filter(|k| k.web) {
         let field = spec.path.replace('.', "_");
@@ -987,27 +1077,23 @@ pub async fn settings_apply(runtime: &Runtime, body: &str) -> crate::Response {
             continue;
         }
         let v = crate::url_decode(&raw.replace('+', " ")).trim().to_string();
-        // Render as the TOML value of the registered kind; lists accept
-        // comma-separated words (or a ready TOML array).
-        let rendered = match spec.kind {
-            Kind::Bool | Kind::Int { .. } | Kind::Float { .. } => v.clone(),
-            Kind::Str | Kind::Enum(_) => format!("{v:?}"),
-            Kind::List => {
-                if v.starts_with('[') {
-                    v.clone()
-                } else {
-                    let items: Vec<String> = v
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| format!("{s:?}"))
-                        .collect();
-                    format!("[{}]", items.join(", "))
-                }
-            }
-            Kind::Table => v.clone(),
-        };
-        match ka_agent_core::config_file::set(&path, spec.path, &rendered) {
+        match render_setting(spec, &v) {
+            Ok(rendered) => pending.push((spec, rendered)),
+            Err(e) => errors.push(e),
+        }
+    }
+    // Validate the whole form before writing anything: one refused key must
+    // not leave the rest of the submission half-persisted.
+    if !errors.is_empty() {
+        let flash = format!(
+            "<p class='bad'>refused, nothing was written: {}</p>",
+            escape_html(&errors.join("; "))
+        );
+        return status_with_flash(runtime, &flash);
+    }
+    let mut applied: Vec<String> = Vec::new();
+    for (spec, rendered) in &pending {
+        match ka_agent_core::config_file::set(&path, spec.path, rendered) {
             Ok(_) => applied.push(format!("{} = {rendered}", spec.path)),
             Err(e) => errors.push(format!("{}: {e}", spec.path)),
         }
@@ -1021,11 +1107,14 @@ pub async fn settings_apply(runtime: &Runtime, body: &str) -> crate::Response {
                 let _ = write!(
                     flash,
                     "<p class='muted'>saved: {}{}</p>",
-                    applied.join(", "),
+                    escape_html(&applied.join(", ")),
                     if restart.is_empty() {
                         String::new()
                     } else {
-                        format!(" — restart needed for: {}", restart.join(", "))
+                        format!(
+                            " — restart needed for: {}",
+                            escape_html(&restart.join(", "))
+                        )
                     }
                 );
             }
@@ -1033,15 +1122,11 @@ pub async fn settings_apply(runtime: &Runtime, body: &str) -> crate::Response {
         }
     }
     if !errors.is_empty() {
-        let _ = write!(flash, "<p class='bad'>{}</p>", errors.join("; "));
+        let _ = write!(
+            flash,
+            "<p class='bad'>{}</p>",
+            escape_html(&errors.join("; "))
+        );
     }
-    // The redirect drops the message; park it in a meta-like query param is
-    // overkill — surface it on the status page via a cookie-free flash by
-    // rendering the status page directly.
-    let mut page = status(runtime);
-    if let Some(body_start) = page.body.find("<h1>Status</h1>") {
-        let at = body_start + "<h1>Status</h1>".len();
-        page.body.insert_str(at, &flash);
-    }
-    page
+    status_with_flash(runtime, &flash)
 }

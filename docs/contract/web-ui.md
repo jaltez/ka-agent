@@ -14,17 +14,22 @@ headings, fences), server-side for history and client-side for live turns
 
 | Step | Command |
 |---|---|
-| Start the daemon with the UI | `ka-agent run --web-port 8480` |
+| Start the daemon (UI on by default) | `ka-agent run` |
+| Override the port for one run | `ka-agent run --web-port 8480` |
+| Turn the UI off | `ka-agent config set web.enabled false` |
 | Mint a login link | `ka-agent dashboard` (one-shot URL; respects the configured port) |
 
-The port default is none (off). `ka-agent dashboard` mints a one-shot token in the
-daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
+`[web] enabled` defaults to `true` and `port` to `8480`, so a plain
+`ka-agent run` serves the panel on `127.0.0.1:8480`; `--web-port` overrides
+the port for that run and `web.enabled = false` disables it. `ka-agent
+dashboard` mints a one-shot token in the daemon's store (`meta` key
+`web_auth_token`) with a 10-minute TTL and prints
 `http://127.0.0.1:<port>/auth?token=<token>`.
 
 ## Auth flow
 
 1. `GET /auth?token=<token>` — validates and **consumes** the token (a second
-   use is `401`), then answers `302` with
+   use is `401`), then answers `303` with
    `Set-Cookie: ka_session=<32 random bytes hex>; HttpOnly; SameSite=Strict;
    Path=/; Max-Age=86400` and `Location: /`.
 2. Every other route requires a valid `ka_session` cookie; otherwise `401`.
@@ -46,7 +51,7 @@ daemon's store (`meta` key `web_auth_token`) with a 10-minute TTL and prints
 | POST | `/memory/edit` | stages a candidate (`text=`) → `303` back to `/memory` |
 | POST | `/memory/candidate` | `id=` + `decision=y\|n` applies a review decision → `303` |
 | GET | `/approvals` | pending asks with allow/deny forms |
-| POST | `/approvals/decide` | `id=` + `decision=y\|n` → `302 /approvals` |
+| POST | `/approvals/decide` | `id=` + `decision=y\|n` → `303 /approvals` |
 | GET | `/audit` | the last 50 audit-chain records (seq, time, actor, action, subject) |
 | GET | `/intents` | the last 20 MCP intents and their status |
 
@@ -59,9 +64,24 @@ The settings form is generated from the config key registry (`plan 1.5`):
 the label is the TOML path, the control follows the key's kind (enum and
 bool become selects, numbers and strings inputs, lists accept
 comma-separated words), the value is the file's current value, and the
-apply column says `now` / `next turn` / `restart`. A POST is applied with
-`config_file::set` and then the live-reload path, so a saved key takes
-effect without a restart when its registered timing allows it.
+apply column says `now` / `next turn` / `restart`.
+
+A POST is validated against the same registry before anything is written:
+
+- `int` keys must parse and fall inside the declared `min..=max` (a
+  browser-side `min`/`max` mirrors the bound, but the server enforces it),
+  `float` keys must be finite and `>= min`, enum keys must be members, and
+  bools must be exactly `true` or `false`.
+- `model`, `background_model` and every `fallback` entry go through
+  `ka_agent_port::catalog::validate_selector`, the check the CLI's
+  `config set` uses, so an unknown selector is refused here too.
+- Every field is validated first; if any is refused, the response names the
+  key and says `refused, nothing was written` — no key of that submission is
+  persisted.
+
+Only after the whole form passes is each value applied with
+`config_file::set` and the live-reload path, so a saved key takes effect
+without a restart when its registered timing allows it.
 
 The chat stream renders tool activity as muted rows inside the turn's
 bubble — `▸ <tool> <detail>` while the call runs, replaced by
@@ -124,8 +144,11 @@ chat surfaces) and any write beyond memory proposals and approval decisions.
 - `apps/ka-agent/tests/web_e2e.rs` — the real binary over real sockets:
   unauthenticated `401` on every page, login → cookie flags → page matrix,
   single-use token replay, POST-only mutations, loopback-only bind, the
-  memory editor round-trip, XSS escaping of seeded turn text, and refusal of
-  an oversized declared `Content-Length` (no unbounded buffering).
+  memory editor round-trip, XSS escaping of seeded turn text, refusal of an
+  oversized declared `Content-Length` (no unbounded buffering), settings
+  refusals for an out-of-range `approval_ttl_secs` and an unknown model
+  selector (with the config file left untouched), and an escaped persona
+  name in the page title.
 
 An approval decision only lands when the live engine still has the ask
 pending (`Runtime::decide` → `UnknownApproval` otherwise); the e2e test
