@@ -148,6 +148,108 @@ impl Runtime {
         }
     }
 
+    /// `/effort [level]`: session-scoped reasoning effort. "" clears it
+    /// (the model's own default); it resets with every `/new`.
+    pub async fn set_effort(&self, level: &str) -> Result<String, Error> {
+        let level = level.trim().to_ascii_lowercase();
+        if !level.is_empty() && !matches!(level.as_str(), "off" | "low" | "medium" | "high" | "max")
+        {
+            return Err(Error::Refused(format!(
+                "unknown effort {level:?} (off|low|medium|high|max)"
+            )));
+        }
+        if let Some(port) = self.live_port() {
+            port.set_effort(level.clone()).await.map_err(Error::Port)?;
+        }
+        *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) =
+            (!level.is_empty()).then(|| level.clone());
+        self.settings_event();
+        Ok(if level.is_empty() {
+            "effort: model default".to_string()
+        } else {
+            format!("effort → {level} (this session)")
+        })
+    }
+
+    /// The session's current effort level, when one was set.
+    pub fn effort(&self) -> Option<String> {
+        self.sh
+            .effort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// `/undo`: ask the engine to revert its most recent file change; the
+    /// engine's answer arrives as a Note.
+    pub async fn undo(&self) -> Result<(), Error> {
+        let port = self
+            .live_port()
+            .ok_or_else(|| Error::Refused("no live session — nothing to undo".into()))?;
+        port.undo_file().await.map_err(Error::Port)
+    }
+
+    /// `/steer <text>`: force a steer into the running reply; when idle it
+    /// is just a message.
+    pub async fn steer(&self, text: &str) -> Result<bool, Error> {
+        let Some(port) = self.live_port() else {
+            return Ok(false);
+        };
+        if self.session_status() != ka_agent_core::SessionStatus::Running {
+            return Ok(false);
+        }
+        port.steer(text.to_string()).await.map_err(Error::Port)?;
+        if let Some(live) = self.lock().live.as_mut() {
+            live.live_text
+                .push_str(&format!("\n\n[added while working] {text}"));
+        }
+        self.sh.emit(AgentEvent::Note {
+            text: "steered into the running reply".into(),
+        });
+        Ok(true)
+    }
+
+    /// Queue rows not yet turned (for `/queue`).
+    pub fn queued(&self) -> Result<Vec<(String, String, String)>, Error> {
+        let sid = self.session_id();
+        let items = self.sh.store.queued_items(&sid)?;
+        Ok(items
+            .into_iter()
+            .map(|i| (i.id.to_string(), i.source, i.text))
+            .collect())
+    }
+
+    /// Clear the durable queue (`/queue clear`).
+    pub fn clear_queue(&self) -> Result<usize, Error> {
+        let sid = self.session_id();
+        let items = self.sh.store.queued_items(&sid)?;
+        for item in &items {
+            self.sh
+                .store
+                .mark_turned(&item.id, &ka_agent_core::TurnId::generate())?;
+        }
+        Ok(items.len())
+    }
+
+    /// The engine's tool inventory, grouped as the engine discovered it.
+    pub fn tools(&self) -> Vec<String> {
+        self.lock()
+            .live
+            .as_ref()
+            .map(|l| l.tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// Broadcast the current model/mode/effort (surfaces show a status bar).
+    pub(crate) fn settings_event(&self) {
+        let cfg = self.cfg();
+        self.sh.emit(AgentEvent::Settings {
+            model: cfg.model.clone(),
+            mode: Some(cfg.mode.clone()),
+            effort: self.effort(),
+        });
+    }
+
     /// Compile the persona into the engine's IDENTITY.md (re-read per
     /// turn by `[prompt] identity_file`). Called at startup, after a
     /// persona edit, and from the maintenance watcher.
@@ -246,6 +348,7 @@ impl Runtime {
         ka_agent_core::config_file::set(&path, "model", &info.id).map_err(Error::Config)?;
         let new = DaemonConfig::load(&path)?;
         self.reload_config(new, false).await;
+        self.settings_event();
         Ok(info.id)
     }
 
@@ -290,6 +393,7 @@ impl Runtime {
         }
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_cfg);
         self.audit(audit_actions::MODE_SET, mode, Some(format!("by {source}")))?;
+        self.settings_event();
         Ok(mode.to_string())
     }
 }

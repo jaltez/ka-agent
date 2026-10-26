@@ -120,6 +120,24 @@ fn default_config_path() -> PathBuf {
 }
 
 fn main() -> std::process::ExitCode {
+    // The sandbox trampoline must run before anything else: `ka-agent
+    // ka-sandbox-exec <policy-json> -- <argv…>` applies the landlock
+    // ruleset to this process and execs the real command (the engine-layer
+    // `[sandbox] mode = "fs"` path on hosts without bubblewrap/firejail).
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(ka_sandbox::TRAMPOLINE_ARG) {
+        let argv: Vec<String> = std::env::args().collect();
+        let policy = argv.get(2).cloned().unwrap_or_default();
+        // `<exe> ka-sandbox-exec <json> -- <argv…>`
+        let rest: Vec<String> = argv.iter().skip(4).cloned().collect();
+        return match ka_sandbox::trampoline::exec_trampoline(&policy, &rest) {
+            Ok(infallible) => match infallible {},
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::ExitCode::from(126)
+            }
+        };
+    }
     let cli = Cli::parse();
     if let Some(p) = &cli.profile {
         if !ka_agent_core::layout::valid_profile_name(p) {

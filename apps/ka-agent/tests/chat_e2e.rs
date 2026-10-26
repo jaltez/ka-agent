@@ -26,6 +26,54 @@ fn spawn_chat(root: &std::path::Path, scenario: &std::path::Path) -> Chat {
     spawn_chat_cfg(root, scenario, "")
 }
 
+/// Same as [`spawn_chat_cfg`] with an explicit mode (the extra-lines helper
+/// pins `guarded`, and a duplicate key is a TOML error).
+fn spawn_chat_mode(root: &std::path::Path, scenario: &std::path::Path, mode: &str) -> Chat {
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let cfg = root.join("ka-agent.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "workspace = {:?}\nmode = {:?}\napproval_ttl_secs = 300\nturn_grace_secs = 5\n",
+            ws.display().to_string(),
+            mode
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("chat")
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--scenario")
+        .arg(scenario)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .env_remove("KA_MODEL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let rx = {
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    };
+    Chat {
+        child,
+        rx,
+        seen: std::cell::RefCell::new(String::new()),
+    }
+}
+
 /// Same, with extra `ka-agent.toml` lines appended (feature tests).
 fn spawn_chat_cfg(root: &std::path::Path, scenario: &std::path::Path, extra: &str) -> Chat {
     let ws = root.join("ws");
@@ -295,6 +343,77 @@ fn send_file_refuses_paths_outside_the_workspace() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 2.5: a message during a running turn steers into it (default
+/// `busy_messages = steer`): the engine delivers it at the tool-batch
+/// boundary ("steer delivered") and the follow-on happens inside the same
+/// turn — one delivery boundary, session back to idle.
+#[test]
+fn message_during_a_turn_steers_the_running_reply() {
+    let root = temp_root("steer-busy");
+    // A slow tool keeps the turn live while the second message arrives; the
+    // engine drains the steer at the batch boundary.
+    let sc = scenario_file(
+        &root,
+        "steer.json",
+        r#"{
+            "steps": [
+                {"call": {"tool": "bash", "args": {"command": "sleep 2"}}},
+                {"text": "done with your note"}
+            ],
+            "stop": "done", "cost_usd": 0.0, "tokens": 1
+        }"#,
+    );
+    let data = root.join("data");
+    // Free mode: the slow bash call must not sit on an approval card while
+    // the steer arrives (the ask, not the steer, would be under test).
+    let mut chat = spawn_chat_mode(&root, &sc, "free");
+    chat.send("first");
+    if !wait_turn_running(&data, Duration::from_secs(30)) {
+        panic!("turn never reached running:\n{}", chat.transcript());
+    }
+    chat.send("use metric units");
+    chat.expect("steered into the running reply", Duration::from_secs(30));
+    chat.expect("steer delivered", Duration::from_secs(30));
+    chat.expect("done with your note", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(10));
+    // Exactly one turn: the steer rode it instead of queueing a second.
+    let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    let turns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns, 1, "the steer must not become its own turn");
+    let inbound: String = conn
+        .query_row("SELECT inbound_text FROM turns LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        inbound.contains("[added while working] use metric units"),
+        "{inbound}"
+    );
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 2.5: `/effort` sets a session level and surfaces the Settings event.
+#[test]
+fn effort_command_sets_the_session_level() {
+    let root = temp_root("effort");
+    let sc = scenario_file(
+        &root,
+        "effort.json",
+        r#"{ "steps": [ {"text": "ok"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("/effort high");
+    chat.expect("effort → high", Duration::from_secs(10));
+    chat.send("/effort");
+    chat.expect("effort → high", Duration::from_secs(10));
+    chat.send("/effort nonsense");
+    chat.expect("unknown effort", Duration::from_secs(10));
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 2.3 approval profile: a read-tier kagent tool never asks, so a guarded
 /// session leaves no approval row behind.
 #[test]
@@ -552,7 +671,8 @@ fn approval_flow_and_queue() {
             "stop": "done", "cost_usd": 0.0, "tokens": 10
         }"#,
     );
-    let mut chat = spawn_chat(&root, &sc);
+    // Durable-queue path (the default is steer; its own test follows).
+    let mut chat = spawn_chat_cfg(&root, &sc, "busy_messages = \"queue\"\n");
     chat.send("please run the thing");
     // The ask surfaces as a card while its turn is live. ka can also report
     // the cycle idle before its permission gate opens (the scripted speaker
@@ -597,7 +717,9 @@ fn message_queues_while_a_turn_is_running() {
         }"#,
     );
     let data = root.join("data");
-    let mut chat = spawn_chat(&root, &sc);
+    // This is the durable-queue path: the config asks for it (the default
+    // is `steer`, covered by its own test).
+    let mut chat = spawn_chat_cfg(&root, &sc, "busy_messages = \"queue\"\n");
     chat.send("first");
     // Wait for the durable state instead of guessing at wall-clock: the turn
     // is persisted `running` once the engine has accepted the prompt, which is

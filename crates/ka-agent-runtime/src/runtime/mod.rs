@@ -171,6 +171,8 @@ struct Shared {
     /// Exact tool names that never ask (the app computes this from the
     /// tool registry and sets it at host start).
     auto_allow: Mutex<Vec<String>>,
+    /// Session-scoped reasoning effort (`/effort`; cleared by `/new`).
+    effort: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -325,6 +327,7 @@ impl Runtime {
                 persona_mtime: Mutex::new(None),
                 started_ms: ka_agent_core::now_ms(),
                 auto_allow: Mutex::new(Vec::new()),
+                effort: Mutex::new(None),
                 inner: Mutex::new(Inner {
                     session,
                     session_allow: std::collections::HashSet::new(),
@@ -474,8 +477,9 @@ impl Runtime {
                 live.deliberate_close = true;
             }
             g.crashes.clear();
-            // "Allow for this session" ends with the session.
+            // "Allow for this session" and the session effort end with it.
             g.session_allow.clear();
+            *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         let live_port = {
             let mut g = self.lock();

@@ -216,8 +216,20 @@ impl PortSession {
         images: Vec<ImagePayload>,
         skills: Vec<String>,
     ) -> Result<(), super::PortError> {
+        self.submit_with_model(text, images, skills, None).await
+    }
+
+    /// Submit with a per-turn model override (background turns).
+    pub async fn submit_with_model(
+        &self,
+        text: String,
+        images: Vec<ImagePayload>,
+        skills: Vec<String>,
+        model: Option<String>,
+    ) -> Result<(), super::PortError> {
         self.send(WorkerCommand::Submit {
             text,
+            model,
             images,
             skills,
         })
@@ -242,6 +254,21 @@ impl PortSession {
     /// Switch the permission mode.
     pub async fn set_mode(&self, mode: String) -> Result<(), super::PortError> {
         self.send(WorkerCommand::SetMode { mode }).await
+    }
+
+    /// Set the per-turn reasoning effort ("" clears it).
+    pub async fn set_effort(&self, level: String) -> Result<(), super::PortError> {
+        self.send(WorkerCommand::SetEffort { level }).await
+    }
+
+    /// Steer the live turn (delivered at the next tool-batch boundary).
+    pub async fn steer(&self, text: String) -> Result<(), super::PortError> {
+        self.send(WorkerCommand::Steer { text }).await
+    }
+
+    /// Undo the most recent file change of the session.
+    pub async fn undo_file(&self) -> Result<(), super::PortError> {
+        self.send(WorkerCommand::UndoFile).await
     }
 
     /// Name (title) the session.

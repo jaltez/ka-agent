@@ -75,6 +75,20 @@ impl Store {
         Ok(())
     }
 
+    /// Append to a turn's inbound text (a message steered into its live
+    /// turn). `inbound_text` is otherwise immutable.
+    pub fn append_turn_inbound(&self, id: &TurnId, suffix: &str) -> Result<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE turns SET inbound_text = inbound_text || ?2 WHERE id = ?1",
+            params![id.as_str(), suffix],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("turn {}", id)));
+        }
+        Ok(())
+    }
+
     /// Restart reconciliation: any turn still `submitted` or `running` when
     /// the daemon comes up is marked `interrupted` (gap G9). `queued` turns
     /// survive — they have not been handed to the engine yet. Returns the

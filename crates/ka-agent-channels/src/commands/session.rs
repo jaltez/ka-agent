@@ -121,3 +121,98 @@ pub(super) fn run_persona<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         Outcome::Reply(ctx.runtime.persona_text())
     })
 }
+
+pub(super) fn run_effort<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        match ctx.runtime.set_effort(ctx.args).await {
+            Ok(reply) => Outcome::Reply(reply),
+            Err(e) => Outcome::Reply(format!("! [effort] {e}")),
+        }
+    })
+}
+
+pub(super) fn run_undo<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let _ = ctx.args;
+        match ctx.runtime.undo().await {
+            Ok(()) => Outcome::Reply("undoing the last file change…".into()),
+            Err(e) => Outcome::Reply(format!("! [undo] {e}")),
+        }
+    })
+}
+
+pub(super) fn run_steer<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let text = ctx.args.trim();
+        if text.is_empty() {
+            return Outcome::Reply("usage: /steer <text>".into());
+        }
+        match ctx.runtime.steer(text).await {
+            Ok(true) => Outcome::Silent,
+            Ok(false) => match ctx.runtime.handle_message(text, ctx.source).await {
+                Ok(()) => Outcome::Silent,
+                Err(e) => Outcome::Reply(format!("! [steer] {e}")),
+            },
+            Err(e) => Outcome::Reply(format!("! [steer] {e}")),
+        }
+    })
+}
+
+pub(super) fn run_queue<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        if ctx.args == "clear" {
+            return match ctx.runtime.clear_queue() {
+                Ok(0) => Outcome::Reply("the queue is empty".into()),
+                Ok(n) => Outcome::Reply(format!("cleared {n} queued message(s)")),
+                Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+            };
+        }
+        match ctx.runtime.queued() {
+            Ok(items) if items.is_empty() => Outcome::Reply("the queue is empty".into()),
+            Ok(items) => {
+                let mut out = format!("{} queued:\n", items.len());
+                for (i, (id, source, text)) in items.iter().enumerate() {
+                    let head: String = text.chars().take(80).collect();
+                    out.push_str(&format!(
+                        "  #{} [{}] {} · {}\n",
+                        i + 1,
+                        source,
+                        ka_agent_core::ids::short_id(id),
+                        head
+                    ));
+                }
+                Outcome::Reply(out.trim_end().to_string())
+            }
+            Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+        }
+    })
+}
+
+pub(super) fn run_tools<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let tools = ctx.runtime.tools();
+        if tools.is_empty() {
+            return Outcome::Reply(
+                "no tools discovered yet — they appear after the first turn".into(),
+            );
+        }
+        let mut engine: Vec<String> = Vec::new();
+        let mut kagent: Vec<String> = Vec::new();
+        let mut servers: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for t in tools {
+            if let Some(rest) = t.strip_prefix("kagent__") {
+                kagent.push(rest.to_string());
+            } else if let Some((server, _tool)) = t.split_once("__") {
+                servers.entry(server.to_string()).or_default().push(t);
+            } else {
+                engine.push(t);
+            }
+        }
+        let mut out = format!("engine: {}", engine.join(", "));
+        out.push_str(&format!("\nkagent: {}", kagent.join(", ")));
+        for (server, list) in &servers {
+            out.push_str(&format!("\n{server}: {}", list.join(", ")));
+        }
+        Outcome::Reply(out)
+    })
+}

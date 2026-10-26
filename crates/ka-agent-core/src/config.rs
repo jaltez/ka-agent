@@ -305,6 +305,18 @@ pub struct DaemonConfig {
     /// Models tried in order when the main one fails (outage, rate
     /// limit); at most two hops per turn.
     pub fallback: Vec<String>,
+    /// Reasoning effort sent to the engine (`off|low|medium|high|max`);
+    /// `None` keeps the model's own default.
+    pub effort: Option<String>,
+    /// Model for background turns (crons, the briefing, `--background`
+    /// asks and `-bg` sources); `None` uses the main model.
+    pub background_model: Option<String>,
+    /// OS sandbox for bash: `auto` (default: fs when a backend exists) |
+    /// `fs` | `off`.
+    pub sandbox: String,
+    /// A message that arrives mid-turn: `steer` (default, rides the
+    /// running reply) or `queue` (durable, next turn).
+    pub busy_messages: String,
     /// `guarded` (default) | `accept_edits` | `free` | `plan`.
     pub mode: String,
     /// Approval card TTL; deny on expiry.
@@ -345,6 +357,10 @@ impl Default for DaemonConfig {
             workspace: PathBuf::from("~/.ka-agent/profiles/default/workspace"),
             model: None,
             fallback: Vec::new(),
+            effort: None,
+            background_model: None,
+            sandbox: "auto".to_string(),
+            busy_messages: "steer".to_string(),
             mode: "guarded".to_string(),
             approval_ttl_secs: 900,
             turn_grace_secs: 10,
@@ -395,6 +411,25 @@ impl DaemonConfig {
             "guarded" | "accept_edits" | "free" | "plan"
         ) {
             return Err(Error::Validate(format!("unknown mode {:?}", self.mode)));
+        }
+        if let Some(effort) = &self.effort
+            && !matches!(effort.as_str(), "off" | "low" | "medium" | "high" | "max")
+        {
+            return Err(Error::Validate(format!(
+                "unknown effort {effort:?} (off|low|medium|high|max)"
+            )));
+        }
+        if !matches!(self.sandbox.as_str(), "auto" | "fs" | "off") {
+            return Err(Error::Validate(format!(
+                "unknown sandbox {:?} (auto|fs|off)",
+                self.sandbox
+            )));
+        }
+        if !matches!(self.busy_messages.as_str(), "steer" | "queue") {
+            return Err(Error::Validate(format!(
+                "unknown busy_messages {:?} (steer|queue)",
+                self.busy_messages
+            )));
         }
         if self.approval_ttl_secs == 0 || self.approval_ttl_secs > 86_400 {
             return Err(Error::Validate(

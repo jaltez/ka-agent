@@ -107,7 +107,17 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         }
     }
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
-    match port.submit(wire, Vec::new(), Vec::new()).await {
+    // Background turns may run on the background model.
+    let background = item.source.starts_with("cron")
+        || item.source == "briefing"
+        || item.source.ends_with("-bg");
+    let model = background
+        .then(|| cfg_of(sh).background_model.clone())
+        .flatten();
+    match port
+        .submit_with_model(wire, Vec::new(), Vec::new(), model)
+        .await
+    {
         Ok(()) => {
             turn.transition(TurnStatus::Running)
                 .map_err(|t| illegal_turn(turn.status, t))
@@ -206,9 +216,47 @@ impl Runtime {
                 SessionStatus::Running
                 | SessionStatus::AwaitingApproval
                 | SessionStatus::Stopping => {
+                    // `busy_messages = "steer"`: an operator message lands
+                    // in the running reply at the next tool-batch boundary.
+                    // Scheduled turns stay uninterrupted, and a session
+                    // with no live turn (awaiting a crash recovery) queues.
+                    let live = self.live_port();
+                    let running = self.current_turn_source();
+                    let steerable = self.cfg().busy_messages == "steer"
+                        && live.is_some()
+                        && !running.as_deref().is_some_and(|s| {
+                            s == "cron" || s.starts_with("cron:") || s == "briefing"
+                        });
+                    if steerable
+                        && let Some(port) = live
+                        && port.steer(text.to_string()).await.is_ok()
+                    {
+                        // Record it on the turn (the durable transcript)
+                        // and in the live stream the surfaces show.
+                        let turn_id = self
+                            .lock()
+                            .live
+                            .as_ref()
+                            .and_then(|l| l.current_turn.clone());
+                        if let Some(id) = turn_id {
+                            let _ = self.sh.store.append_turn_inbound(
+                                &id,
+                                &format!("\n\n[added while working] {text}"),
+                            );
+                        }
+                        if let Some(live) = self.lock().live.as_mut() {
+                            live.live_text
+                                .push_str(&format!("\n\n[added while working] {text}"));
+                        }
+                        self.sh.emit(AgentEvent::Note {
+                            text: "steered into the running reply".into(),
+                        });
+                        return Ok(());
+                    }
                     let item = QueueItem::new(self.session_id(), text.to_string(), source);
                     self.sh.store.enqueue(&item)?;
                     let n = self.sh.store.queue_len(&self.session_id())?;
+                    self.sh.emit(AgentEvent::Queue { depth: n as u32 });
                     self.sh.emit(AgentEvent::Notice {
                         text: format!("queued (#{n})"),
                     });
@@ -428,7 +476,17 @@ impl Runtime {
             "{}\n{text}",
             context_line(&self.sh, source.unwrap_or("console"))
         );
-        match port.submit(wire, Vec::new(), skills).await {
+        // Background turns (crons, the briefing, `-bg` asks) may run on a
+        // cheaper model; everything operator-driven keeps the session one.
+        let src = source.unwrap_or("");
+        let background = src.starts_with("cron") || src == "briefing" || src.ends_with("-bg");
+        let model = background
+            .then(|| self.cfg().background_model.clone())
+            .flatten();
+        match port
+            .submit_with_model(wire, Vec::new(), skills, model)
+            .await
+        {
             Ok(()) => {}
             Err(PortError::EngineClosed) => {
                 turn.transition(TurnStatus::Interrupted)

@@ -480,6 +480,7 @@ async fn forward(cmd: WorkerCommand, commands: Option<&Sender<Command>>) -> Hand
         W::Open { .. } | W::Close => unreachable!("handled by the caller"),
         W::Submit {
             text,
+            model,
             images,
             skills,
         } => {
@@ -496,7 +497,7 @@ async fn forward(cmd: WorkerCommand, commands: Option<&Sender<Command>>) -> Hand
                         })
                         .collect(),
                     allowed_tools: None,
-                    model: None,
+                    model,
                     skills,
                 },
             )
@@ -538,6 +539,31 @@ async fn forward(cmd: WorkerCommand, commands: Option<&Sender<Command>>) -> Hand
         }
         W::Compact => {
             send_cmd(tx, Command::Compact { focus: None }).await;
+            Handled::Other
+        }
+        W::SetEffort { level } => {
+            let parsed = match level.as_str() {
+                "off" => Some(ka_protocol::Effort::Off),
+                "low" => Some(ka_protocol::Effort::Low),
+                "medium" => Some(ka_protocol::Effort::Medium),
+                "high" => Some(ka_protocol::Effort::High),
+                "max" => Some(ka_protocol::Effort::Max),
+                other => {
+                    eprintln!("worker: ignored set_effort with unknown level {other:?}");
+                    None
+                }
+            };
+            if let Some(level) = parsed {
+                send_cmd(tx, Command::SetEffort { level }).await;
+            }
+            Handled::Other
+        }
+        W::Steer { text } => {
+            send_cmd(tx, Command::Steer { text }).await;
+            Handled::Other
+        }
+        W::UndoFile => {
+            send_cmd(tx, Command::UndoFile).await;
             Handled::Other
         }
     }

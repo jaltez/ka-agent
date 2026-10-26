@@ -100,6 +100,10 @@ pub enum WorkerCommand {
     Submit {
         /// Prompt text.
         text: String,
+        /// Per-turn model override (background turns use the background
+        /// model; `None` keeps the session model).
+        #[serde(default)]
+        model: Option<String>,
         /// Images attached to the prompt.
         #[serde(default)]
         images: Vec<ImagePayload>,
@@ -127,6 +131,19 @@ pub enum WorkerCommand {
         /// `guarded` | `accept_edits` | `free` | `plan`.
         mode: String,
     },
+    /// Per-turn reasoning effort (`off|low|medium|high|max`; empty =
+    /// session default).
+    SetEffort {
+        /// The effort level, or "" to clear.
+        level: String,
+    },
+    /// Mid-turn steering: delivered to the engine's live turn.
+    Steer {
+        /// What the operator added.
+        text: String,
+    },
+    /// Undo the most recent file change of this session.
+    UndoFile,
     /// Name (title) the session.
     SetName {
         /// The alias (1–64 chars, no whitespace).
@@ -248,6 +265,7 @@ mod tests {
             scenario: None,
         });
         round_trip(&WorkerCommand::Submit {
+            model: None,
             text: "fix the failing test".into(),
             images: vec![ImagePayload {
                 data_base64: "aGk=".into(),
@@ -260,6 +278,7 @@ mod tests {
         assert_eq!(
             bare,
             WorkerCommand::Submit {
+                model: None,
                 text: "hi".into(),
                 images: Vec::new(),
                 skills: Vec::new(),

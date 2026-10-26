@@ -18,10 +18,18 @@ pub fn compose(
     user_layer: Option<&str>,
     resolve_secret: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
+    let sandbox_on = match cfg.sandbox.as_str() {
+        "fs" => true,
+        "auto" => ka_sandbox::detect_tool().is_some(),
+        _ => false,
+    };
     let has_extras = cfg.search.is_some()
         || !cfg.fallback.is_empty()
         || !cfg.mcp.is_empty()
-        || cfg.approvals.auto_review;
+        || cfg.approvals.auto_review
+        || cfg.effort.is_some()
+        || sandbox_on
+        || cfg.budgets.daily_usd.is_some();
     if !has_extras {
         return Ok(user_layer.map(str::to_string));
     }
@@ -56,6 +64,37 @@ pub fn compose(
             .or_insert_with(|| toml::Table::new().into());
         if let Some(g) = guards.as_table_mut() {
             g.insert("auto_review".into(), true.into());
+        }
+    }
+
+    if let Some(effort) = &cfg.effort {
+        doc.insert("effort".into(), effort.clone().into());
+    }
+
+    // The OS sandbox: `fs` restricts bash without the operator having to
+    // know ka's own vocabulary; the engine fails closed when no backend
+    // exists. Attachments stay writable (send_file, transcript exports).
+    if sandbox_on && !doc.contains_key("sandbox") {
+        let mut sandbox = toml::Table::new();
+        sandbox.insert("mode".into(), "fs".into());
+        // The attachments dir lives under the instance data root; the
+        // engine only needs it for send_file staging and exports.
+        let attachments = ka_agent_core::layout::default_root().join("attachments");
+        sandbox.insert(
+            "allow_write".into(),
+            toml::Value::Array(vec![attachments.to_string_lossy().into_owned().into()]),
+        );
+        doc.insert("sandbox".into(), sandbox.into());
+    }
+
+    // The engine's spend guard is the live budget: the continue-ask it
+    // raises becomes an approval card the operator already knows.
+    if let Some(cap) = cfg.budgets.daily_usd {
+        let guards = doc
+            .entry("guards")
+            .or_insert_with(|| toml::Table::new().into());
+        if let Some(g) = guards.as_table_mut() {
+            g.insert("spend_usd".into(), cap.into());
         }
     }
 
@@ -156,7 +195,12 @@ mod tests {
 
     #[test]
     fn nothing_configured_passes_the_user_layer_through() {
-        let cfg = DaemonConfig::default();
+        // `sandbox = "auto"` composes an fs layer wherever a backend exists
+        // (2.5); the pass-through contract is about every OTHER knob.
+        let cfg = DaemonConfig {
+            sandbox: "off".into(),
+            ..DaemonConfig::default()
+        };
         assert_eq!(compose(&cfg, None, &secrets).unwrap(), None);
         assert_eq!(
             compose(&cfg, Some("mode = \"plan\"\n"), &secrets)
@@ -223,7 +267,10 @@ headers = { Authorization = "secret:gh.token" }
         let cfg: DaemonConfig = toml::from_str("[approvals]\nauto_review = true\n").unwrap();
         let text = compose(&cfg, None, &secrets).unwrap().unwrap();
         assert_eq!(parse(&text).guards.auto_review, Some(true));
-        let off = DaemonConfig::default();
+        let off = DaemonConfig {
+            sandbox: "off".into(),
+            ..DaemonConfig::default()
+        };
         assert_eq!(compose(&off, None, &secrets).unwrap(), None);
     }
 
@@ -235,5 +282,48 @@ headers = { Authorization = "secret:gh.token" }
         .unwrap();
         let err = compose(&cfg, None, &secrets).unwrap_err();
         assert!(err.contains("ka-agent secret set nope"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod step25_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn no_secret(_name: &str) -> Result<String, String> {
+        Err("no secrets".into())
+    }
+
+    #[test]
+    fn effort_sandbox_and_spend_guard_compose() {
+        let cfg = ka_agent_core::DaemonConfig {
+            effort: Some("high".into()),
+            sandbox: "fs".into(),
+            budgets: ka_agent_core::config::Budgets {
+                daily_usd: Some(2.5),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let layer = compose(&cfg, None, &no_secret).unwrap().expect("a layer");
+        let parsed: toml::Value = toml::from_str(&layer).unwrap();
+        assert_eq!(parsed["effort"].as_str(), Some("high"));
+        assert_eq!(parsed["sandbox"]["mode"].as_str(), Some("fs"));
+        assert!(
+            parsed["sandbox"]["allow_write"][0]
+                .as_str()
+                .unwrap()
+                .ends_with("attachments")
+        );
+        assert_eq!(parsed["guards"]["spend_usd"].as_float(), Some(2.5));
+    }
+
+    #[test]
+    fn sandbox_off_composes_nothing() {
+        let cfg = ka_agent_core::DaemonConfig {
+            sandbox: "off".into(),
+            ..Default::default()
+        };
+        assert!(compose(&cfg, None, &no_secret).unwrap().is_none());
     }
 }
