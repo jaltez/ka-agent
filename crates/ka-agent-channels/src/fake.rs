@@ -13,6 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub struct CapturedRequest {
     pub method: String,
     pub body: Value,
+    /// Verbatim body when it was not JSON (multipart uploads such as
+    /// `sendPhoto`/`sendDocument`); `None` for JSON calls.
+    pub raw: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -76,7 +79,7 @@ impl FakeBotServer {
                 };
                 let state = Arc::clone(&rt_state);
                 tokio::spawn(async move {
-                    if let Some((path, body)) = read_request(&mut socket).await {
+                    if let Some((path, body, raw)) = read_request(&mut socket).await {
                         // File downloads bypass the JSON method table.
                         let (status, content_type, response): (&str, &str, Vec<u8>) =
                             if let Some(rest) = path.strip_prefix("/file/") {
@@ -101,7 +104,7 @@ impl FakeBotServer {
                                 (
                                     "200 OK",
                                     "application/json",
-                                    handle(&state, &path, &body).into_bytes(),
+                                    handle(&state, &path, &body, raw).into_bytes(),
                                 )
                             };
                         let head = format!(
@@ -286,7 +289,11 @@ impl FakeBotServer {
 }
 
 /// Read one request: request line + headers, then Content-Length body.
-async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<(String, Value)> {
+/// The raw body comes back alongside the parsed JSON when it was not JSON
+/// (multipart uploads), so tests can assert on the uploaded fields.
+async fn read_request(
+    socket: &mut tokio::net::TcpStream,
+) -> Option<(String, Value, Option<String>)> {
     const MAX_REQUEST: usize = 1024 * 1024;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -335,11 +342,17 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<(String, Val
     let body_bytes = buf.get(head_end + sep_len..)?.to_vec();
     let request_line = head.lines().next()?;
     let path = request_line.split_whitespace().nth(1)?.to_string();
-    let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
-    Some((path, body))
+    let (body, raw) = match serde_json::from_slice(&body_bytes) {
+        Ok(body) => (body, None),
+        Err(_) => (
+            Value::Null,
+            Some(String::from_utf8_lossy(&body_bytes).into_owned()),
+        ),
+    };
+    Some((path, body, raw))
 }
 
-fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
+fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<String>) -> String {
     // path: /bot<token>/<method>
     let method = path.rsplit('/').next().unwrap_or("").to_string();
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,6 +360,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
         st.captured.push(CapturedRequest {
             method,
             body: body.clone(),
+            raw,
         });
         return json!({ "ok": false, "description": "Bad Request: can't parse entities" })
             .to_string();
@@ -355,6 +369,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
         st.captured.push(CapturedRequest {
             method,
             body: body.clone(),
+            raw,
         });
         return json!({ "ok": false, "description": "Not Found: method not found" }).to_string();
     }
@@ -370,7 +385,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
                     .collect(),
             )
         }
-        "sendMessage" => {
+        "sendMessage" | "sendPhoto" | "sendDocument" => {
             let id = st.next_message_id;
             st.next_message_id += 1;
             json!({ "message_id": id })
@@ -392,6 +407,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value) -> String {
     st.captured.push(CapturedRequest {
         method,
         body: body.clone(),
+        raw,
     });
     json!({ "ok": true, "result": result }).to_string()
 }
@@ -413,12 +429,32 @@ struct MatrixState {
     next_batch: u64,
     since_seen: Vec<Option<String>>,
     sent: Vec<CapturedRequest>,
+    /// Every outbound send, with its event type, room and assigned id.
+    events: Vec<SentEvent>,
+    /// `POST /_matrix/media/v3/upload` bodies: `(filename, bytes)`.
+    uploads: Vec<(String, Vec<u8>)>,
+    /// `PUT …/typing/{user}` bodies.
+    typing: Vec<(String, Value)>,
+    next_event_id: u64,
     /// Pending invites `(room, sender)`, emitted under `rooms.invite`.
     invites: Vec<(String, String)>,
     /// Rooms joined via `POST …/rooms/{room}/join` (decoded ids).
     joins: Vec<String>,
     /// `/sync` requests currently held open (long-poll).
     syncs_pending: usize,
+}
+
+/// One outbound Matrix event recorded by the fake homeserver.
+#[derive(Debug, Clone)]
+pub struct SentEvent {
+    /// Room the event was sent to (decoded).
+    pub room: String,
+    /// `m.room.message`, `m.reaction`, ...
+    pub event_type: String,
+    /// The event content exactly as sent.
+    pub body: Value,
+    /// The id the fake assigned to it.
+    pub event_id: String,
 }
 
 /// The bot account invites are addressed to (`state_key`); configure the
@@ -547,11 +583,11 @@ impl FakeHomeserver {
                 };
                 let state = Arc::clone(&rt_state);
                 tokio::spawn(async move {
-                    if let Some((path, body)) = read_request(&mut socket).await {
+                    if let Some((path, body, raw)) = read_request(&mut socket).await {
                         let response = if path.starts_with("/_matrix/client/v3/sync") {
                             matrix_sync(&state, &path).await
                         } else {
-                            matrix_handle(&state, &path, &body)
+                            matrix_handle(&state, &path, &body, raw.as_deref())
                         };
                         let _ = socket
                             .write_all(
@@ -701,11 +737,89 @@ impl FakeHomeserver {
             .since_seen
             .clone()
     }
+
+    /// Every outbound send, with event type, room and assigned event id.
+    pub fn sent_events(&self) -> Vec<SentEvent> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .events
+            .clone()
+    }
+
+    /// Uploaded media: `(filename, bytes)` in order.
+    pub fn uploads(&self) -> Vec<(String, Vec<u8>)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .uploads
+            .clone()
+    }
+
+    /// Typing notifications: `(room, body)` in order.
+    pub fn typing_events(&self) -> Vec<(String, Value)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .typing
+            .clone()
+    }
+
+    /// Queue a reaction from `sender` on `target` (an `m.annotation`).
+    pub fn push_reaction(&self, room: &str, sender: &str, target: &str, key: &str) {
+        let event = serde_json::json!({
+            "type": "m.reaction",
+            "sender": sender,
+            "event_id": format!("$r{}", ka_agent_core::now_ms()),
+            "content": {"m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": target,
+                "key": key,
+            }},
+        });
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .timeline
+            .push((room.to_string(), event));
+    }
+
+    /// Queue a media message (`m.file`, `m.image`, `m.video`) pointing at
+    /// `mxc`; `body` is the operator-visible filename.
+    pub fn push_media_message(
+        &self,
+        room: &str,
+        sender: &str,
+        msgtype: &str,
+        mxc: &str,
+        body: &str,
+    ) {
+        let event = serde_json::json!({
+            "type": "m.room.message",
+            "sender": sender,
+            "event_id": format!("$m{}", ka_agent_core::now_ms()),
+            "content": {"msgtype": msgtype, "body": body, "url": mxc,
+                        "info": {"size": 12, "mimetype": "application/octet-stream"}},
+        });
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .timeline
+            .push((room.to_string(), event));
+    }
 }
 
-fn matrix_handle(state: &Arc<Mutex<MatrixState>>, path: &str, body: &Value) -> String {
+fn matrix_handle(
+    state: &Arc<Mutex<MatrixState>>,
+    path: &str,
+    body: &Value,
+    raw: Option<&str>,
+) -> String {
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(key) = path.strip_prefix("/_matrix/client/v1/media/download/") {
+    if let Some(key) = path
+        .strip_prefix("/_matrix/client/v1/media/download/")
+        .or_else(|| path.strip_prefix("/_matrix/media/v3/download/"))
+    {
         // Test media is ASCII; the JSON-only writer sends it verbatim.
         return st
             .media
@@ -714,21 +828,42 @@ fn matrix_handle(state: &Arc<Mutex<MatrixState>>, path: &str, body: &Value) -> S
             .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
     }
-    if path.contains("/send/m.room.message/") {
-        st.sent.push(CapturedRequest {
-            method: "PUT".into(),
-            body: body.clone(),
-        });
-        serde_json::json!({"event_id": format!("$k{}", st.sent.len())}).to_string()
-    } else if let Some(room) = path
-        .strip_prefix("/_matrix/client/v3/rooms/")
-        .and_then(|r| r.strip_suffix("/join"))
-    {
-        st.joins.push(percent_decode(room));
-        serde_json::json!({"room_id": percent_decode(room)}).to_string()
-    } else {
-        serde_json::json!({}).to_string()
+    if path.starts_with("/_matrix/media/v3/upload") {
+        let name = query_param(path, "filename").unwrap_or_default();
+        let bytes = raw.unwrap_or_default().as_bytes().to_vec();
+        let id = st.media.len() + 1;
+        let key = format!("fake/{id}");
+        st.uploads.push((name, bytes.clone()));
+        st.media.push((key.clone(), bytes));
+        return serde_json::json!({ "content_uri": format!("mxc://{key}") }).to_string();
     }
+    if let Some(rest) = path.strip_prefix("/_matrix/client/v3/rooms/") {
+        if let Some((room, tail)) = rest.split_once("/send/") {
+            let event_type = tail.split('/').next().unwrap_or("").to_string();
+            st.sent.push(CapturedRequest {
+                method: event_type.clone(),
+                body: body.clone(),
+                raw: None,
+            });
+            st.next_event_id += 1;
+            let event_id = format!("$e{}", st.next_event_id);
+            st.events.push(SentEvent {
+                room: percent_decode(room),
+                event_type,
+                body: body.clone(),
+                event_id: event_id.clone(),
+            });
+            return serde_json::json!({ "event_id": event_id }).to_string();
+        }
+        if let Some(room) = rest.strip_suffix("/join") {
+            st.joins.push(percent_decode(room));
+            return serde_json::json!({ "room_id": percent_decode(room) }).to_string();
+        }
+        if let Some((room, _)) = rest.split_once("/typing/") {
+            st.typing.push((percent_decode(room), body.clone()));
+        }
+    }
+    serde_json::json!({}).to_string()
 }
 
 // ---------------------------------------------------------------------------

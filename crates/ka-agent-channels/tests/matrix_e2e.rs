@@ -67,12 +67,31 @@ async fn spawn_stack_with(
     link_operator: bool,
     transcriber: Option<ka_agent_channels::voice::Transcriber>,
 ) -> (Stack, std::path::PathBuf) {
-    let (fake, base) = FakeHomeserver::spawn();
+    spawn_stack_with_port(link_operator, transcriber, WorkerPort::default()).await
+}
+
+async fn spawn_stack_with_port(
+    link_operator: bool,
+    transcriber: Option<ka_agent_channels::voice::Transcriber>,
+    port: WorkerPort,
+) -> (Stack, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "ka-ch-mx-{}-{}",
         std::process::id(),
         DIR_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (stack, dir) = build_stack(dir, link_operator, transcriber, port).await;
+    (stack, dir)
+}
+
+async fn build_stack(
+    dir: std::path::PathBuf,
+    link_operator: bool,
+    transcriber: Option<ka_agent_channels::voice::Transcriber>,
+    port: WorkerPort,
+) -> (Stack, std::path::PathBuf) {
+    let (fake, base) = FakeHomeserver::spawn();
     std::fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(Store::open(&dir.join("state.db")).unwrap());
     if link_operator {
@@ -94,7 +113,7 @@ async fn spawn_stack_with(
         cfg,
         Paths::new(dir.clone()),
         Arc::clone(&store),
-        WorkerPort::default(),
+        port,
         Arc::clone(&surface) as Arc<dyn Surface>,
     )
     .unwrap();
@@ -373,4 +392,389 @@ async fn audio_message_is_transcribed_and_echoed() {
         .await_sent("voice messages are off", Duration::from_secs(10))
         .expect("setup hint");
     stack.stop().await;
+}
+
+/// Not a test in the ordinary sense: when the port spawns this binary as
+/// its worker (`WorkerPort { binary: current_exe() }`), the libtest name
+/// filter `__worker` lands here and this calls the real worker loop with
+/// the scenario the parent left in `KA_DATA_DIR/scenario.json`. Without
+/// the `__worker` argument it is a no-op in a normal test run.
+#[test]
+#[allow(non_snake_case)]
+fn mock__worker() {
+    if !std::env::args().any(|a| a == "__worker") {
+        return;
+    }
+    let Some(dir) = std::env::var_os("KA_DATA_DIR") else {
+        return;
+    };
+    let scenario = std::path::PathBuf::from(dir).join("scenario.json");
+    if !scenario.exists() {
+        return;
+    }
+    let _ = ka_agent_port::run_worker(ka_agent_port::WorkerRun {
+        scenario: Some(scenario),
+    });
+}
+
+/// The port the approval test drives: this test binary as the worker, with
+/// the scripted-speaker scenario the mock worker loads from disk.
+fn scripted_port(dir: &std::path::Path) -> WorkerPort {
+    let scenario = dir.join("ka").join("scenario.json");
+    std::fs::create_dir_all(scenario.parent().unwrap()).unwrap();
+    std::fs::write(
+        &scenario,
+        r#"{"steps": [
+            {"call": {"tool": "bash", "args": {"command": "touch /tmp/ka-agent-matrix-ask-proof"}}},
+            {"text": "done anyway"}
+        ], "stop": "done", "cost_usd": 0.0, "tokens": 10}"#,
+    )
+    .unwrap();
+    // The port spawns `<binary> __worker --scenario …`; libtest refuses the
+    // unknown flag, so a small wrapper forwards only the filter. The
+    // scenario reaches the worker through `KA_DATA_DIR`, which keeps
+    // `scenario_override` (the runtime's scripted-mode preflight) honest.
+    let wrapper = dir.join("worker.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' __worker\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    WorkerPort {
+        binary: wrapper,
+        scenario_override: Some(scenario),
+    }
+}
+
+/// Plan 3.4: an operator turn streams as one message plus `m.replace`
+/// edits; the final edit carries the renderer's HTML. Typing runs while
+/// the turn does and the final edit clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_turn_streams_with_edits() {
+    let (stack, _dir) = spawn_stack(true).await;
+    // Learn the room (commands answer through the sender task).
+    stack.fake.push_room_message(ROOM, OPERATOR, "/status");
+    stack
+        .fake
+        .await_sent("queue", Duration::from_secs(10))
+        .expect("no /status reply");
+
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: "t1".into(),
+            source: format!("matrix:{OPERATOR}"),
+        },
+    ));
+    // The first draft: enough text to be worth a message, no relation.
+    let first = "a".repeat(100);
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: first.clone(),
+        },
+    ));
+    let draft = wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message" && e.body["body"].as_str() == Some(first.as_str())
+    })
+    .await
+    .expect("no streamed draft");
+    assert!(
+        draft.body.get("m.relates_to").is_none(),
+        "the first draft must be a plain message: {:?}",
+        draft.body
+    );
+
+    // More text, throttled: the pump edits the draft with `m.replace`.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::Delta {
+            text: "b".repeat(100),
+        },
+    ));
+    let edit = wait_for_event(&stack.fake, Duration::from_secs(6), |e| {
+        e.event_type == "m.room.message"
+            && e.body["m.relates_to"]["rel_type"].as_str() == Some("m.replace")
+    })
+    .await
+    .expect("no m.replace edit");
+    assert_eq!(
+        edit.body["m.relates_to"]["event_id"].as_str(),
+        Some(draft.event_id.as_str()),
+        "an edit must target the streamed message"
+    );
+
+    // The final edit carries the shared renderer's HTML.
+    let full = format!("**final** {first}");
+    stack.surface.emit(&env(
+        4,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: full.clone(),
+        },
+    ));
+    let final_edit = wait_for_event(&stack.fake, Duration::from_secs(5), |e| {
+        e.event_type == "m.room.message"
+            && e.body["m.new_content"]["formatted_body"]
+                .as_str()
+                .is_some_and(|h| h.contains("<strong>final</strong>"))
+    })
+    .await
+    .expect("no final edit");
+    assert_eq!(
+        final_edit.body["m.new_content"]["body"].as_str(),
+        Some(full.as_str())
+    );
+    assert_eq!(
+        final_edit.body["format"].as_str(),
+        Some("org.matrix.custom.html")
+    );
+
+    // Typing: started with the turn, cleared after the final edit.
+    wait_until("typing start", Duration::from_secs(5), || {
+        stack.fake.typing_events().iter().any(|(room, b)| {
+            room == ROOM && b["typing"] == json!(true) && b["timeout"] == json!(30000)
+        })
+    })
+    .await;
+    wait_until("typing stop", Duration::from_secs(5), || {
+        stack
+            .fake
+            .typing_events()
+            .iter()
+            .any(|(_, b)| b["timeout"] == json!(0))
+    })
+    .await;
+    stack.stop().await;
+}
+
+/// Plan 3.4: a scheduled turn is delivered once — no streamed draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_turn_is_not_streamed() {
+    let (stack, _dir) = spawn_stack(true).await;
+    stack.fake.push_room_message(ROOM, OPERATOR, "/status");
+    stack
+        .fake
+        .await_sent("queue", Duration::from_secs(10))
+        .expect("no /status reply");
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: "t1".into(),
+            source: "cron".into(),
+        },
+    ));
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Delta {
+            text: "x".repeat(200),
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !stack
+            .fake
+            .sent_all()
+            .iter()
+            .any(|s| s.contains(&"x".repeat(50))),
+        "a scheduled turn must not stream: {:?}",
+        stack.fake.sent_all()
+    );
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: "briefing".into(),
+        },
+    ));
+    stack
+        .fake
+        .await_sent("briefing", Duration::from_secs(5))
+        .expect("the final text was not delivered");
+    stack.stop().await;
+}
+
+/// Plan 3.4: ✅ on an approval card decides it through the runtime (once,
+/// exactly like `/y`), so the store row is approved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn card_reaction_approves_the_approval() {
+    let dir = std::env::temp_dir().join(format!(
+        "ka-ch-mx-ask-{}-{}",
+        std::process::id(),
+        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = scripted_port(&dir);
+    let (stack, dir) = build_stack(dir, true, None, port).await;
+
+    stack
+        .fake
+        .push_room_message(ROOM, OPERATOR, "please run the thing");
+    let card = match stack
+        .fake
+        .await_sent("/y to allow", Duration::from_secs(60))
+    {
+        Some(card) => card,
+        None => panic!(
+            "no approval card; sent so far:\n{:?}\naudit: {:?}",
+            stack.fake.sent_all(),
+            audit_details(&dir)
+        ),
+    };
+    assert!(
+        card.body["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains("react ✅")
+    );
+    let card_event = stack
+        .fake
+        .sent_events()
+        .into_iter()
+        .find(|e| e.body["body"].as_str() == card.body["body"].as_str())
+        .expect("the card has no event id");
+    stack
+        .fake
+        .push_reaction(ROOM, OPERATOR, &card_event.event_id, "✅");
+
+    let db = dir.join("state.db");
+    wait_until("approval approved", Duration::from_secs(20), || {
+        approval_status(&db).as_deref() == Some("approved")
+    })
+    .await;
+    let d = dir.clone();
+    wait_until("decide audit", Duration::from_secs(10), || {
+        audit_details(&d)
+            .iter()
+            .filter(|(a, _)| a == "approval.decide")
+            .count()
+            == 1
+    })
+    .await;
+    // A second ✅ on the same (settled) card decides nothing.
+    stack
+        .fake
+        .push_reaction(ROOM, OPERATOR, &card_event.event_id, "✅");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        audit_details(&dir)
+            .iter()
+            .filter(|(a, _)| a == "approval.decide")
+            .count(),
+        1,
+        "a card is single-use"
+    );
+    assert_eq!(approval_status(&db).as_deref(), Some("approved"));
+    stack.stop().await;
+}
+
+fn approval_status(db: &std::path::Path) -> Option<String> {
+    let conn = rusqlite::Connection::open(db).ok()?;
+    conn.query_row("SELECT status FROM approvals LIMIT 1", [], |r| r.get(0))
+        .ok()
+}
+
+/// Plan 3.4: an `m.file` message lands in `<workspace>/attachments` and
+/// the room gets the `@attachments/<file>` reference.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_file_lands_in_attachments() {
+    let (stack, dir) = spawn_stack(true).await;
+    stack.fake.push_media("example.org/f1", b"the file body");
+    stack.fake.push_media_message(
+        ROOM,
+        OPERATOR,
+        "m.file",
+        "mxc://example.org/f1",
+        "report.txt",
+    );
+    stack
+        .fake
+        .await_sent("saved attachments/report.txt", Duration::from_secs(10))
+        .expect("no attachment reply");
+    let saved = dir.join("attachments").join("report.txt");
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "the file body",
+        "the file did not land in attachments"
+    );
+    // The receipt reaction marks the accepted message.
+    wait_until("👀 receipt", Duration::from_secs(5), || {
+        stack
+            .fake
+            .sent_events()
+            .iter()
+            .any(|e| e.event_type == "m.reaction" && e.body["m.relates_to"]["key"] == json!("👀"))
+    })
+    .await;
+    stack.stop().await;
+}
+
+/// Plan 3.4: `AgentEvent::File` uploads the bytes and posts media with the
+/// caption as the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_file_is_uploaded_and_posted() {
+    let (stack, dir) = spawn_stack(true).await;
+    stack.fake.push_room_message(ROOM, OPERATOR, "/status");
+    stack
+        .fake
+        .await_sent("queue", Duration::from_secs(10))
+        .expect("no /status reply");
+    let path = dir.join("report.txt");
+    std::fs::write(&path, b"the report bytes").unwrap();
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::File {
+            path: path.display().to_string(),
+            name: "report.txt".into(),
+            caption: "the report".into(),
+        },
+    ));
+    wait_until("upload", Duration::from_secs(10), || {
+        stack
+            .fake
+            .uploads()
+            .iter()
+            .any(|(name, bytes)| name == "report.txt" && bytes == b"the report bytes")
+    })
+    .await;
+    let sent = wait_for_event(&stack.fake, Duration::from_secs(10), |e| {
+        e.event_type == "m.room.message" && e.body["msgtype"] == json!("m.file")
+    })
+    .await
+    .expect("no media message");
+    assert_eq!(sent.body["body"].as_str(), Some("the report"));
+    assert!(
+        sent.body["url"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("mxc://")),
+        "{:?}",
+        sent.body
+    );
+    stack.stop().await;
+}
+
+/// Poll until a recorded send matches `pred`.
+async fn wait_for_event(
+    fake: &FakeHomeserver,
+    timeout: Duration,
+    pred: impl Fn(&ka_agent_channels::fake::SentEvent) -> bool,
+) -> Option<ka_agent_channels::fake::SentEvent> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(hit) = fake.sent_events().into_iter().find(|e| pred(e)) {
+            return Some(hit);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

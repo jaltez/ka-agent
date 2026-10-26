@@ -50,14 +50,25 @@ pub(crate) async fn save_attachment(
         .download_file(&file_path)
         .await
         .map_err(|e| e.to_string())?;
+    save_attachment_bytes(workspace, &name, &bytes)
+}
+
+/// Write `bytes` to `<workspace>/attachments/<name>` and return the
+/// workspace-relative path. Collisions never overwrite: the first free
+/// `-N` suffix wins. `name` must already be sanitized
+/// ([`sanitize_attachment_name`]).
+pub(crate) fn save_attachment_bytes(
+    workspace: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
     let dir = workspace.join("attachments");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Collisions never overwrite: first free `-N` suffix wins.
-    let mut path = dir.join(&name);
+    let mut path = dir.join(name);
     let mut n = 1;
     while path.exists() {
         n += 1;
-        let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+        let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
         let ext = name.rsplit_once('.').map_or("", |(_, e)| e);
         let candidate = if ext.is_empty() {
             format!("{stem}-{n}")
@@ -66,14 +77,14 @@ pub(crate) async fn save_attachment(
         };
         path = dir.join(candidate);
     }
-    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     path.strip_prefix(workspace)
         .map(|p| p.display().to_string())
         .map_err(|_| "attachment escaped the workspace".to_string())
 }
 
 /// `[A-Za-z0-9._-]` only, no leading dot, ≤ 64 chars, never empty.
-fn sanitize_attachment_name(raw: &str) -> Option<String> {
+pub(crate) fn sanitize_attachment_name(raw: &str) -> Option<String> {
     let mut out = String::new();
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {

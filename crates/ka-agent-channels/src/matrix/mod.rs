@@ -6,8 +6,14 @@
 //! Identity: inbound senders gate on the store's `identities` table as
 //! `matrix:<user_id>` (§8.1); anything else is audited and ignored, except a
 //! `/pair <code>` message which redeems a one-time pairing code (§5.2).
-//! Approvals are text commands (`/y`, `/n`) through the shared router —
-//! the documented channel feature mismatch (no inline keyboards).
+//!
+//! Outbound: operator turns stream as one message edited with `m.replace`
+//! (first draft after 80 characters or 2 s, then one edit every 2 s with
+//! 80 new characters), with `m.typing` while the turn runs; scheduled turns
+//! (`cron`/`briefing`) arrive as one message at the end. Approval cards stay
+//! text (`/y`/`/n`) and also accept a ✅/❌ `m.annotation` reaction. Inbound
+//! `m.image`/`m.file`/`m.video` land in `<workspace>/attachments`, and
+//! `AgentEvent::File` is uploaded and posted as media.
 //!
 //! Delivery is at-least-once with `next_batch` dedupe, mirroring the
 //! Telegram offset: events are dispatched first, then `matrix.next_batch`

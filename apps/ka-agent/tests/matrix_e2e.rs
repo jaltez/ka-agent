@@ -140,7 +140,10 @@ async fn simple_turn_and_next_batch_persistence_across_restart() {
     let hit = fake
         .await_sent("Hello from scripted", Duration::from_secs(30))
         .expect("no room message with the scripted answer");
-    assert_eq!(hit.method, "PUT");
+    // The answer lands as an ordinary room message (short answers are not
+    // streamed, so this is the final chunk, not an edit).
+    assert_eq!(hit.method, "m.room.message", "{:?}", hit.body);
+    assert_eq!(hit.body["msgtype"], "m.text", "{:?}", hit.body);
 
     // next_batch persisted; the restart resumes from it, not from scratch.
     daemon.sigterm_wait(Duration::from_secs(10));

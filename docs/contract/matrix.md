@@ -57,12 +57,29 @@ token_secret = "matrix.access_token"   # KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN
 - **Outbound**: `PUT …/rooms/<id>/send/m.room.message/<txn>`; replies go to
   the room the operator last wrote from; bodies over 3500 chars split on
   newline boundaries.
+- **Streaming**: on an operator turn the reply streams as one message
+  edited in place. The first draft is sent once 80 characters accumulated
+  or 2 s passed since the first delta; further `m.replace` edits
+  (`m.new_content` + `m.relates_to: {rel_type: "m.replace", event_id}`)
+  follow every 2 s with at least 80 new characters. The final edit carries
+  the shared renderer's `formatted_body` (HTML). Scheduled turns (`cron`,
+  `briefing`) are not streamed: their text arrives once, at the end.
+- **Typing**: `PUT …/rooms/<id>/typing/<user>` with `timeout: 30000` when an
+  operator turn starts, refreshed while it runs; the final edit clears it
+  (`timeout: 0`).
+- **Attachments in**: `m.image`/`m.file`/`m.video` download through
+  `/_matrix/client/v1/media/download/<server>/<id>` (falling back to
+  `/_matrix/media/v3/download/…` on 404) into `<workspace>/attachments/`,
+  and the room gets the `@attachments/<file>` reference to paste back.
+- **Attachments out**: `AgentEvent::File` uploads via
+  `POST /_matrix/media/v3/upload` and posts `m.image`/`m.file` with the
+  caption as the body.
 - **HTTP**: the client speaks plain HTTP/1.1 — point `homeserver` at a local
   homeserver or your TLS-terminating reverse proxy; it does not do TLS
   itself.
-- **Approvals**: text commands (`/y`, `/n`) — the documented channel
-  feature mismatch (no inline keyboards in this subset); the card carries
-  the question, the expiry and the hint.
+- **Approvals**: text commands (`/y`, `/n`) and a ✅/❌ `m.annotation`
+  reaction on the card message (a bounded event-id → approval map resolves
+  it). Both decide through the same runtime call.
 
 ## Isolation and parity (exit criteria)
 

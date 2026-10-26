@@ -1,7 +1,6 @@
 // MatrixChannel: the /sync loop, gate, dispatch and the sender task. Split from matrix.rs (moves only).
 
-use super::client::Client;
-use super::surface::MatrixSurface;
+use super::surface::{MatrixSurface, sender_loop};
 use super::*;
 use crate::channel::Channel;
 use crate::commands::{self, Outcome};
@@ -9,56 +8,11 @@ use ka_agent_core::AuditRecord;
 use ka_agent_runtime::Runtime;
 use ka_agent_store::Store;
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, watch};
-
-/// The sender task: sends each queued message to the current room right
-/// away; with no room known yet, messages wait (bounded) until one is set.
-async fn sender_loop(
-    client: Arc<Client>,
-    room: Arc<Mutex<Option<String>>>,
-    room_known: Arc<Notify>,
-    mut rx: mpsc::UnboundedReceiver<String>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let mut backlog: VecDeque<String> = VecDeque::new();
-    let push = |backlog: &mut VecDeque<String>, text: String| {
-        if backlog.len() >= BACKLOG_CAP {
-            backlog.pop_front();
-            eprintln!("matrix: no room known yet; dropped the oldest queued message");
-        }
-        backlog.push_back(text);
-    };
-    loop {
-        let mut stop = false;
-        tokio::select! {
-            _ = shutdown.changed() => stop = true,
-            msg = rx.recv() => match msg {
-                Some(text) => push(&mut backlog, text),
-                None => stop = true,
-            },
-            _ = room_known.notified() => {}
-        }
-        if stop {
-            // Best effort: whatever is already queued still goes out.
-            while let Ok(text) = rx.try_recv() {
-                push(&mut backlog, text);
-            }
-        }
-        let current = room.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(r) = current {
-            while let Some(text) = backlog.pop_front() {
-                client.send_split(&r, &text).await;
-            }
-        }
-        if stop {
-            break;
-        }
-    }
-}
+use tokio::sync::watch;
 
 pub struct MatrixChannel {
     cfg: MatrixConfig,
@@ -153,20 +107,18 @@ impl MatrixChannel {
             }
             return;
         }
-        if kind != "m.room.message" {
+        if !matches!(kind, "m.room.message" | "m.reaction") {
             return;
         }
         let body = event["content"]["body"].as_str().unwrap_or("").trim();
-        if body.is_empty() {
-            return;
-        }
         // §8.1: linked identities only; everyone else is audited, ignored,
         // never answered — except a pairing code (§5.2), silent unless it
         // links.
         if !self.is_linked(sender) {
-            if body
-                .get(..5)
-                .is_some_and(|p| p.eq_ignore_ascii_case("/pair"))
+            if kind == "m.room.message"
+                && body
+                    .get(..5)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("/pair"))
             {
                 if crate::pairing::redeem(&self.store, "matrix", sender, body)
                     == crate::pairing::Redeem::Linked
@@ -181,8 +133,33 @@ impl MatrixChannel {
             return;
         }
         self.set_room(room);
+        // A reaction is an approval decision on a card we posted.
+        if kind == "m.reaction" {
+            self.handle_reaction(room, event).await;
+            return;
+        }
+        // 👀 receipt: received and accepted, before any engine start-up or
+        // queueing makes the room look dead.
+        if let Some(event_id) = event["event_id"].as_str() {
+            let client = Arc::clone(&self.surface.client);
+            let room = room.to_string();
+            let event_id = event_id.to_string();
+            tokio::spawn(async move {
+                let _ = client.react(&room, &event_id, "👀").await;
+            });
+        }
+        // Files land in the workspace attachments inbox, like Telegram's.
+        let msgtype = event["content"]["msgtype"].as_str().unwrap_or("");
+        if matches!(msgtype, "m.image" | "m.file" | "m.video") {
+            let reply = match self.save_media(&event["content"]).await {
+                Ok(rel) => format!("saved {rel} — reference it with @{rel} in your next message"),
+                Err(e) => format!("! [attachment] {e}"),
+            };
+            self.surface.client.send_split(room, &reply).await;
+            return;
+        }
         let transcript;
-        let body = if event["content"]["msgtype"].as_str() == Some("m.audio") {
+        let body = if msgtype == "m.audio" {
             match self.transcribe_audio(room, &event["content"]).await {
                 Some(t) => {
                     transcript = t;
@@ -191,6 +168,9 @@ impl MatrixChannel {
                 None => return,
             }
         } else {
+            if body.is_empty() {
+                return;
+            }
             body
         };
         match commands::route(&self.runtime, &format!("matrix:{sender}"), body).await {
@@ -207,6 +187,61 @@ impl MatrixChannel {
                 }
             }
         }
+    }
+
+    /// ✅/❌ on an approval card decides it through the same runtime call
+    /// `/y`/`/n` use. A card is single-use: its mapping is dropped before
+    /// the decision so a duplicate reaction decides nothing.
+    async fn handle_reaction(&self, room: &str, event: &Value) {
+        let rel = &event["content"]["m.relates_to"];
+        if rel["rel_type"].as_str() != Some("m.annotation") {
+            return;
+        }
+        let allow = match rel["key"].as_str().unwrap_or("") {
+            "✅" => true,
+            "❌" => false,
+            _ => return,
+        };
+        let target = rel["event_id"].as_str().unwrap_or("");
+        let Some(id) = self.surface.approval_for_card(target) else {
+            return;
+        };
+        self.surface.forget_card(target);
+        let decision = if allow {
+            ka_agent_core::ApprovalDecision::Allow
+        } else {
+            ka_agent_core::ApprovalDecision::Deny
+        };
+        let reply = match self.runtime.decide(&id, decision).await {
+            Ok(()) => "decided".to_string(),
+            Err(e) => format!("! [approval] {e}"),
+        };
+        self.surface.client.send_split(room, &reply).await;
+    }
+
+    /// An `m.image`/`m.file`/`m.video` message → a workspace attachment.
+    async fn save_media(&self, content: &Value) -> Result<String, String> {
+        let mxc = content["url"]
+            .as_str()
+            .filter(|u| !u.is_empty())
+            .or_else(|| content["file"]["url"].as_str())
+            .ok_or_else(|| "message has no media url".to_string())?;
+        let mime = content["info"]["mimetype"].as_str().unwrap_or("");
+        let name =
+            crate::attachments::sanitize_attachment_name(content["body"].as_str().unwrap_or(""))
+                .unwrap_or_else(|| {
+                    let kind = content["msgtype"]
+                        .as_str()
+                        .unwrap_or("m.file")
+                        .trim_start_matches("m.");
+                    format!(
+                        "{kind}-{}.{}",
+                        ka_agent_core::ids::short_id(mxc),
+                        media_ext(mime)
+                    )
+                });
+        let bytes = self.surface.client.download_media(mxc).await?;
+        crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
     }
 
     /// An `m.audio` message → its transcript (echoed back); `None` when
@@ -320,6 +355,7 @@ impl Channel for MatrixChannel {
                 Arc::clone(&self.surface.client),
                 Arc::clone(&self.surface.room),
                 Arc::clone(&self.surface.room_known),
+                Arc::clone(&self.surface.cards),
                 outbound,
                 shutdown.clone(),
             ));
@@ -358,5 +394,26 @@ impl Channel for MatrixChannel {
             let _ = tokio::time::timeout(Duration::from_secs(5), sender).await;
             eprintln!("matrix: channel stopped");
         })
+    }
+}
+
+/// A filename extension for an inbound media type, for unnamed files.
+fn media_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/ogg" => "ogg",
+        "audio/mpeg" => "mp3",
+        "application/pdf" => "pdf",
+        "application/json" => "json",
+        "text/plain" => "txt",
+        "text/csv" => "csv",
+        "application/zip" => "zip",
+        _ => "bin",
     }
 }
