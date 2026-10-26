@@ -513,10 +513,9 @@ impl Runtime {
         turn.transition(TurnStatus::Running)
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
-        self.sh.emit(AgentEvent::TurnStarted {
-            turn: turn.id.to_string(),
-            source: source.unwrap_or("").to_string(),
-        });
+        // No `TurnStarted` here: `drive` announces the turn exactly once,
+        // when the engine's own `turn_started` arrives (earlier than this
+        // handshake, and before any delta).
         Ok(())
     }
 

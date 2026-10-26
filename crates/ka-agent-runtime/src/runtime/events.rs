@@ -148,6 +148,29 @@ pub(super) fn rt_persist_status(sh: &Arc<Shared>, status: SessionStatus) {
     }
 }
 
+/// Which runtime turn's start has already been announced.
+///
+/// One `submit → … → idle` cycle is one runtime turn, but the engine emits
+/// `turn_started` for every engine turn inside it (auto-poke, verify, ka's
+/// own queued input). Surfaces reset their per-turn stream on
+/// [`AgentEvent::TurnStarted`], so only the first start of each runtime turn
+/// may be announced; the turn id is claimed before the prompt is handed
+/// over, so repeated starts of the same runtime turn carry the same id.
+#[derive(Default)]
+struct TurnAnnouncements(Option<String>);
+
+impl TurnAnnouncements {
+    /// `true` when this port `turn_started` opens a runtime turn that has
+    /// not been announced yet.
+    fn admit(&mut self, turn: &str) -> bool {
+        if self.0.as_deref() == Some(turn) {
+            return false;
+        }
+        self.0 = Some(turn.to_string());
+        true
+    }
+}
+
 /// The per-worker event loop: maps port events onto state, store and surface
 /// (SEED.md §3.7: only events after our own submission are live output; the
 /// delivery boundary is `idle`).
@@ -158,6 +181,9 @@ pub(super) async fn drive(
 ) {
     // Context meter dedupe: emit only when the integer percentage moves.
     let mut last_ctx_pct: Option<u64> = None;
+    // The runtime turn whose start was already announced (see
+    // `TurnAnnouncements`: the engine starts extra turns inside one cycle).
+    let mut announcements = TurnAnnouncements::default();
     while let Some(ev) = rx.recv().await {
         // Any event is activity: the idle reap's clock resets.
         {
@@ -214,6 +240,14 @@ pub(super) async fn drive(
                             .unwrap_or_default(),
                     )
                 };
+                // Exactly one announcement per runtime turn: a repeated
+                // start carrying the same id is an engine turn inside the
+                // same submit→idle cycle (auto-poke, verify). The id is
+                // claimed before the prompt is handed over, so it is already
+                // the recorded turn id here — nothing to re-emit once known.
+                if !announcements.admit(&turn) {
+                    continue;
+                }
                 sh.emit(AgentEvent::TurnStarted { turn, source });
             }
             PortEvent::DeltaText(t) => {
@@ -692,5 +726,41 @@ pub(super) async fn drive(
                 rt_on_engine_closed(&sh, port.clone()).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::TurnAnnouncements;
+
+    #[test]
+    fn one_announcement_per_runtime_turn() {
+        let mut announcements = TurnAnnouncements::default();
+        assert!(announcements.admit("t1"));
+        assert!(
+            !announcements.admit("t1"),
+            "a repeated start inside the same submit→idle cycle (auto-poke, verify) is not a new turn"
+        );
+        assert!(
+            announcements.admit("t2"),
+            "the next runtime turn carries a new recorded id"
+        );
+        assert!(!announcements.admit("t2"));
+    }
+
+    #[test]
+    fn an_unclaimed_start_is_announced_only_once() {
+        let mut announcements = TurnAnnouncements::default();
+        assert!(
+            announcements.admit(""),
+            "no recorded turn yet: the surface still gets one reset"
+        );
+        assert!(
+            !announcements.admit(""),
+            "a second start without a recorded turn must not reset again"
+        );
+        assert!(announcements.admit("t1"));
     }
 }

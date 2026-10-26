@@ -101,6 +101,10 @@ V-06b — HTTP 200, no events for the dropped prompt). Ka Agent therefore:
   is valid *because* of the single-writer rule (a cycle may contain several
   `turn_started…turn_finished` pairs: auto-poke, verify, queued input —
   `idle` is the delivery boundary, `crates/ka-protocol/src/lib.rs:681-683`).
+  The runtime announces that turn to its surfaces exactly once: the first
+  `turn_started` of the cycle becomes the single `AgentEvent::TurnStarted`
+  (the `turn_id` is claimed before `submit`, so it is already known), and
+  later engine starts in the same cycle are not re-announced;
 - does **not** end the turn on an `idle` that arrives while the turn is still
   open (`submitted`/`running` in the store) or while an ask is pending. Ka
   reports `idle` for the cycle during worker start-up and around its

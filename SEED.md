@@ -365,6 +365,7 @@ When to use each:
   - **[Provisional]** Ka Agent uses `replay` only to check continuity: does the last assistant message match its own log?
 - New output is the span from Ka Agent's `prompt` to the next `idle`.
   - One prompt cycle may contain several `turn_started` … `turn_finished` pairs (auto-poke, verify, queued input), so `idle` is the delivery boundary (`crates/ka-protocol/src/lib.rs:681-683`).
+  - **[Requirement]** A surface is told the turn started exactly once: the first `turn_started` of the cycle is the single `AgentEvent::TurnStarted`, carrying the `turn_id` claimed before `submit` and the channel `source`. Later engine starts inside the same cycle are not announced again — surfaces reset their per-turn stream on this event, so a second one would wipe a live answer.
   - Ka Agent tags the cycle with its own `turn_id`. This is valid because exactly one prompt is in flight per session.
 - Outbound messages are written to an outbox keyed `(turn_id, chunk_index)`, so a crash during delivery cannot produce out-of-order or duplicated chunks beyond the single chunk being sent.
 - A future `ka serve` port would deduplicate by SSE `id:` with a stored high-water mark per serve session. It would also re-create sessions on serve restart, because ids restart at `s1` (G5).
