@@ -451,3 +451,65 @@ fn import_brings_memory_as_candidates_and_skills() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Config CLI: a whole registered section is addressable (`get` renders its
+/// TOML body, `unset` removes the table), while leaf behavior is unchanged.
+#[test]
+fn config_get_and_unset_address_whole_sections() {
+    let root = temp_root("sections");
+    std::fs::write(
+        root.join("config.toml"),
+        "# keep\nmode = \"guarded\"\n\n[search]\nprovider = \"tavily\"\nbase_url = \"https://api.tavily.com\"\n\n[voice]\nprovider = \"local\"\nbase_url = \"http://127.0.0.1:8000/v1\"\n\n[budgets]\ndaily_usd = 2.0\n",
+    )
+    .unwrap();
+
+    let o = ka(&root, &["config", "get", "search"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("provider = \"tavily\"")
+            && out.contains("base_url = \"https://api.tavily.com\""),
+        "{out}"
+    );
+
+    // Leaves keep working.
+    let o = ka(&root, &["config", "get", "search.provider"]);
+    assert_eq!(text(&o).trim(), "tavily");
+    let o = ka(&root, &["config", "set", "search.provider", "brave"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(
+        cfg.search.as_ref().map(|s| s.provider.as_str()),
+        Some("brave")
+    );
+
+    // Unset the whole table: gone, the rest untouched, and still valid.
+    let o = ka(&root, &["config", "unset", "search"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("removed search"), "{}", text(&o));
+    let cfg_text = std::fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(!cfg_text.contains("[search]"), "{cfg_text}");
+    assert!(cfg_text.contains("# keep"), "{cfg_text}");
+    assert!(cfg_text.contains("[voice]"), "{cfg_text}");
+    assert!(cfg_text.contains("daily_usd = 2.0"), "{cfg_text}");
+    assert!(
+        ka_agent_core::DaemonConfig::load(&root.join("config.toml")).is_ok(),
+        "{cfg_text}"
+    );
+
+    let o = ka(&root, &["config", "get", "search"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("section absent"), "{}", text(&o));
+
+    // An unknown key is still refused.
+    let o = ka(&root, &["config", "get", "nope"]);
+    assert!(!o.status.success());
+    assert!(text(&o).contains("unknown key"), "{}", text(&o));
+
+    // A second section is removable the same way.
+    let o = ka(&root, &["config", "unset", "voice"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let cfg_text = std::fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(!cfg_text.contains("[voice]"), "{cfg_text}");
+    let _ = std::fs::remove_dir_all(&root);
+}

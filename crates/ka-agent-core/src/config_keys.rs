@@ -372,7 +372,9 @@ pub static KEYS: &[KeySpec] = &[
         path: "hooks",
         kind: Kind::Table,
         default: "[]",
-        apply: Apply::Worker,
+        // The agent-event hook surface is built once at startup
+        // (`host.rs`); a reload cannot rebuild it, so say "restart".
+        apply: Apply::Restart,
         web: false,
         doc: "operator hooks ([[hooks]]: on, command, optional tool/timeout_secs)",
     },
@@ -427,6 +429,18 @@ pub fn lookup(path: &str) -> Option<&'static KeySpec> {
     KEYS.iter()
         .filter(|k| k.kind == Kind::Table && path.starts_with(&format!("{}.", k.path)))
         .max_by_key(|k| k.path.len())
+}
+
+/// True when `path` names a section (a table) that registered keys live
+/// under — `search`, `voice`, `budgets`, … `config get`/`unset` accept a
+/// whole section; exact keys and [`Kind::Table`] entries (`mcp`, `hooks`)
+/// stay [`lookup`]'s business.
+pub fn is_section(path: &str) -> bool {
+    KEYS.iter().any(|k| {
+        k.path
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('.'))
+    })
 }
 
 /// The closest registered path within edit distance 3, when one exists.
@@ -572,6 +586,37 @@ mod tests {
         assert_eq!(suggest("budget.daily_usd"), Some("budgets.daily_usd"));
         assert_eq!(suggest("timezone2"), Some("timezone"));
         assert_eq!(suggest("aaaaaaaaaaaaaaaa"), None);
+    }
+
+    #[test]
+    fn sections_resolve_whole_tables_but_leaves_stay_leaves() {
+        assert!(is_section("search"));
+        assert!(is_section("voice"));
+        assert!(is_section("budgets"));
+        assert!(!is_section("search.provider"));
+        assert!(!is_section("mcp"));
+        assert!(!is_section("nope"));
+        assert!(!is_section(""));
+    }
+
+    /// `hooks` shapes the agent-event surface `host.rs` builds once at
+    /// startup, so the reload report must say "restart", never "applied".
+    #[test]
+    fn hooks_change_requires_a_restart() {
+        let old = DaemonConfig::default();
+        let mut new = old.clone();
+        new.hooks.push(crate::config::HookSpec {
+            on: "turn_finished".into(),
+            command: "true".into(),
+            tool: None,
+            timeout_secs: None,
+        });
+        let changed = changed(&old, &new);
+        let paths: Vec<_> = changed.iter().map(|k| k.path).collect();
+        assert_eq!(paths, vec!["hooks"]);
+        // runtime::reload_config partitions exactly on this: a Restart
+        // key lands in `restart_required`, never in `applied`.
+        assert_eq!(changed[0].apply, Apply::Restart);
     }
 
     #[test]

@@ -3,6 +3,22 @@
 
 use super::*;
 
+/// Set one value in an already-open document, keeping the spacing and any
+/// trailing comment of the value it replaces (same contract as
+/// `config_file::set`, without re-validating mid-write).
+fn set_doc_value(table: &mut toml_edit::Table, key: &str, value: toml_edit::Value) {
+    match table.get_mut(key) {
+        Some(toml_edit::Item::Value(old)) => {
+            let decor = old.decor().clone();
+            *old = value;
+            *old.decor_mut() = decor;
+        }
+        _ => {
+            table.insert(key, toml_edit::Item::Value(value));
+        }
+    }
+}
+
 impl Setup {
     /// Summary, confirm, write. `Ok(false)` = the operator declined.
     pub(super) async fn confirm_and_write(&mut self) -> Result<bool, Fail> {
@@ -42,7 +58,13 @@ impl Setup {
             println!("nothing was written");
             return Ok(false);
         }
-        self.write().map_err(|e| format!("write failed: {e}"))?;
+        self.write().map_err(|e| {
+            format!(
+                "write failed: {e}\nsome config keys, secrets and store state are already \
+                 written; later setup steps did not run — fix the error and re-run setup \
+                 (it is idempotent)"
+            )
+        })?;
         println!("saved {}", self.args.config.display());
         Ok(true)
     }
@@ -81,20 +103,28 @@ impl Setup {
             if let (Some(key), Some(env)) = (key, voice.key_env()) {
                 catalog::upsert_env_file(&self.env_file(), env, key).map_err(|e| e.to_string())?;
             }
-            if let Some(base) = &voice.base_url {
-                ka_agent_core::config_file::set(
-                    &self.args.config,
-                    "voice.base_url",
-                    &format!("{base:?}"),
-                )
+            // One document edit, validated once: `Voice.provider` has no
+            // serde default and `local` without `base_url` is invalid, so
+            // no single-key order can seed a fresh `[voice]` block — the
+            // local-server choice used to abort setup here.
+            let mut doc = ka_agent_core::config_file::read_doc(&self.args.config)
                 .map_err(|e| e.to_string())?;
+            let table = doc
+                .as_table_mut()
+                .entry("voice")
+                .or_insert(toml_edit::table())
+                .as_table_mut()
+                .ok_or("voice is not a table")?;
+            set_doc_value(
+                table,
+                "provider",
+                toml_edit::Value::from(voice.provider.clone()),
+            );
+            if let Some(base) = &voice.base_url {
+                set_doc_value(table, "base_url", toml_edit::Value::from(base.clone()));
             }
-            ka_agent_core::config_file::set(
-                &self.args.config,
-                "voice.provider",
-                &format!("{:?}", voice.provider),
-            )
-            .map_err(|e| e.to_string())?;
+            ka_agent_core::config_file::write_doc(&self.args.config, &doc)
+                .map_err(|e| e.to_string())?;
         }
         if let Some((provider, key)) = &self.search {
             if let Some(key) = key {

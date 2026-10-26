@@ -27,6 +27,13 @@ fn unknown_key(key: &str) -> String {
     }
 }
 
+/// A leaf key from the registry, or a whole registered section (`search`,
+/// `voice`, …, and the table entries `mcp`/`hooks`): `config get` and
+/// `config unset` accept both. `config set` stays leaf-only.
+fn registered(key: &str) -> bool {
+    ka_agent_core::config_keys::lookup(key).is_some() || ka_agent_core::config_keys::is_section(key)
+}
+
 fn not_created(path: &Path) -> String {
     format!("{} (not created yet — run ka-agent setup)", path.display())
 }
@@ -128,13 +135,17 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 std::process::ExitCode::FAILURE
             }
         },
-        ConfigCommand::Get { key } if ka_agent_core::config_keys::lookup(&key).is_none() => {
+        ConfigCommand::Get { key } if !registered(&key) => {
             eprintln!("ka-agent: {}", unknown_key(&key));
             std::process::ExitCode::FAILURE
         }
         ConfigCommand::Get { key } => match ka_agent_core::config_file::get(&config, &key) {
             Ok(Some(value)) => {
                 println!("{value}");
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(None) if ka_agent_core::config_keys::is_section(&key) => {
+                println!("{key} is not set (section absent)");
                 std::process::ExitCode::SUCCESS
             }
             Ok(None) => {
@@ -174,7 +185,7 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 }
             }
         }
-        ConfigCommand::Unset { key } if ka_agent_core::config_keys::lookup(&key).is_none() => {
+        ConfigCommand::Unset { key } if !registered(&key) => {
             eprintln!("ka-agent: {}", unknown_key(&key));
             std::process::ExitCode::FAILURE
         }

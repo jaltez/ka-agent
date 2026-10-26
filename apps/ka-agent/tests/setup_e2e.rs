@@ -414,3 +414,96 @@ fn setup_voice_section_writes_provider_and_key() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// B1: the local Whisper choice writes `[voice]` on a config that has no
+/// `[voice]` yet. Both fields must land in one validated write —
+/// `Voice.provider` has no serde default and `local` without `base_url` is
+/// invalid, so neither single-key order can seed the section.
+#[test]
+fn setup_voice_local_server_writes_a_fresh_voice_section() {
+    let root = temp_root("voice-local");
+    std::fs::write(root.join("ka-agent.toml"), "mode = \"guarded\"\n").unwrap();
+    let mut child = ka(&root)
+        .args(["setup", "voice"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // choice 3 = local server, empty line = default base URL, save.
+    child.stdin.take().unwrap().write_all(b"3\n\ny\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "setup local voice failed: {text}");
+    assert!(!text.contains("write failed"), "{text}");
+    let cfg = config_of(&root);
+    assert!(
+        cfg.contains("[voice]")
+            && cfg.contains("provider = \"local\"")
+            && cfg.contains("base_url = \"http://127.0.0.1:8000/v1\""),
+        "{cfg}"
+    );
+    // The result is a config the daemon can load.
+    let loaded = ka_agent_core::DaemonConfig::load(&root.join("ka-agent.toml")).unwrap();
+    assert_eq!(
+        loaded.voice.as_ref().map(|v| v.provider.as_str()),
+        Some("local")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Finding 5: an abort after the first writes says what landed and that a
+/// re-run is safe, instead of a bare "write failed" that reads like a
+/// clean stop.
+#[test]
+fn setup_write_failure_says_what_landed_and_that_a_re_run_is_safe() {
+    let root = temp_root("partial");
+    // A directory where the store file belongs makes the store step fail
+    // after the config and secrets have already been written.
+    std::fs::create_dir_all(root.join("data/state.db")).unwrap();
+    let mut child = ka(&root)
+        .args([
+            "setup",
+            "--provider",
+            "anthropic",
+            "--model",
+            "anthropic/claude-sonnet-5",
+            "--key-stdin",
+            "--no-verify",
+            "--no-service",
+            "--yes",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"sk-partial\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("write failed"), "{text}");
+    assert!(
+        text.contains("already written") && text.contains("re-run setup (it is idempotent)"),
+        "{text}"
+    );
+    // What landed landed: the model write is visible, and the message said so.
+    assert!(
+        config_of(&root).contains("model = \"anthropic/claude-sonnet-5\""),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

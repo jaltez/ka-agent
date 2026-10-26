@@ -122,6 +122,19 @@ impl Report {
     }
 }
 
+/// The line for a `state.db` written by a newer binary: the store's own
+/// `Newer` error otherwise vanishes inside checks that only `let Ok(...)`,
+/// leaving unrelated failures on screen.
+fn store_version_issue(err: &ka_agent_store::StoreError) -> Option<String> {
+    match err {
+        ka_agent_store::StoreError::Newer { version } => Some(format!(
+            "state.db is newer than this binary (user_version {version}) — \
+             run the newer ka-agent, or install the release that matches it"
+        )),
+        _ => None,
+    }
+}
+
 pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCode {
     let mut rep = Report::new(json);
     let paths = Paths::new(Paths::default_root());
@@ -165,6 +178,16 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
             }
         }
     };
+
+    // A store written by a newer binary (downgrade, or an older binary on
+    // PATH): every read below fails with `database is newer …` and the
+    // individual checks swallow it. Say it once, up front.
+    if paths.state_db().exists()
+        && let Err(e) = ka_agent_store::Store::open(&paths.state_db())
+        && let Some(line) = store_version_issue(&e)
+    {
+        rep.fail(line);
+    }
 
     // Model + its provider key (the whole point of setup).
     let model = cfg.as_ref().and_then(|c| c.model.clone());
@@ -576,5 +599,22 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use ka_agent_store::StoreError;
+
+    #[test]
+    fn newer_store_maps_to_a_version_and_remedy_line() {
+        let line = store_version_issue(&StoreError::Newer { version: 8 }).unwrap();
+        assert!(line.contains("newer than this binary"), "{line}");
+        assert!(line.contains("user_version 8"), "{line}");
+        assert!(line.contains("newer ka-agent"), "{line}");
+        // Ordinary store errors keep their own message (no duplicate line).
+        assert!(store_version_issue(&StoreError::NotFound("x".into())).is_none());
     }
 }

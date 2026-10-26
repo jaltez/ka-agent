@@ -290,10 +290,12 @@ router), `ka-agent-web`, `ka-agent-plugins` (signed archives, bubblewrap
 sandbox). `docs/contract/` is one behavior contract per subsystem; `doctor`
 embeds their hash so support can compare builds.
 
-**The ka pin.** The `ka-*` engine crates are pinned to the exact released
-version (`=0.3.0`, crates.io) and reported by `doctor`. Upgrades are
-deliberate: bump the pin, keep the contract suite green (SEED §11.3);
-`scripts/check-ka-deps.sh` fails CI if the pin or the boundary drifts.
+**The ka pin.** The `ka-*` engine crates are pinned to one ka-harness git
+revision, `193ad5d` (the `v0.4.1` line noted in `Cargo.toml`), which
+`doctor` reports as `KA_PIN`. Upgrades are deliberate: bump the revision
+in every `ka-*` dependency together, keep the contract suite green
+(SEED §11.3); `scripts/check-ka-deps.sh` fails CI if any one of those
+pins or the boundary drifts.
 
 **Build & test.**
 
