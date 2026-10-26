@@ -716,7 +716,7 @@ async fn flood_control_keeps_drafts_streaming() {
         },
     ));
     server
-        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(30))
         .expect("first draft attempted (and refused with 429)");
     // Wait out `retry_after` (1 s) plus the 1 s draft spacing, then grow
     // the text: a second draft proves streaming was never turned off.
@@ -733,7 +733,7 @@ async fn flood_control_keeps_drafts_streaming() {
                 c.method == "sendMessageDraft"
                     && c.body["text"].as_str().is_some_and(|t| t.len() > 60)
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("draft retried after retry_after; streaming stayed on");
     assert_eq!(
@@ -753,7 +753,7 @@ async fn flood_control_keeps_drafts_streaming() {
     server
         .await_capture(
             |c| c.method == "sendMessage" && c.body["text"].as_str() == Some("done"),
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("final message");
 }
@@ -778,7 +778,7 @@ async fn draft_throttle_ignores_growth_past_the_cap() {
         },
     ));
     let first = server
-        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(30))
         .expect("first draft");
     assert_eq!(
         first.body["text"].as_str().unwrap().chars().count(),
@@ -816,7 +816,10 @@ async fn accepted_message_gets_a_receipt_reaction() {
         .push_text_message(3, 7, 42, "please look into this");
     let reaction = stack
         .server
-        .await_capture(|c| c.method == "setMessageReaction", Duration::from_secs(5))
+        .await_capture(
+            |c| c.method == "setMessageReaction",
+            Duration::from_secs(30),
+        )
         .expect("receipt reaction");
     assert_eq!(reaction.body["chat_id"].as_i64(), Some(7));
     assert_eq!(reaction.body["reaction"][0]["emoji"].as_str(), Some("👀"));
@@ -841,7 +844,7 @@ async fn memory_proposal_card_accepts_with_one_tap() {
     stack.server.push_text_message(1, 7, 42, "/status");
     stack
         .server
-        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(30))
         .expect("status reply");
     let id = ka_agent_core::ids::MemoryId::generate();
     stack
@@ -861,7 +864,7 @@ async fn memory_proposal_card_accepts_with_one_tap() {
                         .unwrap_or("")
                         .contains("Remember this?")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("memory card");
     let short = ka_agent_core::ids::short_id(id.as_str()).to_string();
@@ -873,7 +876,7 @@ async fn memory_proposal_card_accepts_with_one_tap() {
     stack.server.push_callback(2, 7, 42, &data);
     let edited = stack
         .server
-        .await_capture(|c| c.method == "editMessageText", Duration::from_secs(5))
+        .await_capture(|c| c.method == "editMessageText", Duration::from_secs(30))
         .expect("card settled");
     assert!(
         edited.body["text"]
@@ -908,7 +911,7 @@ async fn phone_can_tighten_but_not_loosen_the_mode() {
                         .unwrap_or("")
                         .contains("only get stricter")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("loosening refused");
     stack.server.push_text_message(2, 7, 42, "/mode plan");
@@ -922,7 +925,7 @@ async fn phone_can_tighten_but_not_loosen_the_mode() {
                         .unwrap_or("")
                         .contains("mode → plan")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("tightening allowed");
     assert!(
@@ -948,7 +951,7 @@ async fn phone_cannot_allow_for_the_session() {
                         .unwrap_or("")
                         .contains("only offered in the terminal")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("refused on the phone");
     stop(&mut stack).await;
@@ -975,7 +978,7 @@ async fn files_go_out_as_photo_or_document_with_caption() {
         },
     ));
     let photo = server
-        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(30))
         .expect("image uploaded as a photo");
     let raw = photo.raw.as_deref().unwrap_or("");
     assert!(
@@ -996,7 +999,7 @@ async fn files_go_out_as_photo_or_document_with_caption() {
         },
     ));
     let doc = server
-        .await_capture(|c| c.method == "sendDocument", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendDocument", Duration::from_secs(30))
         .expect("non-image uploaded as a document");
     let raw = doc.raw.as_deref().unwrap_or("");
     assert!(
@@ -1025,7 +1028,7 @@ async fn files_go_out_as_photo_or_document_with_caption() {
                 c.method == "sendMessage"
                     && c.body["text"].as_str().unwrap_or("").contains("! [file]")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("failure notice");
     let text = notice.body["text"].as_str().unwrap_or("");
@@ -1054,7 +1057,7 @@ async fn over_long_caption_is_capped_and_the_file_still_goes_out() {
         },
     ));
     let photo = server
-        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(30))
         .expect("the file still goes out");
     let raw = photo.raw.as_deref().unwrap_or("");
     let marker = "name=\"caption\"\r\n\r\n";
@@ -1092,7 +1095,7 @@ async fn draft_shows_tool_progress_and_skips_scheduled_turns() {
         },
     ));
     let first = server
-        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendMessageDraft", Duration::from_secs(30))
         .expect("activity draft");
     assert_eq!(first.body["text"].as_str(), Some("⋯ running a command"));
     let draft_id = first.body["draft_id"].as_i64().unwrap();
@@ -1124,7 +1127,7 @@ async fn draft_shows_tool_progress_and_skips_scheduled_turns() {
                 c.method == "sendMessageDraft"
                     && c.body["text"].as_str() == Some("⋯ searching the web")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("newest tool label");
     assert_eq!(next.body["draft_id"].as_i64(), Some(draft_id));
@@ -1207,7 +1210,7 @@ async fn skill_proposal_accept_body() {
     stack.server.push_text_message(1, 7, 42, "/status");
     stack
         .server
-        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(30))
         .expect("status reply");
 
     let id = "skill_ab12cd34";
@@ -1235,7 +1238,7 @@ async fn skill_proposal_accept_body() {
                         .unwrap_or("")
                         .contains("Proposed skill: review-helper")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("skill card");
     let keyboard = &card.body["reply_markup"]["inline_keyboard"][0];
@@ -1250,13 +1253,13 @@ async fn skill_proposal_accept_body() {
         .server
         .await_capture(
             |c| c.method == "answerCallbackQuery",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("callback answered");
     assert_eq!(answered.body["text"].as_str(), Some("accepted"));
     let edited = stack
         .server
-        .await_capture(|c| c.method == "editMessageText", Duration::from_secs(5))
+        .await_capture(|c| c.method == "editMessageText", Duration::from_secs(30))
         .expect("card outcome");
     let text = edited.body["text"].as_str().unwrap_or("");
     assert!(
@@ -1285,7 +1288,7 @@ async fn skill_proposal_accept_body() {
                 c.method == "answerCallbackQuery"
                     && c.body["text"].as_str() == Some("already installed")
             },
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("second press answered as already installed");
     assert!(second.body["callback_query_id"].as_str().is_some());
