@@ -85,8 +85,17 @@ Ka Agent isn't set up yet. Start here:
 /// needs one: a missing file is "not set up yet", never an I/O error.
 pub(crate) fn config_problem(path: &std::path::Path, err: &dyn std::fmt::Display) -> String {
     if path.exists() {
+        let text = err.to_string();
+        // `unknown field \`name\``: point at the closest registered key
+        let hint = text
+            .split("unknown field `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .and_then(ka_agent_core::config_keys::suggest)
+            .map(|near| format!("\ndid you mean `{near}`?"))
+            .unwrap_or_default();
         format!(
-            "ka-agent: config {} is invalid: {err}\nfix it with `ka-agent config edit`",
+            "ka-agent: config {} is invalid: {text}{hint}\nfix it with `ka-agent config edit`",
             path.display()
         )
     } else {
@@ -313,6 +322,10 @@ fn main() -> std::process::ExitCode {
             ConfigAction::Edit { config: cfg2 } => config_cli::config(
                 config_cli::ConfigCommand::Edit,
                 config_path(&cfg2.or(config)),
+            ),
+            ConfigAction::Schema { json } => config_cli::config(
+                config_cli::ConfigCommand::Schema { json },
+                config_path(&config),
             ),
         },
         Command::Service { action, config } => {

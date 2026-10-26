@@ -39,60 +39,25 @@ impl Runtime {
     /// with the new settings; a running turn finishes on the old ones.
     pub async fn reload_config(&self, new: DaemonConfig, restart_worker: bool) -> ReloadReport {
         let old = self.cfg();
-        let live_fields = [
-            ("model", differs(&old.model, &new.model)),
-            ("mode", differs(&old.mode, &new.mode)),
-            (
-                "ka.engine_layer",
-                differs(&old.ka.engine_layer, &new.ka.engine_layer),
-            ),
-            ("search", differs(&old.search, &new.search)),
-            ("fallback", differs(&old.fallback, &new.fallback)),
-            ("mcp", differs(&old.mcp, &new.mcp)),
-            ("approvals", differs(&old.approvals, &new.approvals)),
-            (
-                "approval_ttl_secs",
-                differs(&old.approval_ttl_secs, &new.approval_ttl_secs),
-            ),
-            (
-                "turn_grace_secs",
-                differs(&old.turn_grace_secs, &new.turn_grace_secs),
-            ),
-            (
-                "worker_idle_timeout_secs",
-                differs(&old.worker_idle_timeout_secs, &new.worker_idle_timeout_secs),
-            ),
-            (
-                "worker_restart",
-                differs(&old.worker_restart, &new.worker_restart),
-            ),
-            ("budgets", differs(&old.budgets, &new.budgets)),
-            ("timezone", differs(&old.timezone, &new.timezone)),
-            ("calendar", differs(&old.calendar, &new.calendar)),
-            ("notify", differs(&old.notify, &new.notify)),
-        ];
-        let restart_fields = [
-            ("workspace", differs(&old.workspace, &new.workspace)),
-            ("telegram", differs(&old.telegram, &new.telegram)),
-            ("matrix", differs(&old.matrix, &new.matrix)),
-            ("web", differs(&old.web, &new.web)),
-            // The phone channels build their transcriber at start.
-            ("voice", differs(&old.voice, &new.voice)),
-        ];
-        let names = |fields: &[(&str, bool)]| -> Vec<String> {
-            fields
-                .iter()
-                .filter(|(_, c)| *c)
-                .map(|(n, _)| n.to_string())
-                .collect()
-        };
+        let changed = ka_agent_core::config_keys::changed(&old, &new);
         let report = ReloadReport {
-            applied: names(&live_fields),
-            restart_required: names(&restart_fields),
+            applied: changed
+                .iter()
+                .filter(|k| k.apply != ka_agent_core::config_keys::Apply::Restart)
+                .map(|k| k.path.to_string())
+                .collect(),
+            restart_required: changed
+                .iter()
+                .filter(|k| k.apply == ka_agent_core::config_keys::Apply::Restart)
+                .map(|k| k.path.to_string())
+                .collect(),
         };
-        // model, mode, engine layer, search, fallback, mcp, approvals: all shape the
-        // engine the worker was spawned with.
-        let engine_changed = live_fields[..7].iter().any(|(_, c)| *c);
+        // Worker-class keys shape the engine the worker was spawned
+        // with: stop an idle one so the next message starts fresh (a
+        // running turn finishes on the old settings).
+        let engine_changed = changed
+            .iter()
+            .any(|k| k.apply == ka_agent_core::config_keys::Apply::Worker);
         {
             let mut g = self.lock();
             g.budget.daily_usd_cap = new.budgets.daily_usd;
@@ -100,10 +65,91 @@ impl Runtime {
         }
         publish_timezone(&self.sh.store, &new);
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
+        // remember the file's current mtime: the hot-reload watcher must
+        // not re-announce this swap (config set / IPC reload land here)
+        self.remember_config_mtime();
         if restart_worker || engine_changed {
             self.stop_idle_worker().await;
         }
         report
+    }
+
+    /// Record the config file's current mtime as "seen" (called by every
+    /// reload path), and return the previous value for the watcher.
+    fn remember_config_mtime(&self) {
+        let Some(path) = self.config_path() else {
+            return;
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        *self
+            .sh
+            .config_mtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mtime;
+    }
+
+    /// One hot-reload check (each maintenance tick): a config file whose
+    /// mtime moved is reloaded — a valid file applies live (with one
+    /// notice naming what changed), an invalid one keeps the running
+    /// settings and notices the error once per distinct text.
+    pub async fn watch_config_file(&self) {
+        let Some(path) = self.config_path() else {
+            return;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return;
+        };
+        let seen = *self
+            .sh
+            .config_mtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if seen == Some(mtime) {
+            return;
+        }
+        match DaemonConfig::load(&path) {
+            Ok(new) => {
+                let report = self.reload_config(new, false).await;
+                let mut line = String::from("config reloaded");
+                if !report.applied.is_empty() {
+                    line.push_str(&format!(" · applied: {}", report.applied.join(", ")));
+                }
+                if !report.restart_required.is_empty() {
+                    line.push_str(&format!(
+                        " · restart needed: {}",
+                        report.restart_required.join(", ")
+                    ));
+                }
+                self.sh.surface.on_notice(&line);
+                // persist the last good reload for doctor/status
+                let _ = self.sh.store.meta_set("config.reload_error", "");
+            }
+            Err(e) => {
+                let msg =
+                    format!("config.toml has an error — still running the previous settings: {e}");
+                let already = self
+                    .sh
+                    .store
+                    .meta_get("config.reload_error")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if already != msg {
+                    self.sh.surface.on_notice(&msg);
+                    let _ = self.sh.store.meta_set("config.reload_error", &msg);
+                }
+                // do not reload, and do not re-check until the file moves
+                // again: park the mtime so the notice fires once
+                *self
+                    .sh
+                    .config_mtime
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(mtime);
+            }
+        }
     }
 
     /// The model's provider key state against the engine `.env` (the

@@ -443,6 +443,12 @@ pub(crate) enum ConfigAction {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// List every config key: type, default, how a change applies.
+    Schema {
+        /// Emit the registry as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

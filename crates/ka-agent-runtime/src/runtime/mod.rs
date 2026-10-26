@@ -137,15 +137,14 @@ struct Shared {
     >,
     /// Wakes the scheduler when a task is scheduled sooner than its sleep.
     scheduler_tick: tokio::sync::Notify,
+    /// The config file's mtime as last seen by the runtime (any reload
+    /// updates it): the maintenance loop's hot-reload watcher compares
+    /// against it so IPC-triggered reloads are not announced twice.
+    config_mtime: Mutex<Option<std::time::SystemTime>>,
 }
 
 fn cfg_of(sh: &Shared) -> Arc<DaemonConfig> {
     Arc::clone(&sh.cfg.read().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// Field comparison for config sections that only derive `Debug`.
-fn differs<T: std::fmt::Debug>(a: &T, b: &T) -> bool {
-    format!("{a:?}") != format!("{b:?}")
 }
 
 /// Whether the engine can resolve the configured model's provider key.
@@ -276,6 +275,7 @@ impl Runtime {
                 selector_cache: Mutex::new(None),
                 env_cache: Mutex::new(None),
                 scheduler_tick: tokio::sync::Notify::new(),
+                config_mtime: Mutex::new(None),
                 inner: Mutex::new(Inner {
                     session,
                     session_allow: std::collections::HashSet::new(),

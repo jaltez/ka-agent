@@ -15,7 +15,16 @@ pub enum ConfigCommand {
     Get { key: String },
     Set { key: String, value: String },
     Unset { key: String },
+    Schema { json: bool },
     Edit,
+}
+
+/// `unknown key \`x\` — did you mean \`y\`?` against the registry.
+fn unknown_key(key: &str) -> String {
+    match ka_agent_core::config_keys::suggest(key) {
+        Some(near) => format!("unknown key `{key}` — did you mean `{near}`?"),
+        None => format!("unknown key `{key}` — `ka-agent config schema` lists every key"),
+    }
 }
 
 fn not_created(path: &Path) -> String {
@@ -119,6 +128,10 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 std::process::ExitCode::FAILURE
             }
         },
+        ConfigCommand::Get { key } if ka_agent_core::config_keys::lookup(&key).is_none() => {
+            eprintln!("ka-agent: {}", unknown_key(&key));
+            std::process::ExitCode::FAILURE
+        }
         ConfigCommand::Get { key } => match ka_agent_core::config_file::get(&config, &key) {
             Ok(Some(value)) => {
                 println!("{value}");
@@ -133,6 +146,12 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 std::process::ExitCode::FAILURE
             }
         },
+        ConfigCommand::Set { key, value: _ }
+            if ka_agent_core::config_keys::lookup(&key).is_none() =>
+        {
+            eprintln!("ka-agent: {}", unknown_key(&key));
+            std::process::ExitCode::FAILURE
+        }
         ConfigCommand::Set { key, value } => {
             if let Err(e) = check_selectors(&key, &value) {
                 eprintln!("ka-agent: {e}");
@@ -155,6 +174,10 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 }
             }
         }
+        ConfigCommand::Unset { key } if ka_agent_core::config_keys::lookup(&key).is_none() => {
+            eprintln!("ka-agent: {}", unknown_key(&key));
+            std::process::ExitCode::FAILURE
+        }
         ConfigCommand::Unset { key } => match ka_agent_core::config_file::unset(&config, &key) {
             Ok(_) => {
                 println!("removed {key}");
@@ -165,8 +188,52 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 std::process::ExitCode::FAILURE
             }
         },
+        ConfigCommand::Schema { json } => schema(json),
         ConfigCommand::Edit => edit(&config, &paths),
     }
+}
+
+/// `config schema`: one row per registered key, or the registry as JSON.
+fn schema(json: bool) -> std::process::ExitCode {
+    use ka_agent_core::config_keys::{Apply, KEYS, Kind};
+    if json {
+        let rows: Vec<serde_json::Value> = KEYS
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "path": k.path,
+                    "type": k.kind.label(),
+                    "default": k.default,
+                    "applies": k.apply.label(),
+                    "web": k.web,
+                    "doc": k.doc,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_default()
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    for k in KEYS {
+        let kind = match k.kind {
+            Kind::Int { min, max } => format!("int {min}..={max}"),
+            Kind::Float { min } => format!("float ≥ {min}"),
+            Kind::Enum(vals) => format!("enum {}", vals.join("|")),
+            other => other.label().to_string(),
+        };
+        println!(
+            "{} · {} · default {} · applies {} · {}",
+            k.path,
+            kind,
+            k.default,
+            k.apply.label(),
+            k.doc
+        );
+        let _ = Apply::Live;
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// `$VISUAL`/`$EDITOR` (else nano/notepad) on a copy, validated, then
