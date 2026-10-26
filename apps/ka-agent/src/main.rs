@@ -13,6 +13,7 @@ mod daemon;
 mod dashboard;
 mod doctor;
 mod grant;
+mod guard;
 mod host;
 mod identity;
 mod import_cli;
@@ -200,6 +201,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        Command::Guard => guard::run(),
         Command::McpBridge => match bridge::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {

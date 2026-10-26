@@ -197,6 +197,21 @@ impl Host {
         )
         .map_err(|e| format!("ka-agent: runtime init failed: {e}"))?;
         runtime.set_config_path(config.to_path_buf());
+        // Approval profile: reads, proposals and local writes never ask.
+        // The app owns the tool registry, so it computes the exact names
+        // (engine-visible `kagent__*` + granted web_search) once at start.
+        {
+            let mut names: Vec<String> = ka_agent_channels::tools::BUILTINS
+                .iter()
+                .filter(|t| ka_agent_channels::tools::auto_allowed(t.effect))
+                .map(|t| format!("kagent__{}", t.name))
+                .collect();
+            names.extend(ka_agent_channels::tools::plugins::auto_allow_names(&paths));
+            if cfg.search.is_some() {
+                names.push("web_search".to_string());
+            }
+            runtime.set_auto_allow(names);
+        }
         // No-agent cron handlers (M11): the calendar digest runs without the
         // engine. Registered right after the runtime exists, before any tick.
         {

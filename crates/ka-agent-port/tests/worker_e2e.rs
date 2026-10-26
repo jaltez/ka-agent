@@ -37,6 +37,8 @@ impl Env {
             state_dir: self.root.join("state"),
             cache_dir: self.root.join("cache"),
             agent_data_root: self.root.clone(),
+            guard_write: Vec::new(),
+            guard_read: Vec::new(),
         }
     }
 
@@ -67,6 +69,7 @@ impl Env {
             binary: PathBuf::from(env!("CARGO_BIN_EXE_ka-port-test-worker")),
             worker_args: Vec::new(),
             scenario,
+            auto_allow: Vec::new(),
         }
     }
 }

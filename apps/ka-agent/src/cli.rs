@@ -263,6 +263,8 @@ pub(crate) enum Command {
         scenario: Option<PathBuf>,
     },
     /// Hidden: the MCP bridge the Ka engine spawns as `kagent`.
+    #[command(name = "__guard", hide = true)]
+    Guard,
     #[command(name = "__mcp", hide = true)]
     McpBridge,
     /// Manage tool grants (what the agent may reach: hosts, repos, …).

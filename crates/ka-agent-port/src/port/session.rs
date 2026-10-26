@@ -145,6 +145,7 @@ impl PortSession {
                 mode: req.mode,
                 engine_layer_toml: req.engine_layer_toml,
                 scenario: req.scenario,
+                auto_allow: req.auto_allow,
             })
             .await?;
 

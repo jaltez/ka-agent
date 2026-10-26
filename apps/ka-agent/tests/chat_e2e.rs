@@ -74,6 +74,28 @@ fn spawn_chat_cfg(root: &std::path::Path, scenario: &std::path::Path, extra: &st
 }
 
 impl Chat {
+    /// Wrap an already-spawned child (stdout piped).
+    fn from_child(mut child: Child) -> Self {
+        let rx = {
+            let out = child.stdout.take().unwrap();
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(out).lines() {
+                    let Ok(line) = line else { break };
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            rx
+        };
+        Chat {
+            child,
+            rx,
+            seen: std::cell::RefCell::new(String::new()),
+        }
+    }
+
     fn send(&mut self, line: &str) {
         let stdin = self.child.stdin.as_mut().unwrap();
         stdin.write_all(format!("{line}\n").as_bytes()).unwrap();
@@ -207,6 +229,116 @@ fn simple_turn_and_status() {
     chat.expect("queue 0", Duration::from_secs(10));
     chat.expect("worker:", Duration::from_secs(10));
     chat.expect("crashes ", Duration::from_secs(10));
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 2.3 approval profile: a read-tier kagent tool never asks, so a guarded
+/// session leaves no approval row behind.
+#[test]
+fn read_tools_never_ask_in_guarded_mode() {
+    let root = temp_root("profile-read");
+    let sc = scenario_file(
+        &root,
+        "read.json",
+        r#"{ "steps": [
+            {"call": {"tool": "kagent__history_search", "args": {"query": "anything"}}},
+            {"text": "searched without asking"}
+        ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("look something up");
+    chat.expect("searched without asking", Duration::from_secs(60));
+    assert!(
+        !chat.transcript().contains("approve:"),
+        "a read-tier tool must not ask: {}",
+        chat.transcript()
+    );
+    let conn = rusqlite::Connection::open(root.join("data/state.db")).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "no approval row for a read-tier tool");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 2.3 self-protection: the engine cannot write ka-agent's own config, even
+/// with a relative path that no raw-path rule could match.
+#[test]
+fn engine_cannot_write_ka_agents_own_config() {
+    let root = temp_root("guard-write");
+    let data = root.join("data");
+    std::fs::create_dir_all(data.join("ws")).unwrap();
+    let cfg = data.join("config.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "workspace = {:?}\nmode = \"guarded\"\nturn_grace_secs = 5\n",
+            data.join("ws").display().to_string()
+        ),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&cfg).unwrap();
+    // The engine's gate already refuses a plain `../` write as outside the
+    // workspace; the guard's job is the case the gate cannot see: a
+    // symlinked directory INSIDE the workspace that points at a protected
+    // path. Only the hook's canonicalization catches it.
+    std::fs::create_dir_all(data.join("secrets")).unwrap();
+    std::fs::write(data.join("secrets/keep.txt"), "ORIGINAL\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(data.join("secrets"), data.join("ws/sneaky")).unwrap();
+    let sc = scenario_file(
+        &root,
+        "guard.json",
+        r#"{ "steps": [
+            {"call": {"tool": "write", "args": {"path": "sneaky/keep.txt", "content": "HACKED"}}},
+            {"text": "write was blocked"}
+        ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("chat")
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--scenario")
+        .arg(&sc)
+        .env("KA_AGENT_DATA_DIR", &data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut chat = Chat::from_child(child);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("try to edit your config");
+    // The tool result (the guard's reason) rides the strand, not the chat
+    // UI (tool rows arrive with the inline client).
+    chat.expect("write was blocked", Duration::from_secs(60));
+    assert_eq!(
+        std::fs::read_to_string(data.join("secrets/keep.txt")).unwrap(),
+        "ORIGINAL\n",
+        "the secret behind the symlink must be untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        before,
+        "the config file must be untouched"
+    );
+    let strands = data.join("ka/strands");
+    let mut strand = None;
+    for entry in std::fs::read_dir(&strands).unwrap().flatten() {
+        for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+            if file.path().extension().is_some_and(|e| e == "jsonl") {
+                strand = Some(file.path());
+            }
+        }
+    }
+    let jsonl = std::fs::read_to_string(strand.expect("a strand file")).unwrap();
+    assert!(
+        jsonl.contains("protected: ka-agent's own files"),
+        "the guard's reason must reach the model:\n{jsonl}"
+    );
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }

@@ -414,6 +414,40 @@ impl DaemonConfig {
         if self.workspace.as_os_str().is_empty() {
             return Err(Error::Validate("workspace must not be empty".into()));
         }
+        // The workspace is what the engine may write freely; ka-agent's own
+        // files are guarded by path. A workspace that overlaps them either
+        // way round would fight the guard (or starve the engine) — refuse.
+        {
+            let base = crate::layout::base_dir();
+            let data = crate::layout::default_root();
+            let protected = [
+                data.join("config.toml"),
+                data.join("state.db"),
+                data.join("secrets"),
+                data.join("memory"),
+                data.join("engine-home"),
+                data.join("engine-state"),
+                data.join("ka"),
+                data.join("backups"),
+                data.join("logs"),
+                base.join("config.toml"),
+                base.join("active_profile"),
+                base.join("skills"),
+            ];
+            let ws = self.workspace_path();
+            // canonical when it exists; lexical fallback otherwise
+            let ws = std::fs::canonicalize(&ws).unwrap_or(ws);
+            for p in &protected {
+                let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                if ws == p || ws.starts_with(&p) || p.starts_with(&ws) {
+                    return Err(Error::Validate(format!(
+                        "workspace {} overlaps ka-agent's own files ({}) — pick a directory outside the data and profile roots",
+                        ws.display(),
+                        p.display()
+                    )));
+                }
+            }
+        }
         if let Some(usd) = self.budgets.daily_usd
             && usd <= 0.0
         {

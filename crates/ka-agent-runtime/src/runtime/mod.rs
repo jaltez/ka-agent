@@ -168,6 +168,9 @@ struct Shared {
     persona_mtime: Mutex<Option<std::time::SystemTime>>,
     /// When this runtime woke up (ms since epoch), for the header.
     started_ms: i64,
+    /// Exact tool names that never ask (the app computes this from the
+    /// tool registry and sets it at host start).
+    auto_allow: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -321,6 +324,7 @@ impl Runtime {
                 config_mtime: Mutex::new(None),
                 persona_mtime: Mutex::new(None),
                 started_ms: ka_agent_core::now_ms(),
+                auto_allow: Mutex::new(Vec::new()),
                 inner: Mutex::new(Inner {
                     session,
                     session_allow: std::collections::HashSet::new(),
@@ -540,6 +544,72 @@ impl Runtime {
             .live
             .as_ref()
             .and_then(|l| l.current_turn_source.clone())
+    }
+
+    /// Ka-agent's own files the engine may never write (the `__guard`
+    /// list): the live config, store, secrets, memory, engine homes and
+    /// every other profile root.
+    fn guard_write_paths(&self) -> Vec<std::path::PathBuf> {
+        let root = self.sh.paths.root();
+        let base = ka_agent_core::layout::base_dir();
+        let mut out = vec![
+            root.join("config.toml"),
+            root.join("state.db"),
+            root.join("state.db-wal"),
+            root.join("state.db-shm"),
+            root.join("admin.token"),
+            root.join("secrets"),
+            root.join("memory"),
+            root.join("engine-home"),
+            root.join("engine-state"),
+            root.join("ka"),
+            root.join("backups"),
+            root.join("logs"),
+            base.join("config.toml"),
+            base.join("active_profile"),
+            base.join("skills"),
+        ];
+        if let Ok(entries) = std::fs::read_dir(base.join("profiles")) {
+            for e in entries.flatten() {
+                out.push(e.path());
+            }
+        }
+        out
+    }
+
+    /// Files the engine may never read: the secret store, the admin token,
+    /// the engine `.env` and every other profile's secrets.
+    fn guard_read_paths(&self) -> Vec<std::path::PathBuf> {
+        let root = self.sh.paths.root();
+        let base = ka_agent_core::layout::base_dir();
+        let mut out = vec![
+            root.join("secrets"),
+            root.join("admin.token"),
+            self.sh.paths.engine_home().join(".config/ka/.env"),
+        ];
+        if let Ok(entries) = std::fs::read_dir(base.join("profiles")) {
+            for e in entries.flatten() {
+                let secrets = e.path().join("secrets");
+                if e.path() != root {
+                    out.push(secrets);
+                }
+            }
+        }
+        out
+    }
+
+    /// Register the approval profile: exact tool names the engine never
+    /// asks about (reads, proposals, local writes, granted search).
+    pub fn set_auto_allow(&self, names: Vec<String>) {
+        *self.sh.auto_allow.lock().unwrap_or_else(|e| e.into_inner()) = names;
+    }
+
+    fn auto_allow(&self) -> Vec<String> {
+        self.sh
+            .auto_allow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Sequence and fan out one event to every surface.

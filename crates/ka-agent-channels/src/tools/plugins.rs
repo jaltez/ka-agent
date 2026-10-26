@@ -19,7 +19,7 @@ pub struct LoadedPlugin {
 
 /// Enabled plugin tools as MCP tool definitions (generic v1 argument
 /// schema: the manifest declares names, effects and scopes).
-pub(crate) async fn list(ctx: &ToolCtx) -> Vec<Value> {
+pub async fn list(ctx: &ToolCtx) -> Vec<Value> {
     let root = ctx.paths.root().to_path_buf();
     tokio::task::spawn_blocking(move || {
         let (plugins, refused) = load_plugins_at(&root);
@@ -69,7 +69,7 @@ pub(crate) async fn call(ctx: &ToolCtx, name: &str, args: Value) -> Result<Strin
     .map_err(|e| format!("plugin task: {e}"))?
 }
 
-pub(crate) async fn effect_of(ctx: &ToolCtx, name: &str) -> Effect {
+pub async fn effect_of(ctx: &ToolCtx, name: &str) -> Effect {
     let root = ctx.paths.root().to_path_buf();
     let name = name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -97,6 +97,22 @@ fn sha256_of(args: &Value) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     h.finish()
+}
+
+/// Engine-visible names of plugin tools whose effect never asks (the
+/// approval profile), computed synchronously for host start-up.
+pub fn auto_allow_names(paths: &ka_agent_runtime::paths::Paths) -> Vec<String> {
+    let (plugins, _) = load_plugins_at(paths.root());
+    plugins
+        .iter()
+        .flat_map(|p| {
+            p.manifest
+                .tools
+                .iter()
+                .filter(|t| t.effect == "read")
+                .map(|t| format!("kagent__{}", t.name))
+        })
+        .collect()
 }
 
 /// `load_plugins` with the data root passed in (the daemon has Paths).

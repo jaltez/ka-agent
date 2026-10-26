@@ -61,6 +61,8 @@ impl Runtime {
                 state_dir: self.sh.paths.engine_state(),
                 cache_dir: self.sh.paths.engine_cache(),
                 agent_data_root: self.sh.paths.root().to_path_buf(),
+                guard_write: self.guard_write_paths(),
+                guard_read: self.guard_read_paths(),
             };
             let user_layer = cfg
                 .engine_layer_path()
@@ -90,6 +92,7 @@ impl Runtime {
             binary: self.sh.port.binary.clone(),
             worker_args: vec!["__worker".to_string()],
             scenario: None,
+            auto_allow: self.auto_allow(),
         };
         let opened = match self.sh.port.open(req.clone()).await {
             Ok(p) => p,

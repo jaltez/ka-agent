@@ -90,6 +90,11 @@ pub enum WorkerCommand {
         /// production).
         #[serde(default)]
         scenario: Option<PathBuf>,
+        /// Exact tool names that never ask (the approval profile: reads,
+        /// proposals and local writes). Inserted as allow rules ahead of
+        /// every other rule.
+        #[serde(default)]
+        auto_allow: Vec<String>,
     },
     /// One prompt: text plus optional images and per-turn skills.
     Submit {
@@ -205,6 +210,7 @@ mod tests {
         assert_eq!(
             open,
             WorkerCommand::Open {
+                auto_allow: Vec::new(),
                 workspace: "/w".into(),
                 strand: StrandSel::New,
                 model: None,
@@ -224,6 +230,7 @@ mod tests {
     #[test]
     fn every_command_round_trips() {
         round_trip(&WorkerCommand::Open {
+            auto_allow: Vec::new(),
             workspace: "/home/op/work".into(),
             strand: StrandSel::Path("/data/strands/s1-x.jsonl".into()),
             model: Some("anthropic/claude-sonnet-4-5".into()),
@@ -232,6 +239,7 @@ mod tests {
             scenario: Some("/tmp/scen.json".into()),
         });
         round_trip(&WorkerCommand::Open {
+            auto_allow: Vec::new(),
             workspace: "/w".into(),
             strand: StrandSel::New,
             model: None,

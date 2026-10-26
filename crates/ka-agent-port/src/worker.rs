@@ -144,13 +144,20 @@ async fn worker_main(run: WorkerRun) -> Result<(), String> {
                     }
                 };
                 match cmd {
-                    WorkerCommand::Open { workspace, strand, model, mode, engine_layer_toml, scenario } => {
+                    WorkerCommand::Open { workspace, strand, model, mode, engine_layer_toml, scenario, auto_allow } => {
                         if engine.is_some() {
                             let msg = "open: engine already open".to_string();
                             out.emit(WorkerEvent::Fatal { message: msg.clone() }).await;
                             return Err(msg);
                         }
-                        match open_engine(&workspace, &strand, model, mode, engine_layer_toml, scenario, &run).await {
+                        let overlay = OpenOverlay {
+                            model,
+                            mode,
+                            engine_layer_toml,
+                            scenario,
+                            auto_allow: &auto_allow,
+                        };
+                        match open_engine(&workspace, &strand, overlay, &run).await {
                             Ok((meta, commands, events)) => {
                                 engine = Some(meta);
                                 engine_cmds = Some(commands);
@@ -281,16 +288,30 @@ fn mode_word(mode: Mode) -> &'static str {
     }
 }
 
-/// Compose the engine config and spawn the engine for one `open`.
-async fn open_engine(
-    workspace: &Path,
-    strand: &StrandSel,
+/// The per-open overlay inputs (kept together: the engine config chain is
+/// one concern).
+struct OpenOverlay<'a> {
     model: Option<String>,
     mode: Option<String>,
     engine_layer_toml: Option<String>,
     scenario: Option<PathBuf>,
+    auto_allow: &'a [String],
+}
+
+/// Compose the engine config and spawn the engine for one `open`.
+async fn open_engine(
+    workspace: &Path,
+    strand: &StrandSel,
+    overlay: OpenOverlay<'_>,
     run: &WorkerRun,
 ) -> Result<(EngineMeta, Sender<Command>, Receiver<Event>), String> {
+    let OpenOverlay {
+        model,
+        mode,
+        engine_layer_toml,
+        scenario,
+        auto_allow,
+    } = overlay;
     // Config chain: ka defaults < engine layer < security overlay (always
     // last, always wins — SEED §3.4).
     let mut cfg = ka_engine::Config::default();
@@ -317,6 +338,36 @@ async fn open_engine(
         cfg.features.disable.push("tool:remember".to_string());
     }
     cfg.cwd = Some(workspace.to_string_lossy().into_owned());
+
+    // Approval profile: reads, proposals and local writes never ask. Exact
+    // tool-name allow rules sit ahead of every other rule (first match
+    // wins), so the operator's [[rules]] cannot re-open an ask for them.
+    for name in auto_allow.iter().rev() {
+        cfg.rules.insert(
+            0,
+            ka_engine::config::Rule {
+                tool: name.clone(),
+                pattern: None,
+                verdict: ka_engine::config::Verdict::Allow,
+            },
+        );
+    }
+    // Self-protection: ka-agent's own files (config, store, secrets,
+    // memory, other profiles) are off limits to the engine's file tools,
+    // which pattern rules cannot express (`../config.toml` never matches a
+    // raw-path pattern). The guard reads the protected lists from the
+    // worker env; both lists ride the pre_tool_use hook contract.
+    if std::env::var_os("KA_AGENT_GUARD_WRITE").is_some()
+        && let Ok(exe) = std::env::current_exe()
+    {
+        for tool in ["write", "edit", "read", "grep"] {
+            cfg.hooks.push(ka_engine::config::Hook {
+                event: ka_engine::config::HookEvent::PreToolUse,
+                tool: Some(tool.to_string()),
+                command: format!("{:?} __guard", exe),
+            });
+        }
+    }
 
     // The assistant's identity: the runtime compiles persona + house rules
     // into `<engine home>/.config/ka/IDENTITY.md` (HOME in this process);

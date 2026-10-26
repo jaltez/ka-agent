@@ -30,6 +30,10 @@ pub struct WorkerEnv {
     pub cache_dir: PathBuf,
     /// `KA_AGENT_DATA_DIR` for the worker and its spawned MCP bridge.
     pub agent_data_root: PathBuf,
+    /// Paths the engine's file tools may never write (`__guard` list).
+    pub guard_write: Vec<PathBuf>,
+    /// Paths the engine's file tools may never read (`__guard` list).
+    pub guard_read: Vec<PathBuf>,
 }
 
 /// Env-var name markers whose values are ambient operator credentials —
@@ -60,6 +64,16 @@ impl WorkerEnv {
             .env("XDG_CACHE_HOME", &self.cache_dir)
             .env("KA_DATA_DIR", &self.data_dir)
             .env("KA_AGENT_DATA_DIR", &self.agent_data_root);
+        if !self.guard_write.is_empty()
+            && let Ok(joined) = std::env::join_paths(&self.guard_write)
+        {
+            cmd.env("KA_AGENT_GUARD_WRITE", joined);
+        }
+        if !self.guard_read.is_empty()
+            && let Ok(joined) = std::env::join_paths(&self.guard_read)
+        {
+            cmd.env("KA_AGENT_GUARD_READ", joined);
+        }
     }
 }
 
@@ -85,6 +99,8 @@ pub struct OpenRequest {
     pub worker_args: Vec<String>,
     /// Scripted-speaker scenario (tests / e2e; `None` in production).
     pub scenario: Option<PathBuf>,
+    /// Exact tool names the approval profile never asks about.
+    pub auto_allow: Vec<String>,
 }
 
 impl Default for OpenRequest {
@@ -99,6 +115,7 @@ impl Default for OpenRequest {
             binary: PathBuf::new(),
             worker_args: Vec::new(),
             scenario: None,
+            auto_allow: Vec::new(),
         }
     }
 }
@@ -137,6 +154,8 @@ mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             agent_data_root: root.clone(),
+            guard_write: Vec::new(),
+            guard_read: Vec::new(),
         };
         let mut cmd = Command::new("env");
         env.sanitize(&mut cmd);
