@@ -17,9 +17,23 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A port that was free when checked and is unlikely to be handed out
+/// again: the tests run in parallel, so binding :0 and releasing it (the
+/// usual trick) can give two of them the same port before either daemon
+/// binds. Each call walks its own slice of 20000-31999, below the usual
+/// ephemeral range, and re-checks bindability.
 fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let slot = NEXT.fetch_add(1, Ordering::Relaxed) as u32;
+    let base = 20_000 + (std::process::id() % 400) * 10;
+    for i in 0..300 {
+        let port = (base + (slot * 37 + i) % 1_000) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in the test range");
 }
 
 struct Daemon {
