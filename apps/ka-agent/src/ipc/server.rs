@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ka_agent_core::DaemonConfig;
-use ka_agent_runtime::{EventBus, Runtime, SurfaceEvent};
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::{Envelope, EventBus, Runtime};
 
 use super::IpcStream;
 
@@ -103,7 +104,10 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
                     }
                 }
             }
-            (Some(_), Some("attach")) => return serve_attach(reader, w, ctx).await,
+            (Some(req), Some("attach")) => {
+                let since = req.get("since").and_then(|v| v.as_u64()).unwrap_or(0);
+                return serve_attach(reader, w, ctx, since).await;
+            }
             (Some(_), _) => serde_json::json!({"error": "unknown op"}),
             (None, _) => serde_json::json!({"error": "bad json"}),
         }
@@ -112,18 +116,26 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
     w.flush().await
 }
 
-/// `{"op":"attach"}`: a live terminal on the host's session. The server
-/// sends `hello` then every bus event; the client sends `say` lines that go
-/// through the shared command router exactly like a channel message.
+/// `{"op":"attach","since":N}`: a live terminal on the host's session. The
+/// server sends `hello`, then (when `since` names the last seq the client
+/// saw) the replayed gap, then every live envelope — one JSON line each,
+/// `seq` included. The client sends `say` lines that go through the shared
+/// command router exactly like a channel message.
 async fn serve_attach(
     mut reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
     mut w: tokio::net::unix::OwnedWriteHalf,
     ctx: AdminCtx,
+    since: u64,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     use tokio::sync::broadcast::error::RecvError;
-    // Subscribe before the hello so nothing between them is lost.
-    let mut sub = ctx.bus.subscribe();
+    // Subscribe (plus the replay snapshot) before the hello so nothing
+    // between the two is lost; `since` 0 is live only.
+    let (mut sub, replay) = if since > 0 {
+        ctx.bus.subscribe_since(since)
+    } else {
+        (ctx.bus.subscribe(), Vec::new())
+    };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
@@ -132,7 +144,7 @@ async fn serve_attach(
             }
         }
     });
-    let send = |tx: &tokio::sync::mpsc::UnboundedSender<String>, ev: &SurfaceEvent| -> bool {
+    let send = |tx: &tokio::sync::mpsc::UnboundedSender<String>, ev: &Envelope| -> bool {
         match serde_json::to_string(ev) {
             Ok(json) => tx.send(format!("{json}\n")).is_ok(),
             Err(_) => true,
@@ -142,29 +154,50 @@ async fn serve_attach(
         Ok(report) => {
             send(
                 &tx,
-                &SurfaceEvent::Hello {
-                    report: Box::new(report),
-                },
+                &Envelope::new(
+                    0,
+                    AgentEvent::Hello {
+                        report: Box::new(report),
+                    },
+                ),
             );
         }
         Err(e) => {
             send(
                 &tx,
-                &SurfaceEvent::Error {
-                    class: "internal".into(),
-                    message: format!("status: {e}"),
-                },
+                &Envelope::new(
+                    0,
+                    AgentEvent::Error {
+                        class: "internal".into(),
+                        message: format!("status: {e}"),
+                    },
+                ),
             );
+        }
+    }
+    // Events that raced the snapshot ride both the replay and the live
+    // stream; remember the last replayed seq and skip it live.
+    let mut last_sent = replay.last().map_or(0, |env| env.seq);
+    for env in replay {
+        if !send(&tx, &env) {
+            break;
         }
     }
     let fwd_tx = tx.clone();
     let forwarder = tokio::spawn(async move {
         loop {
             let ev = match sub.recv().await {
-                Ok(ev) => ev,
-                Err(RecvError::Lagged(n)) => SurfaceEvent::Notice {
-                    text: format!("(missed {n} events)"),
-                },
+                Ok(ev) if ev.seq > last_sent => {
+                    last_sent = ev.seq;
+                    ev
+                }
+                Ok(_) => continue,
+                Err(RecvError::Lagged(n)) => std::sync::Arc::new(Envelope::new(
+                    0,
+                    AgentEvent::Notice {
+                        text: format!("(missed {n} events)"),
+                    },
+                )),
                 Err(RecvError::Closed) => break,
             };
             if !send(&fwd_tx, &ev) {
@@ -186,9 +219,12 @@ async fn serve_attach(
             if let Ok(report) = ctx.runtime.status_report() {
                 send(
                     &tx,
-                    &SurfaceEvent::Hello {
-                        report: Box::new(report),
-                    },
+                    &Envelope::new(
+                        0,
+                        AgentEvent::Hello {
+                            report: Box::new(report),
+                        },
+                    ),
                 );
             }
             continue;
@@ -205,7 +241,7 @@ async fn serve_attach(
         }
         match ka_agent_channels::commands::route(&ctx.runtime, "console", text).await {
             ka_agent_channels::commands::Outcome::Reply(r) => {
-                send(&tx, &SurfaceEvent::Reply { text: r });
+                send(&tx, &Envelope::new(0, AgentEvent::Reply { text: r }));
             }
             ka_agent_channels::commands::Outcome::Silent => {}
             ka_agent_channels::commands::Outcome::NotACommand => {
@@ -215,10 +251,13 @@ async fn serve_attach(
                 if let Err(e) = ctx.runtime.handle_message(&expanded, "console").await {
                     send(
                         &tx,
-                        &SurfaceEvent::Error {
-                            class: "internal".into(),
-                            message: e.to_string(),
-                        },
+                        &Envelope::new(
+                            0,
+                            AgentEvent::Error {
+                                class: "internal".into(),
+                                message: e.to_string(),
+                            },
+                        ),
                     );
                 }
             }

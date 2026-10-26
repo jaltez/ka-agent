@@ -3,8 +3,8 @@
 //! approval cards wherever they are (Phase 6). Each channel still sends its
 //! own direct replies through its transport.
 
-use ka_agent_core::ApprovalStatus;
-use ka_agent_runtime::surface::{ApprovalCard, Surface};
+use ka_agent_runtime::Envelope;
+use ka_agent_runtime::surface::Surface;
 use std::sync::Arc;
 
 pub struct MultiSurface {
@@ -12,7 +12,7 @@ pub struct MultiSurface {
 }
 
 impl MultiSurface {
-    /// At least one surface is required; pass a `NullSurface` when no
+    /// At least one surface is required; pass a silent [`Surface`] when no
     /// channel is enabled so a channel-less daemon stays observable.
     pub fn new(inner: Vec<Arc<dyn Surface>>) -> Self {
         Self { inner }
@@ -20,81 +20,38 @@ impl MultiSurface {
 }
 
 impl Surface for MultiSurface {
-    fn on_turn_started(&self) {
+    fn emit(&self, ev: &Envelope) {
         for s in &self.inner {
-            s.on_turn_started();
+            s.emit(ev);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use ka_agent_runtime::event::AgentEvent;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<AgentEvent>>);
+    impl Surface for Rec {
+        fn emit(&self, ev: &Envelope) {
+            self.0.lock().unwrap().push(ev.ev.clone());
         }
     }
 
-    fn on_delta_text(&self, text: &str) {
-        for s in &self.inner {
-            s.on_delta_text(text);
-        }
-    }
-
-    fn on_delta_thought(&self, text: &str) {
-        for s in &self.inner {
-            s.on_delta_thought(text);
-        }
-    }
-
-    fn on_note(&self, text: &str) {
-        for s in &self.inner {
-            s.on_note(text);
-        }
-    }
-
-    fn on_notice(&self, text: &str) {
-        for s in &self.inner {
-            s.on_notice(text);
-        }
-    }
-
-    fn on_inbound(&self, source: &str, text: &str) {
-        for s in &self.inner {
-            s.on_inbound(source, text);
-        }
-    }
-
-    fn on_approval(&self, card: &ApprovalCard) {
-        for s in &self.inner {
-            s.on_approval(card);
-        }
-    }
-
-    fn on_approval_settled(&self, approval_id: &str, status: ApprovalStatus) {
-        for s in &self.inner {
-            s.on_approval_settled(approval_id, status);
-        }
-    }
-
-    fn on_memory_proposal(&self, id: &str, text: &str) {
-        for s in &self.inner {
-            s.on_memory_proposal(id, text);
-        }
-    }
-
-    fn on_final_chunk(&self, index: u32, text: &str) {
-        for s in &self.inner {
-            s.on_final_chunk(index, text);
-        }
-    }
-
-    fn on_error(&self, class: &str, message: &str) {
-        for s in &self.inner {
-            s.on_error(class, message);
-        }
-    }
-
-    fn on_turn_finished(&self, stop: &str, cost_usd: f64, tokens: u64) {
-        for s in &self.inner {
-            s.on_turn_finished(stop, cost_usd, tokens);
-        }
-    }
-
-    fn on_session_status(&self, status: ka_agent_core::SessionStatus) {
-        for s in &self.inner {
-            s.on_session_status(status);
-        }
+    #[test]
+    fn every_inner_surface_sees_every_envelope() {
+        let a = Arc::new(Rec::default());
+        let b = Arc::new(Rec::default());
+        let multi = MultiSurface::new(vec![a.clone() as Arc<dyn Surface>, b]);
+        let env = Envelope::new(1, AgentEvent::Notice { text: "hi".into() });
+        multi.emit(&env);
+        assert_eq!(
+            a.0.lock().unwrap().as_slice(),
+            &[AgentEvent::Notice { text: "hi".into() }]
+        );
     }
 }

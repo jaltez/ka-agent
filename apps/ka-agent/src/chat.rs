@@ -2,14 +2,15 @@
 //! background daemon runs, the chat attaches to it over the admin socket
 //! and shares its session with every channel; otherwise it runs a local
 //! runtime (holding the instance lock). Both modes render the same
-//! [`SurfaceEvent`] stream and send through the same command router.
+//! [`Envelope`] stream and send through the same command router.
 
 use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ka_agent_runtime::{SurfaceEvent, paths::Paths};
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::{Envelope, paths::Paths};
 use ka_agent_store::Store;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
@@ -23,9 +24,9 @@ const EOF_WAIT: Duration = Duration::from_secs(120);
 enum Backend {
     Local {
         host: crate::host::Host,
-        rx: broadcast::Receiver<SurfaceEvent>,
+        rx: broadcast::Receiver<std::sync::Arc<Envelope>>,
         /// Router replies and status answers, delivered before bus events.
-        pending: VecDeque<SurfaceEvent>,
+        pending: VecDeque<Envelope>,
     },
     Attached {
         lines: admin::AttachLines,
@@ -44,7 +45,7 @@ impl Backend {
 }
 
 enum Incoming {
-    Event(Box<SurfaceEvent>),
+    Event(std::sync::Arc<Envelope>),
     Lagged(u64),
     Closed,
 }
@@ -94,18 +95,18 @@ impl Backend {
                 // ahead of bus events broadcast before it (an EOF-time
                 // status answer, in particular).
                 match rx.try_recv() {
-                    Ok(ev) => return Incoming::Event(Box::new(ev)),
+                    Ok(ev) => return Incoming::Event(ev),
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
                         return Incoming::Lagged(n);
                     }
                     Err(broadcast::error::TryRecvError::Closed) => return Incoming::Closed,
                     Err(broadcast::error::TryRecvError::Empty) => {}
                 }
-                if let Some(ev) = pending.pop_front() {
-                    return Incoming::Event(Box::new(ev));
+                if let Some(env) = pending.pop_front() {
+                    return Incoming::Event(std::sync::Arc::new(env));
                 }
                 match rx.recv().await {
-                    Ok(ev) => Incoming::Event(Box::new(ev)),
+                    Ok(ev) => Incoming::Event(ev),
                     Err(broadcast::error::RecvError::Lagged(n)) => Incoming::Lagged(n),
                     Err(broadcast::error::RecvError::Closed) => Incoming::Closed,
                 }
@@ -113,8 +114,8 @@ impl Backend {
             Self::Attached { lines, .. } => loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        if let Ok(ev) = serde_json::from_str::<SurfaceEvent>(&line) {
-                            return Incoming::Event(Box::new(ev));
+                        if let Ok(env) = serde_json::from_str::<Envelope>(&line) {
+                            return Incoming::Event(std::sync::Arc::new(env));
                         }
                     }
                     Ok(None) | Err(_) => return Incoming::Closed,
@@ -130,7 +131,7 @@ impl Backend {
                 let (runtime, store) = (&host.runtime, &host.store);
                 match ka_agent_channels::commands::route(runtime, "console", text).await {
                     ka_agent_channels::commands::Outcome::Reply(r) => {
-                        pending.push_back(SurfaceEvent::Reply { text: r });
+                        pending.push_back(Envelope::new(0, AgentEvent::Reply { text: r }));
                     }
                     ka_agent_channels::commands::Outcome::Silent => {}
                     ka_agent_channels::commands::Outcome::NotACommand => {
@@ -138,10 +139,13 @@ impl Backend {
                             ka_agent_channels::refs::expand(store, &runtime.workspace(), text)
                                 .await;
                         if let Err(e) = runtime.handle_message(&expanded, "console").await {
-                            pending.push_back(SurfaceEvent::Error {
-                                class: "internal".into(),
-                                message: e.to_string(),
-                            });
+                            pending.push_back(Envelope::new(
+                                0,
+                                AgentEvent::Error {
+                                    class: "internal".into(),
+                                    message: e.to_string(),
+                                },
+                            ));
                         }
                     }
                 }
@@ -160,9 +164,12 @@ impl Backend {
         match self {
             Self::Local { host, pending, .. } => {
                 match host.runtime.status_report() {
-                    Ok(report) => pending.push_back(SurfaceEvent::Hello {
-                        report: Box::new(report),
-                    }),
+                    Ok(report) => pending.push_back(Envelope::new(
+                        0,
+                        AgentEvent::Hello {
+                            report: Box::new(report),
+                        },
+                    )),
                     Err(e) => return Err(e.to_string()),
                 }
                 Ok(())
@@ -275,37 +282,38 @@ impl Term {
     }
 }
 
-/// Print one event. The strings are the console's long-standing wording.
-fn render(ev: &SurfaceEvent, out: &mut Term) {
-    if !matches!(ev, SurfaceEvent::Delta { .. }) {
+/// Print one envelope. The strings are the console's long-standing wording.
+fn render(env: &Envelope, out: &mut Term) {
+    if !matches!(env.ev, AgentEvent::Delta { .. }) {
         out.settle();
     }
-    match ev {
-        SurfaceEvent::Hello { .. } => {}
-        SurfaceEvent::Reply { text } => println!("{text}"),
-        SurfaceEvent::Inbound { source, text } => {
+    match &env.ev {
+        AgentEvent::Hello { .. } => {}
+        AgentEvent::Reply { text } => println!("{text}"),
+        AgentEvent::Inbound { source, text } => {
             if source != "console" {
                 println!("\n» you ({source}): {text}");
             }
         }
-        SurfaceEvent::TurnStarted => {
+        AgentEvent::TurnStarted { .. } => {
             out.turn_started = Some(std::time::Instant::now());
             println!();
         }
-        SurfaceEvent::Delta { text } => out.delta(text),
-        SurfaceEvent::Note { text } => {
+        AgentEvent::Delta { text } => out.delta(text),
+        AgentEvent::Note { text } => {
             if out.color {
                 println!("\n\x1b[2m· {text}\x1b[0m");
             } else {
                 println!("\n· {text}");
             }
         }
-        SurfaceEvent::Notice { text } => println!("\n· {text}"),
-        SurfaceEvent::Approval {
+        AgentEvent::Notice { text } => println!("\n· {text}"),
+        AgentEvent::Approval {
             id,
             question,
             detail,
             expires_at_ms,
+            ..
         } => {
             println!(
                 "\n┌ approval {id} (expires in {})\n│ {question}",
@@ -318,13 +326,22 @@ fn render(ev: &SurfaceEvent, out: &mut Term) {
             }
             println!("└ approve: /y   deny: /n");
         }
-        SurfaceEvent::ApprovalSettled { id, status } => {
+        AgentEvent::ApprovalSettled { id, status } => {
             println!("\n· approval {id} → {status}");
         }
-        SurfaceEvent::TurnFinished {
+        // Today's wording: the old Surface default turned a proposal into
+        // a notice naming the two commands.
+        AgentEvent::MemoryProposal { id, text } => {
+            let short = ka_agent_core::ids::short_id(id);
+            println!(
+                "\n· 💡 remember this? {text}\n   /memory accept {short} · /memory reject {short}"
+            );
+        }
+        AgentEvent::TurnFinished {
             stop,
             cost_usd,
             tokens,
+            ..
         } => {
             out.end_reply();
             let took = out
@@ -336,12 +353,27 @@ fn render(ev: &SurfaceEvent, out: &mut Term) {
         }
         // Only states that need the operator: a settled turn is already
         // announced by its footer.
-        SurfaceEvent::Status { status } => match status.as_str() {
+        AgentEvent::Session { status } => match status.as_str() {
             "Paused" => println!("· ⏸ paused — /resume to continue (budget or provider key)"),
             "Degraded" => println!("· ⚠ degraded — the worker keeps crashing; /new starts fresh"),
             _ => {}
         },
-        SurfaceEvent::Error { class, message } => println!("\n! [{class}] {message}"),
+        AgentEvent::Error { class, message } => println!("\n! [{class}] {message}"),
+        // Thinking, tool structure, plans and context meters are not drawn
+        // here yet (today's console fidelity).
+        AgentEvent::Thought { .. }
+        | AgentEvent::ToolStarted { .. }
+        | AgentEvent::ToolFinished { .. }
+        | AgentEvent::Plan { .. }
+        | AgentEvent::Context { .. }
+        | AgentEvent::Compacting { .. }
+        | AgentEvent::FinalChunk { .. }
+        | AgentEvent::Reminder { .. }
+        | AgentEvent::File { .. }
+        | AgentEvent::CronFinished { .. }
+        | AgentEvent::Queue { .. }
+        | AgentEvent::Settings { .. }
+        | AgentEvent::SkillProposal { .. } => {}
     }
 }
 
@@ -473,10 +505,10 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(365 * 86_400));
         tokio::select! {
             incoming = backend.next() => match incoming {
-                Incoming::Event(ev) => {
-                    let ev = *ev;
-                    match &ev {
-                        SurfaceEvent::Hello { report } => {
+                Incoming::Event(env) => {
+                    let ev = &env.ev;
+                    match ev {
+                        AgentEvent::Hello { report } => {
                             if !greeted {
                                 greeted = true;
                                 banner(
@@ -494,8 +526,8 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                             hello_seen = true;
                             awaiting_status = false;
                         }
-                        SurfaceEvent::TurnStarted => busy = true,
-                        SurfaceEvent::Status { status } => {
+                        AgentEvent::TurnStarted { .. } => busy = true,
+                        AgentEvent::Session { status } => {
                             if matches!(status.as_str(), "Idle" | "Paused" | "Degraded") {
                                 busy = false;
                             }
@@ -505,7 +537,7 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                                 break;
                             }
                         }
-                        SurfaceEvent::TurnFinished { .. } => {
+                        AgentEvent::TurnFinished { .. } => {
                             awaiting_status = eof_deadline.is_some()
                                 && backend.request_status().await.is_ok();
                             if !awaiting_status && eof_deadline.is_some() {
@@ -514,7 +546,7 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                         }
                         _ => {}
                     }
-                    render(&ev, &mut term);
+                    render(&env, &mut term);
                 }
                 Incoming::Lagged(n) => println!("· (missed {n} events)"),
                 Incoming::Closed => {
@@ -611,17 +643,17 @@ async fn run_once_turn(
             _ = tokio::time::sleep_until(deadline) => return Err(format!("no reply after {}s", timeout.as_secs())),
         };
         match incoming {
-            Incoming::Event(ev) => match *ev {
-                SurfaceEvent::TurnStarted => started = true,
-                SurfaceEvent::Delta { text } => {
+            Incoming::Event(env) => match &env.ev {
+                AgentEvent::TurnStarted { .. } => started = true,
+                AgentEvent::Delta { text } => {
                     started = true;
-                    reply.push_str(&text);
+                    reply.push_str(text);
                 }
-                SurfaceEvent::Error { message, .. } => last_problem = Some(message),
-                SurfaceEvent::Notice { text } if !started => {
-                    last_problem = Some(text);
+                AgentEvent::Error { message, .. } => last_problem = Some(message.clone()),
+                AgentEvent::Notice { text } if !started => {
+                    last_problem = Some(text.clone());
                 }
-                SurfaceEvent::TurnFinished { stop, .. } => {
+                AgentEvent::TurnFinished { stop, .. } => {
                     if reply.trim().is_empty() || stop == "error" {
                         return Err(
                             last_problem.unwrap_or_else(|| format!("the turn ended: {stop}"))
@@ -629,7 +661,7 @@ async fn run_once_turn(
                     }
                     return Ok(reply);
                 }
-                SurfaceEvent::Hello { report }
+                AgentEvent::Hello { report }
                     if !started && report.status == "Idle" && report.queue == 0 =>
                 {
                     return Err(last_problem.unwrap_or_else(|| "the message was not sent".into()));

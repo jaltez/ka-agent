@@ -47,7 +47,10 @@ impl Runtime {
             approval_id,
             Some(format!("{decision:?}")),
         )?;
-        self.sh.surface.on_approval_settled(approval_id, status);
+        self.sh.emit(AgentEvent::ApprovalSettled {
+            id: approval_id.to_string(),
+            status: format!("{status:?}"),
+        });
         let mut g = self.lock();
         if let Some(live) = g.live.as_mut() {
             live.pending_asks.remove(&id);
@@ -119,9 +122,10 @@ impl Runtime {
         };
         for id in &expired {
             self.audit(audit_actions::APPROVAL_EXPIRE, id.as_str(), None)?;
-            self.sh
-                .surface
-                .on_approval_settled(id.as_str(), ka_agent_core::ApprovalStatus::Expired);
+            self.sh.emit(AgentEvent::ApprovalSettled {
+                id: id.as_str().to_string(),
+                status: format!("{:?}", ka_agent_core::ApprovalStatus::Expired),
+            });
         }
         if let Some(port) = self.live_port() {
             for ask_id in answers {

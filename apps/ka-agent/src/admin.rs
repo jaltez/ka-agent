@@ -69,16 +69,26 @@ pub fn is_running(paths: &Paths) -> bool {
 pub type AttachLines = tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>;
 
 /// Open an attach stream: the host answers with a `hello` event, then
-/// every surface event; the client writes `{"op":"say","text":…}` lines.
-pub async fn attach(
+/// every envelope; the client writes `{"op":"say","text":…}` lines.
+/// `since` names the last seq this client saw (0 = live only).
+pub async fn attach_since(
     paths: &Paths,
+    since: u64,
 ) -> Result<(AttachLines, tokio::net::unix::OwnedWriteHalf), AdminError> {
     let sock = sock_path(paths);
     let stream = ipc::connect(paths)
         .await
         .map_err(|_| AdminError::NotRunning(sock.display().to_string()))?;
     let (r, mut w) = stream.into_split();
-    w.write_all(b"{\"op\":\"attach\"}\n").await?;
+    let hello = serde_json::json!({"op": "attach", "since": since});
+    w.write_all(format!("{hello}\n").as_bytes()).await?;
     w.flush().await?;
     Ok((tokio::io::BufReader::new(r).lines(), w))
+}
+
+/// Live-only attach (the common chat client).
+pub async fn attach(
+    paths: &Paths,
+) -> Result<(AttachLines, tokio::net::unix::OwnedWriteHalf), AdminError> {
+    attach_since(paths, 0).await
 }

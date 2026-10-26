@@ -7,8 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use ka_agent_core::{ApprovalStatus, SessionStatus};
-use ka_agent_runtime::surface::{ApprovalCard, Surface};
+use ka_agent_core::ApprovalStatus;
+use ka_agent_runtime::Envelope;
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::surface::Surface;
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 // ---------------------------------------------------------------------------
@@ -41,7 +43,7 @@ enum Progress {
 pub(super) struct SurfaceInner {
     pub(super) client: TelegramClient,
     chat_id: AtomicI64,
-    /// Set between `on_turn_started` and `on_turn_finished`; notes outside
+    /// Set between the turn's start and finish envelopes; notes outside
     /// a turn are dropped (the journal surface keeps them).
     turn_active: AtomicBool,
     progress: Mutex<Progress>,
@@ -250,230 +252,258 @@ impl TelegramSurface {
 }
 
 impl Surface for TelegramSurface {
-    /// Typing indicator only; a progress message appears with the first note.
-    fn on_turn_started(&self) {
-        self.inner.turn_active.store(true, Ordering::Release);
-        // A fresh draft per turn: a non-zero id the API keys the bubble by.
-        *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft {
-            id: (now_ms() & 0x7fff_ffff).max(1),
-            ..Draft::default()
-        };
-        *self
-            .inner
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Progress::None;
-        self.inner
-            .pending_notes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        let Some(chat) = self.inner.chat() else {
-            return;
-        };
-        let mut typing = self.inner.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = typing.take() {
-            old.abort();
-        }
-        let client = self.inner.client.clone();
-        *typing = Some(tokio::spawn(async move {
-            loop {
-                let _ = client.send_chat_action(chat).await;
-                tokio::time::sleep(TYPING_INTERVAL).await;
-            }
-        }));
-    }
-
-    /// In-turn progress: the first note sends `⏳ {note}`; later notes edit
-    /// that message (last 3 shown) at most every 3 s. Outside a turn notes
-    /// are dropped here.
-    fn on_note(&self, text: &str) {
-        if !self.inner.turn_active.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(chat) = self.inner.chat() else {
-            return;
-        };
-        let shown = {
-            let mut notes = self
-                .inner
-                .pending_notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            notes.push(text.to_string());
-            let drop_n = notes.len().saturating_sub(3);
-            notes.drain(..drop_n);
-            notes.join("\n")
-        };
-        let now = now_ms();
-        let mut progress = self
-            .inner
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match *progress {
-            Progress::None => {
-                *progress = Progress::Sending;
+    fn emit(&self, env: &Envelope) {
+        match &env.ev {
+            // Typing indicator only; a progress message appears with the
+            // first note.
+            AgentEvent::TurnStarted { .. } => {
+                self.inner.turn_active.store(true, Ordering::Release);
+                // A fresh draft per turn: a non-zero id the API keys the
+                // bubble by.
+                *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft {
+                    id: (now_ms() & 0x7fff_ffff).max(1),
+                    ..Draft::default()
+                };
+                *self
+                    .inner
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Progress::None;
                 self.inner
-                    .last_progress_edit_ms
-                    .store(now, Ordering::Release);
-                let inner = Arc::clone(&self.inner);
-                let body = format!("⏳ {text}");
-                tokio::spawn(async move {
-                    let sent = inner.client.send_message(chat, &body, None).await.ok();
-                    let orphan = {
-                        let mut p = inner.progress.lock().unwrap_or_else(|e| e.into_inner());
-                        match (sent, *p) {
-                            (Some(id), Progress::Sending) => {
-                                *p = Progress::Shown(id);
-                                None
+                    .pending_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                let Some(chat) = self.inner.chat() else {
+                    return;
+                };
+                let mut typing = self.inner.typing.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(old) = typing.take() {
+                    old.abort();
+                }
+                let client = self.inner.client.clone();
+                *typing = Some(tokio::spawn(async move {
+                    loop {
+                        let _ = client.send_chat_action(chat).await;
+                        tokio::time::sleep(TYPING_INTERVAL).await;
+                    }
+                }));
+            }
+            // In-turn progress: the first note sends `⏳ {note}`; later
+            // notes edit that message (last 3 shown) at most every 3 s.
+            // Outside a turn notes are dropped here.
+            AgentEvent::Note { text } => {
+                if !self.inner.turn_active.load(Ordering::Acquire) {
+                    return;
+                }
+                let Some(chat) = self.inner.chat() else {
+                    return;
+                };
+                let shown = {
+                    let mut notes = self
+                        .inner
+                        .pending_notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    notes.push(text.clone());
+                    let drop_n = notes.len().saturating_sub(3);
+                    notes.drain(..drop_n);
+                    notes.join("\n")
+                };
+                let now = now_ms();
+                let mut progress = self
+                    .inner
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                match *progress {
+                    Progress::None => {
+                        *progress = Progress::Sending;
+                        self.inner
+                            .last_progress_edit_ms
+                            .store(now, Ordering::Release);
+                        let inner = Arc::clone(&self.inner);
+                        let body = format!("⏳ {text}");
+                        tokio::spawn(async move {
+                            let sent = inner.client.send_message(chat, &body, None).await.ok();
+                            let orphan = {
+                                let mut p =
+                                    inner.progress.lock().unwrap_or_else(|e| e.into_inner());
+                                match (sent, *p) {
+                                    (Some(id), Progress::Sending) => {
+                                        *p = Progress::Shown(id);
+                                        None
+                                    }
+                                    (None, Progress::Sending) => {
+                                        *p = Progress::None;
+                                        None
+                                    }
+                                    // the turn ended while the send was in flight
+                                    (sent, _) => sent,
+                                }
+                            };
+                            if let Some(id) = orphan {
+                                let _ = inner.client.delete_message(chat, id).await;
                             }
-                            (None, Progress::Sending) => {
-                                *p = Progress::None;
-                                None
-                            }
-                            // the turn ended while the send was in flight
-                            (sent, _) => sent,
+                        });
+                    }
+                    Progress::Sending => {}
+                    Progress::Shown(message_id) => {
+                        let last = self.inner.last_progress_edit_ms.load(Ordering::Acquire);
+                        if now - last < NOTE_EDIT_INTERVAL_MS {
+                            return;
                         }
-                    };
-                    if let Some(id) = orphan {
-                        let _ = inner.client.delete_message(chat, id).await;
+                        self.inner
+                            .last_progress_edit_ms
+                            .store(now, Ordering::Release);
+                        let client = self.inner.client.clone();
+                        let body = format!("⏳ {shown}");
+                        tokio::spawn(async move {
+                            let _ = client
+                                .edit_message_text(chat, message_id, &body, None)
+                                .await;
+                        });
+                    }
+                }
+            }
+            // Operator-must-receive messages (reminders, cron output,
+            // pauses): always their own message.
+            AgentEvent::Notice { text } => {
+                let inner = Arc::clone(&self.inner);
+                let text = text.clone();
+                tokio::spawn(async move { inner.send_rich(&text).await });
+            }
+            // Streamed as a Bot API draft (throttled, plain text); the
+            // final chunks still carry the rendered answer.
+            AgentEvent::Delta { text } => self.inner.push_draft(text),
+            AgentEvent::FinalChunk { text, .. } => {
+                if self.inner.chat().is_none() {
+                    return;
+                }
+                let inner = Arc::clone(&self.inner);
+                let text = text.clone();
+                tokio::spawn(async move { inner.send_rich(&text).await });
+            }
+            // Stops typing and deletes the progress message; cost lives
+            // in /status.
+            AgentEvent::TurnFinished { .. } => {
+                *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft::default();
+                self.inner.stop_typing();
+                self.inner.turn_active.store(false, Ordering::Release);
+                self.inner
+                    .pending_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                let previous = std::mem::replace(
+                    &mut *self
+                        .inner
+                        .progress
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    Progress::None,
+                );
+                if let (Progress::Shown(message_id), Some(chat)) = (previous, self.inner.chat()) {
+                    let client = self.inner.client.clone();
+                    tokio::spawn(async move {
+                        let _ = client.delete_message(chat, message_id).await;
+                    });
+                }
+            }
+            AgentEvent::MemoryProposal { id, text } => {
+                let Some(chat) = self.inner.chat() else {
+                    return;
+                };
+                let short = ka_agent_core::ids::short_id(id.as_str()).to_string();
+                let markup = json!({
+                    "inline_keyboard": [[
+                        { "text": "✅ Remember", "callback_data": format!("m:{short}:y") },
+                        { "text": "✖ Discard", "callback_data": format!("m:{short}:n") }
+                    ]]
+                });
+                let body = format!("💡 Remember this?\n\n{text}");
+                let client = self.inner.client.clone();
+                tokio::spawn(async move {
+                    let _ = client.send_message(chat, &body, Some(markup)).await;
+                });
+            }
+            AgentEvent::Approval {
+                id,
+                question,
+                detail,
+                expires_at_ms,
+                ..
+            } => {
+                let Some(chat) = self.inner.chat() else {
+                    return;
+                };
+                let full = id.clone();
+                let short = short_id(&full, 12);
+                let mut text = question.clone();
+                if let Some(detail) = detail {
+                    let head: Vec<&str> = detail.lines().take(20).collect();
+                    if !head.is_empty() {
+                        text.push_str("\n\n");
+                        text.push_str(&head.join("\n"));
+                    }
+                }
+                text.push_str(&format!(
+                    "\n\nexpires in {}",
+                    crate::commands::fmt_interval(expires_at_ms - now_ms())
+                ));
+                let first_line = question.lines().next().unwrap_or("").to_string();
+                let markup = json!({
+                    "inline_keyboard": [
+                        [{ "text": "✅ Allow", "callback_data": format!("a:{short}:y") }],
+                        [{ "text": "⛔ Deny", "callback_data": format!("a:{short}:n") }]
+                    ]
+                });
+                let inner = Arc::clone(&self.inner);
+                tokio::spawn(async move {
+                    if let Ok(message_id) =
+                        inner.client.send_message(chat, &text, Some(markup)).await
+                    {
+                        inner
+                            .cards
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(short, (full, message_id, first_line));
                     }
                 });
             }
-            Progress::Sending => {}
-            Progress::Shown(message_id) => {
-                let last = self.inner.last_progress_edit_ms.load(Ordering::Acquire);
-                if now - last < NOTE_EDIT_INTERVAL_MS {
-                    return;
-                }
-                self.inner
-                    .last_progress_edit_ms
-                    .store(now, Ordering::Release);
-                let client = self.inner.client.clone();
-                let body = format!("⏳ {shown}");
-                tokio::spawn(async move {
-                    let _ = client
-                        .edit_message_text(chat, message_id, &body, None)
-                        .await;
-                });
+            AgentEvent::ApprovalSettled { id, status } => {
+                let parsed = match status.as_str() {
+                    "Approved" => ApprovalStatus::Approved,
+                    "Denied" => ApprovalStatus::Denied,
+                    "Cancelled" => ApprovalStatus::Cancelled,
+                    "Superseded" => ApprovalStatus::Superseded,
+                    "Expired" => ApprovalStatus::Expired,
+                    _ => ApprovalStatus::Pending,
+                };
+                self.inner.settle_card(&short_id(id, 12), parsed);
             }
-        }
-    }
-
-    /// Operator-must-receive messages (reminders, cron output, pauses):
-    /// always their own message.
-    fn on_notice(&self, text: &str) {
-        let inner = Arc::clone(&self.inner);
-        let text = text.to_string();
-        tokio::spawn(async move { inner.send_rich(&text).await });
-    }
-
-    /// Streamed as a Bot API draft (throttled, plain text); the final
-    /// chunks still carry the rendered answer.
-    fn on_delta_text(&self, text: &str) {
-        self.inner.push_draft(text);
-    }
-
-    fn on_delta_thought(&self, _text: &str) {}
-
-    fn on_final_chunk(&self, _index: u32, text: &str) {
-        if self.inner.chat().is_none() {
-            return;
-        }
-        let inner = Arc::clone(&self.inner);
-        let text = text.to_string();
-        tokio::spawn(async move { inner.send_rich(&text).await });
-    }
-
-    /// Stops typing and deletes the progress message; cost lives in /status.
-    fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {
-        *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft::default();
-        self.inner.stop_typing();
-        self.inner.turn_active.store(false, Ordering::Release);
-        self.inner
-            .pending_notes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        let previous = std::mem::replace(
-            &mut *self
-                .inner
-                .progress
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-            Progress::None,
-        );
-        if let (Progress::Shown(message_id), Some(chat)) = (previous, self.inner.chat()) {
-            let client = self.inner.client.clone();
-            tokio::spawn(async move {
-                let _ = client.delete_message(chat, message_id).await;
-            });
-        }
-    }
-
-    fn on_memory_proposal(&self, id: &str, text: &str) {
-        let Some(chat) = self.inner.chat() else {
-            return;
-        };
-        let short = ka_agent_core::ids::short_id(id).to_string();
-        let markup = json!({
-            "inline_keyboard": [[
-                { "text": "✅ Remember", "callback_data": format!("m:{short}:y") },
-                { "text": "✖ Discard", "callback_data": format!("m:{short}:n") }
-            ]]
-        });
-        let body = format!("💡 Remember this?\n\n{text}");
-        let client = self.inner.client.clone();
-        tokio::spawn(async move {
-            let _ = client.send_message(chat, &body, Some(markup)).await;
-        });
-    }
-
-    fn on_approval(&self, card: &ApprovalCard) {
-        let Some(chat) = self.inner.chat() else {
-            return;
-        };
-        let full = card.approval_id.clone();
-        let short = short_id(&full, 12);
-        let mut text = card.question.clone();
-        if let Some(detail) = &card.detail {
-            let head: Vec<&str> = detail.lines().take(20).collect();
-            if !head.is_empty() {
-                text.push_str("\n\n");
-                text.push_str(&head.join("\n"));
+            AgentEvent::Error { class, message } => {
+                self.inner.spawn_send(format!("! [{class}] {message}"));
             }
+            // Reasoning, tool structure, plans and status are not drawn on
+            // the phone (today's behavior).
+            AgentEvent::Thought { .. }
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished { .. }
+            | AgentEvent::Plan { .. }
+            | AgentEvent::Context { .. }
+            | AgentEvent::Compacting { .. }
+            | AgentEvent::Inbound { .. }
+            | AgentEvent::Session { .. } => {}
+            // Later steps wire these to real deliveries.
+            AgentEvent::Reminder { .. }
+            | AgentEvent::File { .. }
+            | AgentEvent::CronFinished { .. }
+            | AgentEvent::Queue { .. }
+            | AgentEvent::Settings { .. }
+            | AgentEvent::SkillProposal { .. } => {}
+            // Per-connection events never reach a broadcast surface.
+            AgentEvent::Hello { .. } | AgentEvent::Reply { .. } => {}
         }
-        text.push_str(&format!(
-            "\n\nexpires in {}",
-            crate::commands::fmt_interval(card.expires_at_ms - now_ms())
-        ));
-        let first_line = card.question.lines().next().unwrap_or("").to_string();
-        let markup = json!({
-            "inline_keyboard": [
-                [{ "text": "✅ Allow", "callback_data": format!("a:{short}:y") }],
-                [{ "text": "⛔ Deny", "callback_data": format!("a:{short}:n") }]
-            ]
-        });
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            if let Ok(message_id) = inner.client.send_message(chat, &text, Some(markup)).await {
-                inner
-                    .cards
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(short, (full, message_id, first_line));
-            }
-        });
-    }
-
-    fn on_approval_settled(&self, approval_id: &str, status: ApprovalStatus) {
-        self.inner.settle_card(&short_id(approval_id, 12), status);
-    }
-
-    fn on_session_status(&self, _status: SessionStatus) {}
-
-    fn on_error(&self, class: &str, message: &str) {
-        self.inner.spawn_send(format!("! [{class}] {message}"));
     }
 }

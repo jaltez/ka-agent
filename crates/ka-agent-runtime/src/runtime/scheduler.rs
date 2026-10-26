@@ -167,16 +167,18 @@ impl Runtime {
                     let title = task.title.clone();
                     let this_late_by = late_by(&task);
                     if this_late_by > LATE_GRACE_MS {
-                        self.sh.surface.on_notice(&format!(
-                            "⏰ missed: {title} (overdue by {})",
-                            ka_agent_core::fmt_interval(this_late_by)
-                        ));
+                        self.sh.emit(AgentEvent::Notice {
+                            text: format!(
+                                "⏰ missed: {title} (overdue by {})",
+                                ka_agent_core::fmt_interval(this_late_by)
+                            ),
+                        });
                         let _ = self.sh.store.settle_task(&task.id, "missed");
                         continue;
                     }
-                    self.sh
-                        .surface
-                        .on_notice(&format!("⏰ {title}{}", late_suffix(this_late_by)));
+                    self.sh.emit(AgentEvent::Notice {
+                        text: format!("⏰ {title}{}", late_suffix(this_late_by)),
+                    });
                     let _ = self.sh.store.settle_task(&task.id, "succeeded");
                     fired.push(title);
                 }
@@ -207,15 +209,17 @@ impl Runtime {
                                     "cron re-arm overflow".to_string()
                                 }
                             };
-                            self.sh.surface.on_notice(&note);
+                            self.sh.emit(AgentEvent::Notice { text: note });
                             record(&task, "missed", None);
                             continue;
                         }
-                        self.sh.surface.on_notice(&format!(
-                            "cron '{}' missed (overdue by {})",
-                            spec.text,
-                            ka_agent_core::fmt_interval(this_late_by)
-                        ));
+                        self.sh.emit(AgentEvent::Notice {
+                            text: format!(
+                                "cron '{}' missed (overdue by {})",
+                                spec.text,
+                                ka_agent_core::fmt_interval(this_late_by)
+                            ),
+                        });
                         let _ = self.sh.store.settle_task(&task.id, "missed");
                         record(&task, "missed", None);
                         continue;
@@ -236,11 +240,13 @@ impl Runtime {
                     if spec.mode == ka_agent_core::CronMode::Agent {
                         if let Err(why) = self.preflight() {
                             let _ = self.sh.store.set_task_status(&task.id, "interrupted");
-                            self.sh.surface.on_notice(&format!(
-                                "cron '{}' paused: {why} — then `ka-agent cron resume {}`",
-                                spec.text,
-                                ka_agent_core::ids::short_id(task.id.as_str())
-                            ));
+                            self.sh.emit(AgentEvent::Notice {
+                                text: format!(
+                                    "cron '{}' paused: {why} — then `ka-agent cron resume {}`",
+                                    spec.text,
+                                    ka_agent_core::ids::short_id(task.id.as_str())
+                                ),
+                            });
                             record(&task, "blocked", Some(&why));
                             continue;
                         }
@@ -260,10 +266,12 @@ impl Runtime {
                                     let _ = self.sh.store.settle_task(&task.id, "failed");
                                 }
                             }
-                            self.sh.surface.on_notice(&format!(
-                                "cron '{}' skipped: today's budget is reached",
-                                spec.text
-                            ));
+                            self.sh.emit(AgentEvent::Notice {
+                                text: format!(
+                                    "cron '{}' skipped: today's budget is reached",
+                                    spec.text
+                                ),
+                            });
                             record(&task, "skipped", Some("daily budget reached"));
                             continue;
                         }
@@ -282,15 +290,21 @@ impl Runtime {
                             } else {
                                 (spec.text.clone(), format!("cron: {}", spec.text))
                             };
-                            self.sh
-                                .surface
-                                .on_notice(&format!("{label}{}", late_suffix(this_late_by)));
-                            match self.handle_message(&prompt, "cron").await {
+                            self.sh.emit(AgentEvent::Notice {
+                                text: format!("{label}{}", late_suffix(this_late_by)),
+                            });
+                            let turn_source = if spec.source == crate::briefing::SOURCE {
+                                crate::briefing::SOURCE
+                            } else {
+                                "cron"
+                            };
+                            match self.handle_message(&prompt, turn_source).await {
                                 Ok(()) => true,
                                 Err(e) => {
-                                    self.sh
-                                        .surface
-                                        .on_error("cron", &format!("{}: {e}", task.id.as_str()));
+                                    self.sh.emit(AgentEvent::Error {
+                                        class: "cron".into(),
+                                        message: format!("{}: {e}", task.id.as_str()),
+                                    });
                                     false
                                 }
                             }
@@ -298,13 +312,14 @@ impl Runtime {
                         ka_agent_core::CronMode::NoAgent(kind) => {
                             match self.run_no_agent(kind, &spec.text) {
                                 Ok(out) => {
-                                    self.sh.surface.on_notice(&out);
+                                    self.sh.emit(AgentEvent::Notice { text: out });
                                     true
                                 }
                                 Err(e) => {
-                                    self.sh
-                                        .surface
-                                        .on_error("cron", &format!("{}: {e}", task.id.as_str()));
+                                    self.sh.emit(AgentEvent::Error {
+                                        class: "cron".into(),
+                                        message: format!("{}: {e}", task.id.as_str()),
+                                    });
                                     false
                                 }
                             }
@@ -327,10 +342,13 @@ impl Runtime {
                                 }
                                 // Overflowing schedule: unarmable, fail visibly.
                                 None => {
-                                    self.sh.surface.on_error(
-                                        "cron",
-                                        &format!("{}: recurrence overflow", task.id.as_str()),
-                                    );
+                                    self.sh.emit(AgentEvent::Error {
+                                        class: "cron".into(),
+                                        message: format!(
+                                            "{}: recurrence overflow",
+                                            task.id.as_str()
+                                        ),
+                                    });
                                     let _ = self.sh.store.settle_task(&task.id, "failed");
                                     continue;
                                 }
@@ -347,9 +365,10 @@ impl Runtime {
                     fired.push(spec.text);
                 }
                 other => {
-                    self.sh
-                        .surface
-                        .on_error("cron", &format!("unknown scheduled kind {other:?}"));
+                    self.sh.emit(AgentEvent::Error {
+                        class: "cron".into(),
+                        message: format!("unknown scheduled kind {other:?}"),
+                    });
                     let _ = self.sh.store.settle_task(&task.id, "failed");
                 }
             }
@@ -367,23 +386,26 @@ impl Runtime {
     pub async fn run_maintenance(&self, every: Duration) {
         loop {
             if let Err(e) = self.expire_approvals().await {
-                self.sh
-                    .surface
-                    .on_error("internal", &format!("expiry sweep: {e}"));
+                self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    message: format!("expiry sweep: {e}"),
+                });
             }
             if let Err(e) = self.fire_due_tasks().await {
-                self.sh
-                    .surface
-                    .on_error("internal", &format!("scheduler: {e}"));
+                self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    message: format!("scheduler: {e}"),
+                });
             }
             self.reap_idle_worker().await;
             self.watch_config_file().await;
             // Bounded launchd/redirect logs (journal systems rotate alone).
             let _ = self.sh.paths.rotate_log(5 * 1024 * 1024);
             if let Err(e) = self.announce_memory_proposals() {
-                self.sh
-                    .surface
-                    .on_error("internal", &format!("memory proposals: {e}"));
+                self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    message: format!("memory proposals: {e}"),
+                });
             }
             self.maybe_prune().await;
             let wait = match self.sh.store.next_due_ms() {
@@ -434,13 +456,18 @@ impl Runtime {
                     + report.outbox
                     + report.tasks;
                 if pruned > 0 {
-                    self.sh.surface.on_notice(&format!(
-                        "state pruned: {pruned} old row(s) (runs, approvals, queue, outbox)"
-                    ));
+                    self.sh.emit(AgentEvent::Notice {
+                        text: format!(
+                            "state pruned: {pruned} old row(s) (runs, approvals, queue, outbox)"
+                        ),
+                    });
                 }
             }
             Err(e) => {
-                self.sh.surface.on_error("internal", &format!("prune: {e}"));
+                self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    message: format!("prune: {e}"),
+                });
             }
         }
     }

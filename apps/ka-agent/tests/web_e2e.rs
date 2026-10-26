@@ -51,12 +51,27 @@ impl Daemon {
             }
             break;
         }
-        let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
-            .args(["dashboard", "--no-open"])
-            .envs(self.env())
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "dashboard exited {:?}", out.status);
+        // The web listener binds shortly after the admin socket; retry
+        // while the daemon is still publishing `web.url` (a plain
+        // "web UI is off" here is a startup race, not a verdict).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let out = loop {
+            let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+                .args(["dashboard", "--no-open"])
+                .envs(self.env())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                break out;
+            }
+            assert!(
+                stderr.contains("web UI is off") && Instant::now() < deadline,
+                "dashboard exited {:?} stderr={stderr}",
+                out.status
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
         let stdout = String::from_utf8_lossy(&out.stdout);
         let line = stdout
             .lines()

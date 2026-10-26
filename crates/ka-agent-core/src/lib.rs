@@ -13,6 +13,7 @@ pub mod config;
 pub mod config_file;
 pub mod config_keys;
 pub mod ids;
+pub mod labels;
 pub mod layout;
 pub mod markdown;
 pub mod outbox;

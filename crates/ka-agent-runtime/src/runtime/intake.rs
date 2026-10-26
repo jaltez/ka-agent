@@ -31,12 +31,17 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
     };
     // Queued messages cross channels too: the transcript sees them the
     // same as directly-submitted ones (drain bypasses handle_message).
-    sh.surface.on_inbound(&item.source, &item.text);
+    sh.emit(AgentEvent::Inbound {
+        source: item.source.clone(),
+        text: item.text.clone(),
+    });
     publish_turn_source(&sh.store, &item.source);
     let mut turn = Turn::new(sid.clone(), item.text.clone());
     if let Err(e) = sh.store.insert_turn(&turn) {
-        sh.surface
-            .on_error("internal", &format!("queue drain: {e}"));
+        sh.emit(AgentEvent::Error {
+            class: "internal".into(),
+            message: format!("queue drain: {e}"),
+        });
         return false;
     }
     if turn.transition(TurnStatus::Submitted).is_err() {
@@ -53,6 +58,8 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(live) = g.live.as_mut() {
             live.current_turn = Some(turn.id.clone());
+            live.current_turn_source = Some(item.source.clone());
+            live.turn_started_at = Some(Instant::now());
             live.live_text.clear();
         }
     }
@@ -78,7 +85,10 @@ impl Runtime {
     /// Inbound message: submit now when idle, otherwise enqueue durably
     /// (gap G4 — ka drops mid-cycle prompts, HTTP 200 notwithstanding).
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
-        self.sh.surface.on_inbound(source, text);
+        self.sh.emit(AgentEvent::Inbound {
+            source: source.to_string(),
+            text: text.to_string(),
+        });
         let mut submit_head = false;
         let submit_now = {
             let mut g = self.lock();
@@ -110,9 +120,10 @@ impl Runtime {
                     // non-reentrant mutex here deadlocked every message
                     // after a pause.
                     if g.budget.verdict() == ka_agent_core::BudgetVerdict::Exceeded {
-                        self.sh.surface.on_notice(
-                            "paused: budget reached for this window; use /resume to override or wait for the window to roll",
-                        );
+                        self.sh.emit(AgentEvent::Notice {
+                            text: "paused: budget reached for this window; use /resume to override or wait for the window to roll"
+                                .into(),
+                        });
                         false
                     } else {
                         // Paused→Running is not a legal edge; go through
@@ -132,9 +143,10 @@ impl Runtime {
                     }
                 }
                 SessionStatus::Degraded => {
-                    self.sh.surface.on_notice(
-                        "⚠ degraded — the worker keeps crashing; /new starts a fresh session",
-                    );
+                    self.sh.emit(AgentEvent::Notice {
+                        text: "⚠ degraded — the worker keeps crashing; /new starts a fresh session"
+                            .into(),
+                    });
                     false
                 }
             }
@@ -153,7 +165,9 @@ impl Runtime {
                     let item = QueueItem::new(self.session_id(), text.to_string(), source);
                     self.sh.store.enqueue(&item)?;
                     let n = self.sh.store.queue_len(&self.session_id())?;
-                    self.sh.surface.on_notice(&format!("queued (#{n})"));
+                    self.sh.emit(AgentEvent::Notice {
+                        text: format!("queued (#{n})"),
+                    });
                 }
                 _ => {}
             }
@@ -177,7 +191,7 @@ impl Runtime {
             return Ok(());
         }
         publish_turn_source(&self.sh.store, source);
-        match self.submit_text(text).await {
+        match self.submit_text_with(text, Vec::new(), Some(source)).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Never strand the session in `running`: the queue would
@@ -197,7 +211,7 @@ impl Runtime {
     /// injected (SEED.md §2.6, §9.1). Fails closed: the skill must be
     /// provisioned in the engine home, and the session must be idle — a
     /// skill turn is never queued (the queue carries plain text only).
-    pub async fn handle_skill(&self, name: &str, text: &str) -> Result<(), Error> {
+    pub async fn handle_skill(&self, name: &str, text: &str, source: &str) -> Result<(), Error> {
         let skills = crate::skills::Skills::new(&self.sh.paths.engine_home());
         if !skills.is_enabled(name)? {
             return Err(Error::Refused(format!(
@@ -220,7 +234,10 @@ impl Runtime {
                 .map_err(|t| illegal_session(from, t))?;
         }
         self.persist_session_status(SessionStatus::Running);
-        match self.submit_text_with(text, vec![name.to_string()]).await {
+        match self
+            .submit_text_with(text, vec![name.to_string()], Some(source))
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 let mut g = self.lock();
@@ -303,15 +320,16 @@ impl Runtime {
         Ok(())
     }
 
-    async fn submit_text(&self, text: &str) -> Result<(), Error> {
-        self.submit_text_with(text, Vec::new()).await
-    }
-
     /// Submit with per-turn skills (`Command::Prompt.skills`: the engine
     /// injects the full SKILL.md bodies for these names into this turn).
-    async fn submit_text_with(&self, text: &str, skills: Vec<String>) -> Result<(), Error> {
+    async fn submit_text_with(
+        &self,
+        text: &str,
+        skills: Vec<String>,
+        source: Option<&str>,
+    ) -> Result<(), Error> {
         if let Err(msg) = self.preflight() {
-            self.sh.surface.on_notice(&msg);
+            self.sh.emit(AgentEvent::Notice { text: msg });
             let mut g = self.lock();
             if g.session.status == SessionStatus::Running {
                 g.session.transition(SessionStatus::Idle).ok();
@@ -323,9 +341,10 @@ impl Runtime {
         if let Err(e) = self.ensure_worker().await {
             // A dead worker at submit time behaves like an interruption:
             // surface it, never auto-retry (SEED.md §3.8).
-            self.sh
-                .surface
-                .on_error("internal", &format!("worker start failed: {e}"));
+            self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                message: format!("worker start failed: {e}"),
+            });
             let mut g = self.lock();
             let from = g.session.status;
             g.session
@@ -356,6 +375,8 @@ impl Runtime {
             let mut g = self.lock();
             if let Some(live) = g.live.as_mut() {
                 live.current_turn = Some(turn.id.clone());
+                live.current_turn_source = source.map(str::to_string);
+                live.turn_started_at = Some(Instant::now());
                 live.live_text.clear();
             }
         }
@@ -386,7 +407,10 @@ impl Runtime {
         turn.transition(TurnStatus::Running)
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
-        self.sh.surface.on_turn_started();
+        self.sh.emit(AgentEvent::TurnStarted {
+            turn: turn.id.to_string(),
+            source: source.unwrap_or("").to_string(),
+        });
         Ok(())
     }
 
@@ -408,10 +432,14 @@ impl Runtime {
             }
         };
         let Some(port) = port else {
-            self.sh.surface.on_notice("nothing to stop");
+            self.sh.emit(AgentEvent::Notice {
+                text: "nothing to stop".into(),
+            });
             return Ok(());
         };
-        self.sh.surface.on_notice("stopping…");
+        self.sh.emit(AgentEvent::Notice {
+            text: "stopping…".into(),
+        });
         port.abort().await.ok();
         let grace = Duration::from_secs(self.cfg().turn_grace_secs);
         // Escalate on the *turn*, not the process: a successful abort leaves

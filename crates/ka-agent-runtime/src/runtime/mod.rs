@@ -6,8 +6,9 @@
 //! and delivery of exactly one final answer per prompt cycle at `idle`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ka_agent_core::audit::actions as audit_actions;
 use ka_agent_core::{
@@ -22,8 +23,9 @@ use ka_agent_store::{Store, StoreError};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::event::{AgentEvent, Envelope};
 use crate::paths::Paths;
-use crate::surface::{ApprovalCard, Surface};
+use crate::surface::Surface;
 
 mod approvals;
 mod config;
@@ -82,6 +84,22 @@ struct Live {
     pending_asks: HashMap<ApprovalId, String>,
     live_text: String,
     current_turn: Option<TurnId>,
+    /// Who started the running turn (`console`, `telegram`, `cron`, …):
+    /// `TurnStarted` carries it and later steps gate on it.
+    current_turn_source: Option<String>,
+    /// When the running turn started (its `TurnFinished` reports the
+    /// elapsed time).
+    turn_started_at: Option<Instant>,
+    /// When each in-flight tool call started (its `ToolFinished` reports
+    /// the elapsed time).
+    tool_started: HashMap<String, Instant>,
+    /// The last output excerpt per tool call id (≤ 300 chars): the error
+    /// line of a failed call.
+    tool_excerpt: HashMap<String, String>,
+    /// The tools this worker's engine discovered (for `/tools`).
+    tools: Vec<String>,
+    /// The strand's latest display title (status, not broadcast).
+    title: Option<String>,
     /// We killed this worker on purpose (`/new`, the `/stop` escalation): its
     /// exit must not be booked as a crash.
     deliberate_close: bool,
@@ -120,6 +138,9 @@ struct Shared {
     memory: ka_agent_memory::MemoryStore,
     port: WorkerPort,
     surface: Arc<dyn Surface>,
+    /// The envelope sequence (starts at 1): every emitted envelope takes
+    /// one, so any stream can name the last event it saw.
+    seq: AtomicU64,
     inner: Mutex<Inner>,
     /// No-agent cron handlers, registered by kind (e.g. "calendar").
     /// Registered by the app binary; the runtime only dispatches (M11).
@@ -141,6 +162,14 @@ struct Shared {
     /// updates it): the maintenance loop's hot-reload watcher compares
     /// against it so IPC-triggered reloads are not announced twice.
     config_mtime: Mutex<Option<std::time::SystemTime>>,
+}
+
+impl Shared {
+    /// Sequence and fan out one event to the surface.
+    pub(super) fn emit(&self, ev: AgentEvent) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.surface.emit(&Envelope::new(seq, ev));
+    }
 }
 
 fn cfg_of(sh: &Shared) -> Arc<DaemonConfig> {
@@ -173,22 +202,32 @@ impl Runtime {
         surface: Arc<dyn Surface>,
     ) -> Result<Self, Error> {
         paths.ensure_dirs()?;
+        // The sequence exists before `Shared` does: the recovery notices
+        // below are envelopes too (a subscribed early receiver sees them).
+        let seq = AtomicU64::new(1);
+        let emit = |ev: AgentEvent| {
+            surface.emit(&Envelope::new(seq.fetch_add(1, Ordering::Relaxed), ev));
+        };
         let interrupted = store.reconcile_running_turns(ka_agent_core::now_ms())?;
         if !interrupted.is_empty() {
-            surface.on_notice(&format!(
-                "recovered after restart: {} interrupted turn(s) marked; nothing was re-submitted",
-                interrupted.len()
-            ));
+            emit(AgentEvent::Notice {
+                text: format!(
+                    "recovered after restart: {} interrupted turn(s) marked; nothing was re-submitted",
+                    interrupted.len()
+                ),
+            });
         }
         // A crash mid-fire leaves scheduled tasks `running`; without this
         // they sit invisible to the scheduler forever while `/cron list`
         // still shows them. Marked `interrupted` (= paused, resumable).
         let stuck_tasks = store.reconcile_running_tasks(ka_agent_core::now_ms())?;
         if !stuck_tasks.is_empty() {
-            surface.on_notice(&format!(
-                "recovered after restart: {} scheduled task(s) interrupted mid-fire marked paused",
-                stuck_tasks.len()
-            ));
+            emit(AgentEvent::Notice {
+                text: format!(
+                    "recovered after restart: {} scheduled task(s) interrupted mid-fire marked paused",
+                    stuck_tasks.len()
+                ),
+            });
         }
         let mut session = store
             .list_recent_sessions(1)?
@@ -230,9 +269,11 @@ impl Runtime {
                 .is_ok()
             {
                 store.update_session_status(&session.id, session.status)?;
-                surface.on_notice(&format!(
-                    "recovered session status {from:?} → idle (its turn died with the previous process)"
-                ));
+                emit(AgentEvent::Notice {
+                    text: format!(
+                        "recovered session status {from:?} → idle (its turn died with the previous process)"
+                    ),
+                });
             }
         }
         let session = session;
@@ -271,6 +312,7 @@ impl Runtime {
                 memory,
                 port,
                 surface,
+                seq,
                 no_agent: Mutex::new(HashMap::new()),
                 selector_cache: Mutex::new(None),
                 env_cache: Mutex::new(None),
@@ -426,7 +468,9 @@ impl Runtime {
         };
         self.sh.store.insert_session(&session)?;
         self.audit(audit_actions::SESSION_NEW, session.id.as_str(), None)?;
-        self.sh.surface.on_session_status(SessionStatus::Idle);
+        self.sh.emit(AgentEvent::Session {
+            status: format!("{:?}", SessionStatus::Idle),
+        });
         Ok(session.id)
     }
 
@@ -461,10 +505,16 @@ impl Runtime {
     fn persist_session_status(&self, status: SessionStatus) {
         let id = self.session_id();
         if let Err(e) = self.sh.store.update_session_status(&id, status) {
-            self.sh
-                .surface
-                .on_error("internal", &format!("session status persist: {e}"));
+            self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                message: format!("session status persist: {e}"),
+            });
         }
+    }
+
+    /// Sequence and fan out one event to every surface.
+    pub fn emit(&self, ev: AgentEvent) {
+        self.sh.emit(ev);
     }
 
     // ---- memory & history (SEED.md §4) --------------------------------

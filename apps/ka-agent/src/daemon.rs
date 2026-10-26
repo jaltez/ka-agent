@@ -3,9 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ka_agent_core::{ApprovalStatus, SessionStatus};
-use ka_agent_runtime::Surface;
-use ka_agent_runtime::surface::ApprovalCard;
+use ka_agent_runtime::Envelope;
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::surface::Surface;
 
 use crate::admin;
 use crate::host::{Host, HostOptions};
@@ -15,41 +15,33 @@ use crate::host::{Host, HostOptions};
 pub struct LogSurface;
 
 impl Surface for LogSurface {
-    fn on_note(&self, text: &str) {
-        eprintln!("· {text}");
-    }
-
-    fn on_notice(&self, text: &str) {
-        eprintln!("» {text}");
-    }
-
-    fn on_inbound(&self, source: &str, text: &str) {
-        eprintln!("» you ({source}): {text}");
-    }
-
-    fn on_approval(&self, card: &ApprovalCard) {
-        eprintln!(
-            "┌ approval {} (expires in {})\n│ {}",
-            card.approval_id,
-            ka_agent_core::fmt_interval(card.expires_at_ms - ka_agent_core::now_ms()),
-            card.question
-        );
-    }
-
-    fn on_approval_settled(&self, approval_id: &str, status: ApprovalStatus) {
-        eprintln!("· approval {approval_id} → {status:?}");
-    }
-
-    fn on_turn_finished(&self, stop: &str, cost_usd: f64, tokens: u64) {
-        eprintln!("· turn {stop} · ${cost_usd:.4} · {tokens} tokens");
-    }
-
-    fn on_session_status(&self, status: SessionStatus) {
-        eprintln!("· session {status:?}");
-    }
-
-    fn on_error(&self, class: &str, message: &str) {
-        eprintln!("! [{class}] {message}");
+    fn emit(&self, env: &Envelope) {
+        match &env.ev {
+            AgentEvent::TurnStarted { turn, source } => {
+                eprintln!("· turn started ({source}) {turn}");
+            }
+            AgentEvent::ToolFinished {
+                tool,
+                ok,
+                ms,
+                error,
+                ..
+            } => match (ok, error) {
+                (true, _) => eprintln!("· tool {tool} ok · {ms}ms"),
+                (false, Some(err)) => eprintln!("· tool {tool} failed · {ms}ms · {err}"),
+                (false, None) => eprintln!("· tool {tool} failed · {ms}ms"),
+            },
+            AgentEvent::TurnFinished {
+                stop,
+                cost_usd,
+                tokens,
+                ..
+            } => eprintln!("· turn {stop} · ${cost_usd:.4} · {tokens} tokens"),
+            AgentEvent::Notice { text } => eprintln!("» {text}"),
+            AgentEvent::Error { class, message } => eprintln!("! [{class}] {message}"),
+            AgentEvent::Approval { id, question, .. } => eprintln!("» approval {id}: {question}"),
+            _ => {}
+        }
     }
 }
 

@@ -4,6 +4,8 @@ use super::approvals::session_allow_key;
 use super::intake::drain_queue;
 use super::worker::rt_on_engine_closed;
 use super::*;
+use crate::event::{PlanItem, turn_text};
+use crate::surface::ApprovalCard;
 
 /// Final-answer chunk ceiling before splitting (Telegram 4096 minus margin;
 /// SEED.md §5.4).
@@ -120,7 +122,9 @@ pub(super) fn rt_maybe_idle(sh: &Arc<Shared>) {
     let status = g.session.status;
     drop(g);
     rt_persist_status(sh, status);
-    sh.surface.on_session_status(status);
+    sh.emit(AgentEvent::Session {
+        status: format!("{status:?}"),
+    });
 }
 
 pub(super) fn rt_persist_status(sh: &Arc<Shared>, status: SessionStatus) {
@@ -132,8 +136,10 @@ pub(super) fn rt_persist_status(sh: &Arc<Shared>, status: SessionStatus) {
         .id
         .clone();
     if let Err(e) = sh.store.update_session_status(&sid, status) {
-        sh.surface
-            .on_error("internal", &format!("session status persist: {e}"));
+        sh.emit(AgentEvent::Error {
+            class: "internal".into(),
+            message: format!("session status persist: {e}"),
+        });
     }
 }
 
@@ -145,6 +151,8 @@ pub(super) async fn drive(
     port: Arc<PortSession>,
     mut rx: mpsc::Receiver<PortEvent>,
 ) {
+    // Context meter dedupe: emit only when the integer percentage moves.
+    let mut last_ctx_pct: Option<u64> = None;
     while let Some(ev) = rx.recv().await {
         // Any event is activity: the idle reap's clock resets.
         {
@@ -173,49 +181,125 @@ pub(super) async fn drive(
                     (&snapshot.strand_id, &snapshot.strand_path)
                     && let Err(e) = sh.store.set_strand(&snapshot.id, sid_ref, path_ref)
                 {
-                    sh.surface
-                        .on_error("internal", &format!("strand persist: {e}"));
+                    sh.emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        message: format!("strand persist: {e}"),
+                    });
                 }
                 if replay_messages > 0 {
-                    sh.surface.on_note(&format!(
-                        "resumed session: {replay_messages} replayed messages (not re-delivered)"
-                    ));
+                    sh.emit(AgentEvent::Note {
+                        text: format!(
+                            "resumed session: {replay_messages} replayed messages (not re-delivered)"
+                        ),
+                    });
                 }
             }
-            PortEvent::TurnStarted => sh.surface.on_turn_started(),
+            PortEvent::TurnStarted => {
+                let (turn, source) = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    (
+                        g.live
+                            .as_ref()
+                            .and_then(|l| l.current_turn.clone())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        g.live
+                            .as_ref()
+                            .and_then(|l| l.current_turn_source.clone())
+                            .unwrap_or_default(),
+                    )
+                };
+                sh.emit(AgentEvent::TurnStarted { turn, source });
+            }
             PortEvent::DeltaText(t) => {
                 let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(live) = g.live.as_mut() {
                     live.live_text.push_str(&t);
                 }
                 drop(g);
-                sh.surface.on_delta_text(&t);
+                sh.emit(AgentEvent::Delta { text: t });
             }
-            PortEvent::DeltaThought(t) => sh.surface.on_delta_thought(&t),
-            PortEvent::CallStarted { tool, detail, .. } => {
-                sh.surface.on_note(format!("▸ {tool} {detail}").trim_end());
+            PortEvent::DeltaThought(t) => sh.emit(AgentEvent::Thought { text: t }),
+            PortEvent::CallStarted { tool, id, detail } => {
                 let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(live) = g.live.as_mut() {
-                    live.last_call = Some((tool, detail));
+                    live.last_call = Some((tool.clone(), detail.clone()));
+                    live.tool_started.insert(id.clone(), Instant::now());
+                }
+                drop(g);
+                sh.emit(AgentEvent::ToolStarted { id, tool, detail });
+            }
+            PortEvent::CallFinished { tool, id, ok } => {
+                let started = {
+                    let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.live
+                        .as_mut()
+                        .and_then(|live| live.tool_started.remove(&id))
+                };
+                let excerpt = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.live
+                        .as_ref()
+                        .and_then(|live| live.tool_excerpt.get(&id))
+                        .cloned()
+                };
+                let ms = started.map_or(0, |t| t.elapsed().as_millis() as u64);
+                let error = if ok {
+                    None
+                } else {
+                    excerpt
+                        .as_deref()
+                        .and_then(|e| e.lines().next())
+                        .map(str::to_string)
+                };
+                sh.emit(AgentEvent::ToolFinished {
+                    id,
+                    tool,
+                    ok,
+                    ms,
+                    error,
+                });
+            }
+            PortEvent::CallOutput { excerpt, id, .. } => {
+                // Keep the last excerpt per call: a failed call's first
+                // line rides its `ToolFinished` (visibility is the
+                // structured event, not a formatted note).
+                let capped: String = excerpt.chars().take(300).collect();
+                let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(live) = g.live.as_mut() {
+                    live.tool_excerpt.insert(id, capped);
                 }
             }
-            PortEvent::CallFinished {
-                tool, ok: false, ..
-            } => {
-                sh.surface.on_note(&format!("✗ {tool} failed"));
+            PortEvent::Plan(items) => {
+                sh.emit(AgentEvent::Plan {
+                    items: items
+                        .into_iter()
+                        .map(|(text, state)| PlanItem { text, state })
+                        .collect(),
+                });
             }
-            PortEvent::CallFinished { ok: true, .. } => {}
-            PortEvent::CallOutput {
-                is_error: true,
-                excerpt,
-                ..
-            } => {
-                let first = excerpt.lines().next().unwrap_or("");
-                sh.surface.on_note(&format!("  error: {first}"));
+            PortEvent::Context { used, window } => {
+                let pct = (used * 100).checked_div(window.max(1)).unwrap_or(0);
+                if last_ctx_pct != Some(pct) {
+                    last_ctx_pct = Some(pct);
+                    sh.emit(AgentEvent::Context { used, window });
+                }
             }
-            PortEvent::CallOutput {
-                is_error: false, ..
-            } => {}
+            PortEvent::Title(title) => {
+                if !title.is_empty() {
+                    let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(live) = g.live.as_mut() {
+                        live.title = Some(title);
+                    }
+                }
+            }
+            PortEvent::Compacting { done } => sh.emit(AgentEvent::Compacting { done }),
+            PortEvent::Inventory { tools } => {
+                let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(live) = g.live.as_mut() {
+                    live.tools = tools;
+                }
+            }
             PortEvent::Ask {
                 ask_id,
                 question,
@@ -259,8 +343,9 @@ pub(super) async fn drive(
                         Some("Allow (session)".into()),
                     );
                     let _ = sh.store.append_audit(&mut rec);
-                    sh.surface
-                        .on_note(&format!("✓ allowed for this session: {question}"));
+                    sh.emit(AgentEvent::Note {
+                        text: format!("✓ allowed for this session: {question}"),
+                    });
                     continue;
                 }
                 let kind = ApprovalKind::KaAsk {
@@ -272,8 +357,10 @@ pub(super) async fn drive(
                 let approval = Approval::new(sid, turn_id, kind, ttl as i64);
                 let card = ApprovalCard::from_approval(&approval);
                 if let Err(e) = sh.store.insert_approval(&approval) {
-                    sh.surface
-                        .on_error("internal", &format!("approval persist: {e}"));
+                    sh.emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        message: format!("approval persist: {e}"),
+                    });
                 }
                 // An ask is only actionable while its turn is live. The engine
                 // can raise one after it already reported `idle` (the scripted
@@ -301,7 +388,7 @@ pub(super) async fn drive(
                 if awaiting {
                     rt_persist_status(&sh, status);
                     if let Some(card) = card {
-                        sh.surface.on_approval(&card);
+                        sh.emit(card.to_event());
                     }
                     continue;
                 }
@@ -315,8 +402,10 @@ pub(super) async fn drive(
                     ApprovalStatus::Denied,
                     ka_agent_core::now_ms(),
                 ) {
-                    sh.surface
-                        .on_error("internal", &format!("ask deny persist: {e}"));
+                    sh.emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        message: format!("ask deny persist: {e}"),
+                    });
                 }
                 let mut rec = AuditRecord::new(
                     "runtime",
@@ -325,8 +414,9 @@ pub(super) async fn drive(
                     Some("deny: the turn this ask belongs to already finished".into()),
                 );
                 let _ = sh.store.append_audit(&mut rec);
-                sh.surface
-                    .on_notice("ask auto-denied: its turn already finished (nothing to approve)");
+                sh.emit(AgentEvent::Notice {
+                    text: "ask auto-denied: its turn already finished (nothing to approve)".into(),
+                });
             }
             PortEvent::TurnFinished {
                 stop,
@@ -362,8 +452,10 @@ pub(super) async fn drive(
                             .ok();
                     }
                     if let Err(e) = sh.store.update_turn(&t) {
-                        sh.surface
-                            .on_error("internal", &format!("turn persist: {e}"));
+                        sh.emit(AgentEvent::Error {
+                            class: "internal".into(),
+                            message: format!("turn persist: {e}"),
+                        });
                     }
                 }
                 let (verdict, budget) = {
@@ -377,7 +469,22 @@ pub(super) async fn drive(
                     )
                 };
                 sh.store.meta_set("budget", &budget).ok();
-                sh.surface.on_turn_finished(&stop, cost_usd, tokens);
+                let (ms, text) = {
+                    let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    let live = g.live.as_ref();
+                    (
+                        live.and_then(|l| l.turn_started_at)
+                            .map_or(0, |t| t.elapsed().as_millis() as u64),
+                        turn_text(live.map(|l| l.live_text.as_str()).unwrap_or("")),
+                    )
+                };
+                sh.emit(AgentEvent::TurnFinished {
+                    stop: stop.clone(),
+                    cost_usd,
+                    tokens,
+                    ms,
+                    text,
+                });
                 if verdict == BudgetVerdict::Exceeded {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     let from = g.session.status;
@@ -388,13 +495,15 @@ pub(super) async fn drive(
                     let status = g.session.status;
                     drop(g);
                     rt_persist_status(&sh, status);
-                    sh.surface.on_notice(
-                        "daily budget reached — paused until tomorrow (override via CLI)",
-                    );
+                    sh.emit(AgentEvent::Notice {
+                        text: "daily budget reached — paused until tomorrow (override via CLI)"
+                            .into(),
+                    });
                 }
                 if stop == "error" {
-                    sh.surface
-                        .on_notice("turn ended in error; see /status — nothing was re-submitted");
+                    sh.emit(AgentEvent::Notice {
+                        text: "turn ended in error; see /status — nothing was re-submitted".into(),
+                    });
                 }
                 // A cycle can emit several `turn_finished` events (auto-poke,
                 // verify): the first settles the status, the later ones only
@@ -419,11 +528,11 @@ pub(super) async fn drive(
                     for (i, chunk) in parts.iter().enumerate() {
                         let mut oc = OutboxChunk::new(tid.clone(), i as u32, chunk.clone());
                         sh.store.push_chunk(&oc).ok();
-                        if parts.len() > 1 {
-                            sh.surface.on_final_chunk(i as u32 + 1, chunk);
-                        } else {
-                            sh.surface.on_final_chunk(1, chunk);
-                        }
+                        let index = if parts.len() > 1 { i as u32 + 1 } else { 1 };
+                        sh.emit(AgentEvent::FinalChunk {
+                            index,
+                            text: chunk.clone(),
+                        });
                         oc.status = ka_agent_core::OutboxStatus::Sent;
                         oc.channel_message_id = Some(i as i64);
                         sh.store.mark_sent(&oc.turn, oc.chunk_index, i as i64).ok();
@@ -483,9 +592,12 @@ pub(super) async fn drive(
                 }
                 rt_maybe_idle(&sh);
             }
-            PortEvent::Note(t) => sh.surface.on_note(&t),
+            PortEvent::Note(t) => sh.emit(AgentEvent::Note { text: t }),
             PortEvent::EngineError { class, message, .. } => {
-                sh.surface.on_error(&class, &message);
+                sh.emit(AgentEvent::Error {
+                    class: class.clone(),
+                    message: message.clone(),
+                });
                 if class == "auth" {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     let from = g.session.status;
@@ -511,7 +623,7 @@ pub(super) async fn drive(
                             "auth failure — paused; fix the provider key and /resume".to_string()
                         }
                     };
-                    sh.surface.on_notice(&text);
+                    sh.emit(AgentEvent::Notice { text });
                 }
             }
             PortEvent::EngineClosed => {

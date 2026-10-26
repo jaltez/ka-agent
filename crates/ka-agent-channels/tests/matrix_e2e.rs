@@ -12,8 +12,14 @@ use ka_agent_channels::fake::{FAKE_MATRIX_BOT, FakeHomeserver};
 use ka_agent_channels::{Channel, MatrixChannel, MatrixConfig, MatrixSurface, pairing};
 use ka_agent_core::DaemonConfig;
 use ka_agent_port::WorkerPort;
+use ka_agent_runtime::event::AgentEvent;
 use ka_agent_runtime::surface::Surface;
-use ka_agent_runtime::{Paths, Runtime};
+use ka_agent_runtime::{Envelope, Paths, Runtime};
+
+/// A numbered envelope (seqs only matter to the bus, not the surface).
+fn env(seq: u64, ev: AgentEvent) -> Envelope {
+    Envelope::new(seq, ev)
+}
 use ka_agent_store::Store;
 use serde_json::json;
 use tokio::sync::watch;
@@ -166,16 +172,41 @@ async fn outbound_is_sent_while_sync_is_pending() {
     })
     .await;
     let started = Instant::now();
-    stack.surface.on_final_chunk(0, "answer while polling");
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::FinalChunk {
+            index: 0,
+            text: "answer while polling".into(),
+        },
+    ));
     let hit = stack
         .fake
         .await_sent("answer while polling", Duration::from_secs(2));
     assert!(hit.is_some(), "the reply waited behind /sync");
     assert!(started.elapsed() < Duration::from_secs(2));
     // Progress notes are never posted; status/turn summaries neither.
-    stack.surface.on_note("progress note");
-    stack.surface.on_turn_finished("done", 0.1, 10);
-    stack.surface.on_notice("⏰ ping");
+    stack.surface.emit(&env(
+        2,
+        AgentEvent::Note {
+            text: "progress note".into(),
+        },
+    ));
+    stack.surface.emit(&env(
+        3,
+        AgentEvent::TurnFinished {
+            stop: "done".into(),
+            cost_usd: 0.1,
+            tokens: 10,
+            ms: 5,
+            text: "done".into(),
+        },
+    ));
+    stack.surface.emit(&env(
+        4,
+        AgentEvent::Notice {
+            text: "⏰ ping".into(),
+        },
+    ));
     stack
         .fake
         .await_sent("⏰ ping", Duration::from_secs(2))
@@ -192,7 +223,12 @@ async fn outbound_is_sent_while_sync_is_pending() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queued_messages_wait_for_a_room_then_flush() {
     let (stack, _dir) = spawn_stack(true).await;
-    stack.surface.on_notice("early notice");
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::Notice {
+            text: "early notice".into(),
+        },
+    ));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(stack.fake.sent_all().is_empty());
     stack.fake.push_room_message(ROOM, OPERATOR, "/status");
@@ -283,7 +319,13 @@ async fn replies_carry_formatted_html() {
         .fake
         .await_sent("queue", Duration::from_secs(10))
         .expect("no /status reply");
-    stack.surface.on_final_chunk(0, "**done** with `x < y`");
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::FinalChunk {
+            index: 0,
+            text: "**done** with `x < y`".into(),
+        },
+    ));
     let hit = stack
         .fake
         .await_sent("**done**", Duration::from_secs(5))

@@ -3,8 +3,9 @@
 use super::MatrixConfig;
 use super::client::Client;
 use crate::commands;
-use ka_agent_core::ApprovalStatus;
-use ka_agent_runtime::surface::{ApprovalCard, Surface};
+use ka_agent_runtime::Envelope;
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::surface::Surface;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, mpsc};
 
@@ -58,42 +59,67 @@ impl MatrixSurface {
 }
 
 impl Surface for MatrixSurface {
-    /// In-turn progress: never sent (no message edits on Matrix).
-    fn on_note(&self, _text: &str) {}
-
-    fn on_notice(&self, text: &str) {
-        self.enqueue(text);
+    fn emit(&self, env: &Envelope) {
+        match &env.ev {
+            // In-turn progress: never sent (no message edits on Matrix).
+            AgentEvent::Note { .. } => {}
+            AgentEvent::Notice { text } => self.enqueue(text),
+            AgentEvent::Approval {
+                id,
+                question,
+                expires_at_ms,
+                ..
+            } => {
+                let left = (expires_at_ms - ka_agent_core::now_ms()).max(0);
+                let text = format!(
+                    "approval {} — {}\n\nexpires in {}\n/y to allow · /n to deny",
+                    ka_agent_core::ids::short_id(id),
+                    question,
+                    commands::fmt_interval(left)
+                );
+                self.enqueue(&text);
+            }
+            AgentEvent::ApprovalSettled { id, status } => {
+                self.enqueue(&format!(
+                    "approval {} → {status}",
+                    ka_agent_core::ids::short_id(id)
+                ));
+            }
+            AgentEvent::FinalChunk { text, .. } => self.enqueue(text),
+            AgentEvent::Error { class, message } => {
+                self.enqueue(&format!("! [{class}] {message}"));
+            }
+            // Cost and token counts live in `/status`; nothing is posted.
+            AgentEvent::TurnFinished { .. } => {}
+            // Session state changes are not posted (pauses arrive as
+            // notices).
+            AgentEvent::Session { .. } => {}
+            AgentEvent::MemoryProposal { id, text } => {
+                let short = ka_agent_core::ids::short_id(id);
+                self.enqueue(&format!(
+                    "💡 remember this? {text}\n   /memory accept {short} · /memory reject {short}"
+                ));
+            }
+            // Reasoning, tool structure and streaming drafts are not drawn
+            // on Matrix (today's behavior).
+            AgentEvent::Thought { .. }
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished { .. }
+            | AgentEvent::Plan { .. }
+            | AgentEvent::Context { .. }
+            | AgentEvent::Compacting { .. }
+            | AgentEvent::Inbound { .. }
+            | AgentEvent::TurnStarted { .. }
+            | AgentEvent::Delta { .. } => {}
+            // Later steps wire these to real deliveries.
+            AgentEvent::Reminder { .. }
+            | AgentEvent::File { .. }
+            | AgentEvent::CronFinished { .. }
+            | AgentEvent::Queue { .. }
+            | AgentEvent::Settings { .. }
+            | AgentEvent::SkillProposal { .. } => {}
+            // Per-connection events never reach a broadcast surface.
+            AgentEvent::Hello { .. } | AgentEvent::Reply { .. } => {}
+        }
     }
-
-    fn on_approval(&self, card: &ApprovalCard) {
-        let left = (card.expires_at_ms - ka_agent_core::now_ms()).max(0);
-        let text = format!(
-            "approval {} — {}\n\nexpires in {}\n/y to allow · /n to deny",
-            ka_agent_core::ids::short_id(&card.approval_id),
-            card.question,
-            commands::fmt_interval(left)
-        );
-        self.enqueue(&text);
-    }
-
-    fn on_approval_settled(&self, approval_id: &str, status: ApprovalStatus) {
-        self.enqueue(&format!(
-            "approval {} → {status:?}",
-            ka_agent_core::ids::short_id(approval_id)
-        ));
-    }
-
-    fn on_final_chunk(&self, _index: u32, text: &str) {
-        self.enqueue(text);
-    }
-
-    fn on_error(&self, class: &str, message: &str) {
-        self.enqueue(&format!("! [{class}] {message}"));
-    }
-
-    /// Cost and token counts live in `/status`; nothing is posted.
-    fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {}
-
-    /// Session state changes are not posted (pauses arrive as notices).
-    fn on_session_status(&self, _status: ka_agent_core::SessionStatus) {}
 }

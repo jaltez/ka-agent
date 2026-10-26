@@ -40,18 +40,26 @@ fn runtime_with(root: &std::path::Path, store: Arc<Store>, notes: Arc<Notes>) ->
 struct Notes(Mutex<Vec<String>>);
 
 impl ka_agent_runtime::surface::Surface for Notes {
-    fn on_note(&self, text: &str) {
-        self.0.lock().unwrap().push(format!("note: {text}"));
-    }
-    fn on_approval(&self, _card: &ka_agent_runtime::surface::ApprovalCard) {}
-    fn on_approval_settled(&self, _id: &str, _status: ka_agent_core::ApprovalStatus) {}
-    fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {}
-    fn on_session_status(&self, _status: ka_agent_core::SessionStatus) {}
-    fn on_error(&self, class: &str, message: &str) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(format!("error[{class}]: {message}"));
+    fn emit(&self, env: &ka_agent_runtime::Envelope) {
+        use ka_agent_runtime::event::AgentEvent;
+        match &env.ev {
+            AgentEvent::Note { text } => {
+                self.0.lock().unwrap().push(format!("note: {text}"));
+            }
+            AgentEvent::Notice { text } => {
+                self.0.lock().unwrap().push(text.clone());
+            }
+            AgentEvent::Reminder { text, .. } => {
+                self.0.lock().unwrap().push(text.clone());
+            }
+            AgentEvent::Error { class, message } => {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("error[{class}]: {message}"));
+            }
+            _ => {}
+        }
     }
 }
 

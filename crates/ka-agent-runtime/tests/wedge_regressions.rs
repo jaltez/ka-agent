@@ -39,12 +39,7 @@ fn runtime_with(
 
 struct SilentSurface;
 impl ka_agent_runtime::surface::Surface for SilentSurface {
-    fn on_note(&self, _text: &str) {}
-    fn on_approval(&self, _card: &ka_agent_runtime::surface::ApprovalCard) {}
-    fn on_approval_settled(&self, _id: &str, _status: ApprovalStatus) {}
-    fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {}
-    fn on_session_status(&self, _status: ka_agent_core::SessionStatus) {}
-    fn on_error(&self, _class: &str, _message: &str) {}
+    fn emit(&self, _env: &ka_agent_runtime::Envelope) {}
 }
 
 fn config(root: &std::path::Path) -> ka_agent_core::DaemonConfig {

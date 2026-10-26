@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ka_agent_runtime::{EventBus, Runtime, SurfaceEvent};
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::{Envelope, EventBus, Runtime};
 use ka_agent_store::Store;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +41,11 @@ impl Request {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// First value of a query parameter.
+    fn query_param(&self, name: &str) -> Option<&str> {
+        self.query.get(name).map(String::as_str)
     }
 }
 
@@ -531,6 +537,9 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
 
 /// `GET /events`: server-sent events from the bus. Authenticated like any
 /// page; the connection lives until the client or the daemon goes away.
+/// Each event carries an SSE `id:` (the envelope's `seq`), so a reconnect
+/// with `Last-Event-ID` replays exactly the gap it missed from the bus
+/// ring.
 async fn serve_events(
     req: &Request,
     auth: &Auth,
@@ -547,33 +556,53 @@ async fn serve_events(
     if socket.write_all(head.as_bytes()).await.is_err() {
         return;
     }
-    let mut rx = bus.subscribe();
+    // A reconnect names the last seq it saw (SSE `Last-Event-ID`, or
+    // `?since=` for a first page refresh); 0 means live only.
+    let since = req
+        .headers_get("last-event-id")
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| req.query_param("since").and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(0);
+    let (mut rx, replay) = if since > 0 {
+        bus.subscribe_since(since)
+    } else {
+        (bus.subscribe(), Vec::new())
+    };
+    // Events that raced the snapshot ride both the replay and the live
+    // stream; remember the last replayed seq and skip it live.
+    let mut last_sent = replay.last().map_or(0, |env| env.seq);
+    for env in replay {
+        if write_sse(&mut socket, &env).await.is_err() {
+            return;
+        }
+    }
+    let _ = socket.flush().await;
     let mut ping = tokio::time::interval(Duration::from_secs(25));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            ev = rx.recv() => {
-                let ev = match ev {
-                    Ok(ev) => ev,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => SurfaceEvent::Notice {
-                        text: format!("(missed {n} events)"),
-                    },
+            env = rx.recv() => {
+                let env = match env {
+                    Ok(env) if env.seq > last_sent => {
+                        last_sent = env.seq;
+                        env
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        std::sync::Arc::new(Envelope::new(
+                            0,
+                            AgentEvent::Notice {
+                                text: format!("(missed {n} events)"),
+                            },
+                        ))
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
-                if matches!(ev, SurfaceEvent::Hello { .. } | SurfaceEvent::Reply { .. }) {
+                if matches!(env.ev, AgentEvent::Hello { .. } | AgentEvent::Reply { .. }) {
                     continue;
                 }
-                match serde_json::to_string(&ev) {
-                    Ok(json) => {
-                        if socket
-                            .write_all(format!("data: {json}\n\n").as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(_) => continue,
+                if write_sse(&mut socket, &env).await.is_err() {
+                    return;
                 }
             }
             _ = ping.tick() => {
@@ -584,6 +613,18 @@ async fn serve_events(
         }
         let _ = socket.flush().await;
     }
+}
+
+/// One SSE frame: `id:` (the seq, for `Last-Event-ID` reconnects) +
+/// `data:` (the whole envelope, `seq` and `at_ms` included).
+async fn write_sse(socket: &mut tokio::net::TcpStream, env: &Envelope) -> std::io::Result<()> {
+    let json = match serde_json::to_string(env) {
+        Ok(json) => json,
+        Err(_) => return Ok(()),
+    };
+    socket
+        .write_all(format!("id: {}\ndata: {json}\n\n", env.seq).as_bytes())
+        .await
 }
 
 /// Escape user-derived text for safe HTML rendering.

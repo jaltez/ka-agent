@@ -231,7 +231,10 @@ fn drive_instance(root: &Path, marker: &str) {
             seen.push_str(&line);
             seen.push('\n');
         }
-        if seen.contains("forty-two") {
+        // The delivery boundary (the `· turn done` footer) is what writes
+        // the episode index; waiting for it (not just the streamed text)
+        // keeps `/remember` from racing the FTS write.
+        if seen.contains("forty-two") && seen.contains("turn done") {
             break;
         }
         assert!(

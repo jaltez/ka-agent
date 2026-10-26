@@ -29,7 +29,7 @@ pub(super) fn run_skill<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let rest = ctx.args;
         match rest.split_once(' ') {
             Some((name, prompt)) if !name.is_empty() && !prompt.is_empty() => {
-                match ctx.runtime.handle_skill(name, prompt).await {
+                match ctx.runtime.handle_skill(name, prompt, ctx.source).await {
                     // The turn itself streams back through the surface.
                     Ok(()) => Outcome::Silent,
                     Err(e) => Outcome::Reply(format!("! [skill] {e}")),

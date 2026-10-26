@@ -13,7 +13,27 @@ use ka_agent_channels::{TelegramChannel, TelegramConfig, TelegramSurface};
 use ka_agent_core::DaemonConfig;
 use ka_agent_core::config::Telegram as TelegramSettings;
 use ka_agent_port::WorkerPort;
-use ka_agent_runtime::surface::{ApprovalCard, Surface};
+use ka_agent_runtime::Envelope;
+use ka_agent_runtime::event::AgentEvent;
+use ka_agent_runtime::surface::Surface;
+
+/// A numbered envelope (seqs only matter to the bus, not the surface).
+fn env(seq: u64, ev: AgentEvent) -> Envelope {
+    Envelope::new(seq, ev)
+}
+
+fn finished(seq: u64) -> Envelope {
+    env(
+        seq,
+        AgentEvent::TurnFinished {
+            stop: "done".into(),
+            cost_usd: 0.0,
+            tokens: 0,
+            ms: 0,
+            text: String::new(),
+        },
+    )
+}
 use ka_agent_runtime::{Paths, Runtime};
 use ka_agent_store::Store;
 use tokio::sync::watch;
@@ -358,14 +378,14 @@ async fn approval_card_and_callback_settle() {
     let (server, base) = FakeBotServer::spawn();
     let surface = TelegramSurface::new(base.clone(), "tok-appr".to_string(), None);
     let full_id = "appr_0123456789abcdef";
-    let card = ApprovalCard {
-        approval_id: full_id.to_string(),
+    let card = AgentEvent::Approval {
+        id: full_id.to_string(),
         question: "run `rm -rf /tmp/x`?".to_string(),
         detail: None,
         options: vec!["allow".into(), "deny".into()],
         expires_at_ms: 1_799_999_999_000,
     };
-    surface.on_approval(&card);
+    surface.emit(&env(1, card.clone()));
     // no chat yet: must no-op
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
@@ -375,7 +395,7 @@ async fn approval_card_and_callback_settle() {
     );
     // learn the chat, render the card
     surface.set_chat(9);
-    surface.on_approval(&card);
+    surface.emit(&env(2, card));
     let sent = server
         .await_capture(
             |c| c.method == "sendMessage" && c.body["reply_markup"].is_object(),
@@ -469,9 +489,21 @@ async fn approval_card_and_callback_settle() {
 async fn surface_noops_until_chat_is_known() {
     let (server, base) = FakeBotServer::spawn();
     let surface = TelegramSurface::new(base, "tok-nochat".to_string(), None);
-    surface.on_final_chunk(0, "chunk");
-    surface.on_error("test", "boom");
-    surface.on_turn_finished("done", 0.0, 0);
+    surface.emit(&env(
+        1,
+        AgentEvent::FinalChunk {
+            index: 0,
+            text: "chunk".into(),
+        },
+    ));
+    surface.emit(&env(
+        2,
+        AgentEvent::Error {
+            class: "test".into(),
+            message: "boom".into(),
+        },
+    ));
+    surface.emit(&finished(3));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         server.captured().is_empty(),
@@ -486,14 +518,31 @@ async fn surface_noops_until_chat_is_known() {
 async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
     let (server, base) = FakeBotServer::spawn();
     let surface = TelegramSurface::new(base, "tok-draft".to_string(), Some(7));
-    surface.on_turn_started();
+    surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: String::new(),
+        },
+    ));
     let chunk = "word ".repeat(12); // 60 chars per delta
-    for _ in 0..3 {
-        surface.on_delta_text(&chunk);
+    for i in 0..3 {
+        surface.emit(&env(
+            2 + i as u64,
+            AgentEvent::Delta {
+                text: chunk.clone(),
+            },
+        ));
         tokio::time::sleep(Duration::from_millis(1100)).await;
     }
-    surface.on_final_chunk(1, &chunk.repeat(3));
-    surface.on_turn_finished("done", 0.0, 0);
+    surface.emit(&env(
+        5,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: chunk.repeat(3),
+        },
+    ));
+    surface.emit(&finished(6));
     let final_msg = server
         .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
         .expect("final message");
@@ -528,14 +577,31 @@ async fn refused_drafts_fall_back_to_the_finished_message() {
     let (server, base) = FakeBotServer::spawn();
     server.set_reject_drafts(true);
     let surface = TelegramSurface::new(base, "tok-nodraft".to_string(), Some(7));
-    surface.on_turn_started();
+    surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: String::new(),
+        },
+    ));
     let chunk = "word ".repeat(12);
-    for _ in 0..3 {
-        surface.on_delta_text(&chunk);
+    for i in 0..3 {
+        surface.emit(&env(
+            2 + i as u64,
+            AgentEvent::Delta {
+                text: chunk.clone(),
+            },
+        ));
         tokio::time::sleep(Duration::from_millis(1100)).await;
     }
-    surface.on_final_chunk(1, "the whole answer");
-    surface.on_turn_finished("done", 0.0, 0);
+    surface.emit(&env(
+        5,
+        AgentEvent::FinalChunk {
+            index: 1,
+            text: "the whole answer".into(),
+        },
+    ));
+    surface.emit(&finished(6));
     server
         .await_capture(
             |c| c.method == "sendMessage" && c.body["text"].as_str() == Some("the whole answer"),

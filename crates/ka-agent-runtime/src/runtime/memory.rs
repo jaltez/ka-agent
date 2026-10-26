@@ -214,13 +214,18 @@ impl Runtime {
             return Ok(0);
         };
         for c in fresh.iter().take(MAX_CARDS) {
-            self.sh.surface.on_memory_proposal(c.id.as_str(), &c.text);
+            self.sh.emit(AgentEvent::MemoryProposal {
+                id: c.id.as_str().to_string(),
+                text: c.text.clone(),
+            });
         }
         if fresh.len() > MAX_CARDS {
-            self.sh.surface.on_notice(&format!(
-                "{} more memory proposals — /memory review",
-                fresh.len() - MAX_CARDS
-            ));
+            self.sh.emit(AgentEvent::Notice {
+                text: format!(
+                    "{} more memory proposals — /memory review",
+                    fresh.len() - MAX_CARDS
+                ),
+            });
         }
         self.sh
             .store

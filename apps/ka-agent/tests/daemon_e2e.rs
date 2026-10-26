@@ -253,6 +253,107 @@ fn chat_attaches_to_the_running_daemon() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// An attach client watching a scripted tool turn receives the structured
+/// `tool_started`/`tool_finished` envelopes, with strictly increasing seqs
+/// (every line is one sequenced envelope).
+#[test]
+fn attach_stream_carries_tool_envelopes_with_increasing_seq() {
+    let root = temp_root("attach-tools");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let sc = root.join("tools.json");
+    std::fs::write(
+        &sc,
+        r#"{
+            "steps": [
+                {"call": {"tool": "bash", "args": {"command": "echo structured"}}},
+                {"text": "tools ran"}
+            ],
+            "stop": "done", "cost_usd": 0.0, "tokens": 4
+        }"#,
+    )
+    .unwrap();
+    // Free mode: the bash call needs no approval card, so the tool
+    // envelopes stream straight through.
+    let cfg = root.join("ka-agent.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "workspace = {:?}\nmode = \"free\"\nturn_grace_secs = 5\n[web]\nenabled = false\n",
+            ws.display().to_string()
+        ),
+    )
+    .unwrap();
+    let data = root.join("data");
+    let mut daemon = {
+        let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+            .arg("run")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("--scenario")
+            .arg(&sc)
+            .env("KA_AGENT_DATA_DIR", &data)
+            .env_remove("KA_MODEL")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Daemon { child, data }
+    };
+    daemon.wait_sock(Duration::from_secs(10));
+    let mut stream = std::os::unix::net::UnixStream::connect(daemon.sock()).unwrap();
+    stream
+        .write_all(b"{\"op\":\"attach\",\"since\":0}\n{\"op\":\"say\",\"text\":\"run it\"}\n")
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    let mut first = true;
+    let mut tool_seqs: Vec<(u64, String)> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        line.clear();
+        // A short read timeout keeps the deadline honest.
+        stream
+            .set_read_timeout(Some(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(50)),
+            ))
+            .ok();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            panic!("attach stream closed before the tool envelopes arrived");
+        }
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        if first {
+            first = false;
+            assert_eq!(v["ev"], "hello", "first line: {v}");
+        }
+        match v["ev"].as_str() {
+            Some(kind @ ("tool_started" | "tool_finished")) => {
+                tool_seqs.push((v["seq"].as_u64().unwrap(), kind.to_string()));
+            }
+            Some("turn_finished") => break,
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "timed out at: {v}");
+    }
+    let seqs: Vec<u64> = tool_seqs.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(
+        tool_seqs.len(),
+        2,
+        "one started + one finished: {tool_seqs:?}"
+    );
+    assert_eq!(tool_seqs[0].1, "tool_started", "{tool_seqs:?}");
+    assert_eq!(tool_seqs[1].1, "tool_finished", "{tool_seqs:?}");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "tool envelope seqs must increase: {seqs:?}"
+    );
+    assert!(seqs[0] >= 1, "seqs start at 1");
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// G1: `briefing on` schedules exactly one briefing cron; `briefing now`
 /// makes the running daemon send it — the engine sees the briefing prompt
 /// with today's context; `briefing off` removes it.

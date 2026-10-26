@@ -1,71 +1,32 @@
-//! The in-process event bus: every runtime surface event, broadcast to any
+//! The in-process event bus: every runtime envelope, broadcast to any
 //! number of live clients (attached terminals, web chat streams). It is one
 //! more [`Surface`] in the daemon's fan-out; clients subscribe and render.
+//!
+//! A ring of the last [`RING`] envelopes backs [`EventBus::subscribe_since`]:
+//! a reconnecting client that names the last seq it saw gets exactly the
+//! gap replayed (older gaps collapse into one `(missed events)` notice).
 
-use ka_agent_core::{ApprovalStatus, SessionStatus};
-use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
 use tokio::sync::broadcast;
 
-use crate::status::StatusReport;
-use crate::surface::{ApprovalCard, Surface};
+use crate::event::{AgentEvent, Envelope};
+use crate::surface::Surface;
 
 /// Bounded backlog per subscriber; a slower client sees `Lagged(n)`.
 const CAPACITY: usize = 1024;
 
-/// One surface event on the wire (NDJSON for attach, SSE for the web).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "ev", rename_all = "snake_case")]
-pub enum SurfaceEvent {
-    /// First event on an attach connection (sent only by attach servers).
-    Hello {
-        /// Boxed: the report dwarfs every other variant (the wire format is
-        /// unchanged — serde serializes the box transparently).
-        report: Box<StatusReport>,
-    },
-    /// A router reply for one client; never broadcast.
-    Reply {
-        text: String,
-    },
-    Inbound {
-        source: String,
-        text: String,
-    },
-    TurnStarted,
-    Delta {
-        text: String,
-    },
-    Note {
-        text: String,
-    },
-    Notice {
-        text: String,
-    },
-    Approval {
-        id: String,
-        question: String,
-        detail: Option<String>,
-        expires_at_ms: i64,
-    },
-    ApprovalSettled {
-        id: String,
-        status: String,
-    },
-    TurnFinished {
-        stop: String,
-        cost_usd: f64,
-        tokens: u64,
-    },
-    Status {
-        status: String,
-    },
-    Error {
-        class: String,
-        message: String,
-    },
-}
+/// How many recent envelopes a reconnect can replay.
+const RING: usize = 256;
+
+/// Seq for synthesized envelopes (`(missed events)`): every real envelope
+/// is ≥ 1, so 0 is free.
+const SYNTH_SEQ: u64 = 0;
 
 pub struct EventBus {
-    tx: broadcast::Sender<SurfaceEvent>,
+    tx: broadcast::Sender<Arc<Envelope>>,
+    ring: Mutex<VecDeque<Arc<Envelope>>>,
 }
 
 impl Default for EventBus {
@@ -77,84 +38,58 @@ impl Default for EventBus {
 impl EventBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            ring: Mutex::new(VecDeque::with_capacity(RING)),
+        }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<SurfaceEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<Envelope>> {
         self.tx.subscribe()
     }
 
-    fn send(&self, ev: SurfaceEvent) {
+    /// Subscribe plus a replay of everything after `seq`: the ring entries
+    /// with a newer seq, oldest first, and — when `seq` predates the ring —
+    /// one leading `(missed events)` envelope. Subscribe happens before the
+    /// snapshot so nothing between the two is lost.
+    pub fn subscribe_since(
+        &self,
+        seq: u64,
+    ) -> (broadcast::Receiver<Arc<Envelope>>, Vec<Arc<Envelope>>) {
+        let rx = self.tx.subscribe();
+        let mut replay = Vec::new();
+        {
+            let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(oldest) = ring.front()
+                && seq + 1 < oldest.seq
+            {
+                replay.push(Arc::new(Envelope::new(
+                    SYNTH_SEQ,
+                    AgentEvent::Notice {
+                        text: "(missed events)".into(),
+                    },
+                )));
+            }
+            replay.extend(ring.iter().filter(|e| e.seq > seq).cloned());
+        }
+        (rx, replay)
+    }
+
+    fn send(&self, env: Arc<Envelope>) {
+        let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        if ring.len() == RING {
+            ring.pop_front();
+        }
+        ring.push_back(Arc::clone(&env));
+        drop(ring);
         // No subscriber is not an error: nobody is watching right now.
-        let _ = self.tx.send(ev);
+        let _ = self.tx.send(env);
     }
 }
 
 impl Surface for EventBus {
-    fn on_turn_started(&self) {
-        self.send(SurfaceEvent::TurnStarted);
-    }
-
-    fn on_delta_text(&self, text: &str) {
-        self.send(SurfaceEvent::Delta {
-            text: text.to_string(),
-        });
-    }
-
-    fn on_note(&self, text: &str) {
-        self.send(SurfaceEvent::Note {
-            text: text.to_string(),
-        });
-    }
-
-    fn on_notice(&self, text: &str) {
-        self.send(SurfaceEvent::Notice {
-            text: text.to_string(),
-        });
-    }
-
-    fn on_inbound(&self, source: &str, text: &str) {
-        self.send(SurfaceEvent::Inbound {
-            source: source.to_string(),
-            text: text.to_string(),
-        });
-    }
-
-    fn on_approval(&self, card: &ApprovalCard) {
-        self.send(SurfaceEvent::Approval {
-            id: card.approval_id.clone(),
-            question: card.question.clone(),
-            detail: card.detail.clone(),
-            expires_at_ms: card.expires_at_ms,
-        });
-    }
-
-    fn on_approval_settled(&self, approval_id: &str, status: ApprovalStatus) {
-        self.send(SurfaceEvent::ApprovalSettled {
-            id: approval_id.to_string(),
-            status: format!("{status:?}"),
-        });
-    }
-
-    fn on_turn_finished(&self, stop: &str, cost_usd: f64, tokens: u64) {
-        self.send(SurfaceEvent::TurnFinished {
-            stop: stop.to_string(),
-            cost_usd,
-            tokens,
-        });
-    }
-
-    fn on_session_status(&self, status: SessionStatus) {
-        self.send(SurfaceEvent::Status {
-            status: format!("{status:?}"),
-        });
-    }
-
-    fn on_error(&self, class: &str, message: &str) {
-        self.send(SurfaceEvent::Error {
-            class: class.to_string(),
-            message: message.to_string(),
-        });
+    fn emit(&self, env: &Envelope) {
+        self.send(Arc::new(env.clone()));
     }
 }
 
@@ -164,34 +99,77 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn events_serialize_with_a_snake_case_tag() {
-        let v = serde_json::to_value(SurfaceEvent::TurnStarted).unwrap();
-        assert_eq!(v, serde_json::json!({"ev": "turn_started"}));
-        let v = serde_json::to_value(SurfaceEvent::Delta { text: "hi".into() }).unwrap();
-        assert_eq!(v, serde_json::json!({"ev": "delta", "text": "hi"}));
+    fn notice(text: &str, seq: u64) -> Envelope {
+        Envelope::new(seq, AgentEvent::Notice { text: text.into() })
+    }
+
+    fn emit_n(bus: &EventBus, n: u64) {
+        for i in 1..=n {
+            bus.emit(&notice(&format!("e{i}"), i));
+        }
     }
 
     #[test]
-    fn subscribers_receive_surface_calls() {
+    fn subscribers_receive_emitted_envelopes_in_order() {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        bus.on_inbound("telegram", "hello");
-        bus.on_notice("⏰ ping");
-        bus.on_final_chunk(1, "ignored: deltas already carried it");
+        bus.emit(&notice("hello", 1));
+        bus.emit(&notice("ping", 2));
         assert_eq!(
-            rx.try_recv().unwrap(),
-            SurfaceEvent::Inbound {
-                source: "telegram".into(),
+            rx.try_recv().unwrap().ev,
+            AgentEvent::Notice {
                 text: "hello".into()
             }
         );
+        assert_eq!(rx.try_recv().unwrap().seq, 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscribe_since_replays_exactly_the_gap() {
+        let bus = EventBus::new();
+        emit_n(&bus, 5);
+        let (mut rx, replay) = bus.subscribe_since(2);
+        let seqs: Vec<u64> = replay.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 4, 5]);
+        // The live stream starts after the replay, with no overlap.
+        bus.emit(&notice("e6", 6));
+        assert_eq!(rx.try_recv().unwrap().seq, 6);
+    }
+
+    #[test]
+    fn subscribe_since_zero_replays_the_whole_ring() {
+        let bus = EventBus::new();
+        emit_n(&bus, 3);
+        let (_, replay) = bus.subscribe_since(0);
+        let seqs: Vec<u64> = replay.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_seq_older_than_the_ring_gets_a_missed_notice() {
+        let bus = EventBus::new();
+        emit_n(&bus, 300); // the ring holds 45..=300
+        let (_, replay) = bus.subscribe_since(10);
+        assert_eq!(replay.len(), RING + 1, "notice + the whole ring");
+        assert_eq!(replay[0].seq, SYNTH_SEQ);
         assert_eq!(
-            rx.try_recv().unwrap(),
-            SurfaceEvent::Notice {
-                text: "⏰ ping".into()
+            replay[0].ev,
+            AgentEvent::Notice {
+                text: "(missed events)".into()
             }
         );
-        assert!(rx.try_recv().is_err());
+        assert_eq!(replay[1].seq, 45);
+        assert_eq!(replay.last().unwrap().seq, 300);
+    }
+
+    #[test]
+    fn ring_boundary_plays_back_without_a_notice() {
+        let bus = EventBus::new();
+        emit_n(&bus, 300); // the ring holds 45..=300
+        let (_, replay) = bus.subscribe_since(44);
+        assert_eq!(replay.len(), RING);
+        assert_eq!(replay[0].seq, 45);
+        assert!(replay.iter().all(|e| e.seq != SYNTH_SEQ));
     }
 }

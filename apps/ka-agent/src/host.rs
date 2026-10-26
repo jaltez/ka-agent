@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ka_agent_core::DaemonConfig;
 use ka_agent_runtime::{
-    EventBus, InstanceLock, LockError, Runtime, Surface, SurfaceEvent, paths::Paths,
+    Envelope, EventBus, InstanceLock, LockError, Runtime, Surface, paths::Paths,
 };
 use ka_agent_store::Store;
 use tokio::sync::broadcast;
@@ -41,7 +41,7 @@ pub struct Host {
     sock_path: PathBuf,
     /// Subscribed before the runtime existed (its recovery notices count);
     /// the local chat takes it, the daemon never does.
-    early_rx: Option<broadcast::Receiver<SurfaceEvent>>,
+    early_rx: Option<broadcast::Receiver<std::sync::Arc<Envelope>>>,
 }
 
 impl Host {
@@ -52,7 +52,7 @@ impl Host {
     }
 
     /// The bus receiver subscribed before the runtime existed. Taken once,
-    pub fn take_early_rx(&mut self) -> Option<broadcast::Receiver<SurfaceEvent>> {
+    pub fn take_early_rx(&mut self) -> Option<broadcast::Receiver<std::sync::Arc<Envelope>>> {
         self.early_rx.take()
     }
 

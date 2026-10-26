@@ -349,22 +349,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use ka_agent_core::ApprovalStatus;
-    use ka_agent_core::{DaemonConfig, SessionStatus};
+    use ka_agent_core::DaemonConfig;
     use ka_agent_port::WorkerPort;
-    use ka_agent_runtime::surface::{ApprovalCard, Surface};
+    use ka_agent_runtime::surface::Surface;
     use ka_agent_runtime::{Paths, Runtime};
     use ka_agent_store::Store;
     use std::sync::Arc;
 
     struct NullSurface;
     impl Surface for NullSurface {
-        fn on_note(&self, _text: &str) {}
-        fn on_approval(&self, _card: &ApprovalCard) {}
-        fn on_approval_settled(&self, _approval_id: &str, _status: ApprovalStatus) {}
-        fn on_turn_finished(&self, _stop: &str, _cost_usd: f64, _tokens: u64) {}
-        fn on_session_status(&self, _status: SessionStatus) {}
-        fn on_error(&self, _class: &str, _message: &str) {}
+        fn emit(&self, _env: &ka_agent_runtime::Envelope) {}
     }
 
     fn test_runtime() -> Runtime {

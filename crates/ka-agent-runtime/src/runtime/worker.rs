@@ -111,6 +111,12 @@ impl Runtime {
                 pending_asks: HashMap::new(),
                 live_text: String::new(),
                 current_turn: None,
+                current_turn_source: None,
+                turn_started_at: None,
+                tool_started: HashMap::new(),
+                tool_excerpt: HashMap::new(),
+                tools: Vec::new(),
+                title: None,
                 deliberate_close: false,
                 last_activity_ms: ka_agent_core::now_ms(),
                 last_call: None,
@@ -226,14 +232,18 @@ pub(super) async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>
         (target, note)
     };
     for id in sh.store.expire_pending(now).unwrap_or_default() {
-        sh.surface
-            .on_approval_settled(id.as_str(), ka_agent_core::ApprovalStatus::Expired);
+        sh.emit(AgentEvent::ApprovalSettled {
+            id: id.as_str().to_string(),
+            status: format!("{:?}", ka_agent_core::ApprovalStatus::Expired),
+        });
     }
     rt_persist_status(sh, status);
-    sh.surface.on_session_status(status);
+    sh.emit(AgentEvent::Session {
+        status: format!("{status:?}"),
+    });
     if deliberate {
-        sh.surface.on_note(&note);
+        sh.emit(AgentEvent::Note { text: note.clone() });
     } else {
-        sh.surface.on_notice(&note);
+        sh.emit(AgentEvent::Notice { text: note });
     }
 }

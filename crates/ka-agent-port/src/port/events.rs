@@ -92,15 +92,28 @@ pub enum PortEvent {
     },
     /// The engine (or worker) is gone; the session is dead.
     EngineClosed,
+    /// The model's live todo list (`todos`): whole-list replacement of
+    /// `(text, state)` pairs, in display order.
+    Plan(Vec<(String, String)>),
+    /// Live context meter during a turn.
+    Context { used: u64, window: u64 },
+    /// The strand's display title (empty titles are dropped by the
+    /// runtime, not the port).
+    Title(String),
+    /// A context digest (compaction) started (`false`) or finished.
+    Compacting { done: bool },
+    /// Bootstrap inventory: the tool names this engine offers.
+    Inventory { tools: Vec<String> },
 }
 
 /// Map one ka event to its port projection; `None` drops it. Dropped by
 /// design: `session_info` (captured as strand identity), the bootstrap
 /// state echo (`model_changed`, `mode_changed`, `effort_changed`,
-/// `features_changed`), `inventory`, `todos`, `title`, `context_meter`,
-/// `context_breakdown`, `digest_*`, call-kind deltas, and every
-/// surface-specific event. Bootstrap state is verified by contract
-/// tests, not streamed upward.
+/// `features_changed`), `context_breakdown`, call-kind deltas, and every
+/// surface-specific event. Bootstrap state is verified by contract tests,
+/// not streamed upward. `todos`, `context_meter`, `title`, `digest_*` and
+/// `inventory` project to their port forms (plan, context, title,
+/// compacting, inventory); the runtime decides what is broadcast.
 pub(crate) fn map_ka_event(
     ev: ka_protocol::Event,
     strand_id: Option<&str>,
@@ -116,6 +129,23 @@ pub(crate) fn map_ka_event(
             replay_messages: messages.len(),
         },
         E::TurnStarted { .. } => PortEvent::TurnStarted,
+        E::ContextMeter { used, window } => PortEvent::Context { used, window },
+        E::Title { title } => PortEvent::Title(title),
+        E::DigestStarted => PortEvent::Compacting { done: false },
+        E::DigestFinished { .. } => PortEvent::Compacting { done: true },
+        E::Inventory { tools, .. } => PortEvent::Inventory { tools },
+        E::Todos { items } => PortEvent::Plan(
+            items
+                .into_iter()
+                .map(|t| {
+                    let state = match t.state {
+                        ka_protocol::TodoState::Pending => "pending",
+                        ka_protocol::TodoState::Done => "done",
+                    };
+                    (t.text, state.to_string())
+                })
+                .collect(),
+        ),
         E::Delta {
             kind: DeltaKind::Text(text),
         } => PortEvent::DeltaText(text),
@@ -402,11 +432,78 @@ mod tests {
             Event::ModeChanged {
                 mode: ka_protocol::Mode::Plan,
             },
-            Event::Title { title: "t".into() },
-            Event::ContextMeter { used: 1, window: 2 },
-            Event::DigestStarted,
+            Event::EffortChanged {
+                level: ka_protocol::Effort::Medium,
+            },
         ] {
             assert_eq!(map_ka_event(ev, None, None), None);
         }
+    }
+
+    #[test]
+    fn plan_context_title_compacting_and_inventory_project() {
+        assert_eq!(
+            map_ka_event(
+                Event::Todos {
+                    items: vec![
+                        ka_protocol::TodoItem {
+                            text: "first".into(),
+                            state: ka_protocol::TodoState::Pending,
+                            confidence: None,
+                        },
+                        ka_protocol::TodoItem {
+                            text: "second".into(),
+                            state: ka_protocol::TodoState::Done,
+                            confidence: Some(90),
+                        },
+                    ],
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::Plan(vec![
+                ("first".into(), "pending".into()),
+                ("second".into(), "done".into()),
+            ]))
+        );
+        assert_eq!(
+            map_ka_event(Event::ContextMeter { used: 9, window: 0 }, None, None),
+            Some(PortEvent::Context { used: 9, window: 0 })
+        );
+        assert_eq!(
+            map_ka_event(Event::Title { title: "t".into() }, None, None),
+            Some(PortEvent::Title("t".into()))
+        );
+        assert_eq!(
+            map_ka_event(Event::DigestStarted, None, None),
+            Some(PortEvent::Compacting { done: false })
+        );
+        assert_eq!(
+            map_ka_event(
+                Event::DigestFinished {
+                    kept: ka_protocol::RecordId("r7".into()),
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::Compacting { done: true })
+        );
+        assert_eq!(
+            map_ka_event(
+                Event::Inventory {
+                    tools: vec!["read".into()],
+                    mcp: Vec::new(),
+                    agents: Vec::new(),
+                    skills: Vec::new(),
+                    prompts: Vec::new(),
+                    disabled: Vec::new(),
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::Inventory {
+                tools: vec!["read".into()]
+            })
+        );
     }
 }

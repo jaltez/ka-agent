@@ -57,7 +57,7 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   sent as normal messages. While a turn runs: typing action every 4 s plus
   one editable progress message (edits throttled to 1 per 3 s, last 3
   notes buffered).
-- Final answer: `on_final_chunk` sends one message per chunk (runtime chunks
+- Final answer: the `final_chunk` envelope sends one message per chunk (runtime chunks
   ≤3800 chars at paragraph boundaries); the surface closes unbalanced ```
   fences per chunk and spaces sends ≥1 s (official per-chat guidance ~1/s).
 - Approval cards (SEED.md §5.5): question + detail (first 20 lines) +

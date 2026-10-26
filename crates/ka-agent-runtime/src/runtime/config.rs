@@ -123,7 +123,7 @@ impl Runtime {
                         report.restart_required.join(", ")
                     ));
                 }
-                self.sh.surface.on_notice(&line);
+                self.sh.emit(AgentEvent::Notice { text: line });
                 // persist the last good reload for doctor/status
                 let _ = self.sh.store.meta_set("config.reload_error", "");
             }
@@ -138,7 +138,7 @@ impl Runtime {
                     .flatten()
                     .unwrap_or_default();
                 if already != msg {
-                    self.sh.surface.on_notice(&msg);
+                    self.sh.emit(AgentEvent::Notice { text: msg.clone() });
                     let _ = self.sh.store.meta_set("config.reload_error", &msg);
                 }
                 // do not reload, and do not re-check until the file moves
