@@ -27,7 +27,7 @@ fn history_path() -> std::path::PathBuf {
 pub enum Action {
     /// The operator submitted this line.
     Submit(String),
-    /// Ctrl-C with an empty draft: stop the reply (or arm quit).
+    /// Ctrl-C on an empty draft while a turn runs: stop the reply.
     Interrupt,
     /// Ctrl-D on an empty draft.
     Eof,
@@ -160,7 +160,7 @@ impl Terminal {
                     }
                 }
                 Key::Down => {
-                    if let Some(line) = self.history.next(&self.editor.text()) {
+                    if let Some(line) = self.history.next() {
                         self.editor.set(&line);
                     }
                 }
@@ -208,7 +208,10 @@ impl Terminal {
                 Key::Ctrl('g') => {
                     self.edit_in_editor();
                 }
-                Key::Ctrl('c') => {
+                Key::Interrupt => {
+                    // Ctrl-C (Unix 0x03, Windows the console event): a
+                    // non-empty draft is cleared, an empty one stops the
+                    // running turn, and twice on an idle prompt quits.
                     if !self.editor.is_empty() {
                         self.editor.clear();
                         self.completions.clear();
@@ -226,12 +229,6 @@ impl Terminal {
                                 print!("\r\n\x1b[2m(press Ctrl-C again to quit)\x1b[0m");
                             }
                         }
-                    }
-                }
-                Key::Interrupt => {
-                    if busy {
-                        self.draw();
-                        return Some(Action::Interrupt);
                     }
                 }
                 Key::Eof => {

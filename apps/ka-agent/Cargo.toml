@@ -11,8 +11,9 @@ name = "ka-agent"
 path = "src/main.rs"
 
 [dependencies]
-# The inline terminal client's raw mode (termios only; no TUI framework).
-rustix = { version = "1", features = ["termios", "stdio"] }
+# The inline terminal client's raw mode (termios), stdin polling for the
+# ESC pause, and the stdio descriptors. No TUI framework.
+rustix = { version = "1", features = ["termios", "stdio", "event"] }
 ka-agent-core = { workspace = true }
 ka-agent-port = { workspace = true }
 ka-agent-store = { workspace = true }

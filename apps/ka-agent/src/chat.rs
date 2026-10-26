@@ -487,6 +487,61 @@ fn spawn_input(prompt: bool) -> tokio::sync::mpsc::UnboundedReceiver<Option<Stri
     rx
 }
 
+/// A card the draft's bare `y`/`n`/`s` may answer: `(kind, id)`, kind one of
+/// `approval`, `memory`, `skill`.
+type PendingCard = (String, String);
+
+/// Translate one submitted line against the armed card. Returns the line to
+/// send and whether the submission answered the card. An answered card is
+/// discharged: a later bare `y` is a message to the model, not a stale
+/// command against a card that is already settled.
+fn resolve_submission(text: &str, pending: Option<&PendingCard>) -> (String, bool) {
+    let bare = text.trim();
+    let Some((kind, id)) = pending else {
+        return (text.to_string(), false);
+    };
+    match bare {
+        "y" | "n" | "s" => {
+            let line = match (bare, kind.as_str()) {
+                ("y", "memory") => format!("/memory accept {id}"),
+                ("n", "memory") => format!("/memory reject {id}"),
+                ("y", "skill") => format!("/skills accept {id}"),
+                ("n", "skill") => format!("/skills reject {id}"),
+                ("s", _) => format!("/y {id} session"),
+                (verb, _) => format!("/{verb} {id}"),
+            };
+            (line, true)
+        }
+        _ if answers_card(bare, kind, id) => (text.to_string(), true),
+        _ => (text.to_string(), false),
+    }
+}
+
+/// True when a full-form command addresses the armed card: `/y <id>` /
+/// `/n <id>` (an approval), `/memory accept|reject <id>` (a memory card),
+/// `/skills accept|reject <id>` (a skill card).
+fn answers_card(text: &str, kind: &str, id: &str) -> bool {
+    use ka_agent_core::ids::id_matches;
+    let mut parts = text.split_whitespace();
+    let Some(command) = parts.next() else {
+        return false;
+    };
+    match command {
+        "/y" | "/n" if kind == "approval" => {
+            parts.next().is_some_and(|target| id_matches(id, target))
+        }
+        "/memory" if kind == "memory" => {
+            matches!(parts.next(), Some("accept" | "reject"))
+                && parts.next().is_some_and(|target| id_matches(id, target))
+        }
+        "/skills" if kind == "skill" => {
+            matches!(parts.next(), Some("accept" | "reject"))
+                && parts.next().is_some_and(|target| id_matches(id, target))
+        }
+        _ => false,
+    }
+}
+
 pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::ExitCode {
     let paths = Paths::new(Paths::default_root());
     let mut backend = if admin::is_running(&paths) {
@@ -524,8 +579,9 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
     } else {
         None
     };
-    // A pending card the draft's `y`/`n`/`s` keys may answer.
-    let mut pending_card: Option<(String, String)> = None;
+    // The newest card the draft's `y`/`n`/`s` may answer; discharged once a
+    // submission addresses it (or its approval settles).
+    let mut pending_card: Option<PendingCard> = None;
     // One reader only: the terminal owns stdin when it is active.
     let mut input = if interactive {
         None
@@ -624,19 +680,10 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                     None => std::future::pending().await,
                 }
             } => match action {
-                Some(crate::term::Action::Submit(mut text)) => {
-                    let bare = text.trim().to_string();
-                    if matches!(bare.as_str(), "y" | "n" | "s")
-                        && let Some((kind, id)) = pending_card.clone()
-                    {
-                        text = match (bare.as_str(), kind.as_str()) {
-                            ("y", "memory") => format!("/memory accept {id}"),
-                            ("n", "memory") => format!("/memory reject {id}"),
-                            ("y", "skill") => format!("/skills accept {id}"),
-                            ("n", "skill") => format!("/skills reject {id}"),
-                            ("s", _) => format!("/y {id} session"),
-                            (verb, _) => format!("/{verb} {id}"),
-                        };
+                Some(crate::term::Action::Submit(text)) => {
+                    let (text, answered) = resolve_submission(&text, pending_card.as_ref());
+                    if answered {
+                        pending_card = None;
                     }
                     if matches!(text.as_str(), "/quit" | "/q" | "/exit") {
                         break;
@@ -805,5 +852,68 @@ fn mode_badge() -> String {
         String::new()
     } else {
         format!(" · mode {mode}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn card(kind: &str, id: &str) -> PendingCard {
+        (kind.to_string(), id.to_string())
+    }
+
+    #[test]
+    fn a_bare_answer_is_only_rewritten_while_a_card_is_armed() {
+        let memory = card("memory", "deadbeefcafe");
+        assert_eq!(
+            resolve_submission("y", Some(&memory)),
+            ("/memory accept deadbeefcafe".to_string(), true)
+        );
+        assert_eq!(
+            resolve_submission("n", Some(&memory)),
+            ("/memory reject deadbeefcafe".to_string(), true)
+        );
+        let skill = card("skill", "s1");
+        assert_eq!(
+            resolve_submission("y", Some(&skill)),
+            ("/skills accept s1".to_string(), true)
+        );
+        let approval = card("approval", "a1");
+        assert_eq!(
+            resolve_submission("s", Some(&approval)),
+            ("/y a1 session".to_string(), true)
+        );
+        // Once answered the card is discharged: the same bare `y` reaches the
+        // model unchanged instead of becoming a command against a stale id.
+        assert_eq!(resolve_submission("y", None), ("y".to_string(), false));
+        // Surrounding whitespace still counts as the shortcut.
+        assert!(resolve_submission("  y \n", Some(&memory)).1);
+    }
+
+    #[test]
+    fn a_full_command_that_answers_the_card_discharges_it() {
+        let memory = card("memory", "abcdef123456");
+        assert_eq!(
+            resolve_submission("/memory accept abcdef123456", Some(&memory)),
+            ("/memory accept abcdef123456".to_string(), true)
+        );
+        // Short ids resolve, as the card prints them.
+        assert!(resolve_submission("/memory reject abcdef", Some(&memory)).1);
+        // A message that does not address the card leaves it armed.
+        assert_eq!(
+            resolve_submission("what is on my calendar?", Some(&memory)),
+            ("what is on my calendar?".to_string(), false)
+        );
+        // The wrong command family or another id does not answer it.
+        assert!(!resolve_submission("/skills reject abcdef", Some(&memory)).1);
+        assert!(!resolve_submission("/memory accept 999999", Some(&memory)).1);
+        // `/y` answers approvals, not proposals: the card stays armed.
+        assert!(!resolve_submission("/y abcdef", Some(&memory)).1);
+        let approval = card("approval", "aa11bb22");
+        assert!(resolve_submission("/y aa11bb22", Some(&approval)).1);
+        assert!(resolve_submission("/y aa11bb22 session", Some(&approval)).1);
+        assert!(!resolve_submission("/memory accept aa11bb22", Some(&approval)).1);
     }
 }

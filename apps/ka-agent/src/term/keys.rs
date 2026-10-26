@@ -1,7 +1,8 @@
 //! Key decoding for the inline terminal client: a dedicated std thread
 //! reads stdin bytes, decodes UTF-8 characters and the escape sequences the
 //! editor binds, and forwards [`Key`] events. Split reads are buffered; a
-//! lone ESC is only emitted after a short pause (an arrow key arrives whole).
+//! lone ESC is only emitted after a short pause (an arrow key arrives whole),
+//! and control bytes the editor binds nothing to are consumed and ignored.
 
 use tokio::sync::mpsc;
 
@@ -25,7 +26,8 @@ pub enum Key {
     Tab,
     BackTab,
     Esc,
-    /// Ctrl-C.
+    /// Ctrl-C: the only control byte both platforms map here (never
+    /// [`Key::Ctrl`]); the driver clears the draft, stops a turn, or quit-arms.
     Interrupt,
     /// Ctrl-D.
     Eof,
@@ -141,20 +143,54 @@ fn map_key(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModi
     }
 }
 
+/// How long a lone ESC waits for the rest of its sequence: an arrow key
+/// arrives in one write, well inside the pause; an operator pressing Esc
+/// (then Enter) waits longer.
+#[cfg(unix)]
+const ESC_PAUSE: rustix::event::Timespec = rustix::event::Timespec {
+    tv_sec: 0,
+    tv_nsec: 30_000_000,
+};
+
 /// Decode stdin until EOF; every complete key is sent. `None` payload means
 /// the stream closed.
 #[cfg(unix)]
 pub fn spawn_reader() -> mpsc::Receiver<Key> {
     let (tx, rx) = mpsc::channel(256);
     std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut stdin = std::io::stdin();
+        use rustix::event::{PollFd, PollFlags, poll};
+        // Read the descriptor directly: `std::io::Stdin` buffers, so `poll`
+        // could time out while bytes sit in that buffer. The terminal owns
+        // stdin while it is active, so no other reader competes.
+        let stdin = rustix::stdio::stdin();
         let mut buf = [0u8; 1024];
         let mut pending: Vec<u8> = Vec::new();
         loop {
-            let n = match stdin.read(&mut buf) {
+            // Wait for bytes; with a partial buffer, only for the ESC pause.
+            let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
+            let timeout = (!pending.is_empty()).then_some(&ESC_PAUSE);
+            match poll(&mut fds, timeout) {
+                Ok(0) => {
+                    match flush_after_timeout(&pending) {
+                        Flush::Nothing => {}
+                        Flush::Emit(key) => {
+                            pending.clear();
+                            if tx.blocking_send(key).is_err() {
+                                return;
+                            }
+                        }
+                        Flush::Drop => pending.clear(),
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => break,
+            }
+            let n = match rustix::io::read(stdin, &mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
+                Err(rustix::io::Errno::INTR) => continue,
                 Err(_) => break,
             };
             pending.extend_from_slice(&buf[..n]);
@@ -169,6 +205,7 @@ pub fn spawn_reader() -> mpsc::Receiver<Key> {
                         }
                         idx += used;
                     }
+                    Decoded::Ignore(used) => idx += used,
                     Decoded::NeedMore => break,
                 }
             }
@@ -185,7 +222,33 @@ pub fn spawn_reader() -> mpsc::Receiver<Key> {
 #[cfg(unix)]
 enum Decoded {
     Key(Key, usize),
+    /// A byte sequence with no binding: consume `usize` bytes, emit nothing.
+    Ignore(usize),
     NeedMore,
+}
+
+/// What the ESC pause does with a buffer no further byte arrived for.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum Flush {
+    /// Nothing buffered.
+    Nothing,
+    /// A lone ESC: emit it and drop the truncated sequence behind it.
+    Emit(Key),
+    /// A split UTF-8 character: drop it (it cannot become valid text).
+    Drop,
+}
+
+/// Decide what a timed-out `pending` buffer becomes. Pure so the pause's
+/// rules are testable without a terminal: a lone ESC (or the prefix of an
+/// unfinished escape sequence) is the Esc key, anything else is garbage.
+#[cfg(unix)]
+fn flush_after_timeout(pending: &[u8]) -> Flush {
+    match pending.first() {
+        None => Flush::Nothing,
+        Some(0x1b) => Flush::Emit(Key::Esc),
+        Some(_) => Flush::Drop,
+    }
 }
 
 /// Decode one key at the head of `bytes`.
@@ -201,7 +264,9 @@ fn decode_one(bytes: &[u8]) -> Decoded {
         0x03 => Decoded::Key(Key::Interrupt, 1),
         0x04 => Decoded::Key(Key::Eof, 1),
         0x01..=0x1a => Decoded::Key(Key::Ctrl((b - 1 + b'a') as char), 1),
-        0x00..=0x1f => Decoded::NeedMore, // other control bytes: ignore
+        // Ctrl-\ Ctrl-] Ctrl-^ Ctrl-_ and NUL: bound to nothing. Consume
+        // them, or the decoder would stall until the buffer-drop limit.
+        0x00 | 0x1c..=0x1f => Decoded::Ignore(1),
         _ => {
             // UTF-8: find the char length from the leading byte.
             let len = match b {
@@ -305,7 +370,9 @@ fn decode_paste(bytes: &[u8], start: usize) -> Decoded {
     Decoded::Key(Key::Paste(payload), start + pos + END.len())
 }
 
-#[cfg(test)]
+/// The decoder is Unix-only (Windows decodes crossterm events), so its tests
+/// are too: `cargo test` on Windows must still compile.
+#[cfg(all(test, unix))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
@@ -313,6 +380,7 @@ mod tests {
     fn one(input: &[u8]) -> (Key, usize) {
         match decode_one(input) {
             Decoded::Key(k, n) => (k, n),
+            Decoded::Ignore(_) => panic!("ignored: {input:?}"),
             Decoded::NeedMore => panic!("incomplete: {input:?}"),
         }
     }
@@ -352,5 +420,48 @@ mod tests {
             decode_one(b"\x1b[200~unterminated"),
             Decoded::NeedMore
         ));
+    }
+
+    #[test]
+    fn unbound_control_bytes_are_consumed_and_ignored() {
+        // Ctrl-\ in the middle used to wedge the decoder until the 4 KiB
+        // drop; it must vanish and leave the surrounding text intact.
+        let input = b"hello\x1cworld";
+        let mut keys = Vec::new();
+        let mut idx = 0;
+        while idx < input.len() {
+            match decode_one(&input[idx..]) {
+                Decoded::Key(key, used) => {
+                    keys.push(key);
+                    idx += used;
+                }
+                Decoded::Ignore(used) => idx += used,
+                Decoded::NeedMore => panic!("stalled at byte {idx}"),
+            }
+        }
+        assert_eq!(
+            keys,
+            "helloworld".chars().map(Key::Char).collect::<Vec<_>>()
+        );
+        assert_eq!(idx, input.len());
+        for byte in [0x00, 0x1c, 0x1d, 0x1e, 0x1f] {
+            assert!(matches!(decode_one(&[byte]), Decoded::Ignore(1)));
+        }
+    }
+
+    #[test]
+    fn a_timed_out_buffer_flushes_a_lone_esc_and_drops_the_rest() {
+        assert_eq!(flush_after_timeout(b""), Flush::Nothing);
+        // Esc on its own, and the prefix of an unfinished sequence: the
+        // operator pressed Esc, the rest is not a key.
+        assert_eq!(flush_after_timeout(b"\x1b"), Flush::Emit(Key::Esc));
+        assert_eq!(flush_after_timeout(b"\x1b["), Flush::Emit(Key::Esc));
+        assert_eq!(
+            flush_after_timeout(b"\x1b[200~half a paste"),
+            Flush::Emit(Key::Esc)
+        );
+        // A split UTF-8 char never becomes valid text: drop it silently.
+        assert_eq!(flush_after_timeout(b"\xc3"), Flush::Drop);
+        assert_eq!(flush_after_timeout("\u{e9}".as_bytes()), Flush::Drop);
     }
 }

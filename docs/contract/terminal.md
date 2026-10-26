@@ -44,11 +44,11 @@ pong                                                                          �
 | Backspace / Delete | delete |
 | Ctrl-W | kill the word before the cursor |
 | Ctrl-K / Ctrl-U | kill to end / to start |
-| ↑/↓ | history, filtered by the draft's prefix |
+| ↑/↓ | history; the walk filters by the draft it started with, and ↓ past the newest entry restores that draft |
 | Ctrl-R | incremental reverse search (Enter accepts, Ctrl-G cancels) |
 | Tab | complete `/command` names and aliases, or `@path` in the workspace (≤ 10 shown, a single match inserts) |
-| Ctrl-C | clear the draft; with an empty draft, stop the running turn; twice on an idle prompt quits |
-| Ctrl-D | quit (EOF) |
+| Ctrl-C | a non-empty draft is cleared; on an empty draft a running turn is stopped; twice on an idle prompt (within 2 s) quits |
+| Ctrl-D | quit on an empty draft (EOF) |
 | Ctrl-L | clear the screen, keep the live area |
 | Ctrl-O | toggle tool detail rows |
 | Ctrl-T | toggle streamed thinking |
@@ -57,7 +57,13 @@ pong                                                                          �
 
 Raw mode keeps output post-processing (`OPOST`) on so `\n` still starts at
 column 0, enables bracketed paste and focus reporting, and restores the
-terminal state on drop, on Ctrl-C and on panic.
+terminal state on drop and on panic (including the panic hook).
+
+A lone `ESC` is emitted after a 30 ms pause: an arrow key arrives whole and
+decodes immediately, while `Esc` followed by `Enter` inside that pause is
+read as `Alt-Enter` (a newline in the draft, folded to a space). Control
+bytes with no binding (`Ctrl-\`, `Ctrl-]`, `Ctrl-^`, `Ctrl-_`, NUL) are
+consumed and ignored instead of stalling the decoder.
 
 ## Approval and proposal cards
 
@@ -65,20 +71,25 @@ Cards print as permanent blocks above the live area: `y` allows, `n` denies,
 `s` allows for the session (the one-letter answers resolve against the
 newest pending card; the full forms `/y <id> [session]`, `/n <id>`,
 `/memory accept|reject <id>`, `/skills accept|reject <id>` still work).
+Answering a card discharges it: a later bare `y`/`n`/`s` is an ordinary
+message to the model, never a command against an already-settled id.
 
 ## Wiring and files
 
 `apps/ka-agent/src/term/`: `raw.rs` (termios guard), `keys.rs` (byte decoder
-with split-read buffering and an ESC timeout), `editor.rs` (chars, cursor,
-wrapping, history, reverse search), `complete.rs`, `view.rs` (status line,
-activity, redraw, Markdown flush), `cards.rs`, `mod.rs` (the driver the chat
-loop polls beside `backend.next()`). Only one reader owns stdin: the
-terminal when it is active, the line reader otherwise.
+with split-read buffering, the ESC pause and the control-byte skip),
+`editor.rs` (chars, cursor, wrapping, history, reverse search), `complete.rs`,
+`view.rs` (status line, activity, redraw, Markdown flush), `cards.rs`,
+`mod.rs` (the driver the chat loop polls beside `backend.next()`). Only one
+reader owns stdin: the terminal when it is active, the line reader otherwise.
 
 ## Verification
 
-Unit tests cover the decoder (split reads, UTF-8, paste, modifyOtherKeys),
-the editor (kills, wrapping by display width, history walk and search), and
-the view (activity steps, status truncation, tool rows). The real binary is
-smoked in a tmux pane: banner, draft, Enter, tool row, answer, footer — and
-the same session under `script` with a piped stdin for the split-read path.
+Unit tests cover the decoder (split reads, UTF-8, paste, modifyOtherKeys,
+unbound control bytes, the ESC-pause flush), the editor (kills, wrapping by
+display width, history walk and search, newest-entry load, draft restore),
+the view (activity steps, status truncation, tool rows), and the chat's
+one-letter card answers (rewritten only while the card is armed). The real
+binary is smoked in a tmux pane: banner, draft, Enter, tool row, answer,
+footer — and the same session under `script` with a piped stdin for the
+split-read path.

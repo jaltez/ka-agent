@@ -184,11 +184,15 @@ impl History {
     pub fn load(path: std::path::PathBuf) -> Self {
         let mut lines = Vec::new();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            for line in text.lines().take(HISTORY_MAX) {
+            for line in text.lines() {
                 if let Ok(s) = serde_json::from_str::<String>(line) {
                     lines.push(s);
                 }
             }
+        }
+        if lines.len() > HISTORY_MAX {
+            // The newest entries are the ones worth recalling.
+            lines.drain(..lines.len() - HISTORY_MAX);
         }
         Self {
             lines,
@@ -199,6 +203,10 @@ impl History {
     }
 
     pub fn push(&mut self, line: &str) {
+        // A submission ends any walk: the next Up starts from the newest
+        // entry and the draft saved by the old walk is gone.
+        self.pos = None;
+        self.saved.clear();
         if line.trim().is_empty() || self.lines.last().is_some_and(|l| l == line) {
             return;
         }
@@ -226,21 +234,24 @@ impl History {
         }
     }
 
-    /// Up: previous entry, optionally prefix-filtered by the draft.
-    pub fn prev(&mut self, prefix: &str) -> Option<String> {
+    /// Up: previous entry. `draft` is the editor's text and is only read
+    /// when a walk starts (it is saved, and the whole walk filters by it,
+    /// so later calls may pass the line currently shown).
+    pub fn prev(&mut self, draft: &str) -> Option<String> {
         if self.lines.is_empty() {
             return None;
         }
         let start = match self.pos {
             Some(p) => p.checked_sub(1),
             None => {
-                self.saved = prefix.to_string();
+                self.saved = draft.to_string();
                 Some(self.lines.len().saturating_sub(1))
             }
         };
+        let filter = self.saved.clone();
         let mut i = start;
         while let Some(idx) = i {
-            if prefix.is_empty() || self.lines[idx].starts_with(prefix) {
+            if filter.is_empty() || self.lines[idx].starts_with(&filter) {
                 self.pos = Some(idx);
                 return Some(self.lines[idx].clone());
             }
@@ -249,20 +260,20 @@ impl History {
         None
     }
 
-    /// Down: next entry, or back to the draft.
-    pub fn next(&mut self, prefix: &str) -> Option<String> {
+    /// Down: next entry (same filter as the walk up), or the draft saved
+    /// when the walk started, restoring what the operator was typing.
+    pub fn next(&mut self) -> Option<String> {
         let pos = self.pos?;
         let mut i = pos + 1;
         while i < self.lines.len() {
-            if prefix.is_empty() || self.lines[i].starts_with(prefix) {
+            if self.saved.is_empty() || self.lines[i].starts_with(&self.saved) {
                 self.pos = Some(i);
                 return Some(self.lines[i].clone());
             }
             i += 1;
         }
         self.pos = None;
-        self.saved.clear();
-        Some(String::new())
+        Some(std::mem::take(&mut self.saved))
     }
 
     /// Reverse search hits for a query (newest first).
@@ -333,9 +344,60 @@ mod tests {
         h.push("git log"); // duplicate dropped
         assert_eq!(h.prev("git"), Some("git log".into()));
         assert_eq!(h.prev("git"), Some("git status".into()));
-        assert_eq!(h.next("git"), Some("git log".into()));
-        assert_eq!(h.next("git"), Some(String::new()));
+        assert_eq!(h.next(), Some("git log".into()));
+        // Past the newest entry the draft saved at walk start comes back.
+        assert_eq!(h.next(), Some("git".into()));
         assert_eq!(h.search("cargo"), vec!["cargo test".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_restores_the_draft_not_an_empty_line() {
+        let dir = std::env::temp_dir().join(format!("ka-hist-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut h = History::load(dir.join("history"));
+        h.push("cargo test");
+        h.push("cargo build");
+        // The driver passes the editor's text on every key: the draft first,
+        // then the recalled line. Only the first one is the draft.
+        assert_eq!(h.prev("car"), Some("cargo build".into()));
+        assert_eq!(h.prev("cargo build"), Some("cargo test".into()));
+        assert_eq!(h.prev("cargo test"), None);
+        assert_eq!(h.next(), Some("cargo build".into()));
+        let draft = h.next().unwrap();
+        assert_eq!(draft, "car");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_submission_starts_the_next_walk_over() {
+        let dir = std::env::temp_dir().join(format!("ka-hist-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut h = History::load(dir.join("history"));
+        h.push("one");
+        h.push("two");
+        assert_eq!(h.prev(""), Some("two".into()));
+        // Submitting (even the recalled line) ends the walk.
+        h.push("three");
+        assert_eq!(h.prev(""), Some("three".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_load_keeps_the_newest_entries() {
+        let dir = std::env::temp_dir().join(format!("ka-hist-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let mut body = String::new();
+        for i in 0..HISTORY_MAX + 5 {
+            body.push_str(&serde_json::to_string(&format!("line {i}")).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+        let h = History::load(path);
+        assert_eq!(h.lines.len(), HISTORY_MAX);
+        assert_eq!(h.lines.first().map(String::as_str), Some("line 5"));
+        assert_eq!(h.lines.last().map(String::as_str), Some("line 1004"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -473,4 +473,18 @@ mod tests {
         assert_eq!(tool_failed_line("edit", "boom\nstack"), "  ✗ edit · boom");
         assert!(tool_line("web_fetch", "https://example.com/x").contains("reading"));
     }
+
+    #[test]
+    fn truncate_keeps_every_line_within_width() {
+        // The ellipsis needs a column of its own: a character that would land
+        // exactly in the last column yields to the mark, because the live
+        // area's row math assumes no line exceeds `width`.
+        assert_eq!(truncate_display("abcdXY", 5), "abcd…");
+        // Nothing is truncated when the text fits, exact fit included.
+        assert_eq!(truncate_display("abcdX", 5), "abcdX");
+        assert_eq!(truncate_display("abcd", 5), "abcd");
+        // Wide characters count two columns.
+        assert_eq!(truncate_display("你好世界", 5), "你好…");
+        assert!(truncate_display("你好世界", 5).width() <= 5);
+    }
 }
