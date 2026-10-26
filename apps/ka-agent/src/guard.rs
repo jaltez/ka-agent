@@ -61,6 +61,10 @@ fn resolve(path: &Path) -> PathBuf {
 
 /// Is `path` equal to or beneath any protected entry?
 fn inside(path: &Path, list: &[PathBuf]) -> Option<PathBuf> {
+    // Both sides go through `resolve`: a candidate built from a symlinked
+    // spelling of the same directory (macOS `/var` → `/private/var`) must
+    // match the resolved root, or the guard stops protecting its files.
+    let path = resolve(path);
     for entry in list {
         let entry = resolve(entry);
         if path == entry || path.starts_with(&entry) {

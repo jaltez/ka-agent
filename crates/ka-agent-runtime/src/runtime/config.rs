@@ -34,6 +34,21 @@ impl Runtime {
     /// change) stops an idle worker so the next message starts a fresh one
     /// with the new settings; a running turn finishes on the old ones.
     pub async fn reload_config(&self, new: DaemonConfig, restart_worker: bool) -> ReloadReport {
+        // One writer at a time: a hot-reload that loaded the file before a
+        // live setter could otherwise apply its stale snapshot last and
+        // silently undo the setter (a `/mode plan` reverting to guarded).
+        let _guard = self.sh.config_lock.lock().await;
+        self.reload_config_locked(new, restart_worker).await
+    }
+
+    /// The swap without the config lock: callers that already hold it
+    /// (the file watcher, the live setters) use this so the load and the
+    /// apply cannot interleave with another writer.
+    pub(crate) async fn reload_config_locked(
+        &self,
+        new: DaemonConfig,
+        restart_worker: bool,
+    ) -> ReloadReport {
         let old = self.cfg();
         let changed = ka_agent_core::config_keys::changed(&old, &new);
         let report = ReloadReport {
@@ -92,6 +107,10 @@ impl Runtime {
         let Some(path) = self.config_path() else {
             return;
         };
+        // Hold the lock from the mtime check through the apply: a live
+        // setter that writes the file meanwhile must not be undone by the
+        // snapshot taken here.
+        let _guard = self.sh.config_lock.lock().await;
         let Ok(meta) = std::fs::metadata(&path) else {
             return;
         };
@@ -108,7 +127,7 @@ impl Runtime {
         }
         match DaemonConfig::load(&path) {
             Ok(new) => {
-                let report = self.reload_config(new, false).await;
+                let report = self.reload_config_locked(new, false).await;
                 let mut line = String::from("config reloaded");
                 if !report.applied.is_empty() {
                     line.push_str(&format!(" · applied: {}", report.applied.join(", ")));
@@ -345,9 +364,10 @@ impl Runtime {
         let path = self
             .config_path()
             .ok_or_else(|| Error::Refused("no config file — run ka-agent setup".into()))?;
+        let _guard = self.sh.config_lock.lock().await;
         ka_agent_core::config_file::set(&path, "model", &info.id).map_err(Error::Config)?;
         let new = DaemonConfig::load(&path)?;
-        self.reload_config(new, false).await;
+        self.reload_config_locked(new, false).await;
         self.settings_event();
         Ok(info.id)
     }
@@ -382,6 +402,9 @@ impl Runtime {
         let path = self
             .config_path()
             .ok_or_else(|| Error::Refused("no config file — run ka-agent setup".into()))?;
+        // One writer at a time, and mark the file as seen so the watcher
+        // does not re-announce (or re-apply a stale snapshot) afterwards.
+        let _guard = self.sh.config_lock.lock().await;
         ka_agent_core::config_file::set(&path, "mode", &format!("{mode:?}"))
             .map_err(Error::Config)?;
         let mut new_cfg = (*self.cfg()).clone();
@@ -392,6 +415,7 @@ impl Runtime {
             let _ = port.set_mode(mode.to_string()).await;
         }
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_cfg);
+        self.remember_config_mtime();
         self.audit(audit_actions::MODE_SET, mode, Some(format!("by {source}")))?;
         self.settings_event();
         Ok(mode.to_string())

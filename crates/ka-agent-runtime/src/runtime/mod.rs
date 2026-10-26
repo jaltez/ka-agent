@@ -164,6 +164,10 @@ struct Shared {
     /// updates it): the maintenance loop's hot-reload watcher compares
     /// against it so IPC-triggered reloads are not announced twice.
     config_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// Serializes config writers with the hot-reload watcher: a reload
+    /// that loaded a stale file must not undo a live setter, and a setter
+    /// must not race a reload's apply.
+    config_lock: tokio::sync::Mutex<()>,
     /// The persona file's mtime as last seen (identity watcher).
     persona_mtime: Mutex<Option<std::time::SystemTime>>,
     /// When this runtime woke up (ms since epoch), for the header.
@@ -324,6 +328,7 @@ impl Runtime {
                 env_cache: Mutex::new(None),
                 scheduler_tick: tokio::sync::Notify::new(),
                 config_mtime: Mutex::new(None),
+                config_lock: tokio::sync::Mutex::new(()),
                 persona_mtime: Mutex::new(None),
                 started_ms: ka_agent_core::now_ms(),
                 auto_allow: Mutex::new(Vec::new()),

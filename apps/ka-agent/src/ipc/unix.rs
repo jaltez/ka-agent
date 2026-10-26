@@ -58,13 +58,26 @@ impl IpcListener {
 /// One accepted or connected stream over the admin socket.
 pub struct IpcStream {
     stream: UnixStream,
+    /// The socket owner's uid; unused where the platform has no
+    /// peer-credential call (macOS/BSD rely on the 0600 mode).
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     own_uid: u32,
 }
 
 impl IpcStream {
-    /// SO_PEERCRED: the peer is the socket's owner (same uid).
+    /// The peer is the socket's owner. Linux/Android ask the kernel
+    /// (`SO_PEERCRED`); elsewhere the socket's 0600 mode is the gate — the
+    /// kernel refuses a connect from another user, and there is no safe
+    /// peer-credential call for macOS without `unsafe` FFI.
     pub fn peer_ok(&self) -> bool {
-        self.stream.peer_cred().map(|c| c.uid()).unwrap_or(u32::MAX) == self.own_uid
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.stream.peer_cred().map(|c| c.uid()).ok() == Some(self.own_uid)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            true
+        }
     }
 
     /// Split into halves (the attach stream's reader/writer). The platform-
