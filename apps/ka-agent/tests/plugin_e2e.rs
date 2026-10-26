@@ -113,7 +113,7 @@ fn start_host(data: &std::path::Path) -> Host {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
         .env("KA_AGENT_DATA_DIR", data)
         .arg("run")
         .arg("--config")
@@ -128,8 +128,13 @@ fn start_host(data: &std::path::Path) -> Host {
         if sock.exists() {
             return Host(child);
         }
+        if child.try_wait().unwrap().is_some() {
+            panic!("host exited before the socket appeared");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("host never came up at {}", data.display());
 }
 
