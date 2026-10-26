@@ -28,6 +28,7 @@ mod sessions;
 mod tasks;
 mod turns;
 
+pub use candidates::SkillCandidateRow;
 pub use retention::PruneReport;
 
 use std::path::Path;
@@ -86,6 +87,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v5.sql"),
     include_str!("schema_v6.sql"),
     include_str!("schema_v7.sql"),
+    include_str!("schema_v8.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -138,6 +140,9 @@ pub struct CandidateRow {
     pub text: String,
     pub provenance: Option<String>,
     pub created_ms: i64,
+    /// Target memory file (`facts`/`preferences`/`environment`/`profile`);
+    /// `None` = facts.
+    pub file: Option<String>,
 }
 
 /// One channel identity linked to this instance's operator (SEED.md §8.1).

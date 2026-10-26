@@ -348,7 +348,7 @@ async fn reminder_beyond_grace_is_missed() {
     assert_eq!(row.status, ka_agent_core::TaskStatus::Missed);
     let seen = notes.0.lock().unwrap().join("\n");
     assert!(
-        seen.contains("⏰ missed: water the plants"),
+        seen.contains("missed: water the plants"),
         "surface saw: {seen}"
     );
     assert!(seen.contains("overdue by 2h"), "surface saw: {seen}");
@@ -372,10 +372,7 @@ async fn reminder_within_grace_fires_with_late_marker() {
     let row = store.get_task(&task.id).unwrap().unwrap();
     assert_eq!(row.status, ka_agent_core::TaskStatus::Succeeded);
     let seen = notes.0.lock().unwrap().join("\n");
-    assert!(
-        seen.contains("⏰ stretch (late by 5m)"),
-        "surface saw: {seen}"
-    );
+    assert!(seen.contains("stretch (late by 5m)"), "surface saw: {seen}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

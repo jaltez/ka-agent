@@ -233,6 +233,68 @@ fn simple_turn_and_status() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 2.4: the model sets a reminder, it lists it, and it fires as ⏰ with no
+/// model turn.
+#[test]
+fn remind_tool_sets_and_fires_a_reminder() {
+    let root = temp_root("remind-tool");
+    let sc = scenario_file(
+        &root,
+        "remind.json",
+        r#"{ "steps": [
+            {"call": {"tool": "kagent__remind", "args": {"action": "add", "when": "in 1m", "text": "stretch"}}},
+            {"text": "reminder set"}
+        ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("remind me to stretch in a minute");
+    chat.expect("reminder set", Duration::from_secs(60));
+    chat.send("/reminders");
+    chat.expect("stretch", Duration::from_secs(10));
+    // Fires within the minute (the scheduler ticks every 15 s).
+    chat.expect("⏰ stretch", Duration::from_secs(120));
+    chat.send("/reminders");
+    chat.expect("no reminders", Duration::from_secs(10));
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 2.4: send_file refuses paths outside the workspace and attachments.
+#[test]
+fn send_file_refuses_paths_outside_the_workspace() {
+    let root = temp_root("send-file");
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::write(root.join("data/secret.txt"), "nope").unwrap();
+    let sc = scenario_file(
+        &root,
+        "send.json",
+        r#"{ "steps": [
+            {"call": {"tool": "kagent__send_file", "args": {"path": "../data/secret.txt"}}},
+            {"text": "could not send it"}
+        ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("send me your secrets");
+    chat.expect("could not send it", Duration::from_secs(60));
+    let strands = root.join("data/ka/strands");
+    let mut jsonl = String::new();
+    for entry in std::fs::read_dir(&strands).unwrap().flatten() {
+        for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+            if file.path().extension().is_some_and(|e| e == "jsonl") {
+                jsonl = std::fs::read_to_string(file.path()).unwrap_or_default();
+            }
+        }
+    }
+    assert!(
+        jsonl.contains("send_file only sends files from the workspace or attachments"),
+        "the refusal must reach the model:\n{jsonl}"
+    );
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 2.3 approval profile: a read-tier kagent tool never asks, so a guarded
 /// session leaves no approval row behind.
 #[test]

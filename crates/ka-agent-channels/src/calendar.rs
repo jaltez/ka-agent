@@ -77,6 +77,57 @@ fn render(raw: &str, now: &jiff::Zoned) -> String {
     text
 }
 
+/// One event occurrence for tool/agent use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalEvent {
+    pub start: jiff::Zoned,
+    pub all_day: bool,
+    pub summary: String,
+}
+
+/// Events overlapping `[from 00:00, to 00:00)` local days, sorted by start
+/// (the `calendar_events` tool). Reuses the digest loader and expansion.
+pub fn events_between(
+    source: &str,
+    store: &Store,
+    tz: &jiff::tz::TimeZone,
+    from: jiff::civil::Date,
+    to: jiff::civil::Date,
+) -> Result<Vec<CalEvent>, String> {
+    let raw = load(source, store)?;
+    let lo = from
+        .to_zoned(tz.clone())
+        .map_err(|e| format!("bad date {from}: {e}"))?;
+    let hi = to
+        .to_zoned(tz.clone())
+        .map_err(|e| format!("bad date {to}: {e}"))?;
+    let (events, _unexpanded) = parse_events(&raw, tz);
+    let mut out = Vec::new();
+    for ev in &events {
+        for start in occurrences(ev, &lo, &hi) {
+            out.push(CalEvent {
+                start,
+                all_day: ev.all_day,
+                summary: ev.summary.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|e| e.start.timestamp().as_millisecond());
+    Ok(out)
+}
+
+/// The configured calendar cron's source text (`<data>` store), when one
+/// exists.
+pub fn configured_source(store: &Store) -> Option<String> {
+    store.cron_tasks().ok().and_then(|rows| {
+        rows.iter().find_map(|t| {
+            ka_agent_core::CronSpec::from_payload(t.payload.as_deref()?)
+                .filter(|s| s.mode == ka_agent_core::CronMode::NoAgent("calendar".into()))
+                .map(|s| s.text)
+        })
+    })
+}
+
 /// Load the ICS body: granted+SSRF-guarded HTTP(S) or a local file path.
 fn load(source: &str, store: &Store) -> Result<String, String> {
     if source.starts_with("http://") || source.starts_with("https://") {

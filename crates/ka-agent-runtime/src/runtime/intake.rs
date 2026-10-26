@@ -522,6 +522,13 @@ impl Runtime {
     }
 
     /// Skills the engine currently discovers (for `/skills` and doctor).
+    /// Provision one skill into the engine home (the `/skills accept`
+    /// path): true when the operator's library has it.
+    pub fn enable_skill(&self, name: &str) -> Result<bool, Error> {
+        let skills = crate::skills::Skills::new(&self.sh.paths.engine_home());
+        skills.enable(name).map_err(Error::Skills)
+    }
+
     pub fn skills_enabled(&self) -> Vec<crate::skills::SkillInfo> {
         crate::skills::Skills::new(&self.sh.paths.engine_home()).enabled()
     }

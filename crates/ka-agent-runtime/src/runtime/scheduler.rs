@@ -167,17 +167,21 @@ impl Runtime {
                     let title = task.title.clone();
                     let this_late_by = late_by(&task);
                     if this_late_by > LATE_GRACE_MS {
-                        self.sh.emit(AgentEvent::Notice {
+                        self.sh.emit(AgentEvent::Reminder {
+                            id: task.id.to_string(),
                             text: format!(
-                                "⏰ missed: {title} (overdue by {})",
+                                "missed: {title} (overdue by {})",
                                 ka_agent_core::fmt_interval(this_late_by)
                             ),
                         });
                         let _ = self.sh.store.settle_task(&task.id, "missed");
                         continue;
                     }
-                    self.sh.emit(AgentEvent::Notice {
-                        text: format!("⏰ {title}{}", late_suffix(this_late_by)),
+                    // Structured so every surface can render it its own
+                    // way (the chat shows ⏰, phones a notification).
+                    self.sh.emit(AgentEvent::Reminder {
+                        id: task.id.to_string(),
+                        text: format!("{title}{}", late_suffix(this_late_by)),
                     });
                     let _ = self.sh.store.settle_task(&task.id, "succeeded");
                     fired.push(title);

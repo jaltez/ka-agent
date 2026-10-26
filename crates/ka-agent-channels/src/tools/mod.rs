@@ -16,6 +16,7 @@ use ka_agent_runtime::paths::Paths;
 use ka_agent_store::Store;
 use serde_json::Value;
 
+pub mod assistant;
 pub mod github;
 pub mod history;
 pub mod http;
@@ -137,6 +138,34 @@ pub static BUILTINS: &[ToolSpec] = &[
         schema: github::pull_review_schema,
         effect: Effect::ExternalWrite,
         run: github::pull_review,
+    },
+    ToolSpec {
+        name: "remind",
+        description: "Set, list or cancel a reminder for the operator. A reminder is a notification: it fires without a model turn. when: 'in 2h30m', 'at 18:30', 'tomorrow 9am', 'fri 17:00', '2026-11-03 10:00' or RFC 3339.",
+        schema: assistant::remind_schema,
+        effect: Effect::LocalWrite,
+        run: assistant::remind,
+    },
+    ToolSpec {
+        name: "send_file",
+        description: "Send a file from the workspace (or attachments) to the operator on their channels, with an optional caption.",
+        schema: assistant::send_file_schema,
+        effect: Effect::LocalWrite,
+        run: assistant::send_file,
+    },
+    ToolSpec {
+        name: "calendar_events",
+        description: "List the operator's calendar events for a window (the configured /calendar source): from YYYY-MM-DD, days 1-14.",
+        schema: assistant::calendar_schema,
+        effect: Effect::Read,
+        run: assistant::calendar_events,
+    },
+    ToolSpec {
+        name: "skill_propose",
+        description: "Offer a reusable procedure as a new skill draft. The operator reviews it, and only an accepted proposal is installed in the skill library.",
+        schema: assistant::skill_propose_schema,
+        effect: Effect::Propose,
+        run: assistant::skill_propose,
     },
     ToolSpec {
         name: "cron_list",

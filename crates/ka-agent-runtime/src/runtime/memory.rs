@@ -103,12 +103,19 @@ impl Runtime {
         }) else {
             return Ok(false);
         };
-        let mem_id = self.sh.memory.add(
-            ka_agent_memory::MemoryFile::Facts,
-            &row.text,
-            &row.source,
-            None,
-        )?;
+        // The proposal names its target file (facts by default).
+        let file = match row.file.as_deref() {
+            None | Some("facts") => ka_agent_memory::MemoryFile::Facts,
+            Some("preferences") => ka_agent_memory::MemoryFile::Preferences,
+            Some("environment") => ka_agent_memory::MemoryFile::Environment,
+            Some("profile") => ka_agent_memory::MemoryFile::Profile,
+            Some(other) => {
+                return Err(Error::Refused(format!(
+                    "candidate names an unknown memory file {other:?}"
+                )));
+            }
+        };
+        let mem_id = self.sh.memory.add(file, &row.text, &row.source, None)?;
         self.refresh_compiled_memory()?;
         self.sh
             .memory

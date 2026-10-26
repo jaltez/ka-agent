@@ -595,7 +595,9 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// something shaped like a credential (memory is compiled into every
 /// prompt and synced to git), or text phrased as instructions to the agent
 /// (the classic way to poison memory).
-pub fn screen_proposal(text: &str) -> Result<(), String> {
+/// The invisible/direction-changing half of the proposal screen (shared
+/// with the persona and skill writers).
+pub fn screen_invisible(text: &str) -> Result<(), String> {
     const INVISIBLE: &[char] = &[
         '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}',
     ];
@@ -610,6 +612,11 @@ pub fn screen_proposal(text: &str) -> Result<(), String> {
             c as u32
         ));
     }
+    Ok(())
+}
+
+/// The credential-shape half (no API keys or private keys in stored text).
+pub fn screen_credentials(text: &str) -> Result<(), String> {
     let lower = text.to_lowercase();
     let secret_shapes = [
         "sk-",
@@ -624,6 +631,7 @@ pub fn screen_proposal(text: &str) -> Result<(), String> {
         "-----begin",
         "bearer ",
     ];
+
     for word in lower
         .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | '(' | ')'))
     {
@@ -636,6 +644,15 @@ pub fn screen_proposal(text: &str) -> Result<(), String> {
     if lower.contains("-----begin") {
         return Err("refused: looks like a key block — secrets never go into memory".into());
     }
+    Ok(())
+}
+
+/// The full proposal screen: invisible characters, credential shapes, and
+/// the instruction-shape rule (a memory is a fact, not a command).
+pub fn screen_proposal(text: &str) -> Result<(), String> {
+    screen_invisible(text)?;
+    screen_credentials(text)?;
+    let lower = text.to_lowercase();
     let commands = [
         "ignore previous",
         "ignore all previous",

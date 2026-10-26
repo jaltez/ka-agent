@@ -308,6 +308,29 @@ fn render(env: &Envelope, out: &mut Term) {
             }
         }
         AgentEvent::Notice { text } => println!("\n· {text}"),
+        AgentEvent::Reminder { text, .. } => println!("\n⏰ {text}"),
+        AgentEvent::File {
+            path,
+            name,
+            caption,
+        } => {
+            let cap = if caption.is_empty() {
+                String::new()
+            } else {
+                format!(" — {caption}")
+            };
+            let _ = name;
+            println!("\n📎 {path}{cap}");
+        }
+        AgentEvent::SkillProposal {
+            id,
+            name,
+            description,
+        } => {
+            println!(
+                "\n💡 skill proposal {name}: {description}\n   /skills accept {id} · /skills reject {id}"
+            );
+        }
         AgentEvent::Approval {
             id,
             question,
@@ -368,12 +391,9 @@ fn render(env: &Envelope, out: &mut Term) {
         | AgentEvent::Context { .. }
         | AgentEvent::Compacting { .. }
         | AgentEvent::FinalChunk { .. }
-        | AgentEvent::Reminder { .. }
-        | AgentEvent::File { .. }
         | AgentEvent::CronFinished { .. }
         | AgentEvent::Queue { .. }
-        | AgentEvent::Settings { .. }
-        | AgentEvent::SkillProposal { .. } => {}
+        | AgentEvent::Settings { .. } => {}
     }
 }
 
