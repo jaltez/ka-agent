@@ -55,6 +55,21 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args;
         let reply = match rest {
+            "log" => match runtime.memory_log(10) {
+                Ok(rows) if rows.is_empty() => "no memory commits yet".to_string(),
+                Ok(rows) => {
+                    let mut out = String::from("recent memory changes (newest first):\n");
+                    for (sha, date, subject) in rows {
+                        out.push_str(&format!("  {sha} {date} {subject}\n"));
+                    }
+                    out.trim_end().to_string()
+                }
+                Err(e) => format!("git not installed — memory history is off ({e})"),
+            },
+            "undo" => match runtime.memory_undo() {
+                Ok(subject) => format!("undone: {subject}"),
+                Err(e) => format!("! [memory] {e}"),
+            },
             "files" => match runtime.memory_report() {
                 Ok(report) => {
                     let files: Vec<String> = report

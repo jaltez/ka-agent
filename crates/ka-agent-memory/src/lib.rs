@@ -595,6 +595,58 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// something shaped like a credential (memory is compiled into every
 /// prompt and synced to git), or text phrased as instructions to the agent
 /// (the classic way to poison memory).
+impl MemoryStore {
+    /// `/memory log`: the most recent commits, newest first.
+    pub fn log(&self, n: usize) -> Result<Vec<(String, String, String)>, Error> {
+        let out = Self::git(
+            &self.root_path(),
+            &[
+                "log",
+                &format!("-n{}", n.clamp(1, 100)),
+                "--format=%h%x1f%ad%x1f%s",
+                "--date=short",
+            ],
+        )?;
+        if out.trim().is_empty() || out.contains("does not have any commits") {
+            return Ok(Vec::new());
+        }
+        Ok(out
+            .lines()
+            .filter_map(|l| {
+                let mut parts = l.split('\x1f');
+                Some((
+                    parts.next()?.to_string(),
+                    parts.next()?.to_string(),
+                    parts.next()?.to_string(),
+                ))
+            })
+            .collect())
+    }
+
+    /// `/memory undo`: revert the most recent commit and recompile. The
+    /// compiled MEMORY.md is refreshed by the caller (it owns the engine
+    /// home); this returns the reverted commit's subject.
+    pub fn undo_last(&self) -> Result<String, Error> {
+        let root = self.root_path();
+        let subject = Self::git(&root, &["log", "-n1", "--format=%s"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if subject.is_empty() {
+            return Err(Error::Git("nothing to undo".into()));
+        }
+        // `git revert --no-edit HEAD` refuses on conflicts; a memory tree
+        // never conflicts (single writer), so a failure is real.
+        Self::git(&root, &["revert", "--no-edit", "HEAD"])?;
+        Ok(subject)
+    }
+
+    /// The memory root the store was opened on.
+    pub fn root_path(&self) -> std::path::PathBuf {
+        self.root.clone()
+    }
+}
+
 /// The invisible/direction-changing half of the proposal screen (shared
 /// with the persona and skill writers).
 pub fn screen_invisible(text: &str) -> Result<(), String> {
@@ -928,5 +980,41 @@ mod tests {
         for ms in [0i64, 1, 1_761_754_050_999, 4_102_444_800_000] {
             assert_eq!(parse_rfc3339(&rfc3339(ms)), Some(ms));
         }
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn log_lists_commits_and_undo_reverts_the_last() {
+        let root = std::env::temp_dir().join(format!("ka-mem-undo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = MemoryStore::open(&root).unwrap();
+        store
+            .add(MemoryFile::Facts, "likes tea", "test", None)
+            .unwrap();
+        store.commit("memory: add likes tea").unwrap();
+        store
+            .add(MemoryFile::Facts, "hates coffee", "test", None)
+            .unwrap();
+        store.commit("memory: add hates coffee").unwrap();
+
+        // The store also commits the default persona on open; the log is
+        // newest-first.
+        let log = store.log(5).unwrap();
+        assert!(log.len() >= 2, "{log:?}");
+        assert_eq!(log[0].2, "memory: add hates coffee");
+        assert_eq!(log[1].2, "memory: add likes tea");
+
+        let reverted = store.undo_last().unwrap();
+        assert_eq!(reverted, "memory: add hates coffee");
+        let text = store.compiled_text(4096).unwrap();
+        assert!(text.contains("likes tea"), "{text}");
+        assert!(!text.contains("hates coffee"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

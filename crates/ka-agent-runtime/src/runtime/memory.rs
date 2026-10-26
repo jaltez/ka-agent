@@ -86,6 +86,21 @@ impl Runtime {
 
     /// `/memory accept <id>`: candidate → stable memory. The id may be a
     /// unique prefix (like `/cron rm`).
+    /// `/memory log`: the most recent memory commits, newest first.
+    pub fn memory_log(&self, n: usize) -> Result<Vec<(String, String, String)>, Error> {
+        self.sh.memory.log(n).map_err(Error::Memory)
+    }
+
+    /// `/memory undo`: revert the most recent memory commit and recompile
+    /// MEMORY.md. Returns the reverted commit's subject.
+    pub fn memory_undo(&self) -> Result<String, Error> {
+        let subject = self.sh.memory.undo_last().map_err(Error::Memory)?;
+        self.refresh_compiled_memory()?;
+        self.audit(audit_actions::MEMORY_ACCEPT, "undo", Some(subject.clone()))
+            .ok();
+        Ok(subject)
+    }
+
     pub fn accept_candidate(&self, id: &str) -> Result<bool, Error> {
         let pending = self.sh.store.pending_candidates_full()?;
         let matches: Vec<_> = pending
