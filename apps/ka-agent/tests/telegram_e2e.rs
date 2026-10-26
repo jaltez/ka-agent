@@ -358,8 +358,11 @@ async fn voice_note_becomes_a_turn_with_its_transcript() {
         Duration::from_secs(30),
     )
     .expect("answer to the voice note");
+    // The fake re-serves an unacked update while the daemon is slow under
+    // load, so the transcription endpoint may see the same audio twice;
+    // what must NOT happen is a second turn (asserted below).
     let req = stt.requests();
-    assert_eq!(req.len(), 1);
+    assert!(!req.is_empty(), "the voice note was transcribed");
     let body = String::from_utf8_lossy(&req[0].body);
     assert!(
         body.contains("whisper-1") && body.contains("OggS fake audio"),
@@ -374,6 +377,10 @@ async fn voice_note_becomes_a_turn_with_its_transcript() {
         )
         .unwrap();
     assert_eq!(inbound, "remind me to water the plants");
+    let turns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns, 1, "the voice note becomes exactly one turn");
     daemon.sigterm_wait(Duration::from_secs(10));
 
     // Voice off: the hint, nothing submitted.

@@ -62,9 +62,9 @@ fn setup_yes_flow_writes_config_env_and_doctor_passes_model() {
         "setup: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // A2: the run ends with the "you're live" card, not a bare "Done".
+    // A2: the run ends with the "awake" card, not a bare "Done".
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("You're live."), "{stdout}");
+    assert!(stdout.contains("☥ Ka is awake."), "{stdout}");
     assert!(
         stdout.contains("Talk to Ka:") && stdout.contains("Try:"),
         "{stdout}"

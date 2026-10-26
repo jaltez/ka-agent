@@ -22,6 +22,7 @@ mod memory_cli;
 mod model_cli;
 mod ops;
 mod pair;
+mod persona_cli;
 mod plugin_cli;
 mod profile_cli;
 mod prompt;
@@ -282,6 +283,7 @@ fn main() -> std::process::ExitCode {
             };
             rt.block_on(daemon::run_daemon(config_path(&config), scenario, web_port))
         }
+        Command::Persona { action, config } => persona_cli::persona(action, config_path(&config)),
         Command::Restart => daemon::restart_client(),
         Command::Status { json } => daemon::status_client(json),
         Command::Completions { shell } => completions(shell),

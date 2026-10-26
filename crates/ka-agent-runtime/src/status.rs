@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatusReport {
     pub session_id: String,
+    /// The assistant's persona name (`Ka` by default).
+    #[serde(default)]
+    pub persona: String,
+    /// When this runtime woke up (ms since epoch), for the header.
+    #[serde(default)]
+    pub awake_since_ms: i64,
     /// `Debug` of the session status (`Idle`, `AwaitingApproval`, …).
     pub status: String,
     pub strand_id: Option<String>,
@@ -159,13 +165,22 @@ impl StatusReport {
             .map(ka_agent_core::ids::short_id)
             .unwrap_or("(new)");
         // Anything looser than `guarded` is worth a glance every time.
+        let since = jiff::Timestamp::from_millisecond(self.awake_since_ms)
+            .map(|t| t.to_zoned(now.time_zone().clone()))
+            .map(|z| format!("{:02}:{:02}", z.hour(), z.minute()))
+            .unwrap_or_else(|_| "--:--".to_string());
+        let persona = if self.persona.is_empty() {
+            "Ka".to_string()
+        } else {
+            self.persona.clone()
+        };
         let mode = match self.mode.as_str() {
             "free" => "⚠ mode free (acts without asking)".to_string(),
             "accept_edits" => "mode accept_edits (edits without asking)".to_string(),
             m => format!("mode {m}"),
         };
         let mut out = format!(
-            "{state} · {model} · {mode}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
+            "☥ {persona} · awake since {since} · {state} · {model} · {mode}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
             ka_agent_core::ids::short_id(&self.session_id),
             self.timezone
         );
@@ -218,6 +233,8 @@ mod tests {
 
     fn report() -> StatusReport {
         StatusReport {
+            persona: "Ka".into(),
+            awake_since_ms: 0,
             session_id: "sess_19a3f2b4c1d-00-a1b2c3d4".into(),
             status: "Idle".into(),
             strand_id: None,
@@ -250,7 +267,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "● idle · anthropic/claude-sonnet-5 · mode guarded",
+                "☥ Ka · awake since 01:00 · ● idle · anthropic/claude-sonnet-5 · mode guarded",
                 "worker: running (stops after 15m idle)",
                 "today: $0.0123 of $5.00 · 12,345 tokens",
                 "queue 0 · approvals 0 · crashes 0",
@@ -313,7 +330,7 @@ mod tests {
         r.worker_running = false;
         r.limit_usd = None;
         let text = r.render(&now());
-        assert!(text.starts_with("⏸ paused — /resume"), "{text}");
+        assert!(text.contains("⏸ paused — /resume"), "{text}");
         assert!(
             text.contains("model: none — run `ka-agent setup`"),
             "{text}"
@@ -321,7 +338,7 @@ mod tests {
         assert!(text.contains("worker: stopped (starts with your next message)"));
         assert!(text.contains("today: $0.0123 (no limit)"));
         r.status = "AwaitingApproval".into();
-        assert!(r.render(&now()).starts_with("● awaiting_approval"));
+        assert!(r.render(&now()).contains("● awaiting_approval"));
     }
 
     #[test]

@@ -207,9 +207,11 @@ impl Host {
                 Arc::new(move |src| ka_agent_channels::calendar::digest_in(src, &st, &tz)),
             );
         }
+        let name = runtime.persona_name();
         if opts.channels {
             println!(
-                "ka-agent run · session {} · data {}",
+                "ka-agent run · {} is awake · session {} · data {}",
+                name,
                 runtime.session_id(),
                 paths.root().display()
             );

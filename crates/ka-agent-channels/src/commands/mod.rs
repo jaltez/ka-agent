@@ -265,6 +265,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         run: approvals::run_n,
     },
     CommandSpec {
+        name: "persona",
+        args: "",
+        summary: "show the assistant's persona",
+        example: "/persona",
+        telegram: false,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_persona,
+    },
+    CommandSpec {
         name: "quit",
         args: "",
         summary: "leave the terminal chat",

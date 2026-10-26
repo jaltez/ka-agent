@@ -10,6 +10,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+pub mod persona;
+
 /// Default compilation budget for the compiled `MEMORY.md` (SEED.md §4.4).
 pub const DEFAULT_BUDGET_BYTES: usize = 6144;
 
@@ -30,6 +32,8 @@ pub enum Error {
     Git(String),
     #[error("malformed provenance comment: {0}")]
     Parse(String),
+    #[error("invalid persona: {0}")]
+    Persona(String),
 }
 
 /// One accepted memory entry, parsed back from the Markdown files.
@@ -60,11 +64,12 @@ pub struct CompileReport {
     pub truncated: bool,
 }
 
-/// The well-known memory files (SEED.md §4.2).
+/// The well-known memory files (SEED.md §4.2). The persona is NOT one of
+/// them: it is free-form instructions compiled into IDENTITY.md, never
+/// into MEMORY.md (see [`persona`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryFile {
     Profile,
-    Persona,
     Preferences,
     Environment,
     Conventions,
@@ -77,7 +82,6 @@ impl MemoryFile {
     pub fn name(&self) -> String {
         match self {
             MemoryFile::Profile => "profile.md".into(),
-            MemoryFile::Persona => "persona.md".into(),
             MemoryFile::Preferences => "preferences.md".into(),
             MemoryFile::Environment => "environment.md".into(),
             MemoryFile::Conventions => "conventions.md".into(),
@@ -95,7 +99,6 @@ impl MemoryFile {
     pub fn title(&self) -> String {
         match self {
             MemoryFile::Profile => "Profile".into(),
-            MemoryFile::Persona => "Persona".into(),
             MemoryFile::Preferences => "Preferences".into(),
             MemoryFile::Environment => "Environment".into(),
             MemoryFile::Conventions => "Conventions".into(),
@@ -107,7 +110,6 @@ impl MemoryFile {
     fn from_rel(rel: &str) -> Option<MemoryFile> {
         Some(match rel {
             "profile.md" => MemoryFile::Profile,
-            "persona.md" => MemoryFile::Persona,
             "preferences.md" => MemoryFile::Preferences,
             "environment.md" => MemoryFile::Environment,
             "conventions.md" => MemoryFile::Conventions,
@@ -132,7 +134,6 @@ impl MemoryStore {
         std::fs::create_dir_all(root.join("projects"))?;
         for file in [
             MemoryFile::Profile,
-            MemoryFile::Persona,
             MemoryFile::Preferences,
             MemoryFile::Environment,
             MemoryFile::Conventions,
@@ -152,9 +153,11 @@ impl MemoryStore {
         }
         Self::git(root, &["config", "user.name", GIT_NAME])?;
         Self::git(root, &["config", "user.email", GIT_EMAIL])?;
-        Ok(Self {
+        let store = Self {
             root: root.to_path_buf(),
-        })
+        };
+        store.migrate_persona()?;
+        Ok(store)
     }
 
     /// The raw text of one well-known file, `None` before it exists.
@@ -447,7 +450,6 @@ impl MemoryStore {
     fn scan_files(&self) -> Result<Vec<String>, Error> {
         let mut rels = vec![
             "profile.md".to_string(),
-            "persona.md".to_string(),
             "preferences.md".to_string(),
             "environment.md".to_string(),
             "conventions.md".to_string(),

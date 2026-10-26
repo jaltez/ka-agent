@@ -399,6 +399,7 @@ impl Runtime {
             }
             self.reap_idle_worker().await;
             self.watch_config_file().await;
+            self.watch_persona().await;
             // Bounded launchd/redirect logs (journal systems rotate alone).
             let _ = self.sh.paths.rotate_log(5 * 1024 * 1024);
             if let Err(e) = self.announce_memory_proposals() {

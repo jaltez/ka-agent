@@ -15,6 +15,7 @@ pub mod surface;
 pub use bus::EventBus;
 pub use event::{AgentEvent, Envelope, PlanItem};
 pub use paths::{InstanceLock, LockError, Paths};
+pub use runtime::compile_identity;
 pub use runtime::{CancelOutcome, Error, ModelKeyState, ReloadReport, Runtime, memory_preamble};
 pub use status::StatusReport;
 pub use surface::{ApprovalCard, Surface};

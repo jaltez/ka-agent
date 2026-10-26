@@ -543,6 +543,14 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
             })
         );
     }
+    // Human closing line only: --json must stay one document.
+    if rep.json.is_none() {
+        if rep.failed {
+            println!("fix the ✗ lines above, then run `ka-agent doctor` again");
+        } else {
+            println!("all in balance.");
+        }
+    }
     if rep.failed {
         std::process::ExitCode::FAILURE
     } else {

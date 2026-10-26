@@ -384,8 +384,10 @@ fn banner(model: Option<&str>, attached: bool, extra: &[String]) {
     } else {
         format!(" [{profile}]")
     };
+    let name = persona_name();
+    let mode = mode_badge();
     println!(
-        "Ka Agent{profile} · {} · {} · /help · Ctrl-C stops a reply, Ctrl-D quits",
+        "☥ {name}{profile} · {}{mode} · {} · /help · Ctrl-C stops a reply, Ctrl-D quits",
         model.unwrap_or("no model"),
         if attached {
             "connected to the background service"
@@ -599,7 +601,14 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
             _ = tokio::time::sleep_until(wait_until), if eof_deadline.is_some() => break,
         }
     }
+    let attached = backend.is_attached();
     backend.close();
+    let name = persona_name();
+    if attached {
+        println!("{name} keeps watch in the background.");
+    } else {
+        println!("{name} rests.");
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -671,5 +680,28 @@ async fn run_once_turn(
             Incoming::Lagged(_) => {}
             Incoming::Closed => return Err("the connection closed".into()),
         }
+    }
+}
+
+/// The assistant's display name (`Ka` by default), read from the store.
+fn persona_name() -> String {
+    let path = ka_agent_core::layout::base_dir()
+        .join("memory")
+        .join("persona.md");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| ka_agent_memory::persona::persona_name(&t))
+        .unwrap_or_else(|| "Ka".to_string())
+}
+
+/// ` · mode <x>` when the mode is not the guarded default.
+fn mode_badge() -> String {
+    let mode = ka_agent_core::DaemonConfig::load(&crate::config_path(&None))
+        .map(|c| c.mode)
+        .unwrap_or_else(|_| "guarded".to_string());
+    if mode == "guarded" {
+        String::new()
+    } else {
+        format!(" · mode {mode}")
     }
 }

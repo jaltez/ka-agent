@@ -318,6 +318,16 @@ async fn open_engine(
     }
     cfg.cwd = Some(workspace.to_string_lossy().into_owned());
 
+    // The assistant's identity: the runtime compiles persona + house rules
+    // into `<engine home>/.config/ka/IDENTITY.md` (HOME in this process);
+    // the engine re-reads it per turn, so persona edits need no restart.
+    if let Some(home) = std::env::var_os("HOME") {
+        let identity = PathBuf::from(home).join(".config/ka/IDENTITY.md");
+        if identity.exists() {
+            cfg.prompt.identity_file = Some(identity.to_string_lossy().into_owned());
+        }
+    }
+
     // MCP bridge: the engine's kagent__* tools (memory_propose, notes_*).
     // Spawned as this same binary with `__mcp`; it inherits the worker's
     // sanitized env, including KA_AGENT_DATA_DIR for the store.

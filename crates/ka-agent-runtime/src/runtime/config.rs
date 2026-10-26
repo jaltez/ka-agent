@@ -21,14 +21,10 @@ pub(super) fn publish_timezone(store: &Store, cfg: &DaemonConfig) {
 
 /// The memory preamble tells the model which zone to schedule in: every
 /// clock time the operator writes is local, never UTC.
-pub fn memory_preamble(cfg: &DaemonConfig) -> String {
-    let tz = cfg.time_zone();
-    let offset = jiff::Timestamp::now().to_zoned(tz.clone()).offset();
-    format!(
-        "Operator timezone: {} (UTC{} now). Schedule clock times in this zone.",
-        tz.iana_name().unwrap_or("UTC"),
-        offset
-    )
+pub fn memory_preamble(_cfg: &DaemonConfig) -> String {
+    // The operator's clock context rides the per-turn `<ctx .../>` line
+    // (step 2.2); the compiled MEMORY.md carries facts only.
+    String::new()
 }
 
 impl Runtime {
@@ -149,6 +145,76 @@ impl Runtime {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(mtime);
             }
+        }
+    }
+
+    /// Compile the persona into the engine's IDENTITY.md (re-read per
+    /// turn by `[prompt] identity_file`). Called at startup, after a
+    /// persona edit, and from the maintenance watcher.
+    pub fn refresh_identity(&self) -> Result<(), Error> {
+        let persona = self.sh.memory.persona_text();
+        let text = crate::runtime::compile_identity(&persona);
+        let dir = self.sh.paths.engine_home().join(".config/ka");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("IDENTITY.md"), text)?;
+        self.remember_persona_mtime();
+        Ok(())
+    }
+
+    /// The persona's display name (`Ka` by default).
+    pub fn persona_name(&self) -> String {
+        self.sh.memory.persona_name()
+    }
+
+    /// The current persona text.
+    pub fn persona_text(&self) -> String {
+        self.sh.memory.persona_text()
+    }
+
+    /// Persist a new persona and recompile IDENTITY.md in-process.
+    pub fn set_persona(&self, text: &str) -> Result<(), Error> {
+        self.sh.memory.write_persona(text)?;
+        self.refresh_identity()
+    }
+
+    fn persona_path(&self) -> std::path::PathBuf {
+        self.sh.paths.root().join("memory/persona.md")
+    }
+
+    fn remember_persona_mtime(&self) {
+        let mtime = std::fs::metadata(self.persona_path())
+            .and_then(|m| m.modified())
+            .ok();
+        *self
+            .sh
+            .persona_mtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mtime;
+    }
+
+    /// One persona watch (each maintenance tick): a hand-edited
+    /// persona.md recompiles IDENTITY.md; the next turn speaks as the new
+    /// persona without a restart.
+    pub async fn watch_persona(&self) {
+        let Ok(meta) = std::fs::metadata(self.persona_path()) else {
+            return;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return;
+        };
+        let seen = *self
+            .sh
+            .persona_mtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if seen == Some(mtime) {
+            return;
+        }
+        if let Err(e) = self.refresh_identity() {
+            self.sh.emit(crate::event::AgentEvent::Error {
+                class: "internal".into(),
+                message: format!("persona: {e}"),
+            });
         }
     }
 

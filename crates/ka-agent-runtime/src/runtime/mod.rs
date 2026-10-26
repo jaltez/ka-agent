@@ -30,6 +30,7 @@ use crate::surface::Surface;
 mod approvals;
 mod config;
 mod events;
+mod identity;
 mod intake;
 mod memory;
 mod scheduler;
@@ -39,6 +40,7 @@ use config::publish_timezone;
 
 pub use config::{ReloadReport, memory_preamble};
 pub use events::split_final_text;
+pub use identity::{LEGACY_AGENTS_MD_SHA256, compile_identity, legacy_agents_md_status};
 pub use scheduler::CancelOutcome;
 pub use worker::Backoff;
 
@@ -162,6 +164,10 @@ struct Shared {
     /// updates it): the maintenance loop's hot-reload watcher compares
     /// against it so IPC-triggered reloads are not announced twice.
     config_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// The persona file's mtime as last seen (identity watcher).
+    persona_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// When this runtime woke up (ms since epoch), for the header.
+    started_ms: i64,
 }
 
 impl Shared {
@@ -298,12 +304,7 @@ impl Runtime {
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
             &memory_preamble(&cfg),
         )?;
-        // Operator-facing workspace context (M11): never overwrite an
-        // existing AGENTS.md; a read-only workspace must not fail startup.
-        if let Err(e) = write_agents_md(&cfg) {
-            eprintln!("runtime: AGENTS.md not written: {e}");
-        }
-        Ok(Self {
+        let runtime = Self {
             sh: Arc::new(Shared {
                 cfg: std::sync::RwLock::new(Arc::new(cfg)),
                 config_path: Mutex::new(None),
@@ -318,6 +319,8 @@ impl Runtime {
                 env_cache: Mutex::new(None),
                 scheduler_tick: tokio::sync::Notify::new(),
                 config_mtime: Mutex::new(None),
+                persona_mtime: Mutex::new(None),
+                started_ms: ka_agent_core::now_ms(),
                 inner: Mutex::new(Inner {
                     session,
                     session_allow: std::collections::HashSet::new(),
@@ -327,7 +330,22 @@ impl Runtime {
                     restart_attempt: 0,
                 }),
             }),
-        })
+        };
+        // The assistant's identity (persona + house rules) compiled into
+        // the engine's IDENTITY.md; re-read per turn, so persona edits
+        // need no restart. A read-only engine home must not fail startup.
+        if let Err(e) = runtime.refresh_identity() {
+            eprintln!("runtime: IDENTITY.md not written: {e}");
+        }
+        // Remove our own leftover seeded AGENTS.md (identity moved to
+        // IDENTITY.md); an operator's modified copy is never touched
+        // (doctor reports leftovers).
+        if let Some(path) = identity::legacy_agents_md_status(&runtime.workspace())
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            eprintln!("runtime: legacy AGENTS.md not removed: {e}");
+        }
+        Ok(runtime)
     }
 
     // ---- introspection -------------------------------------------------
@@ -403,6 +421,8 @@ impl Runtime {
         let tz = cfg.time_zone();
         Ok(crate::status::StatusReport {
             session_id: sid.to_string(),
+            persona: self.persona_name(),
+            awake_since_ms: self.sh.started_ms,
             status: format!("{status:?}"),
             strand_id: strand,
             model: cfg.model.clone(),
@@ -540,44 +560,6 @@ impl Runtime {
     }
     // ---- submission ------------------------------------------------------
 }
-
-/// Seed the workspace with an `AGENTS.md` context file (M11). Written only
-/// when absent — an operator's own file is never touched.
-fn write_agents_md(cfg: &DaemonConfig) -> std::io::Result<()> {
-    let ws = cfg.workspace_path();
-    let path = ws.join("AGENTS.md");
-    if path.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&ws)?;
-    std::fs::write(&path, AGENTS_MD)
-}
-
-const AGENTS_MD: &str = r#"# Ka Agent
-
-This workspace is served by ka-agent, a resident personal assistant running
-on the Ka engine. One operator per instance; everything is auditable.
-
-- Memory: durable facts live under `<data>/memory/` and are compiled into the
-  engine's MEMORY.md. Propose new facts with the `kagent__memory_propose`
-  tool for operator review; never store them yourself.
-- Operator commands: /help lists them all (/status /new /stop /resume
-  /model /remember /memory /history /remind /reminders /cron /calendar
-  /approvals /skills /y /n).
-- Scheduling: reminders and crons use the operator's local time. One-shot
-  `/cron add in 10m <text>`; recurring `/cron add every 1h <text>`,
-  `/cron add every day at 08:00 <text>` or
-  `/cron add every mon at 09:00 <text>`. Reminders accept `in 2h30m`,
-  `at 18:30`, `tomorrow 9am`, `fri 17:00` or `2026-11-03 10:00`. The
-  `cron_manage` tool does the same from the engine ('at' takes RFC 3339
-  with the operator's UTC offset).
-- References: `@<file>`, `@<dir>/`, `@turn:<id-prefix>`, `@https://…` inline
-  in a message inject that context into the turn.
-- External effects (HTTP writes, GitHub) require operator grants and
-  approvals; a daily budget applies.
-- Health and audit: `ka-agent doctor`, `ka-agent history`; backups under
-  `<data>/backups/`.
-"#;
 
 #[cfg(test)]
 mod tests {

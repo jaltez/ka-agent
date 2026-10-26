@@ -408,11 +408,12 @@ fn newest_inbound_containing(data: &std::path::Path, needle: &str, timeout: Dura
     false
 }
 
-/// M11 cron e2e: a one-shot job fires through the real scheduler and the
+/// Cron e2e: a one-shot job fires through the real scheduler and the
 /// engine answers; `/cron list` shows the recurring job; `/cron rm` removes
-/// it. Also covers the AGENTS.md seed (created once, never overwritten).
+/// it. Also: no AGENTS.md is seeded any more (identity lives in
+/// IDENTITY.md), and an operator's own AGENTS.md is never touched.
 #[test]
-fn cron_end_to_end_and_agents_md_seeded_once() {
+fn cron_end_to_end_and_agents_md_left_alone() {
     let root = temp_root("cron-e2e");
     let sc = scenario_file(
         &root,
@@ -421,16 +422,12 @@ fn cron_end_to_end_and_agents_md_seeded_once() {
     );
     let mut chat = spawn_chat(&root, &sc);
 
-    // AGENTS.md is seeded during Runtime::new; wait for boot to finish.
+    // The local session is up; no AGENTS.md is seeded (2.1 moved the
+    // assistant's identity to the engine's IDENTITY.md).
+    chat.expect("local session", Duration::from_secs(60));
     let agents_md = root.join("ws/AGENTS.md");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !agents_md.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let seeded = std::fs::read_to_string(&agents_md).unwrap_or_default();
-    assert!(seeded.contains("# Ka Agent"), "{seeded}");
-    assert!(seeded.contains("/cron"), "{seeded}");
-    // The operator takes ownership of the file.
+    assert!(!agents_md.exists(), "no AGENTS.md is seeded");
+    // An operator's own file is theirs; later boots leave it untouched.
     std::fs::write(&agents_md, "OPERATOR-MARKER-XYZ\n").unwrap();
 
     chat.send("/cron add every 1h tick-tick");

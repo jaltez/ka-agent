@@ -6,13 +6,12 @@
 use ka_agent_memory::{MemoryFile, MemoryStore};
 use ka_agent_runtime::paths::Paths;
 
-use crate::{MemoryAction, config_path};
+use crate::MemoryAction;
 
 fn resolve_file(name: &str) -> Option<MemoryFile> {
     match name {
         "" | "facts" => Some(MemoryFile::Facts),
         "profile" => Some(MemoryFile::Profile),
-        "persona" => Some(MemoryFile::Persona),
         "preferences" => Some(MemoryFile::Preferences),
         "environment" => Some(MemoryFile::Environment),
         "conventions" => Some(MemoryFile::Conventions),
@@ -38,7 +37,7 @@ fn resync(store: &MemoryStore, file: &MemoryFile) -> Result<(), String> {
         .install_compiled(
             &engine_config_ka(&paths),
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
-            &memory_cli_preamble(),
+            "",
         )
         .map_err(|e| e.to_string())?;
     let changed = store
@@ -121,12 +120,4 @@ pub fn memory_action(action: MemoryAction) -> std::process::ExitCode {
             }
         }
     }
-}
-
-/// The operator timezone from the config (best effort: the memory CLI must
-/// work even with a broken config).
-fn memory_cli_preamble() -> String {
-    ka_agent_core::DaemonConfig::load(&config_path(&None))
-        .map(|cfg| ka_agent_runtime::memory_preamble(&cfg))
-        .unwrap_or_default()
 }

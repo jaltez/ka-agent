@@ -114,3 +114,10 @@ pub(super) fn run_quit<'a>(_ctx: Ctx<'a>) -> CmdFuture<'a> {
         Outcome::Reply("/quit leaves the terminal chat — nothing to quit here".into())
     })
 }
+
+pub(super) fn run_persona<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let _ = ctx.args;
+        Outcome::Reply(ctx.runtime.persona_text())
+    })
+}

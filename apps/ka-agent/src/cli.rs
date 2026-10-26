@@ -25,6 +25,13 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Show, edit or reset the assistant's persona.
+    Persona {
+        #[command(subcommand)]
+        action: Option<PersonaAction>,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     /// Bring memory and skills from hermes | openclaw | claude | codex.
     #[command(hide = true)]
     Import {
@@ -451,7 +458,17 @@ pub(crate) enum ConfigAction {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(clap::Subcommand)]
+pub(crate) enum PersonaAction {
+    /// Print the persona.
+    Show,
+    /// Open $VISUAL/$EDITOR on a validated copy, save and recompile.
+    Edit,
+    /// Restore the default persona (keeps the current name).
+    Reset,
+}
+
+#[derive(clap::Subcommand)]
 pub(crate) enum GrantAction {
     /// Add a grant scope.
     Add { scope: String },

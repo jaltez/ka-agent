@@ -316,10 +316,21 @@ impl Setup {
 
     /// The end of setup: where to talk, what to try (only what this
     /// install can actually do), where to look when something is off.
+    fn name(&self) -> String {
+        let path = ka_agent_core::layout::base_dir()
+            .join("memory")
+            .join("persona.md");
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|t| ka_agent_memory::persona::persona_name(&t))
+            .unwrap_or_else(|| "Ka".to_string())
+    }
+
     pub(super) fn live_card(&self, paired: bool) -> String {
-        let mut out = String::from(
-            "\nYou're live.\n\nTalk to Ka:\n  ka-agent             in this terminal\n",
-        );
+        let name = self.name();
+        let mut out = String::from(format!(
+            "\n☥ {name} is awake.\n\nTalk to {name}:\n  ka-agent             in this terminal\n"
+        ));
         if paired && let Some(u) = &self.telegram_user {
             out.push_str(&format!("  @{u}  on Telegram\n"));
         }

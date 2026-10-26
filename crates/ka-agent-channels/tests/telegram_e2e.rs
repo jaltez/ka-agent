@@ -526,14 +526,17 @@ async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
         },
     ));
     let chunk = "word ".repeat(12); // 60 chars per delta
-    for i in 0..3 {
+    // Five deltas ~1.2 s apart: the throttle window is 1 s, and extra
+    // deltas give margin when the test box is loaded (each draft send is
+    // an HTTP round-trip to the fake).
+    for i in 0..5 {
         surface.emit(&env(
             2 + i as u64,
             AgentEvent::Delta {
                 text: chunk.clone(),
             },
         ));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
     }
     surface.emit(&env(
         5,
