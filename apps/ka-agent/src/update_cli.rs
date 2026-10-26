@@ -26,6 +26,7 @@ fn target_triple() -> Result<String, String> {
     let os = match std::env::consts::OS {
         "linux" => "unknown-linux-gnu",
         "macos" => "apple-darwin",
+        "windows" => "pc-windows-msvc",
         other => return Err(format!("unsupported OS {other}")),
     };
     let arch = match std::env::consts::ARCH {
@@ -130,7 +131,9 @@ pub fn update(action: UpdateAction) -> ExitCode {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
-    let name = format!("ka-agent-{triple}.tar.gz");
+    // Windows ships a zip; every Unix target a tarball (see release.yml).
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let name = format!("ka-agent-{triple}.{ext}");
     let Some(asset) = release.assets.iter().find(|a| a.name == name) else {
         return fail(format!("release {latest} has no {name}"));
     };
@@ -178,9 +181,20 @@ pub fn update(action: UpdateAction) -> ExitCode {
         return fail(e);
     }
     // Replace atomically: new file next to the old, rename over it.
-    let new_bin = staging.join("ka-agent");
+    let new_bin = staging.join(bin_name());
     if let Ok(meta) = std::fs::metadata(&exe) {
         let _ = std::fs::set_permissions(&new_bin, meta.permissions());
+    }
+    // Windows refuses to replace a running image but allows renaming it
+    // (the image stays mapped under the old name until the process exits).
+    #[cfg(windows)]
+    {
+        let old = exe.with_extension("old.exe");
+        let _ = std::fs::remove_file(&old);
+        if let Err(e) = std::fs::rename(&exe, &old) {
+            let _ = std::fs::remove_file(&staging);
+            return fail(format!("cannot set {} aside — {e}", exe.display()));
+        }
     }
     if let Err(e) = std::fs::rename(&new_bin, &exe) {
         let _ = std::fs::remove_file(&staging);
@@ -192,18 +206,38 @@ pub fn update(action: UpdateAction) -> ExitCode {
     let _ = std::fs::remove_file(&staging);
 
     // Restart every installed profile's service (they run the old binary).
+    // Unix: ask the running daemon to stop; its supervisor restarts it.
+    // Windows: the logon task does not respawn on exit, so start it here
+    // (the old process exits on its own once its image is gone).
     let mut restarted = 0;
     if std::env::var_os("KA_AGENT_DATA_DIR").is_none() {
         for p in ka_agent_core::layout::list_profiles() {
             if !crate::service::is_installed_for(&p) {
                 continue;
             }
-            let paths = ka_agent_runtime::Paths::new(ka_agent_core::layout::compose_profile_root(
-                &ka_agent_core::layout::base_dir(),
-                &p,
-            ));
-            if crate::admin::request(&paths, &serde_json::json!({"op": "shutdown"})).is_ok() {
-                restarted += 1;
+            #[cfg(unix)]
+            {
+                let paths =
+                    ka_agent_runtime::Paths::new(ka_agent_core::layout::compose_profile_root(
+                        &ka_agent_core::layout::base_dir(),
+                        &p,
+                    ));
+                if crate::admin::request(&paths, &serde_json::json!({"op": "shutdown"})).is_ok() {
+                    restarted += 1;
+                }
+            }
+            #[cfg(windows)]
+            {
+                // schtasks needs the profile in the environment of the call
+                // for `names()`; the per-profile task name is enough.
+                let name = crate::service::windows_task_name(&p);
+                if std::process::Command::new("schtasks.exe")
+                    .args(["/Run", "/TN", &name])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+                {
+                    restarted += 1;
+                }
             }
         }
     }
@@ -215,19 +249,46 @@ pub fn update(action: UpdateAction) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn write_and_extract(tarball: &[u8], staging: &std::path::Path) -> Result<(), String> {
+/// The binary's name inside the release archive.
+fn bin_name() -> &'static str {
+    if cfg!(windows) {
+        "ka-agent.exe"
+    } else {
+        "ka-agent"
+    }
+}
+
+/// Unpack the release asset's single binary into `staging`: system `tar`
+/// on Unix, PowerShell's `Expand-Archive` on Windows (no archive crates in
+/// the dependency set on purpose).
+fn write_and_extract(asset: &[u8], staging: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(staging).map_err(|e| format!("{}: {e}", staging.display()))?;
-    let gz = staging.join("t.tar.gz");
-    std::fs::write(&gz, tarball).map_err(|e| format!("{}: {e}", gz.display()))?;
+    let archive = staging.join(if cfg!(windows) { "a.zip" } else { "a.tar.gz" });
+    std::fs::write(&archive, asset).map_err(|e| format!("{}: {e}", archive.display()))?;
+    #[cfg(not(windows))]
     let out = std::process::Command::new("tar")
         .arg("xzf")
-        .arg(&gz)
+        .arg(&archive)
         .arg("-C")
         .arg(staging)
         .arg("ka-agent")
         .output()
         .map_err(|e| format!("cannot run tar: {e}"))?;
-    let _ = std::fs::remove_file(&gz);
+    #[cfg(windows)]
+    let out = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Expand-Archive -LiteralPath",
+        ])
+        .arg(&archive)
+        .arg("-DestinationPath")
+        .arg(staging)
+        .arg("-Force")
+        .output()
+        .map_err(|e| format!("cannot run powershell: {e}"))?;
+    let _ = std::fs::remove_file(&archive);
     if !out.status.success() {
         return Err(format!(
             "extract: {}",
