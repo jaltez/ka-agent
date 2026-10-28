@@ -20,6 +20,10 @@ fn ka(root: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ka-agent"));
     cmd.env("KA_AGENT_DATA_DIR", root.join("data"))
         .env("KA_AGENT_CONFIG", root.join("ka-agent.toml"))
+        // The model picker merges the live models.dev registry; the
+        // suite must never call the real one — an unreachable local
+        // URL makes every run fall back to the catalog silently.
+        .env("KA_AGENT_MODELS_REGISTRY", "http://127.0.0.1:9/api.json")
         .env_remove("KA_MODEL");
     for (k, _) in std::env::vars() {
         if k.ends_with("_API_KEY") {

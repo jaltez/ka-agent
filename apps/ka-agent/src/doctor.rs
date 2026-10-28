@@ -552,10 +552,12 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
             .key_env
             .and_then(|e| env.get(e).cloned())
             .or_else(|| p.key_env.and_then(|e| std::env::var(e).ok()));
-        let check = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        let check = rt
+            .as_ref()
             .map(|rt| rt.block_on(catalog::check_credentials(&p, key.as_deref())));
         match check {
             Ok(CredentialCheck::Ok { models }) => rep.ok(format!(
@@ -574,6 +576,23 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
                 rep.warn(&format!("online: {message}"));
             }
             Err(e) => rep.warn(&format!("online checks unavailable: {e}")),
+        }
+        // The registry still lists models gateways have stopped
+        // serving: one minimal request proves the configured model
+        // itself answers (same wording as `ka-agent models --probe`).
+        if let (Some(rt), Ok(sel)) = (rt.as_ref().ok(), catalog::validate_selector(model)) {
+            let model_id = sel.id.split('@').next().unwrap_or(&sel.id).to_string();
+            match rt.block_on(crate::models_live::probe(&p, &model_id, key.as_deref())) {
+                crate::models_live::ProbeOutcome::Answers => {
+                    rep.ok(format!("{model_id} answers"));
+                }
+                crate::models_live::ProbeOutcome::Refused(message) => {
+                    rep.fail(format!("{model_id}: {message}"));
+                }
+                crate::models_live::ProbeOutcome::NotProbed => {
+                    rep.info(&format!("{model_id} not probed (no key)"));
+                }
+            }
         }
     }
 

@@ -190,15 +190,12 @@ impl Setup {
         let Some(p) = self.provider.clone() else {
             return Ok(());
         };
-        let mut options: Vec<String> = Vec::new();
-        if let Some(d) = catalog::default_model(p.name) {
-            options.push(d.to_string());
-        }
-        for m in catalog::catalog_models(p.name) {
-            if !options.contains(&m) {
-                options.push(m);
-            }
-        }
+        // The picker offers the live registry merged over the catalog
+        // (new models appear without a code change); offline — or with
+        // no cache yet — it silently shows the catalog alone. The
+        // fetch is bounded by the registry's 5 s timeout.
+        let reg = crate::models_live::load(self.paths.root(), false);
+        let mut options = crate::models_live::merged(p.name, reg.as_ref());
         for id in &self.live_models {
             let full = format!("{}/{}", p.name, id);
             if !options.contains(&full) {

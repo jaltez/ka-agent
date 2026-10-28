@@ -153,11 +153,18 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// List models per provider.
+    /// List models per provider, merged with the live models.dev registry.
     #[command(hide = true)]
     Models {
         /// Omit for every provider.
         provider: Option<String>,
+        /// Refetch the live registry even when the cache is fresh.
+        #[arg(long)]
+        refresh: bool,
+        /// Probe one model with a real request (omit the value to
+        /// probe the configured model).
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "VENDOR/MODEL")]
+        probe: Option<String>,
         #[arg(short, long)]
         config: Option<PathBuf>,
     },

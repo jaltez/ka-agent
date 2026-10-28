@@ -517,3 +517,327 @@ fn config_get_and_unset_address_whole_sections() {
     assert!(!cfg_text.contains("[voice]"), "{cfg_text}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A one-shot fake HTTP server: answers connections with `answers`
+/// (one each, in order), records every request it saw, and stops
+/// listening after the last answer — the URL then refuses connections,
+/// which is how the tests go "offline".
+struct FakeHttp {
+    url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+fn fake_http(answers: Vec<(u16, &'static str)>) -> FakeHttp {
+    use std::io::Write as _;
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let head = String::from_utf8_lossy(&buf);
+            let Some(end) = head.find("\r\n\r\n") else {
+                continue;
+            };
+            let len: usize = head[..end]
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .starts_with("content-length:")
+                        .then(|| {
+                            l.split(':')
+                                .nth(1)
+                                .unwrap_or("0")
+                                .trim()
+                                .parse()
+                                .unwrap_or(0)
+                        })
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    std::thread::spawn(move || {
+        for (i, mut stream) in listener.incoming().flatten().enumerate() {
+            let req = read_request(&mut stream);
+            recorder.lock().unwrap().push(req);
+            let Some((status, body)) = answers.get(i) else {
+                break;
+            };
+            let reason = if *status == 200 { "OK" } else { "Bad Request" };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            if i + 1 == answers.len() {
+                break; // drop the listener: further connects are refused
+            }
+        }
+    });
+    FakeHttp {
+        url: format!("http://127.0.0.1:{port}"),
+        seen,
+    }
+}
+
+/// `ka-agent` with an isolated home plus extra environment (the fake
+/// registry/gateway URLs). Provider keys are stripped so the key state
+/// in `models` output and the probe's no-key path are deterministic.
+fn ka_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ka-agent"));
+    cmd.args(args)
+        .env("HOME", root)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .env("KA_AGENT_CONFIG", root.join("config.toml"))
+        .env_remove("KA_AGENT_PROFILE")
+        .env_remove("KA_AGENT_HOME")
+        .env_remove("OPENCODE_API_KEY");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// The live models.dev registry merged into `ka-agent models`: new
+/// models lead the list, the fetch is cached, and the footer says
+/// where the live half came from.
+#[test]
+fn models_merges_the_registry_and_writes_the_cache() {
+    let root = temp_root("reg-merge");
+    let reg = fake_http(vec![(
+        200,
+        r#"{"opencode": {"models": {"new-shiny": {}, "alpha-free": {}}},
+            "anthropic": {"models": {"claude-sonnet-5": {}}}}"#,
+    )]);
+    let o = ka_env(
+        &root,
+        &["models", "opencode-go"],
+        &[("KA_AGENT_MODELS_REGISTRY", &reg.url)],
+    );
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("opencode-go  key "), "{out}");
+    assert_eq!(
+        lines[1], "  opencode-go/alpha-free",
+        "registry models lead, sorted: {out}"
+    );
+    assert_eq!(lines[2], "  opencode-go/new-shiny", "{out}");
+    assert_eq!(
+        lines[3], "  opencode-go/glm-5.3",
+        "catalog models follow (default first): {out}"
+    );
+    let footer = lines.iter().find(|l| l.starts_with("live ")).unwrap_or(&"");
+    assert!(
+        footer.starts_with("live 2 from models.dev ") && !footer.contains("(cached)"),
+        "fresh fetch footer: {out}"
+    );
+    // The raw body and its fetched-at marker are cached under the data
+    // root.
+    let cache = root.join("data/cache/models-dev.json");
+    assert!(
+        std::fs::read_to_string(&cache)
+            .unwrap_or_default()
+            .contains("new-shiny"),
+        "cache not written: {}",
+        cache.display()
+    );
+    assert!(root.join("data/cache/models-dev.json.at").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Offline, the cached registry keeps answering (marked `(cached)`),
+/// and with no cache at all the listing is exactly the old
+/// catalog-only output — default first, no footer line.
+#[test]
+fn models_serves_the_cache_when_the_registry_is_unreachable() {
+    let root = temp_root("reg-cache");
+    // One answer, then the listener closes: the second run is offline.
+    let reg = fake_http(vec![(
+        200,
+        r#"{"opencode": {"models": {"new-shiny": {}}}}"#,
+    )]);
+    let o = ka_env(
+        &root,
+        &["models", "opencode-go"],
+        &[("KA_AGENT_MODELS_REGISTRY", &reg.url)],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("  opencode-go/new-shiny"), "{}", text(&o));
+
+    let o = ka_env(
+        &root,
+        &["models", "opencode-go"],
+        &[("KA_AGENT_MODELS_REGISTRY", &reg.url)],
+    );
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("  opencode-go/new-shiny"),
+        "the cache still answers: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("live 1 from models.dev ") && l.ends_with(" (cached)")),
+        "cached footer: {out}"
+    );
+
+    // Offline with no cache at all: byte-identical to the catalog-only
+    // listing (header, default model first, no footer of any kind).
+    let bare = temp_root("reg-none");
+    let o = ka_env(
+        &bare,
+        &["models", "opencode-go"],
+        &[("KA_AGENT_MODELS_REGISTRY", "http://127.0.0.1:9/api.json")],
+    );
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert_eq!(
+        out.lines().next().unwrap(),
+        "opencode-go  key ✗  OpenCode Go subscription gateway — open coding models",
+        "{out}"
+    );
+    assert_eq!(
+        out.lines().nth(1).unwrap(),
+        "  opencode-go/glm-5.3",
+        "the default leads as before: {out}"
+    );
+    assert!(
+        !out.contains("models.dev") && !out.contains("catalog only"),
+        "no footer when offline without a cache: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&bare);
+}
+
+/// `models --probe <vendor/model>`: one real request; a dead model
+/// reports the gateway's own error message verbatim.
+#[test]
+fn probe_reports_a_dead_model_with_the_gateway_message() {
+    let root = temp_root("probe-dead");
+    let gw = fake_http(vec![(
+        400,
+        r#"{"error":{"type":"server_error","message":"Upstream request failed: Model is unavailable."}}"#,
+    )]);
+    let o = ka_env(
+        &root,
+        &["models", "--probe", "opencode-go/cat-jam-free"],
+        &[
+            ("KA_AGENT_PROBE_URL", &gw.url),
+            ("OPENCODE_API_KEY", "sk-test"),
+        ],
+    );
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.trim_end().ends_with(
+            "✗ opencode-go/cat-jam-free: Upstream request failed: Model is unavailable."
+        ),
+        "{out}"
+    );
+    // What left the process was one minimal chat completion with the
+    // gateway's session-routing header.
+    let seen = gw.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "exactly one request: {seen:?}");
+    let req = &seen[0];
+    assert!(req.starts_with("POST /chat/completions"), "{req}");
+    assert!(
+        req.to_ascii_lowercase()
+            .contains("x-opencode-session: ka-agent-doctor"),
+        "{req}"
+    );
+    assert!(req.contains("Bearer sk-test"), "{req}");
+    assert!(req.contains("\"max_tokens\":1"), "{req}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `models --probe` without a key sends nothing and says so.
+#[test]
+fn probe_without_a_key_is_not_probed() {
+    let root = temp_root("probe-nokey");
+    // The URL is unreachable on purpose: without a key the probe must
+    // not touch the network at all.
+    let o = ka_env(
+        &root,
+        &["models", "--probe", "opencode-go/glm-5.3"],
+        &[("KA_AGENT_PROBE_URL", "http://127.0.0.1:9/v1")],
+    );
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.trim_end()
+            .ends_with("· opencode-go/glm-5.3 not probed (no key)"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The setup picker offers the registry's models ahead of the catalog
+/// (its default pick becomes the registry's first model), and the
+/// answer still goes through the catalog's selector validation.
+#[test]
+fn setup_picker_offers_registry_models_first() {
+    use std::io::Write as _;
+    let root = temp_root("pick-reg");
+    let reg = fake_http(vec![(
+        200,
+        r#"{"anthropic": {"models": {"claude-super-9": {}}}}"#,
+    )]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args([
+            "setup",
+            "--provider",
+            "anthropic",
+            "--key-stdin",
+            "--no-verify",
+            "--no-service",
+        ])
+        .env("HOME", &root)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .env("KA_AGENT_CONFIG", root.join("config.toml"))
+        .env("KA_AGENT_MODELS_REGISTRY", &reg.url)
+        .env_remove("KA_AGENT_PROFILE")
+        .env_remove("KA_AGENT_HOME")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // key, model default pick, timezone, workspace, channels, search,
+    // briefing, save, service, test message — the piped flow.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"sk-pick\n\ny\n\n3\n\n\ny\nn\nn\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    let cfg = std::fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(
+        cfg.contains("model = \"anthropic/claude-super-9\""),
+        "the registry's first model is the default pick: {cfg}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

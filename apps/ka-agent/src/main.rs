@@ -22,6 +22,7 @@ mod layout;
 mod mcp_cli;
 mod memory_cli;
 mod model_cli;
+mod models_live;
 mod ops;
 mod pair;
 mod persona_cli;
@@ -334,8 +335,15 @@ fn main() -> std::process::ExitCode {
         }
         Command::Models {
             provider,
-            config: _,
-        } => model_cli::models(provider),
+            refresh,
+            probe,
+            config,
+        } => model_cli::models(model_cli::ModelsArgs {
+            provider,
+            refresh,
+            probe,
+            config: config_path(&config),
+        }),
         Command::Config { action, config } => match action {
             ConfigAction::Path => {
                 config_cli::config(config_cli::ConfigCommand::Path, config_path(&config))
