@@ -97,7 +97,7 @@ pub(super) fn run_mode<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         if rest.is_empty() {
             let current = runtime.config().mode.clone();
             return Outcome::Reply(format!(
-                "mode {current} — /mode guarded (asks before acting) · accept_edits (edits without asking) · plan (read and plan only) · free (acts without asking)"
+                "mode {current} — /mode ask (asks before acting) · accept_edits (edits without asking) · allow (acts without asking) · readonly (read and plan only); the old names guarded/free/plan still work"
             ));
         }
         match runtime.set_mode(rest, ctx.source).await {

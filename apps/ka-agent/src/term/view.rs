@@ -52,7 +52,7 @@ impl View {
             daily_cap: None,
             queued: 0,
             plan: None,
-            mode: "guarded".into(),
+            mode: "ask".into(),
             focused: true,
             verbose: false,
             width,
@@ -92,7 +92,7 @@ impl View {
         if let Some((done, total)) = self.plan {
             parts.push(format!("plan {done}/{total}"));
         }
-        if self.mode != "guarded" {
+        if self.mode != "ask" {
             parts.push(format!("mode {}", self.mode));
         }
         let mut line = parts.join(" · ");
@@ -391,14 +391,14 @@ mod tests {
         v.daily_cap = Some(3.0);
         v.queued = 2;
         v.plan = Some((1, 3));
-        v.mode = "plan".into();
+        v.mode = "readonly".into();
         let line = v.status_line();
         assert!(line.contains("☥ Ka"), "{line}");
         assert!(line.contains("ctx 42%"), "{line}");
         assert!(line.contains("$0.40/3.00"), "{line}");
         assert!(line.contains("queued 2"), "{line}");
         assert!(line.contains("plan 1/3"), "{line}");
-        assert!(line.contains("mode plan"), "{line}");
+        assert!(line.contains("mode readonly"), "{line}");
 
         v.width = 20;
         let short = v.status_line();

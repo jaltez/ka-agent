@@ -1,5 +1,5 @@
 //! Phase 6 e2e: the Matrix channel against a fake homeserver, passing the
-//! same suite shape as the Telegram e2e — a scripted turn, the guarded
+//! same suite shape as the Telegram e2e — a scripted turn, the ask-mode
 //! approval round-trip (text `/y`, the documented channel difference), the
 //! identity gate, and `next_batch` persistence across a restart.
 

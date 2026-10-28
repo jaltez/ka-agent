@@ -128,7 +128,8 @@ pub enum WorkerCommand {
     },
     /// Switch the permission mode.
     SetMode {
-        /// `guarded` | `accept_edits` | `free` | `plan`.
+        /// `ask` | `accept_edits` | `allow` | `readonly` (the old
+        /// `guarded`/`free`/`plan` spellings are accepted as aliases).
         mode: String,
     },
     /// Per-turn reasoning effort (`off|low|medium|high|max`; empty =
@@ -251,7 +252,7 @@ mod tests {
             workspace: "/home/op/work".into(),
             strand: StrandSel::Path("/data/strands/s1-x.jsonl".into()),
             model: Some("anthropic/claude-sonnet-4-5".into()),
-            mode: Some("guarded".into()),
+            mode: Some("ask".into()),
             engine_layer_toml: Some("model = \"a/b\"\n".into()),
             scenario: Some("/tmp/scen.json".into()),
         });
@@ -293,7 +294,7 @@ mod tests {
             selector: "openai/gpt-5.2".into(),
         });
         round_trip(&WorkerCommand::SetMode {
-            mode: "plan".into(),
+            mode: "readonly".into(),
         });
         round_trip(&WorkerCommand::SetName {
             name: "CI flake hunt".into(),
@@ -313,7 +314,7 @@ mod tests {
             r#"{"op":"close"}"#
         );
         let set_mode = serde_json::to_string(&WorkerCommand::SetMode {
-            mode: "free".into(),
+            mode: "allow".into(),
         })
         .unwrap();
         assert!(set_mode.starts_with(r#"{"op":"set_mode""#), "{set_mode}");

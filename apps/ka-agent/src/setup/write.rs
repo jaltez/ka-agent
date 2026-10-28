@@ -96,7 +96,7 @@ impl Setup {
             .map_err(|e| e.to_string())?;
         }
         if self.fresh {
-            ka_agent_core::config_file::set(&self.args.config, "mode", "\"guarded\"")
+            ka_agent_core::config_file::set(&self.args.config, "mode", "\"ask\"")
                 .map_err(|e| e.to_string())?;
         }
         if let Some((voice, key)) = &self.voice {

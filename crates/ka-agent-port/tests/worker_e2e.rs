@@ -267,8 +267,9 @@ async fn resume_replays_prior_history() {
     second.close().await.unwrap();
 }
 
-/// 3. Ask flow: a non-read-only bash command in guarded mode asks; deny →
-///    the turn continues and finishes.
+/// 3. Ask flow: a non-read-only bash command in ask mode asks; deny →
+///    the turn continues and finishes. Opened with the old `guarded`
+///    spelling on purpose — aliases still parse at the port.
 #[tokio::test]
 async fn guarded_bash_asks_and_deny_completes_turn() {
     let env = Env::new("ask");

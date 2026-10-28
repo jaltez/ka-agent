@@ -86,7 +86,7 @@ pub struct OpenRequest {
     pub strand: StrandSelector,
     /// Model selector re-asserted after attach.
     pub model: Option<String>,
-    /// Permission mode re-asserted after attach (`guarded` default).
+    /// Permission mode re-asserted after attach (`ask` default).
     pub mode: Option<String>,
     /// Ka engine layer TOML applied below the worker's security overlay.
     pub engine_layer_toml: Option<String>,

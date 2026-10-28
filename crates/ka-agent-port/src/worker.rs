@@ -54,13 +54,17 @@ pub fn run_worker(run: WorkerRun) -> Result<(), String> {
     runtime.block_on(worker_main(run))
 }
 
-/// Parse a permission-mode word (`guarded|accept_edits|free|plan`).
+/// Parse a permission-mode word. Canonical vocabulary first
+/// (`ask|accept_edits|allow|readonly`); the old words
+/// (`guarded|accept_edits|free|plan`) stay accepted as aliases — the
+/// daemon normalizes at load, so an old word here means an unpinned
+/// caller (`open` from a test or an older client).
 pub fn parse_mode(s: &str) -> Option<Mode> {
     match s {
-        "guarded" => Some(Mode::Guarded),
-        "accept_edits" => Some(Mode::AcceptEdits),
-        "free" => Some(Mode::Free),
-        "plan" => Some(Mode::Plan),
+        "ask" | "guarded" => Some(Mode::Guarded),
+        "accept_edits" | "accept-edits" => Some(Mode::AcceptEdits),
+        "allow" | "free" => Some(Mode::Free),
+        "readonly" | "plan" => Some(Mode::Plan),
         _ => None,
     }
 }
@@ -279,6 +283,11 @@ async fn reassert_policy(engine: &mut Option<EngineMeta>, commands: Option<&Send
     // through the event pump
 }
 
+/// The engine's own wire word for a mode. The pinned engine (ka rev
+/// 193ad5d) only knows the old vocabulary — `guarded | accept_edits |
+/// free | plan` is exactly what its `Mode` wire format accepts — so this
+/// mapping MUST keep emitting those names no matter what the daemon's
+/// config says (`ask`/`allow`/`readonly` would be rejected on the wire).
 fn mode_word(mode: Mode) -> &'static str {
     match mode {
         Mode::Guarded => "guarded",
@@ -322,12 +331,14 @@ async fn open_engine(
     }
     let requested_mode = match mode.as_deref() {
         None => None,
-        Some(word) => Some(
-            parse_mode(word)
-                .ok_or_else(|| format!("unknown mode {word:?} (guarded|accept_edits|free|plan)"))?,
-        ),
+        Some(word) => Some(parse_mode(word).ok_or_else(|| {
+            format!(
+                "unknown mode {word:?} (ask|accept_edits|allow|readonly; \
+                     guarded/free/plan still work)"
+            )
+        })?),
     };
-    // Security overlay: explicit-or-guarded mode, bash auto-backgrounding
+    // Security overlay: explicit-or-ask mode, bash auto-backgrounding
     // off (a detached job would escape cancellation, gap G15), and the
     // engine's `remember` hand off — memory proposals go through Ka
     // Agent (§4.4). The overlay always wins over the engine layer.

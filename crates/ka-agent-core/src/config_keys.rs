@@ -133,11 +133,11 @@ pub static KEYS: &[KeySpec] = &[
     },
     KeySpec {
         path: "mode",
-        kind: Kind::Enum(&["guarded", "accept_edits", "free", "plan"]),
-        default: "guarded",
+        kind: Kind::Enum(&["ask", "accept_edits", "allow", "readonly"]),
+        default: "ask",
         apply: Apply::Worker,
         web: true,
-        doc: "permission mode: guarded asks, accept_edits auto-applies edits, plan is read-only, free asks nothing",
+        doc: "permission mode: ask asks, accept_edits auto-applies edits, allow asks nothing, readonly never executes (plan only) — the old names (guarded/free/plan) still work",
     },
     KeySpec {
         path: "approval_ttl_secs",
@@ -623,7 +623,7 @@ mod tests {
     fn changed_reports_only_differing_keys() {
         let old = DaemonConfig::default();
         let mut new = old.clone();
-        new.mode = "free".to_string();
+        new.mode = "allow".to_string();
         new.web.port = 9999;
         let changed = changed(&old, &new);
         let paths: Vec<_> = changed.iter().map(|k| k.path).collect();

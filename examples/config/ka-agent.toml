@@ -21,9 +21,10 @@ workspace = "~/.ka-agent/profiles/default/workspace"
 # and cron time is interpreted here. (Top-level keys go before any [table].)
 # timezone = "Europe/Madrid"
 
-# Permission mode for new sessions: "guarded" (default) | "accept_edits"
-# | "free" | "plan". Re-asserted by the worker after every attach.
-mode = "guarded"
+# Permission mode for new sessions: "ask" (default) | "accept_edits" |
+# "allow" | "readonly". The old names (guarded/free/plan) still work.
+# Re-asserted by the worker after every attach.
+mode = "ask"
 
 # Approval card TTL in seconds; unanswered approvals deny on expiry
 # (fail closed). Range 1..=86400.
@@ -103,7 +104,7 @@ enabled = false
 # MCP servers whose tools the agent may use (`ka-agent mcp add`). Exactly
 # one of `command` (stdio) or `url` (HTTP). `secret:<name>` values resolve
 # from the secret store (`ka-agent secret set <name>`) when the agent
-# starts; in guarded mode every call asks first.
+# starts; in ask mode every call asks first.
 # [[mcp]]
 # name = "notes"
 # command = "npx"

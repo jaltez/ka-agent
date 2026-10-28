@@ -843,12 +843,12 @@ fn persona_name() -> String {
         .unwrap_or_else(|| "Ka".to_string())
 }
 
-/// ` · mode <x>` when the mode is not the guarded default.
+/// ` · mode <x>` when the mode is not the ask default.
 fn mode_badge() -> String {
     let mode = ka_agent_core::DaemonConfig::load(&crate::config_path(&None))
         .map(|c| c.mode)
-        .unwrap_or_else(|_| "guarded".to_string());
-    if mode == "guarded" {
+        .unwrap_or_else(|_| "ask".to_string());
+    if mode == "ask" {
         String::new()
     } else {
         format!(" · mode {mode}")

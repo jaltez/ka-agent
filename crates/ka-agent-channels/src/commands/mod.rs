@@ -126,9 +126,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "mode",
-        args: "[guarded|accept_edits|plan|free]",
+        args: "[ask|accept_edits|allow|readonly]",
         summary: "how much the agent may do without asking",
-        example: "/mode plan",
+        example: "/mode readonly",
         telegram: true,
         aliases: &[],
         reach: Reach::Everywhere,

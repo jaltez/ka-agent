@@ -107,6 +107,6 @@ token_secret = "matrix.access_token"   # KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN
   grant); instance B — separate data root — sees no episode, no grant, no
   identity, no memory row of A's. Nothing crosses.
 - `apps/ka-agent/tests/matrix_e2e.rs`: the same suite shape as Telegram —
-  scripted turn + `next_batch` persistence across restart, guarded approval
-  round-trip over `/y`, unlinked sender ignored and audited while the linked
-  operator is served.
+  scripted turn + `next_batch` persistence across restart, ask-mode
+  approval round-trip over `/y`, unlinked sender ignored and audited while
+  the linked operator is served.

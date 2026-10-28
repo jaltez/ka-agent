@@ -25,7 +25,7 @@ is appended by the overlay. `secret:<name>` values in their `env`/`headers`
 resolve from the secret store at worker spawn — in memory, never in the
 config file. With more than one operator server the engine's
 `tools.mcp.discovery` defaults to `lazy`. Their tools are exec-tier hands
-like the bridge's: in `guarded` mode every call asks, and the approval card
+like the bridge's: in `ask` mode every call asks, and the approval card
 names the tool (`use \`server__tool\`?`).
 
 The MCP server inherits the worker's sanitized env, including

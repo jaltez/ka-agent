@@ -36,7 +36,7 @@ impl Runtime {
     pub async fn reload_config(&self, new: DaemonConfig, restart_worker: bool) -> ReloadReport {
         // One writer at a time: a hot-reload that loaded the file before a
         // live setter could otherwise apply its stale snapshot last and
-        // silently undo the setter (a `/mode plan` reverting to guarded).
+        // silently undo the setter (a `/mode readonly` reverting to ask).
         let _guard = self.sh.config_lock.lock().await;
         self.reload_config_locked(new, restart_worker).await
     }
@@ -374,24 +374,32 @@ impl Runtime {
 
     /// `/mode`: switch the permission mode, persisted and applied to a
     /// live worker at once. From a phone channel the mode may only get
-    /// stricter (free < accept_edits < guarded < plan): a lost phone must
+    /// stricter (allow < accept_edits < ask < readonly): a lost phone must
     /// not be able to turn approvals off.
     pub async fn set_mode(&self, mode: &str, source: &str) -> Result<String, Error> {
+        /// Strictness rank; `None` names no mode. The old spellings stay
+        /// accepted here as a defense in depth — the daemon's config is
+        /// normalized at load, but callers hand in raw operator input.
         fn strictness(m: &str) -> Option<u8> {
             Some(match m {
-                "free" => 0,
-                "accept_edits" => 1,
-                "guarded" => 2,
-                "plan" => 3,
+                "allow" | "free" => 0,
+                "accept_edits" | "accept-edits" => 1,
+                "ask" | "guarded" => 2,
+                "readonly" | "plan" => 3,
                 _ => return None,
             })
         }
         let mode = mode.trim();
-        let new = strictness(mode).ok_or_else(|| {
-            Error::Refused(format!(
-                "unknown mode {mode:?}: guarded | accept_edits | plan | free"
-            ))
-        })?;
+        let Some(canonical) = ka_agent_core::config::normalize_mode(mode) else {
+            return Err(Error::Refused(format!(
+                "unknown mode {mode:?}: ask | accept_edits | allow | readonly \
+                 (the old names guarded/accept_edits/free/plan still work)"
+            )));
+        };
+        // Unreachable for a word `normalize_mode` accepted, but the phone
+        // check below must never run on an unranked word.
+        let new = strictness(&canonical)
+            .ok_or_else(|| Error::Refused(format!("unknown mode {mode:?}")))?;
         let phone = source.starts_with("telegram:") || source.starts_with("matrix:");
         let current = strictness(&self.cfg().mode).unwrap_or(2);
         if phone && new < current {
@@ -404,20 +412,26 @@ impl Runtime {
             .ok_or_else(|| Error::Refused("no config file — run ka-agent setup".into()))?;
         // One writer at a time, and mark the file as seen so the watcher
         // does not re-announce (or re-apply a stale snapshot) afterwards.
+        // The canonical word is what gets persisted — an alias typed by
+        // the operator is never written back.
         let _guard = self.sh.config_lock.lock().await;
-        ka_agent_core::config_file::set(&path, "mode", &format!("{mode:?}"))
+        ka_agent_core::config_file::set(&path, "mode", &format!("{canonical:?}"))
             .map_err(Error::Config)?;
         let mut new_cfg = (*self.cfg()).clone();
-        new_cfg.mode = mode.to_string();
+        new_cfg.mode = canonical.clone();
         // Live worker: switch now (a turn in flight finishes under the old
         // mode); the config keeps it for the next worker.
         if let Some(port) = self.live_port() {
-            let _ = port.set_mode(mode.to_string()).await;
+            let _ = port.set_mode(canonical.clone()).await;
         }
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_cfg);
         self.remember_config_mtime();
-        self.audit(audit_actions::MODE_SET, mode, Some(format!("by {source}")))?;
+        self.audit(
+            audit_actions::MODE_SET,
+            &canonical,
+            Some(format!("by {source}")),
+        )?;
         self.settings_event();
-        Ok(mode.to_string())
+        Ok(canonical)
     }
 }

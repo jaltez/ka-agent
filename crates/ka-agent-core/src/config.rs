@@ -362,7 +362,9 @@ pub struct DaemonConfig {
     /// A message that arrives mid-turn: `steer` (default, rides the
     /// running reply) or `queue` (durable, next turn).
     pub busy_messages: String,
-    /// `guarded` (default) | `accept_edits` | `free` | `plan`.
+    /// `ask` (default) | `accept_edits` | `allow` | `readonly`. The old
+    /// names (`guarded`, `free`, `plan`, `accept-edits`) are accepted
+    /// forever and normalized at load ([`normalize_mode`]).
     pub mode: String,
     /// Approval card TTL; deny on expiry.
     pub approval_ttl_secs: u64,
@@ -409,7 +411,7 @@ impl Default for DaemonConfig {
             background_model: None,
             sandbox: "auto".to_string(),
             busy_messages: "steer".to_string(),
-            mode: "guarded".to_string(),
+            mode: "ask".to_string(),
             approval_ttl_secs: 900,
             turn_grace_secs: 10,
             worker_idle_timeout_secs: 900,
@@ -431,6 +433,32 @@ impl Default for DaemonConfig {
     }
 }
 
+/// The canonical permission-mode word for an operator's input, or `None`
+/// when it names no mode. The pre-rename vocabulary is accepted forever:
+/// `guarded` → `ask`, `free` → `allow`, `plan` → `readonly`,
+/// `accept-edits` → `accept_edits` (`accept_edits` kept its name).
+pub fn normalize_mode(s: &str) -> Option<String> {
+    Some(
+        match s {
+            "ask" | "guarded" => "ask",
+            "accept_edits" | "accept-edits" => "accept_edits",
+            "allow" | "free" => "allow",
+            "readonly" | "plan" => "readonly",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// The validation error for a mode word that names nothing (neither the
+/// canonical vocabulary nor one of the old aliases).
+fn unknown_mode(mode: &str) -> String {
+    format!(
+        "unknown mode {mode:?} (ask | accept_edits | allow | readonly; \
+         the old names guarded/accept_edits/free/plan still work)"
+    )
+}
+
 impl DaemonConfig {
     /// Load and validate. `~` expands against `$HOME`.
     pub fn load(path: &Path) -> Result<Self, Error> {
@@ -450,16 +478,18 @@ impl DaemonConfig {
             .is_some();
         let mut cfg = cfg;
         cfg.set_default_workspace(has_workspace, &crate::layout::default_root());
+        // Old-vocabulary modes normalize here: everything downstream
+        // (badges, `/mode` replies, the worker's mode word) speaks only
+        // `ask | accept_edits | allow | readonly`.
+        cfg.mode =
+            normalize_mode(&cfg.mode).ok_or_else(|| Error::Validate(unknown_mode(&cfg.mode)))?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if !matches!(
-            self.mode.as_str(),
-            "guarded" | "accept_edits" | "free" | "plan"
-        ) {
-            return Err(Error::Validate(format!("unknown mode {:?}", self.mode)));
+        if normalize_mode(&self.mode).is_none() {
+            return Err(Error::Validate(unknown_mode(&self.mode)));
         }
         for h in &self.hooks {
             if !AGENT_HOOK_EVENTS.contains(&h.on.as_str())
@@ -734,7 +764,7 @@ mod tests {
     fn minimal_config_loads_with_defaults() {
         let p = write_tmp("minimal", "workspace = \"/tmp/ws\"\n");
         let cfg = DaemonConfig::load(&p).unwrap();
-        assert_eq!(cfg.mode, "guarded");
+        assert_eq!(cfg.mode, "ask");
         assert_eq!(cfg.approval_ttl_secs, 900);
         assert!(cfg.model.is_none());
     }
@@ -755,7 +785,52 @@ mod tests {
             mode: "yolo".into(),
             ..DaemonConfig::default()
         };
-        assert!(cfg.validate().is_err());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ask | accept_edits | allow | readonly"),
+            "{err}"
+        );
+        assert!(
+            err.contains("guarded/accept_edits/free/plan still work"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn normalize_mode_maps_old_names_and_keeps_canonical() {
+        // Canonical words pass through untouched.
+        for word in ["ask", "accept_edits", "allow", "readonly"] {
+            assert_eq!(normalize_mode(word).as_deref(), Some(word));
+        }
+        // The old vocabulary is accepted forever as an alias.
+        assert_eq!(normalize_mode("guarded").as_deref(), Some("ask"));
+        assert_eq!(normalize_mode("free").as_deref(), Some("allow"));
+        assert_eq!(normalize_mode("plan").as_deref(), Some("readonly"));
+        assert_eq!(
+            normalize_mode("accept-edits").as_deref(),
+            Some("accept_edits")
+        );
+        // Anything else names no mode.
+        assert_eq!(normalize_mode("yolo"), None);
+        assert_eq!(normalize_mode(""), None);
+    }
+
+    #[test]
+    fn old_mode_names_normalize_at_load() {
+        let p = write_tmp("alias-ask", "workspace = \"/tmp/ws\"\nmode = \"guarded\"\n");
+        assert_eq!(DaemonConfig::load(&p).unwrap().mode, "ask");
+        let p = write_tmp("alias-allow", "workspace = \"/tmp/ws\"\nmode = \"free\"\n");
+        assert_eq!(DaemonConfig::load(&p).unwrap().mode, "allow");
+        let p = write_tmp(
+            "alias-readonly",
+            "workspace = \"/tmp/ws\"\nmode = \"plan\"\n",
+        );
+        assert_eq!(DaemonConfig::load(&p).unwrap().mode, "readonly");
+        let p = write_tmp(
+            "alias-kebab",
+            "workspace = \"/tmp/ws\"\nmode = \"accept-edits\"\n",
+        );
+        assert_eq!(DaemonConfig::load(&p).unwrap().mode, "accept_edits");
     }
 
     #[test]
@@ -850,7 +925,8 @@ digest_time = "07:30"
 "#;
         let p = write_tmp("full", toml_src);
         let cfg = DaemonConfig::load(&p).unwrap();
-        assert_eq!(cfg.mode, "plan");
+        // `plan` is the old name; load answers with the canonical word.
+        assert_eq!(cfg.mode, "readonly");
         assert_eq!(cfg.worker_restart.crash_max, 3);
         assert_eq!(cfg.budgets.daily_usd, Some(5.0));
         assert_eq!(cfg.telegram.allow_user_ids, vec![12345]);

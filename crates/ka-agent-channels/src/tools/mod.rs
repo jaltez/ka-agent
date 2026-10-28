@@ -27,7 +27,7 @@ pub mod schedule;
 
 /// What a tool can do to the world. The approval profile auto-allows
 /// `Read | Propose | LocalWrite`; `Schedule`/`ExternalWrite` still ask in
-/// guarded mode.
+/// ask mode (the default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     /// Reads state; never changes anything.

@@ -923,7 +923,7 @@ async fn phone_can_tighten_but_not_loosen_the_mode() {
                     && c.body["text"]
                         .as_str()
                         .unwrap_or("")
-                        .contains("mode → plan")
+                        .contains("mode → readonly")
             },
             Duration::from_secs(30),
         )
@@ -931,7 +931,7 @@ async fn phone_can_tighten_but_not_loosen_the_mode() {
     assert!(
         std::fs::read_to_string(&cfg_path)
             .unwrap()
-            .contains("mode = \"plan\"")
+            .contains("mode = \"readonly\"")
     );
     stop(&mut stack).await;
 }

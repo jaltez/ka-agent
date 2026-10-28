@@ -164,7 +164,7 @@ impl StatusReport {
             .as_deref()
             .map(ka_agent_core::ids::short_id)
             .unwrap_or("(new)");
-        // Anything looser than `guarded` is worth a glance every time.
+        // Anything looser than `ask` is worth a glance every time.
         let since = jiff::Timestamp::from_millisecond(self.awake_since_ms)
             .map(|t| t.to_zoned(now.time_zone().clone()))
             .map(|z| format!("{:02}:{:02}", z.hour(), z.minute()))
@@ -175,8 +175,9 @@ impl StatusReport {
             self.persona.clone()
         };
         let mode = match self.mode.as_str() {
-            "free" => "⚠ mode free (acts without asking)".to_string(),
+            "allow" => "⚠ mode allow (acts without asking)".to_string(),
             "accept_edits" => "mode accept_edits (edits without asking)".to_string(),
+            "readonly" => "mode readonly (read and plan only, never executes)".to_string(),
             m => format!("mode {m}"),
         };
         let mut out = format!(
@@ -239,7 +240,7 @@ mod tests {
             status: "Idle".into(),
             strand_id: None,
             model: Some("anthropic/claude-sonnet-5".into()),
-            mode: "guarded".into(),
+            mode: "ask".into(),
             worker_running: true,
             idle_timeout_secs: 900,
             spent_usd: 0.0123,
@@ -267,7 +268,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "☥ Ka · awake since 01:00 · ● idle · anthropic/claude-sonnet-5 · mode guarded",
+                "☥ Ka · awake since 01:00 · ● idle · anthropic/claude-sonnet-5 · mode ask",
                 "worker: running (stops after 15m idle)",
                 "today: $0.0123 of $5.00 · 12,345 tokens",
                 "queue 0 · approvals 0 · crashes 0",

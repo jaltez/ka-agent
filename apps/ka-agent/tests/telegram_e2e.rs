@@ -1,8 +1,8 @@
 //! Full-stack e2e: the real daemon (`ka-agent run`) + Telegram channel +
 //! engine worker with the scripted speaker, driven against a fake Bot API
-//! server (`ka_agent_channels::fake`). Covers the simple turn, the guarded
-//! approval round-trip over inline keyboards, and offset persistence across
-//! daemon restarts.
+//! server (`ka_agent_channels::fake`). Covers the simple turn, the
+//! ask-mode approval round-trip over inline keyboards, and offset
+//! persistence across daemon restarts.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -190,7 +190,7 @@ async fn simple_turn_and_offset_persistence_across_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guarded_approval_over_inline_keyboard() {
+async fn ask_mode_approval_over_inline_keyboard() {
     let root = temp_root("ask");
     let _ = std::fs::remove_file(MARKER);
     let (fake, base) = FakeBotServer::spawn();
@@ -211,7 +211,7 @@ async fn guarded_approval_over_inline_keyboard() {
     let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
     wait_polling(&fake);
 
-    // Guarded mode: the bash call surfaces as an approval card with an
+    // Ask mode: the bash call surfaces as an approval card with an
     // inline keyboard.
     fake.push_text_message(1, 42, 42, "run it");
     let card = fake
@@ -243,8 +243,8 @@ async fn guarded_approval_over_inline_keyboard() {
     )
     .expect("no final answer after allow");
 
-    // Observed: allowing the card runs the bash call in the guarded
-    // workspace, so the marker exists once the turn completes.
+    // Observed: allowing the card runs the bash call in the workspace,
+    // so the marker exists once the turn completes.
     assert!(
         Path::new(MARKER).exists(),
         "allow did not run the scripted bash call"

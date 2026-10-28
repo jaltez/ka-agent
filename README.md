@@ -52,7 +52,7 @@ in your terminal too.
 | | |
 |---|---|
 | `/status` | model, spend vs limits, queue, next task |
-| `/mode [m]` | guarded (asks) · accept_edits · plan (read-only) · free — with a badge when not guarded |
+| `/mode [m]` | ask (default, asks) · accept_edits · allow · readonly (read-only) — badge when not ask; the old names guarded/free/plan still work |
 | `/model provider/model` | switch model, applied live |
 | `/new` · `/stop` · `/resume` | fresh session · abort reply · lift a pause |
 | `/remember <fact>` · `/forget <id>` | durable memory (git-backed; `/memory` lists ids) |
@@ -84,7 +84,7 @@ leaves. Details: `docs/contract/terminal.md`.
 ## What it can do
 
 Out of the box Ka works in its workspace (read, write, edit, run commands —
-behind approvals in the default `guarded` mode), keeps notes and memory,
+behind approvals in the default `ask` mode), keeps notes and memory,
 and schedules. Three settings widen its reach:
 
 ```sh
@@ -95,7 +95,7 @@ ka-agent mcp add home --url http://homeassistant.local:8123/mcp \
 ka-agent config set fallback '["openai/gpt-5.1"]'   # if the main model fails
 ```
 
-MCP tools appear to the model as `<server>__<tool>`; in `guarded` mode each
+MCP tools appear to the model as `<server>__<tool>`; in `ask` mode each
 call asks first (the card names the tool). `secret:<name>` values come from
 `ka-agent secret set <name>` when the agent starts and never touch the
 config file. `ka-agent status` shows a `tools:` line with what is on, and
@@ -185,7 +185,7 @@ commented copy of the schema is in
 [`examples/config/ka-agent.toml`](examples/config/ka-agent.toml). Edit it
 with `ka-agent config set <key> <value>` / `config edit` — comments and key
 order survive, safe changes apply to the running agent live, the rest tells
-you to `ka-agent restart`. Key settings: `model`, `mode` (`guarded` default),
+you to `ka-agent restart`. Key settings: `model`, `mode` (`ask` default),
 `timezone`, `budgets.daily_usd` / `daily_tokens`, `worker_idle_timeout_secs`,
 `[web]`, `[calendar]`.
 

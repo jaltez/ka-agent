@@ -481,10 +481,10 @@ fn effort_command_sets_the_session_level() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// 2.3 approval profile: a read-tier kagent tool never asks, so a guarded
-/// session leaves no approval row behind.
+/// 2.3 approval profile: a read-tier kagent tool never asks, so an
+/// ask-mode session leaves no approval row behind.
 #[test]
-fn read_tools_never_ask_in_guarded_mode() {
+fn read_tools_never_ask_in_ask_mode() {
     let root = temp_root("profile-read");
     let sc = scenario_file(
         &root,
@@ -1260,8 +1260,9 @@ fn settled_turn_prints_a_footer_and_no_session_noise() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// H1: `/mode` switches live and persists; a non-guarded mode carries a
-/// badge in /status.
+/// H1: `/mode` switches live and persists; a non-ask mode carries a badge
+/// in /status. Old names (`plan`, `guarded`, `free`) still type-check and
+/// answer with the canonical word (`readonly`, `ask`, `allow`).
 #[test]
 fn mode_switches_live_and_persists() {
     let root = temp_root("mode");
@@ -1271,19 +1272,28 @@ fn mode_switches_live_and_persists() {
         r#"{ "steps": [ {"text": "ok"} ], "stop": "done" }"#,
     );
     let mut chat = spawn_chat(&root, &sc);
+    // The fixture config says `mode = "guarded"` (the old name) — the
+    // loaded and reported mode is the canonical `ask`.
+    chat.send("/status");
+    chat.expect("mode ask", Duration::from_secs(30));
     chat.send("/mode plan");
-    chat.expect("mode → plan", Duration::from_secs(30));
+    chat.expect("mode → readonly", Duration::from_secs(30));
     chat.send("/status");
-    chat.expect("mode plan", Duration::from_secs(30));
-    chat.send("/mode free");
-    chat.expect("mode → free", Duration::from_secs(30));
+    chat.expect("mode readonly", Duration::from_secs(30));
+    chat.send("/mode guarded");
+    chat.expect("mode → ask", Duration::from_secs(30));
+    chat.send("/mode allow");
+    chat.expect("mode → allow", Duration::from_secs(30));
     chat.send("/status");
-    chat.expect("⚠ mode free (acts without asking)", Duration::from_secs(30));
+    chat.expect(
+        "⚠ mode allow (acts without asking)",
+        Duration::from_secs(30),
+    );
     chat.send("/mode sideways");
     chat.expect("unknown mode", Duration::from_secs(30));
     chat.send("/quit");
     let cfg = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
-    assert!(cfg.contains("mode = \"free\""), "{cfg}");
+    assert!(cfg.contains("mode = \"allow\""), "{cfg}");
     std::fs::remove_dir_all(&root).ok();
 }
 
