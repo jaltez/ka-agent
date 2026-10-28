@@ -359,8 +359,12 @@ fn update_downloads_verifies_and_swaps() {
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::fs::write(&target, "old binary").unwrap();
     let run = |api: &str, args: &[&str]| {
+        // The data root must be the test's own: `update` records its check
+        // in the store, and without this the test writes into the real
+        // instance's state.db (doctor then reports a bogus 9.9.9 release).
         let o = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
             .args(args)
+            .env("KA_AGENT_DATA_DIR", dir.join("data"))
             .env("KA_AGENT_UPDATE_API", api)
             .env("KA_AGENT_INSTALL_TO", &target)
             .output()
