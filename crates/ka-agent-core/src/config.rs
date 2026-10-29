@@ -225,6 +225,90 @@ pub struct Approvals {
     /// (it never denies; anything uncertain still asks you). Off by default.
     pub auto_review: bool,
 }
+/// One `[[grants.path]]` entry's reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Writable without asking (the engine's sandbox allowlist plus
+    /// allow rules for `write`/`edit`).
+    Allow,
+    /// The engine's own ask flow decides (the same as no entry).
+    Ask,
+    /// Blocked in every mode, for bash and the file tools alike.
+    Deny,
+}
+
+impl<'de> Deserialize<'de> for Access {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = Access;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("allow | ask | deny (`always` still reads as allow)")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Access, E> {
+                match s {
+                    "allow" | "always" => Ok(Access::Allow),
+                    "ask" => Ok(Access::Ask),
+                    "deny" => Ok(Access::Deny),
+                    other => Err(E::unknown_variant(other, &["allow", "ask", "deny"])),
+                }
+            }
+        }
+        deserializer.deserialize_str(V)
+    }
+}
+
+/// One per-directory grant (`[[grants.path]]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathGrant {
+    /// Absolute directory the grant covers.
+    pub dir: PathBuf,
+    /// The grant's reach: allow | ask | deny (`always` = allow).
+    pub access: Access,
+}
+
+/// Operator grants (`[grants]`): what the engine may do without an
+/// approval card — pre-approved directories, installs, or everything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grants {
+    /// App/package installs (`sudo apt-get install`, `npm i -g`,
+    /// `pip install`, `cargo install`, `go install`, `nix-env -i`, …)
+    /// run without asking; `false` denies them naming this switch.
+    #[serde(default)]
+    pub install: bool,
+    /// Full access: the OS sandbox is off, installs are granted and
+    /// path denies are ignored. ka-agent's own files stay protected.
+    #[serde(default)]
+    pub full: bool,
+    /// Keep the one-line full-access advisory in `status` and `doctor`
+    /// (`false` silences it; the access itself is unchanged).
+    #[serde(default = "default_true")]
+    pub advisory: bool,
+    /// Per-directory grants (`[[grants.path]]`).
+    #[serde(default)]
+    pub path: Vec<PathGrant>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Grants {
+    fn default() -> Self {
+        Self {
+            install: false,
+            full: false,
+            advisory: true,
+            path: Vec::new(),
+        }
+    }
+}
 
 /// Proactive-message manners: strict `[notify]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -396,6 +480,8 @@ pub struct DaemonConfig {
     pub voice: Option<Voice>,
     pub notify: Notify,
     pub approvals: Approvals,
+    /// Operator grants (`[grants]`): paths, installs, full access.
+    pub grants: Grants,
     /// Operator hooks ([[hooks]]).
     #[serde(default)]
     pub hooks: Vec<HookSpec>,
@@ -428,6 +514,7 @@ impl Default for DaemonConfig {
             voice: None,
             notify: Notify::default(),
             approvals: Approvals::default(),
+            grants: Grants::default(),
             hooks: Vec::new(),
         }
     }
@@ -688,6 +775,21 @@ impl DaemonConfig {
                 return Err(Error::Validate(format!(
                     "mcp {:?} needs exactly one of `command` (stdio) or `url` (http)",
                     m.name
+                )));
+            }
+        }
+        let mut grant_dirs = std::collections::BTreeSet::new();
+        for g in &self.grants.path {
+            if !g.dir.is_absolute() {
+                return Err(Error::Validate(format!(
+                    "grants.path dir {} must be absolute",
+                    g.dir.display()
+                )));
+            }
+            if !grant_dirs.insert(g.dir.clone()) {
+                return Err(Error::Validate(format!(
+                    "grants.path dir {} is listed twice",
+                    g.dir.display()
                 )));
             }
         }
@@ -992,5 +1094,64 @@ digest_time = "07:30"
             ws.ends_with(".ka-agent/profiles/default/workspace"),
             "default workspace lives under the default profile root: {ws:?}"
         );
+    }
+
+    #[test]
+    fn grants_parse_with_the_always_alias() {
+        let p = write_tmp(
+            "grants",
+            "workspace = \"/tmp/ws\"\n\
+             [grants]\ninstall = true\nfull = true\n\
+             [[grants.path]]\ndir = \"/srv/data\"\naccess = \"allow\"\n\
+             [[grants.path]]\ndir = \"/srv/always\"\naccess = \"always\"\n\
+             [[grants.path]]\ndir = \"/srv/ask\"\naccess = \"ask\"\n\
+             [[grants.path]]\ndir = \"/srv/deny\"\naccess = \"deny\"\n",
+        );
+        let cfg = DaemonConfig::load(&p).unwrap();
+        assert!(cfg.grants.install && cfg.grants.full && cfg.grants.advisory);
+        assert_eq!(cfg.grants.path.len(), 4);
+        assert_eq!(cfg.grants.path[0].access, Access::Allow);
+        assert_eq!(cfg.grants.path[1].access, Access::Allow, "always = allow");
+        assert_eq!(cfg.grants.path[2].access, Access::Ask);
+        assert_eq!(cfg.grants.path[3].access, Access::Deny);
+    }
+
+    #[test]
+    fn grants_default_off_but_advisory_on() {
+        let p = write_tmp("grants-default", "workspace = \"/tmp/ws\"\n");
+        let cfg = DaemonConfig::load(&p).unwrap();
+        assert!(!cfg.grants.install);
+        assert!(!cfg.grants.full);
+        assert!(cfg.grants.advisory);
+        assert!(cfg.grants.path.is_empty());
+    }
+
+    #[test]
+    fn grants_reject_relative_and_duplicate_dirs() {
+        let mut cfg = DaemonConfig::default();
+        cfg.grants.path = vec![PathGrant {
+            dir: PathBuf::from("rel/dir"),
+            access: Access::Allow,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must be absolute"), "{err}");
+
+        let mut dup = DaemonConfig::default();
+        dup.grants.path = vec![
+            PathGrant {
+                dir: PathBuf::from("/srv/x"),
+                access: Access::Allow,
+            },
+            PathGrant {
+                dir: PathBuf::from("/srv/x"),
+                access: Access::Deny,
+            },
+        ];
+        let err = dup.validate().unwrap_err().to_string();
+        assert!(err.contains("listed twice"), "{err}");
+
+        // Absolute, distinct dirs validate.
+        dup.grants.path[1].dir = PathBuf::from("/srv/y");
+        assert!(dup.validate().is_ok());
     }
 }

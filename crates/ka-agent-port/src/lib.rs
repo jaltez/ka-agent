@@ -21,8 +21,8 @@ pub mod token_lock;
 pub mod worker;
 
 pub use port::{
-    BoxFut, KaPort, OpenRequest, PortError, PortEvent, PortSession, StrandSelector, WorkerEnv,
-    WorkerPort,
+    BoxFut, GuardGrants, KaPort, OpenRequest, PortError, PortEvent, PortSession, StrandSelector,
+    WorkerEnv, WorkerPort,
 };
 pub use proto::{ImagePayload, StrandSel, WorkerCommand, WorkerEvent};
 pub use scenario::{Scenario, ScenarioSpeaker, Step};

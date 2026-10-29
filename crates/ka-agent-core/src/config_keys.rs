@@ -418,6 +418,38 @@ pub static KEYS: &[KeySpec] = &[
         web: true,
         doc: "a cheap model pre-screens reviewable asks",
     },
+    KeySpec {
+        path: "grants.install",
+        kind: Kind::Bool,
+        default: "false",
+        apply: Apply::Worker,
+        web: true,
+        doc: "let app installs run without asking (sudo apt, npm -g, pip, cargo, go, nix)",
+    },
+    KeySpec {
+        path: "grants.full",
+        kind: Kind::Bool,
+        default: "false",
+        apply: Apply::Worker,
+        web: true,
+        doc: "full access: sandbox off, installs granted, path denies ignored",
+    },
+    KeySpec {
+        path: "grants.advisory",
+        kind: Kind::Bool,
+        default: "true",
+        apply: Apply::Live,
+        web: true,
+        doc: "keep the one-line full-access warning in status and doctor",
+    },
+    KeySpec {
+        path: "grants.path",
+        kind: Kind::Table,
+        default: "[]",
+        apply: Apply::Worker,
+        web: false,
+        doc: "per-directory grants ([[grants.path]]: dir, access allow|ask|deny)",
+    },
 ];
 
 /// Exact key lookup, else the longest registered table prefix.

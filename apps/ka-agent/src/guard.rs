@@ -97,6 +97,246 @@ fn target_path(tool: &str, args: &Value, cwd: &Path) -> Option<PathBuf> {
     Some(if p.is_absolute() { p } else { cwd.join(p) })
 }
 
+/// Grant decisions from the worker env (`KA_AGENT_GUARD_GRANTS`,
+/// serialized by `WorkerEnv::sanitize`). Absent env = all-false: every
+/// grant check below stays off.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Grants {
+    install: bool,
+    full: bool,
+    hard: bool,
+    deny: Vec<PathBuf>,
+    allow: Vec<PathBuf>,
+}
+
+fn grants_env() -> Grants {
+    let Some(text) = std::env::var("KA_AGENT_GUARD_GRANTS").ok() else {
+        return Grants::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return Grants::default();
+    };
+    let dirs = |key: &str| -> Vec<PathBuf> {
+        v[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d.as_str())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Grants {
+        install: v["install"].as_bool().unwrap_or(false),
+        full: v["full"].as_bool().unwrap_or(false),
+        hard: v["hard"].as_bool().unwrap_or(false),
+        deny: dirs("deny"),
+        allow: dirs("allow"),
+    }
+}
+
+/// Bash self-protection beyond the file-level list. In every mode the
+/// enumerated own files (config, store, secrets, …) are denied; when
+/// `hard` (allow mode or `grants.full`) no operator gate remains for
+/// bash, so the whole data root and the binary are protected too — the
+/// workspace (the hook's `cwd`) and the attachments dir stay writable.
+fn bash_protects(resolved: &Path, cwd: &Path, hard: bool) -> Option<String> {
+    if let Some(hit) = inside(resolved, &protected("KA_AGENT_GUARD_WRITE")) {
+        return Some(format!(
+            "protected: ka-agent's own files ({} is inside {})",
+            resolved.display(),
+            hit.display()
+        ));
+    }
+    if !hard {
+        return None;
+    }
+    let root = std::env::var_os("KA_AGENT_DATA_DIR").map(PathBuf::from)?;
+    let hit = inside(resolved, std::slice::from_ref(&root))?;
+    let r = resolve(resolved);
+    let open = [resolve(cwd), resolve(&root.join("attachments"))];
+    if open.iter().any(|ok| r == *ok || r.starts_with(ok)) {
+        return None;
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && resolve(&exe) == r
+    {
+        return Some(format!(
+            "protected: ka-agent's own files ({} is the ka-agent binary)",
+            r.display()
+        ));
+    }
+    Some(format!(
+        "protected: ka-agent's own files ({} is inside {})",
+        r.display(),
+        hit.display()
+    ))
+}
+
+/// Strip one level of quotes when they wrap the whole word.
+fn unquote(word: &str) -> &str {
+    let bytes = word.as_bytes();
+    if bytes.len() >= 2 {
+        let (a, b) = (bytes[0], bytes[bytes.len() - 1]);
+        if (a == b'"' || a == b'\'') && a == b {
+            return &word[1..word.len() - 1];
+        }
+    }
+    word
+}
+
+/// True when the word is path-shaped: absolute, home- or
+/// dot-relative.
+fn path_shaped(word: &str) -> bool {
+    word.starts_with('/')
+        || word.starts_with("~/")
+        || word.starts_with("./")
+        || word.starts_with("../")
+}
+
+/// Path-shaped tokens of a bash command, conservatively tokenized on
+/// whitespace: words that look like paths, `>`/`>>`/`2>` redirect
+/// targets (glued or separate), and `path=` argument values. Trailing
+/// shell punctuation is dropped so `touch /a/b;` still yields `/a/b`.
+fn bash_path_tokens(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for word in command.split_whitespace() {
+        let word = unquote(word);
+        // redirect targets, glued (">file", "2>>file") or separate ("> file")
+        let word = word
+            .strip_prefix("2>>")
+            .or_else(|| word.strip_prefix("2>"))
+            .or_else(|| word.strip_prefix("1>>"))
+            .or_else(|| word.strip_prefix("1>"))
+            .or_else(|| word.strip_prefix("&>>"))
+            .or_else(|| word.strip_prefix("&>"))
+            .or_else(|| word.strip_prefix(">>"))
+            .or_else(|| word.strip_prefix('>'))
+            .unwrap_or(word);
+        if word == ">" || word == ">>" {
+            continue; // the target is its own word
+        }
+        let value = word.strip_prefix("path=").unwrap_or(word);
+        let trimmed = value.trim_end_matches([';', ',', '&', '|']);
+        if path_shaped(trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// The first program word of one shell segment and the words after it,
+/// with sudo/doas (and their flags, including `-u <user>`-style pairs)
+/// stripped. `None` when the segment names nothing.
+fn split_program(segment: &str) -> Option<(String, Vec<String>)> {
+    let words: Vec<String> = segment
+        .split_whitespace()
+        .map(|w| unquote(w).trim_end_matches([';', ',']).to_string())
+        .collect();
+    let mut i = 0;
+    if words.first().is_some_and(|w| w == "sudo" || w == "doas") {
+        i = 1;
+        while i < words.len() {
+            let w = &words[i];
+            if w == "-u" || w == "-g" {
+                i += 2; // the flag and its value
+            } else if w.starts_with('-') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let prog = words.get(i)?;
+    let base = prog.rsplit('/').next().unwrap_or(prog).to_string();
+    Some((base, words[i + 1..].to_vec()))
+}
+
+/// True when the command installs software. Conservative by design:
+/// plain `apt list`, `pip show` or `npm install` (local) never match —
+/// only install subcommands (and `-g` for npm) do.
+fn install_class(command: &str) -> bool {
+    for segment in command.split([';', '\n']).flat_map(|s| {
+        s.split("&&")
+            .flat_map(|s| s.split("||"))
+            .flat_map(|s| s.split('|'))
+    }) {
+        let Some((prog, rest)) = split_program(segment) else {
+            continue;
+        };
+        // first word after the program that is not a flag
+        let sub = rest.iter().find(|w| !w.starts_with('-'));
+        let any = |needle: &str| rest.iter().any(|w| w == needle);
+        let installs = match prog.as_str() {
+            "apt" | "apt-get" | "dnf" | "yum" | "pip" | "pip3" | "pipx" | "cargo" | "go" => {
+                sub.is_some_and(|s| s == "install")
+            }
+            "dpkg" => any("-i") || any("--install"),
+            "pacman" => ["-S", "-Sy", "-Su", "-Syu", "-Syy", "-Syyu", "--sync"]
+                .iter()
+                .any(|f| any(f)),
+            "npm" => {
+                sub.is_some_and(|s| s == "install" || s == "i" || s == "add")
+                    && (any("-g") || any("--global"))
+            }
+            "nix-env" => any("-i") || any("-iA") || any("--install"),
+            _ => false,
+        };
+        if installs {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve a token the way the file tools' paths resolve (`~` then
+/// cwd-relative), then run the bash checks.
+fn bash_guard(command: &str, cwd: &Path, g: &Grants) -> std::process::ExitCode {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for token in bash_path_tokens(command) {
+        let expanded = if let Some(rest) = token.strip_prefix("~/") {
+            match &home {
+                Some(h) => h.join(rest),
+                None => continue,
+            }
+        } else {
+            PathBuf::from(&token)
+        };
+        let resolved = resolve(&expanded);
+        // Self-protection always holds, whatever the grants.
+        if let Some(reason) = bash_protects(&resolved, cwd, g.hard) {
+            eprintln!("{reason}");
+            return std::process::ExitCode::from(2);
+        }
+        if !g.full
+            && let Some(hit) = inside(&resolved, &g.deny)
+        {
+            eprintln!(
+                "denied by grant for {} — remove or change the [[grants.path]] entry to allow it",
+                hit.display()
+            );
+            return std::process::ExitCode::from(2);
+        }
+    }
+    if g.full {
+        // No gate remains: pre-approve so ask mode never asks.
+        println!("{{\"decision\":\"allow\"}}");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if install_class(command) {
+        if g.install {
+            // Pre-approve: the hook's allow downgrades the permission
+            // ask to allow (hardstops still apply engine-side).
+            println!("{{\"decision\":\"allow\"}}");
+        } else {
+            eprintln!("app installs are denied — set grants.install = true to allow them");
+            return std::process::ExitCode::from(2);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 pub fn run() -> std::process::ExitCode {
     let mut input = String::new();
     if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
@@ -113,13 +353,18 @@ pub fn run() -> std::process::ExitCode {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("/"));
+    let g = grants_env();
+    if tool == "bash" {
+        let command = args["command"].as_str().unwrap_or("");
+        return bash_guard(command, &cwd, &g);
+    }
     let Some(target) = target_path(tool, &args, &cwd) else {
         return std::process::ExitCode::SUCCESS;
     };
     let resolved = resolve(&target);
-    let (list, verb) = match tool {
-        "write" | "edit" => (protected("KA_AGENT_GUARD_WRITE"), "write"),
-        "read" | "grep" => (protected("KA_AGENT_GUARD_READ"), "read"),
+    let list = match tool {
+        "write" | "edit" => protected("KA_AGENT_GUARD_WRITE"),
+        "read" | "grep" => protected("KA_AGENT_GUARD_READ"),
         _ => return std::process::ExitCode::SUCCESS,
     };
     if let Some(hit) = inside(&resolved, &list) {
@@ -130,7 +375,21 @@ pub fn run() -> std::process::ExitCode {
         );
         return std::process::ExitCode::from(2);
     }
-    let _ = verb;
+    if !g.full
+        && let Some(hit) = inside(&resolved, &g.deny)
+    {
+        eprintln!(
+            "denied by grant for {} — remove or change the [[grants.path]] entry to allow it",
+            hit.display()
+        );
+        return std::process::ExitCode::from(2);
+    }
+    // A granted dir pre-approves the write/edit call (the hook's allow
+    // only downgrades an ask: engine deny rules still refuse). This is
+    // the mechanism for N allow dirs — no first-rule-per-tool quirk.
+    if matches!(tool, "write" | "edit") && (g.full || inside(&resolved, &g.allow).is_some()) {
+        println!("{{\"decision\":\"allow\"}}");
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -193,5 +452,91 @@ mod tests {
             "a cwd search inside a protected dir is refused"
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn scanner_finds_paths_redirects_and_path_args() {
+        assert_eq!(
+            bash_path_tokens("touch /tmp/outside-grants"),
+            vec!["/tmp/outside-grants"]
+        );
+        assert_eq!(
+            bash_path_tokens("echo x > /srv/log.txt 2>>/srv/err.txt"),
+            vec!["/srv/log.txt", "/srv/err.txt"]
+        );
+        assert_eq!(
+            bash_path_tokens("cat ~/notes ./here ../up;"),
+            vec!["~/notes", "./here", "../up"]
+        );
+        assert_eq!(
+            bash_path_tokens("tool --flag path=/etc/app.conf plain"),
+            vec!["/etc/app.conf"]
+        );
+        // words that are not paths, redirects without targets and
+        // quotes around non-paths never appear
+        assert!(bash_path_tokens("echo hi && ls -la").is_empty());
+        // a quoted path is unquoted when the quotes wrap the whole
+        // word; internal spaces stay conservative (two words, neither
+        // path-shaped)
+        assert_eq!(bash_path_tokens("rm '/root/secret'"), vec!["/root/secret"]);
+        assert!(bash_path_tokens("rm '/root/secret file'").is_empty());
+    }
+
+    #[test]
+    fn classifier_matches_install_commands_only() {
+        for yes in [
+            "sudo apt-get install -y cowsay",
+            "sudo apt install cowsay",
+            "apt-get -y install htop",
+            "doas dnf install ripgrep",
+            "yum install git",
+            "dpkg -i pkg.deb",
+            "dpkg --install pkg.deb",
+            "pacman -Syu",
+            "npm install -g typescript",
+            "npm i -g prettier",
+            "pip install requests",
+            "pip3 install --user httpie",
+            "pipx install black",
+            "cargo install ripgrep",
+            "go install golang.org/x/tools/cmd/goimports@latest",
+            "nix-env -i hello",
+            "nix-env -iA nixpkgs.hello",
+            "cd /tmp && sudo apt-get install -y sl",
+            "sudo -u root apt-get install -y sl",
+        ] {
+            assert!(install_class(yes), "should match: {yes}");
+        }
+        for no in [
+            "apt list --upgradable",
+            "apt-get update",
+            "pip show requests",
+            "pip3 --version",
+            "npm install", // local project install
+            "npm list -g",
+            "cargo build --release",
+            "go build ./...",
+            "dpkg -l",
+            "pacman -Q",
+            "nix-env -q",
+            "echo apt-get install -y cowsay",
+            "cat /var/log/apt-get install notes",
+            "sudo ls /root",
+        ] {
+            assert!(!install_class(no), "must not match: {no}");
+        }
+    }
+
+    #[test]
+    fn split_program_strips_sudo_flags_and_paths() {
+        let (prog, rest) = split_program("sudo apt-get install -y cowsay").unwrap();
+        assert_eq!(prog, "apt-get");
+        assert_eq!(rest, vec!["install", "-y", "cowsay"]);
+        let (prog, rest) = split_program("doas -u root ls -la").unwrap();
+        assert_eq!(prog, "ls");
+        assert_eq!(rest, vec!["-la"]);
+        assert_eq!(split_program("/usr/bin/env whoami").unwrap().0, "env");
+        assert_eq!(split_program("apt list").unwrap().0, "apt");
+        assert_eq!(split_program(""), None);
     }
 }

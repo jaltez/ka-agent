@@ -39,6 +39,7 @@ impl Env {
             agent_data_root: self.root.clone(),
             guard_write: Vec::new(),
             guard_read: Vec::new(),
+            guard_grants: Default::default(),
         }
     }
 

@@ -364,14 +364,16 @@ async fn open_engine(
         );
     }
     // Self-protection: ka-agent's own files (config, store, secrets,
-    // memory, other profiles) are off limits to the engine's file tools,
-    // which pattern rules cannot express (`../config.toml` never matches a
-    // raw-path pattern). The guard reads the protected lists from the
-    // worker env; both lists ride the pre_tool_use hook contract.
-    if std::env::var_os("KA_AGENT_GUARD_WRITE").is_some()
+    // memory, other profiles) are off limits to the engine's file tools
+    // and to bash, which pattern rules cannot express (`../config.toml`
+    // never matches a raw-path pattern; a command can name any path).
+    // The guard reads the protected lists and the grant decisions from
+    // the worker env; both ride the pre_tool_use hook contract.
+    if (std::env::var_os("KA_AGENT_GUARD_WRITE").is_some()
+        || std::env::var_os("KA_AGENT_GUARD_GRANTS").is_some())
         && let Ok(exe) = std::env::current_exe()
     {
-        for tool in ["write", "edit", "read", "grep"] {
+        for tool in ["bash", "write", "edit", "read", "grep"] {
             cfg.hooks.push(ka_engine::config::Hook {
                 event: ka_engine::config::HookEvent::PreToolUse,
                 tool: Some(tool.to_string()),

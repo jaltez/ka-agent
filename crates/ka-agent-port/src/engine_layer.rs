@@ -18,11 +18,24 @@ pub fn compose(
     user_layer: Option<&str>,
     resolve_secret: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
-    let sandbox_on = match cfg.sandbox.as_str() {
+    let detected = match cfg.sandbox.as_str() {
         "fs" => true,
         "auto" => ka_sandbox::detect_tool().is_some(),
         _ => false,
     };
+    // The pinned engine (ka rev 193ad5d, `crates/ka-engine/src/voice.rs`
+    // ~2720-2760) poses a "sandbox grant for `…`" ask even when the
+    // permission gate returned `Gate::Allow` — so `mode = "allow"` and
+    // `grants.full` must keep the sandbox off entirely, or bash would
+    // still ask outside the workspace.
+    let sandbox_on = detected && cfg.mode != "allow" && !cfg.grants.full;
+    // Allow-dir grants ride the sandbox allowlist and engine rules.
+    let grant_dirs: Vec<&ka_agent_core::config::PathGrant> = cfg
+        .grants
+        .path
+        .iter()
+        .filter(|g| g.access == ka_agent_core::config::Access::Allow)
+        .collect();
     let has_extras = cfg.search.is_some()
         || !cfg.fallback.is_empty()
         || !cfg.mcp.is_empty()
@@ -117,6 +130,24 @@ pub fn compose(
             toml::Value::Array(vec![attachments.to_string_lossy().into_owned().into()]),
         );
         doc.insert("sandbox".into(), sandbox.into());
+    }
+
+    // Granted dirs join the sandbox allowlist whichever sandbox table
+    // ended up in the layer (ours or the operator's): bash redirects
+    // inside them must not compute an extra sandbox-grant ask.
+    if sandbox_on && let Some(sandbox) = doc.get_mut("sandbox").and_then(toml::Value::as_table_mut)
+    {
+        let list = sandbox
+            .entry("allow_write".to_string())
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        if let toml::Value::Array(arr) = list {
+            for g in &grant_dirs {
+                let dir = toml::Value::String(g.dir.to_string_lossy().into_owned());
+                if !arr.contains(&dir) {
+                    arr.push(dir);
+                }
+            }
+        }
     }
 
     // The engine's spend guard is the live budget: the continue-ask it
@@ -357,5 +388,86 @@ mod step25_tests {
             ..Default::default()
         };
         assert!(compose(&cfg, None, &no_secret).unwrap().is_none());
+    }
+
+    #[test]
+    fn allow_and_full_modes_keep_the_sandbox_off() {
+        // The pinned engine asks for sandbox grants even under Gate::Allow
+        // (voice.rs ~2720), so allow/full must not compose [sandbox] at all.
+        let mut cfg = ka_agent_core::DaemonConfig {
+            sandbox: "fs".into(),
+            mode: "allow".into(),
+            ..Default::default()
+        };
+        let layer = compose(&cfg, None, &no_secret).unwrap();
+        assert!(layer.is_none(), "no extras -> pass-through: {layer:?}");
+        // With an extra the layer exists but carries no sandbox table.
+        cfg.effort = Some("low".into());
+        let parsed: toml::Value =
+            toml::from_str(&compose(&cfg, None, &no_secret).unwrap().unwrap()).unwrap();
+        assert!(parsed.get("sandbox").is_none());
+
+        let mut full = ka_agent_core::DaemonConfig {
+            sandbox: "fs".into(),
+            effort: Some("low".into()),
+            ..Default::default()
+        };
+        full.grants.full = true;
+        let parsed: toml::Value =
+            toml::from_str(&compose(&full, None, &no_secret).unwrap().unwrap()).unwrap();
+        assert!(parsed.get("sandbox").is_none());
+    }
+
+    #[test]
+    fn allow_dirs_join_the_sandbox_only() {
+        let cfg: ka_agent_core::DaemonConfig = toml::from_str(
+            "sandbox = \"fs\"\n\
+             [[grants.path]]\ndir = \"/srv/ok\"\naccess = \"always\"\n\
+             [[grants.path]]\ndir = \"/srv/ok2\"\naccess = \"allow\"\n\
+             [[grants.path]]\ndir = \"/srv/nope\"\naccess = \"deny\"\n",
+        )
+        .unwrap();
+        let text = compose(&cfg, None, &no_secret).unwrap().unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let writes: Vec<&str> = parsed["sandbox"]["allow_write"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(writes.contains(&"/srv/ok"), "{writes:?}");
+        assert!(writes.contains(&"/srv/ok2"), "{writes:?}");
+        assert!(
+            !writes.contains(&"/srv/nope"),
+            "deny dirs never widen the sandbox: {writes:?}"
+        );
+        // No engine rules are composed for grant dirs: the `__guard`
+        // hook pre-approves writes inside them (write/edit), so N
+        // granted dirs behave identically.
+        let engine = ka_engine::Config::parse_layer(&text, "t").unwrap();
+        assert!(
+            engine
+                .rules
+                .iter()
+                .all(|r| !r.pattern.as_deref().is_some_and(|p| p.contains("/srv/"))),
+            "{:?}",
+            engine.rules
+        );
+    }
+
+    #[test]
+    fn user_layer_rules_survive_grant_composition_untouched() {
+        // Sandbox off + a grant dir composes nothing at all (the guard
+        // handles the grant), so the operator's rules pass through
+        // verbatim.
+        let cfg: ka_agent_core::DaemonConfig = toml::from_str(
+            "sandbox = \"off\"\n[[grants.path]]\ndir = \"/srv/ok\"\naccess = \"allow\"\n",
+        )
+        .unwrap();
+        let user = "[[rules]]\ntool = \"write\"\npattern = \"secret/**\"\nverdict = \"deny\"\n";
+        assert_eq!(
+            compose(&cfg, Some(user), &no_secret).unwrap().as_deref(),
+            Some(user)
+        );
     }
 }

@@ -101,6 +101,29 @@ call asks first (the card names the tool). `secret:<name>` values come from
 config file. `ka-agent status` shows a `tools:` line with what is on, and
 `ka-agent doctor` checks the keys and secrets they need.
 
+### Permissions, grants and self-protection
+
+Out of the box the engine works inside its workspace behind approval
+cards (`ask`); `/mode allow` drops the cards for the session. Wider or
+narrower reach is a `[grants]` block in `ka-agent.toml`:
+
+```toml
+[grants]
+install = true                       # sudo apt/npm -g/pip/cargo/go installs run unasked
+
+[[grants.path]]
+dir = "/srv/data"                    # absolute
+access = "allow"                     # allow | ask | deny — writable without asking
+```
+
+`deny` blocks a directory outright (bash and file tools, every mode);
+`grants.full = true` turns everything off-asking (sandbox, installs,
+denies) and `status`/`doctor` say so (`grants.advisory = false` silences
+the reminder). ka-agent's own files — config, store, secrets, memory,
+the data root and the binary — stay protected in every mode, and the
+engine's own catastrophic-command hardstops still ask. Details:
+`docs/contract/grants.md`.
+
 ## Channels (phone)
 
 ```sh

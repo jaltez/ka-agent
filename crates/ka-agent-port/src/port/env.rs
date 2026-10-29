@@ -34,6 +34,43 @@ pub struct WorkerEnv {
     pub guard_write: Vec<PathBuf>,
     /// Paths the engine's file tools may never read (`__guard` list).
     pub guard_read: Vec<PathBuf>,
+    /// Grant decisions the `__guard` hook enforces or pre-approves.
+    pub guard_grants: GuardGrants,
+}
+
+/// What the `__guard` hook may pre-approve or deny beyond the protected
+/// lists, serialized as `KA_AGENT_GUARD_GRANTS`. Absent env = all-false:
+/// the hook's grant logic stays off and behavior is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuardGrants {
+    /// `grants.install` (implicitly true under `full`): install-class
+    /// commands are pre-approved instead of denied.
+    pub install: bool,
+    /// `grants.full`: deny dirs and the install gate are skipped,
+    /// bash and file writes are pre-approved. Self-protection stays.
+    pub full: bool,
+    /// `[[grants.path]]` deny dirs: blocked for bash and file tools.
+    pub deny: Vec<PathBuf>,
+    /// `[[grants.path]]` allow dirs: `write`/`edit` inside them are
+    /// pre-approved (N dirs behave identically — no first-rule quirk).
+    pub allow: Vec<PathBuf>,
+    /// No operator gate remains for bash (`mode = "allow"` or `full`),
+    /// so the whole data root is protected, not just the file list.
+    pub hard: bool,
+}
+
+impl GuardGrants {
+    /// The JSON the hook reads. Keep in sync with `__guard`'s parser.
+    fn to_env_json(&self) -> String {
+        serde_json::json!({
+            "install": self.install,
+            "full": self.full,
+            "hard": self.hard,
+            "deny": self.deny.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
+            "allow": self.allow.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
 }
 
 /// Env-var name markers whose values are ambient operator credentials —
@@ -74,6 +111,9 @@ impl WorkerEnv {
         {
             cmd.env("KA_AGENT_GUARD_READ", joined);
         }
+        // Always sent (all-false by default): the hook's parser treats
+        // absence as all-false, so older daemons stay compatible.
+        cmd.env("KA_AGENT_GUARD_GRANTS", self.guard_grants.to_env_json());
     }
 }
 
@@ -156,6 +196,7 @@ mod tests {
             agent_data_root: root.clone(),
             guard_write: Vec::new(),
             guard_read: Vec::new(),
+            guard_grants: GuardGrants::default(),
         };
         let mut cmd = Command::new("env");
         env.sanitize(&mut cmd);
@@ -192,6 +233,40 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("ANTHROPIC_API_KEY"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn sanitize_carries_guard_grants_json() {
+        let root = std::env::temp_dir().join(format!("ka-port-grants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        let env = WorkerEnv {
+            home: root.join("home"),
+            guard_grants: GuardGrants {
+                install: true,
+                full: false,
+                deny: vec![PathBuf::from("/srv/nope")],
+                allow: vec![PathBuf::from("/srv/ok")],
+                hard: true,
+            },
+            ..WorkerEnv::default()
+        };
+        let mut cmd = Command::new("env");
+        env.sanitize(&mut cmd);
+        let output = cmd.output().await.unwrap().stdout;
+        let text = String::from_utf8_lossy(&output);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("KA_AGENT_GUARD_GRANTS="))
+            .unwrap_or_else(|| panic!("no grants env in: {text}"));
+        let v: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("KA_AGENT_GUARD_GRANTS=")).unwrap();
+        assert_eq!(v["install"], serde_json::json!(true));
+        assert_eq!(v["full"], serde_json::json!(false));
+        assert_eq!(v["hard"], serde_json::json!(true));
+        assert_eq!(v["deny"], serde_json::json!(["/srv/nope"]));
+        assert_eq!(v["allow"], serde_json::json!(["/srv/ok"]));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

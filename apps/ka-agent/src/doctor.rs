@@ -135,6 +135,48 @@ fn store_version_issue(err: &ka_agent_store::StoreError) -> Option<String> {
     }
 }
 
+/// Grants lines for the report: the full-access warning (when
+/// `grants.advisory` is on) and one info line with the path grants and
+/// the install state. `--json` collects them like every other check.
+fn grants_lines(cfg: &DaemonConfig) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    if cfg.grants.full && cfg.grants.advisory {
+        out.push((
+            "warn",
+            "grants.full is on: nothing asks — the sandbox is off, installs run, path denies are ignored"
+                .to_string(),
+        ));
+    }
+    let dirs: Vec<String> = cfg
+        .grants
+        .path
+        .iter()
+        .map(|g| {
+            format!(
+                "{} ({})",
+                g.dir.display(),
+                match g.access {
+                    ka_agent_core::config::Access::Allow => "allow",
+                    ka_agent_core::config::Access::Ask => "ask",
+                    ka_agent_core::config::Access::Deny => "deny",
+                }
+            )
+        })
+        .collect();
+    let paths = if dirs.is_empty() {
+        "0 paths".to_string()
+    } else {
+        format!("{} paths ({})", dirs.len(), dirs.join(", "))
+    };
+    let install = if cfg.grants.install || cfg.grants.full {
+        "on"
+    } else {
+        "off"
+    };
+    out.push(("info", format!("grants: {paths}, install {install}")));
+    out
+}
+
 pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCode {
     let mut rep = Report::new(json);
     let paths = Paths::new(Paths::default_root());
@@ -264,6 +306,12 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
                     missing.join(", "),
                     missing[0]
                 ));
+            }
+        }
+        for (level, line) in grants_lines(cfg) {
+            match level {
+                "warn" => rep.warn(&line),
+                _ => rep.info(&line),
             }
         }
     }
@@ -635,5 +683,46 @@ mod tests {
         assert!(line.contains("newer ka-agent"), "{line}");
         // Ordinary store errors keep their own message (no duplicate line).
         assert!(store_version_issue(&StoreError::NotFound("x".into())).is_none());
+    }
+    #[test]
+    fn grants_lines_warn_on_full_and_list_paths() {
+        let mut cfg = DaemonConfig::default();
+        let lines = grants_lines(&cfg);
+        assert_eq!(
+            lines,
+            vec![("info", "grants: 0 paths, install off".to_string())],
+            "{lines:?}"
+        );
+
+        cfg.grants.full = true;
+        let lines = grants_lines(&cfg);
+        assert_eq!(lines[0].0, "warn", "{lines:?}");
+        assert!(lines[0].1.contains("grants.full is on"), "{lines:?}");
+        // full grants installs too, so the info line says on
+        assert!(lines[1].1.contains("install on"), "{lines:?}");
+
+        // advisory = false silences the warning; the info line stays.
+        cfg.grants.advisory = false;
+        let lines = grants_lines(&cfg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, "info", "{lines:?}");
+
+        cfg.grants.advisory = true;
+        cfg.grants.install = true;
+        cfg.grants.path = vec![
+            ka_agent_core::config::PathGrant {
+                dir: PathBuf::from("/srv/ok"),
+                access: ka_agent_core::config::Access::Allow,
+            },
+            ka_agent_core::config::PathGrant {
+                dir: PathBuf::from("/srv/no"),
+                access: ka_agent_core::config::Access::Deny,
+            },
+        ];
+        let text = grants_lines(&cfg)[1].1.clone();
+        assert_eq!(
+            text,
+            "grants: 2 paths (/srv/ok (allow), /srv/no (deny)), install on"
+        );
     }
 }

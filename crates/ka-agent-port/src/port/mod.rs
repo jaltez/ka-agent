@@ -15,7 +15,7 @@ mod env;
 mod events;
 mod session;
 
-pub use env::{OpenRequest, StrandSelector, WorkerEnv};
+pub use env::{GuardGrants, OpenRequest, StrandSelector, WorkerEnv};
 pub use events::PortEvent;
 pub use session::PortSession;
 

@@ -63,6 +63,31 @@ impl Runtime {
                 agent_data_root: self.sh.paths.root().to_path_buf(),
                 guard_write: self.guard_write_paths(),
                 guard_read: self.guard_read_paths(),
+                // Grant decisions ride the same pre_tool_use hook
+                // contract as the protected lists
+                // (KA_AGENT_GUARD_GRANTS). `hard` marks that no
+                // operator gate remains for bash (allow mode or
+                // full): then the whole data root is protected, not
+                // just ka-agent's enumerated own files.
+                guard_grants: ka_agent_port::GuardGrants {
+                    install: cfg.grants.install || cfg.grants.full,
+                    full: cfg.grants.full,
+                    deny: cfg
+                        .grants
+                        .path
+                        .iter()
+                        .filter(|g| g.access == ka_agent_core::config::Access::Deny)
+                        .map(|g| g.dir.clone())
+                        .collect(),
+                    allow: cfg
+                        .grants
+                        .path
+                        .iter()
+                        .filter(|g| g.access == ka_agent_core::config::Access::Allow)
+                        .map(|g| g.dir.clone())
+                        .collect(),
+                    hard: cfg.grants.full || cfg.mode == "allow",
+                },
             };
             let user_layer = cfg
                 .engine_layer_path()

@@ -79,6 +79,9 @@ pub struct Capabilities {
     pub voice: Option<String>,
     pub mcp: Vec<String>,
     pub fallback: Vec<String>,
+    /// `grants.full` with `grants.advisory` on: the one-line warning.
+    #[serde(default)]
+    pub full_access: bool,
 }
 
 impl Capabilities {
@@ -88,6 +91,7 @@ impl Capabilities {
             voice: cfg.voice.as_ref().map(|v| v.provider.clone()),
             mcp: cfg.mcp.iter().map(|m| m.name.clone()).collect(),
             fallback: cfg.fallback.clone(),
+            full_access: cfg.grants.full && cfg.grants.advisory,
         }
     }
 
@@ -179,6 +183,13 @@ impl StatusReport {
             "accept_edits" => "mode accept_edits (edits without asking)".to_string(),
             "readonly" => "mode readonly (read and plan only, never executes)".to_string(),
             m => format!("mode {m}"),
+        };
+        // The full-access advisory rides the mode line (badge style);
+        // grants.advisory = false silences it.
+        let mode = if self.capabilities.full_access {
+            format!("{mode} · ⚠ full access (grants.full): nothing asks")
+        } else {
+            mode
         };
         let mut out = format!(
             "☥ {persona} · awake since {since} · {state} · {model} · {mode}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
@@ -314,6 +325,7 @@ mod tests {
             voice: None,
             mcp: vec!["github".into(), "home".into()],
             fallback: vec!["openai/gpt-5.1".into()],
+            full_access: false,
         };
         let text = r.render(&now());
         assert_eq!(
@@ -321,6 +333,34 @@ mod tests {
             Some("tools: web search (tavily) · mcp github, home · fallback openai/gpt-5.1")
         );
         assert_eq!(report().render(&now()).lines().count(), 5);
+    }
+
+    #[test]
+    fn full_access_advisory_rides_the_mode_line() {
+        let mut r = report();
+        r.capabilities.full_access = true;
+        let text = r.render(&now());
+        assert!(
+            text.contains("⚠ full access (grants.full): nothing asks"),
+            "{text}"
+        );
+        // still one header line, not a sixth line
+        assert_eq!(text.lines().count(), 5, "{text}");
+        // advisory off (or full off): no trace
+        let plain = report().render(&now());
+        assert!(!plain.contains("full access"), "{plain}");
+    }
+
+    #[test]
+    fn capabilities_read_grants_from_config() {
+        let mut cfg = ka_agent_core::DaemonConfig::default();
+        cfg.grants.full = true;
+        assert!(Capabilities::from_config(&cfg).full_access);
+        cfg.grants.advisory = false;
+        assert!(!Capabilities::from_config(&cfg).full_access);
+        let mut plain = ka_agent_core::DaemonConfig::default();
+        plain.grants.install = true;
+        assert!(!Capabilities::from_config(&plain).full_access);
     }
 
     #[test]
