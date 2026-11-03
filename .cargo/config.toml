@@ -1,0 +1,3 @@
+[profile.dev]
+# Keep target/ bounded: no incremental cache (was >100 GB and growing).
+incremental = false
