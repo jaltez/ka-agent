@@ -408,3 +408,66 @@ async fn voice_note_becomes_a_turn_with_its_transcript() {
     daemon.sigterm_wait(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// B1: a captioned photo is submitted as a turn — the caption is the
+/// prompt, the file rides along as an `@attachments/…` reference — and
+/// the bare "saved" ack is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn captioned_photo_becomes_a_turn_with_caption_and_ref() {
+    let root = temp_root("caption");
+    let (fake, base) = FakeBotServer::spawn();
+    let cfg = write_config(&root, &base);
+    let sc = scenario_file(
+        &root,
+        "caption.json",
+        r#"{ "steps": [ {"text": "Caption noted"} ], "stop": "done" }"#,
+    );
+    let data = root.join("data");
+    fake.push_file("p-cap-1", "photos/p-cap-1.jpg", b"fake jpeg payload");
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    wait_polling(&fake);
+    fake.push_update(serde_json::json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "chat": { "id": 42, "type": "private" },
+            "date": 0,
+            "photo": [
+                { "file_id": "p-cap-1-small", "width": 90, "height": 90 },
+                { "file_id": "p-cap-1", "width": 1280, "height": 720 },
+            ],
+            "caption": "what is this?",
+        }
+    }));
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("Caption noted")),
+        Duration::from_secs(30),
+    )
+    .expect("the caption became a turn");
+    let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    let inbound: String = conn
+        .query_row(
+            "SELECT inbound_text FROM turns ORDER BY created_ms DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(inbound.contains("what is this?"), "caption kept: {inbound}");
+    assert!(
+        inbound.contains("@attachments/"),
+        "the file rides along as a reference: {inbound}"
+    );
+    let turns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns, 1, "the captioned photo is exactly one turn");
+    // The ack (if any) would have been sent before the answer arrived.
+    let acked = fake
+        .captured()
+        .into_iter()
+        .any(|c| send_message_text(&c).is_some_and(|t| t.contains("saved attachments/")));
+    assert!(!acked, "no bare ack for a captioned photo");
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}

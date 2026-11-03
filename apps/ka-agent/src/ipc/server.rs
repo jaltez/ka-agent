@@ -24,6 +24,98 @@ pub(crate) struct AdminCtx {
     pub(crate) paths_root: PathBuf,
 }
 
+/// `ask --wait` (F1): submit, then hold the reply until this request's
+/// own turn settles. The bus is subscribed before the submit so no event
+/// of the turn is missed; the turn is identified by comparing the stored
+/// inbound text (the runtime writes the turn row before it runs). The
+/// turn's `TurnFinished` is the next one after its `TurnStarted` (the
+/// single-writer rule makes turns strictly sequential).
+async fn ask_and_wait(ctx: &AdminCtx, text: &str, source: &str) -> serde_json::Value {
+    let queued = ctx
+        .runtime
+        .status_report()
+        .map(|r| r.queue > 0 || r.status != "Idle")
+        .unwrap_or(false);
+    let mut rx = ctx.bus.subscribe();
+    if let Err(e) = ctx.runtime.handle_message(text, source).await {
+        return serde_json::json!({"error": e.to_string()});
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut ours = false;
+    let mut submitted = false;
+    let mut last_notice: Option<String> = None;
+    loop {
+        let env = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Err(_) => {
+                return serde_json::json!({
+                    "error": "timed out after 300s waiting for the turn"
+                });
+            }
+            Ok(Err(_)) => return serde_json::json!({"error": "the event bus closed"}),
+            Ok(Ok(env)) => env,
+        };
+        match &env.ev {
+            AgentEvent::Inbound { text: t, .. } if t == text => submitted = true,
+            AgentEvent::TurnStarted { turn, .. } if !ours => {
+                ours = ctx
+                    .store
+                    .get_turn(&ka_agent_core::TurnId(turn.clone()))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|t| t.inbound_text == text);
+            }
+            AgentEvent::TurnFinished {
+                stop, text: answer, ..
+            } if ours => {
+                let failed = stop == "error";
+                let mut out = serde_json::json!({
+                    "ok": !failed,
+                    "queued": queued,
+                    "stop": stop,
+                    "reply": answer,
+                });
+                if failed {
+                    // The admin client treats any `error` key as a failure:
+                    // only include it when the turn actually failed.
+                    out["error"] = serde_json::json!("the turn ended in error");
+                }
+                return out;
+            }
+            AgentEvent::Error { class, message } if ours => {
+                return serde_json::json!({
+                    "ok": false,
+                    "queued": queued,
+                    "error": format!("[{class}] {message}"),
+                });
+            }
+            AgentEvent::Session { status } if ours && status == "Degraded" => {
+                return serde_json::json!({
+                    "ok": false,
+                    "queued": queued,
+                    "error": "the worker keeps crashing — /new starts a fresh session",
+                });
+            }
+            // The submit was accepted but refused before any turn started
+            // (preflight: no model, missing key): the session goes back to
+            // Idle with a Notice that carries the reason. A queued submit
+            // never looks like this — the queue keeps the session Running.
+            AgentEvent::Notice { text } if submitted && !ours => {
+                last_notice = Some(text.clone());
+            }
+            AgentEvent::Session { status } if submitted && !ours && status == "Idle" => {
+                return serde_json::json!({
+                    "ok": false,
+                    "queued": queued,
+                    "error": last_notice.clone().unwrap_or_else(|| {
+                        "the turn did not start (the daemon refused the message)".to_string()
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The tool context for one relayed call: the daemon's own runtime, store
 /// and paths (no second store reader, no env-based data root).
 fn tool_ctx(ctx: &AdminCtx) -> ka_agent_channels::tools::ToolCtx {
@@ -135,13 +227,25 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
                     .get("background")
                     .and_then(|b| b.as_bool())
                     .unwrap_or(false);
+                let wait = req.get("wait").and_then(|w| w.as_bool()).unwrap_or(false);
                 if text.trim().is_empty() {
                     serde_json::json!({"error": "ask needs a text"})
                 } else {
                     let source = if background { "cli-bg" } else { "cli" };
-                    match ctx.runtime.handle_message(text, source).await {
-                        Ok(()) => serde_json::json!({"ok": true, "queued": false}),
-                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    if wait {
+                        ask_and_wait(&ctx, text, source).await
+                    } else {
+                        match ctx.runtime.handle_message(text, source).await {
+                            Ok(()) => {
+                                let queued = ctx
+                                    .runtime
+                                    .status_report()
+                                    .map(|r| r.queue > 0)
+                                    .unwrap_or(false);
+                                serde_json::json!({"ok": true, "queued": queued})
+                            }
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        }
                     }
                 }
             }

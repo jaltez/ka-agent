@@ -502,6 +502,10 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             let body = String::from_utf8_lossy(&req.body);
             pages::tasks_cancel(runtime, &body).await
         }
+        ("POST", "/tasks/snooze") => {
+            let body = String::from_utf8_lossy(&req.body);
+            pages::tasks_snooze(runtime, &body)
+        }
         ("GET", "/skills") => pages::skills(runtime),
         ("POST", "/skills/toggle") => {
             let body = String::from_utf8_lossy(&req.body);

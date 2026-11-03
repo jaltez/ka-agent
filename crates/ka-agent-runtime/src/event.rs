@@ -46,13 +46,15 @@ pub enum AgentEvent {
         detail: String,
     },
     /// A tool call finished; `error` is the first line of its output when
-    /// the call failed.
+    /// the call failed, and `output` is a bounded excerpt of what a
+    /// successful call printed (surfaces show it on demand, dim).
     ToolFinished {
         id: String,
         tool: String,
         ok: bool,
         ms: u64,
         error: Option<String>,
+        output: Option<String>,
     },
     /// The model's live plan (whole-list replacement).
     Plan { items: Vec<PlanItem> },

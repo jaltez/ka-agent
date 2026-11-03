@@ -111,24 +111,10 @@ fn clear(store: &Store) {
 /// `address` on `channel`. Success links the identity, audits
 /// `identity.pair` and consumes the code; the fifth wrong attempt burns it.
 pub fn redeem(store: &Store, channel: &str, address: &str, text: &str) -> Redeem {
-    let raw = match store.meta_get(PAIRING_KEY) {
-        Ok(Some(raw)) if !raw.is_empty() => raw,
-        _ => return Redeem::NoCode,
+    let mut pending = match load_pending(store, channel) {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
     };
-    let Ok(mut pending) = serde_json::from_str::<Pending>(&raw) else {
-        return Redeem::NoCode;
-    };
-    if pending.channel != channel {
-        return Redeem::NoCode;
-    }
-    if ka_agent_core::now_ms() > pending.expires_ms {
-        clear(store);
-        return Redeem::Expired;
-    }
-    if pending.attempts >= MAX_ATTEMPTS {
-        clear(store);
-        return Redeem::Locked;
-    }
     if !is_pair_command(text) {
         return Redeem::Wrong;
     }
@@ -139,6 +125,59 @@ pub fn redeem(store: &Store, channel: &str, address: &str, text: &str) -> Redeem
         .filter(|c| *c != '-')
         .map(|c| c.to_ascii_uppercase())
         .collect();
+    redeem_pending(store, &mut pending, channel, address, &given)
+}
+
+/// Redeem a bare pairing code — the payload of a `/start=<code>` deep
+/// link — with [`redeem`]'s exact semantics: the same 10-minute window,
+/// attempt budget and constant-time compare, so a wrong payload burns an
+/// attempt exactly like a wrong `/pair`.
+pub fn redeem_code(store: &Store, channel: &str, address: &str, code: &str) -> Redeem {
+    let mut pending = match load_pending(store, channel) {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let given: String = code
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    redeem_pending(store, &mut pending, channel, address, &given)
+}
+
+/// Load the pending code for `channel` and apply the shared TTL and
+/// attempt gates; `Err` carries the verdict the caller returns.
+fn load_pending(store: &Store, channel: &str) -> Result<Pending, Redeem> {
+    let raw = match store.meta_get(PAIRING_KEY) {
+        Ok(Some(raw)) if !raw.is_empty() => raw,
+        _ => return Err(Redeem::NoCode),
+    };
+    let Ok(pending) = serde_json::from_str::<Pending>(&raw) else {
+        return Err(Redeem::NoCode);
+    };
+    if pending.channel != channel {
+        return Err(Redeem::NoCode);
+    }
+    if ka_agent_core::now_ms() > pending.expires_ms {
+        clear(store);
+        return Err(Redeem::Expired);
+    }
+    if pending.attempts >= MAX_ATTEMPTS {
+        clear(store);
+        return Err(Redeem::Locked);
+    }
+    Ok(pending)
+}
+
+/// Compare and settle one loaded attempt: a match links the identity and
+/// consumes the code; a mismatch burns one attempt (and locks at the cap).
+fn redeem_pending(
+    store: &Store,
+    pending: &mut Pending,
+    channel: &str,
+    address: &str,
+    given: &str,
+) -> Redeem {
     if constant_time_eq(given.as_bytes(), pending.code.as_bytes()) {
         if let Err(e) = store.link_identity(channel, address, "pairing") {
             eprintln!("pairing: link {channel}:{address}: {e}");

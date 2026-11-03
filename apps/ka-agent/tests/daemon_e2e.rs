@@ -487,18 +487,46 @@ fn notify_and_ask_reach_the_running_agent() {
     let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(v["ok"], serde_json::json!(true));
 
-    // The CLI asks through the same op; the turn lands in the store queue
-    // (no model here, so the preflight refuses and the session stays
-    // consistent — what matters is the trigger path answered).
+    // The CLI asks through the same op. This daemon has no model, so the
+    // preflight refuses the turn: `ask` must say so and exit non-zero
+    // (F1: success must never be reported for a turn that did not run).
     let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
         .args(["ask", "what changed today?"])
         .env("KA_AGENT_DATA_DIR", &daemon.data)
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr: {stderr}");
     assert!(
-        out.status.success(),
+        stderr.contains("no model configured"),
+        "the refusal must name the fix: {stderr}"
+    );
+
+    // With a model that answers (the scripted speaker), the same command
+    // waits for the turn and prints its answer.
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let scenario = root.join("scenario.json");
+    std::fs::write(
+        &scenario,
+        r#"{"steps":[{"text":"fresh answer"}],"stop":"done","cost_usd":0.0,"tokens":1}"#,
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon_with(&root, Some(&scenario));
+    daemon.wait_sock(Duration::from_secs(10));
+    let ok = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["ask", "--wait", "say something"])
+        .env("KA_AGENT_DATA_DIR", &daemon.data)
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("fresh answer"),
+        "stdout: {}",
+        String::from_utf8_lossy(&ok.stdout)
     );
 
     daemon.sigterm_wait(Duration::from_secs(10));

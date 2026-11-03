@@ -115,6 +115,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         run: session::run_resume,
     },
     CommandSpec {
+        name: "retry",
+        args: "",
+        summary: "re-send the last failed or interrupted question",
+        example: "/retry",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_retry,
+    },
+    CommandSpec {
         name: "model",
         args: "[provider/model]",
         summary: "show or switch the model",
@@ -325,6 +335,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         run: session::run_tools,
     },
     CommandSpec {
+        name: "keys",
+        args: "",
+        summary: "the terminal client's key bindings",
+        example: "/keys",
+        telegram: false,
+        aliases: &[],
+        reach: Reach::Local,
+        run: run_keys,
+    },
+    CommandSpec {
         name: "quit",
         args: "",
         summary: "leave the terminal chat",
@@ -335,6 +355,38 @@ pub const COMMANDS: &[CommandSpec] = &[
         run: session::run_quit,
     },
 ];
+
+/// The terminal key table `/keys` prints — the same rows as
+/// `docs/contract/terminal.md`'s key table, so the in-app list and the
+/// contract cannot drift apart in spirit (both name every binding).
+fn keys_text() -> String {
+    [
+        "Enter — submit the draft",
+        "Shift-Enter / Alt-Enter / Ctrl-J — newline inside the draft (typed newlines fold to a space; pasted text keeps its lines)",
+        "←/→, Home/End, Ctrl-A — cursor movement",
+        "Alt-b / Alt-f, Ctrl-←/→ — word movement",
+        "Backspace / Delete — delete",
+        "Ctrl-W — kill the word before the cursor",
+        "Ctrl-K / Ctrl-U — kill to end / to start",
+        "Ctrl-Y — yank the last kill back",
+        "↑/↓ — history (the walk filters by the draft it started with)",
+        "Ctrl-R — incremental reverse search (Enter accepts, Esc or Ctrl-G cancels)",
+        "Tab — complete /commands and @paths (a single match inserts; several list and Tab cycles through them)",
+        "Ctrl-C — clear the draft; on an empty draft stop the running turn; twice on an idle prompt quits",
+        "Esc — stop the running turn; idle, dismiss the completions",
+        "Ctrl-D — quit on an empty draft",
+        "Ctrl-L — clear the screen, keep the live area",
+        "Ctrl-O — toggle tool detail rows",
+        "Ctrl-T — toggle streamed thinking",
+        "Ctrl-E — expand the last tool's call and output",
+        "Ctrl-G — edit the draft in $VISUAL/$EDITOR",
+    ]
+    .join("\n")
+}
+
+fn run_keys<'a>(_ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move { Outcome::Reply(keys_text()) })
+}
 
 /// One line per command: `/name args — summary`.
 pub fn help_text() -> String {

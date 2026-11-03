@@ -38,6 +38,29 @@ pub struct StatusReport {
     /// operator.
     #[serde(default)]
     pub memory: Option<MemoryUse>,
+    /// The model the engine last reported as answering, when it differs
+    /// from the configured selector (a fallback hop).
+    #[serde(default)]
+    pub live_model: Option<String>,
+    /// A newer release the daemon's periodic check found, once per
+    /// sighting (`update available: vX`).
+    #[serde(default)]
+    pub update_available: Option<String>,
+    /// Per-channel poll health: a dead phone link shows here instead of
+    /// reading `● idle`.
+    #[serde(default)]
+    pub channels: Vec<ChannelHealth>,
+}
+
+/// One channel's poll health (`status` renders failing channels).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChannelHealth {
+    pub channel: String,
+    /// When the channel last polled successfully (ms since epoch; 0 when
+    /// it never has).
+    pub ok_since_ms: i64,
+    /// The last poll error, when the link has not recovered since.
+    pub last_error: Option<String>,
 }
 
 /// How full the compiled memory is (it truncates silently past the budget).
@@ -204,6 +227,30 @@ impl StatusReport {
             out.push('\n');
             out.push_str(&line);
         }
+        if let Some(model) = &self.live_model
+            && self.model.as_deref() != Some(model.as_str())
+        {
+            out.push_str(&format!("\nmodel in use: {model} (fallback)"));
+        }
+        for channel in &self.channels {
+            if let Some(err) = &channel.last_error {
+                let since = if channel.ok_since_ms == 0 {
+                    "start-up".to_string()
+                } else {
+                    jiff::Timestamp::from_millisecond(channel.ok_since_ms)
+                        .map(|t| t.to_zoned(now.time_zone().clone()))
+                        .map(|z| format!("{:02}:{:02}", z.hour(), z.minute()))
+                        .unwrap_or_else(|_| "--:--".to_string())
+                };
+                out.push_str(&format!(
+                    "\n{}: erroring since {since} ({err})",
+                    channel.channel
+                ));
+            }
+        }
+        if let Some(version) = &self.update_available {
+            out.push_str(&format!("\nupdate available: {version} — ka-agent update"));
+        }
         out
     }
 }
@@ -265,6 +312,9 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             capabilities: Capabilities::default(),
             memory: None,
+            live_model: None,
+            update_available: None,
+            channels: Vec::new(),
         }
     }
 

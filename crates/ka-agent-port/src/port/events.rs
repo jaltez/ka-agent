@@ -104,6 +104,10 @@ pub enum PortEvent {
     Compacting { done: bool },
     /// Bootstrap inventory: the tool names this engine offers.
     Inventory { tools: Vec<String> },
+    /// The engine reported a different model than the configured one (a
+    /// fallback hop, or a live selector change): surfaces show it as the
+    /// model actually answering (F3).
+    ModelChanged(String),
 }
 
 /// Map one ka event to its port projection; `None` drops it. Dropped by
@@ -186,6 +190,9 @@ pub(crate) fn map_ka_event(
         },
         E::Idle => PortEvent::Idle,
         E::Note { message } => PortEvent::Note(message),
+        // A fallback hop or a live selector change must be visible: the
+        // operator has to know which model actually answered (F3).
+        E::ModelChanged { selector } => PortEvent::ModelChanged(selector),
         E::Error {
             class,
             retryable,
@@ -426,9 +433,6 @@ mod tests {
     fn unmapped_events_are_dropped() {
         for ev in [
             Event::SessionInfo { id: "s1".into() },
-            Event::ModelChanged {
-                selector: "a/b".into(),
-            },
             Event::ModeChanged {
                 mode: ka_protocol::Mode::Plan,
             },
@@ -438,6 +442,17 @@ mod tests {
         ] {
             assert_eq!(map_ka_event(ev, None, None), None);
         }
+        // ModelChanged is no longer dropped: the fallback hop is visible.
+        assert_eq!(
+            map_ka_event(
+                Event::ModelChanged {
+                    selector: "a/b".into(),
+                },
+                None,
+                None,
+            ),
+            Some(PortEvent::ModelChanged("a/b".into()))
+        );
     }
 
     #[test]

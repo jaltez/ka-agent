@@ -223,10 +223,17 @@ impl TelegramClient {
         .map(|_| ())
     }
 
-    pub(crate) async fn send_chat_action(&self, chat_id: i64) -> Result<(), ChannelError> {
+    /// `sendChatAction` with an explicit action (`typing`,
+    /// `upload_photo`, `upload_document`, …): the 4 s TurnStarted loop
+    /// keeps `typing`, file uploads fire the matching `upload_*` once.
+    pub(crate) async fn send_chat_action(
+        &self,
+        chat_id: i64,
+        action: &str,
+    ) -> Result<(), ChannelError> {
         self.call(
             "sendChatAction",
-            json!({ "chat_id": chat_id, "action": "typing" }),
+            json!({ "chat_id": chat_id, "action": action }),
         )
         .await
         .map(|_| ())
@@ -250,6 +257,29 @@ impl TelegramClient {
             json!({
                 "commands": commands
             }),
+        )
+        .await
+    }
+
+    /// `setMyDescription` — the "What can this bot do?" text on the empty
+    /// chat screen (≤ 512 chars). Best-effort, like `setMyCommands`.
+    pub(crate) async fn set_my_description(
+        &self,
+        description: &str,
+    ) -> Result<Value, ChannelError> {
+        self.call("setMyDescription", json!({ "description": description }))
+            .await
+    }
+
+    /// `setMyShortDescription` — the chat-list blurb (≤ 120 chars).
+    /// Best-effort, like `setMyCommands`.
+    pub(crate) async fn set_my_short_description(
+        &self,
+        description: &str,
+    ) -> Result<Value, ChannelError> {
+        self.call(
+            "setMyShortDescription",
+            json!({ "description": description }),
         )
         .await
     }

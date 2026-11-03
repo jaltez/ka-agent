@@ -357,6 +357,7 @@ impl Channel for MatrixChannel {
                 };
                 match sync {
                     Ok(value) => {
+                        self.runtime.note_channel_ok("matrix");
                         let first = since.is_none();
                         if let Some(next) = value["next_batch"].as_str() {
                             since = Some(next.to_string());
@@ -371,6 +372,7 @@ impl Channel for MatrixChannel {
                     }
                     Err(e) => {
                         eprintln!("matrix: sync error: {e}; backing off");
+                        self.runtime.note_channel_err("matrix", &e.to_string());
                         tokio::select! {
                             _ = shutdown.changed() => break,
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {}

@@ -111,7 +111,8 @@ pub fn models(args: ModelsArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     // The live models.dev registry, merged over the pinned catalog:
-    // `None` (offline, no cache) keeps the output exactly as before.
+    // `None` (offline, no cache) keeps the model list as before; the
+    // footer then says the registry did not answer.
     let reg = crate::models_live::load(paths.root(), args.refresh);
     for p in list {
         let key = match p.key_env {
@@ -129,9 +130,7 @@ pub fn models(args: ModelsArgs) -> std::process::ExitCode {
         if more > 0 {
             println!("  … and {more} more");
         }
-        if let Some(foot) = crate::models_live::footer(reg.as_ref(), p.name) {
-            println!("{foot}");
-        }
+        println!("{}", crate::models_live::footer(reg.as_ref(), p.name));
     }
     std::process::ExitCode::SUCCESS
 }
@@ -180,6 +179,10 @@ fn probe(config: &std::path::Path, target: &str) -> std::process::ExitCode {
     };
     let model = sel.id.split('@').next().unwrap_or(&sel.id).to_string();
     let outcome = rt.block_on(crate::models_live::probe(&p, &model, key.as_deref()));
-    println!("{} {}", outcome.mark(), outcome.line(&model));
+    println!(
+        "{} {}",
+        outcome.mark(),
+        outcome.line(&model, sel.key_env.as_deref())
+    );
     std::process::ExitCode::SUCCESS
 }

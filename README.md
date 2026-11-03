@@ -55,6 +55,7 @@ in your terminal too.
 | `/mode [m]` | ask (default, asks) · accept_edits · allow · readonly (read-only) — badge when not ask; the old names guarded/free/plan still work |
 | `/model provider/model` | switch model, applied live |
 | `/new` · `/stop` · `/resume` | fresh session · abort reply · lift a pause |
+| `/retry` | re-send the last failed or interrupted question (also the ↻ button on Telegram) |
 | `/remember <fact>` · `/forget <id>` | durable memory (git-backed; `/memory` lists ids) |
 | `/history [query]` · `/history show <id>` | past turns |
 | `/remind <when> <text>` · `/reminders` | notifications, no model turn |
@@ -192,7 +193,7 @@ units). The config is strict — unknown keys are errors.
 config, web port, channels and service units:
 
 ```sh
-ka-agent profile create work          # config from default, minus channels; next free web port
+ka-agent profile create work          # one-time copy of default's config — it never tracks later changes there; minus channels, next free web port
 ka-agent profile create work --copy-keys   # also copy the provider keys
 ka-agent -p work setup                # any command takes -p/--profile
 ka-agent profile use work             # make it the default for commands without -p

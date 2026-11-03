@@ -92,6 +92,39 @@ impl Runtime {
         }
     }
 
+    /// Snooze one scheduled reminder by id prefix: its next fire moves to
+    /// `at_ms` (parsed by the caller with the `/remind` grammar) and it
+    /// goes back to `queued`. Reminders only — a cron's next fire belongs
+    /// to its cadence (`ka-agent cron`). `Cancelled(title)` carries the
+    /// rescheduled reminder's title.
+    pub fn snooze_reminder(&self, id_prefix: &str, at_ms: i64) -> Result<CancelOutcome, Error> {
+        let matches: Vec<_> = self
+            .sh
+            .store
+            .scheduled_tasks()?
+            .into_iter()
+            .filter(|t| {
+                t.kind == "reminder"
+                    && ka_agent_core::ids::id_matches(t.id.as_str(), id_prefix.trim())
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(CancelOutcome::NotFound),
+            [one] => {
+                self.sh
+                    .store
+                    .update_task_schedule(&one.id, Some(at_ms), "queued")?;
+                self.sh.scheduler_tick.notify_one();
+                Ok(CancelOutcome::Cancelled(one.title.clone()))
+            }
+            many => Ok(CancelOutcome::Ambiguous(
+                many.iter()
+                    .map(|t| ka_agent_core::ids::short_id(t.id.as_str()).to_string())
+                    .collect(),
+            )),
+        }
+    }
+
     /// Fire due tasks (reminders and crons); called from the scheduler
     /// timer. Each item is claimed (`queued -> running`) before it acts and
     /// settled after; a concurrent cancel/pause wins both races (claim and

@@ -242,7 +242,24 @@ impl Setup {
         self.step_service()?;
         self.step_first_reply().await?;
         self.final_lines(paired);
+        Self::import_hint();
         Ok(std::process::ExitCode::SUCCESS)
+    }
+
+    /// C3: one line when the operator's HOME holds a known agent tree —
+    /// the one command that carries its memory and skills over.
+    pub(super) fn import_hint() {
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+            return;
+        };
+        let home = std::path::PathBuf::from(home);
+        let found = ["hermes", "openclaw", "claude", "codex"]
+            .into_iter()
+            .find(|a| home.join(format!(".{a}")).is_dir());
+        if let Some(agent) = found {
+            println!();
+            println!("bring your old agent's memory: ka-agent import {agent} --dry-run");
+        }
     }
 
     async fn pair_telegram(&mut self) -> Result<(), Fail> {
@@ -261,6 +278,9 @@ impl Setup {
         let user = self.telegram_user.clone().unwrap_or_default();
         println!();
         println!("Open https://t.me/{user} and send:  /pair {code}");
+        if !user.is_empty() {
+            println!("Or tap:  https://t.me/{user}?start={code}");
+        }
         println!(
             "waiting for your message… (Ctrl-C to skip; pair later with `ka-agent pair telegram`)"
         );

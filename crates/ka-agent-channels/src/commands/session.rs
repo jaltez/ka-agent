@@ -42,6 +42,20 @@ pub(super) fn run_resume<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     })
 }
 
+/// `/retry`: re-send the newest turn when it ended in error/interrupted.
+pub(super) fn run_retry<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        match ctx.runtime.retry_last().await {
+            Ok(Some(text)) => {
+                let head: String = text.lines().next().unwrap_or("").chars().take(60).collect();
+                Outcome::Reply(format!("↻ re-sending \"{head}\""))
+            }
+            Ok(None) => Outcome::Reply("nothing to retry (the last turn did not fail)".into()),
+            Err(e) => Outcome::Reply(format!("! [retry] {e}")),
+        }
+    })
+}
+
 /// The operator's answer to `/model` with no argument.
 async fn model_status(runtime: &Runtime) -> Outcome {
     let current = runtime.config().model.clone();

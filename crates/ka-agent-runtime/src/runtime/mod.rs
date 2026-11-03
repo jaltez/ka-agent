@@ -177,6 +177,15 @@ struct Shared {
     auto_allow: Mutex<Vec<String>>,
     /// Session-scoped reasoning effort (`/effort`; cleared by `/new`).
     effort: Mutex<Option<String>>,
+    /// Per-channel poll health, set by the channel tasks: a dead phone
+    /// link must show in `status`, not only in the journal (F8).
+    channel_health: Mutex<HashMap<String, crate::status::ChannelHealth>>,
+    /// The model the engine last reported as answering (a fallback hop),
+    /// when it differs from the configured selector (F3).
+    live_model: Mutex<Option<String>>,
+    /// The newest release seen by the daemon's periodic check (F4); the
+    /// status line and one Notice surface it.
+    update_available: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -333,6 +342,9 @@ impl Runtime {
                 started_ms: ka_agent_core::now_ms(),
                 auto_allow: Mutex::new(Vec::new()),
                 effort: Mutex::new(None),
+                channel_health: Mutex::new(HashMap::new()),
+                live_model: Mutex::new(None),
+                update_available: Mutex::new(None),
                 inner: Mutex::new(Inner {
                     session,
                     session_allow: std::collections::HashSet::new(),
@@ -431,6 +443,16 @@ impl Runtime {
             .find(|t| t.status == ka_agent_core::TaskStatus::Queued)
             .and_then(|t| t.scheduled_at_ms.map(|at| (t.title, at)));
         let tz = cfg.time_zone();
+        let channels = {
+            let g = self
+                .sh
+                .channel_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut rows: Vec<_> = g.values().cloned().collect();
+            rows.sort_by(|a, b| a.channel.cmp(&b.channel));
+            rows
+        };
         Ok(crate::status::StatusReport {
             session_id: sid.to_string(),
             persona: self.persona_name(),
@@ -462,7 +484,68 @@ impl Runtime {
                     .map(|c| c.len())
                     .unwrap_or(0),
             }),
+            live_model: self
+                .sh
+                .live_model
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            update_available: self
+                .sh
+                .update_available
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            channels,
         })
+    }
+
+    /// Record a channel poll outcome (F8): success clears the error.
+    pub fn note_channel_ok(&self, channel: &str) {
+        let mut g = self
+            .sh
+            .channel_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = g.entry(channel.to_string()).or_default();
+        entry.channel = channel.to_string();
+        entry.ok_since_ms = ka_agent_core::now_ms();
+        entry.last_error = None;
+    }
+
+    /// Record a channel poll failure; `ok_since_ms` keeps the last
+    /// successful poll (0 when the channel never worked).
+    pub fn note_channel_err(&self, channel: &str, err: &str) {
+        let mut g = self
+            .sh
+            .channel_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = g.entry(channel.to_string()).or_default();
+        entry.channel = channel.to_string();
+        entry.last_error = Some(err.chars().take(160).collect());
+    }
+
+    /// Record the release a periodic check found (F4): `Some(version)`
+    /// when newer than this binary, `None` when current. A new sighting
+    /// emits exactly one Notice.
+    pub fn set_update_available(&self, version: Option<String>) {
+        let mut g = self
+            .sh
+            .update_available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if g.as_deref() == version.as_deref() {
+            return;
+        }
+        let announce = version.clone();
+        *g = version;
+        drop(g);
+        if let Some(v) = announce {
+            self.sh.emit(AgentEvent::Notice {
+                text: format!("update available: {v} — ka-agent update"),
+            });
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

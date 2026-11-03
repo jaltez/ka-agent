@@ -242,7 +242,7 @@ impl Setup {
                 if self.voice.is_none() || !self.confirm_and_write().await? {
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
-                crate::config_cli::apply_live(&self.paths, &self.args.config);
+                crate::config_cli::apply_live(&self.args.config);
                 println!("Voice notes on — restart the agent so the phone channels pick it up");
                 Ok(std::process::ExitCode::SUCCESS)
             }
@@ -259,7 +259,7 @@ impl Setup {
                 if self.search.is_none() || !self.confirm_and_write().await? {
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
-                crate::config_cli::apply_live(&self.paths, &self.args.config);
+                crate::config_cli::apply_live(&self.args.config);
                 println!("Web search is on — try: \"search the web for …\"");
                 Ok(std::process::ExitCode::SUCCESS)
             }
@@ -327,6 +327,7 @@ impl Setup {
         self.step_workspace_yes()?;
         self.confirm_and_write().await?;
         print!("{}", self.live_card(false));
+        Self::import_hint();
         Ok(std::process::ExitCode::SUCCESS)
     }
 

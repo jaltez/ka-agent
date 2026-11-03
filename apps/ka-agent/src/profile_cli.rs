@@ -321,6 +321,8 @@ fn create(name: &str, from: &str, copy_keys: bool, clone_memory: bool) -> ExitCo
     println!("created profile {name} (from {from}, web :{port})");
     println!("  data    {}", paths.root().display());
     println!("  config  {}", config.display());
+    // D11: say it once at the moment it matters — the copy is one-time.
+    println!("  note    the config is a one-time copy — it does not track later changes to {from}");
     if !copy_keys {
         println!("  keys    none — run `ka-agent -p {name} setup` or pass --copy-keys");
     }

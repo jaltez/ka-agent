@@ -26,11 +26,31 @@ pub struct View {
     pub daily_cap: Option<f64>,
     pub queued: usize,
     pub plan: Option<(usize, usize)>,
+    /// The session status (`Paused`/`Degraded` show a status-line badge).
+    pub session: String,
     pub mode: String,
     pub focused: bool,
     pub verbose: bool,
     pub width: usize,
+    /// The most recent finished tool (Ctrl-E reprints it as a block).
+    pub last_tool: Option<LastTool>,
+    /// In-flight calls' invocations (`ToolFinished` no longer carries one).
+    tool_details: std::collections::HashMap<String, String>,
     spinner: usize,
+}
+
+/// The last finished tool, everything the event wire carries about it.
+#[derive(Clone)]
+pub struct LastTool {
+    pub tool: String,
+    pub detail: String,
+    pub ms: u64,
+    pub ok: bool,
+    /// The output excerpt the runtime surfaced: the first line for a
+    /// failed call, a bounded excerpt for a successful one.
+    pub error: Option<String>,
+    /// A successful call's bounded output excerpt (Ctrl-E reprints it).
+    pub output: Option<String>,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -52,10 +72,13 @@ impl View {
             daily_cap: None,
             queued: 0,
             plan: None,
+            session: String::new(),
             mode: "ask".into(),
             focused: true,
             verbose: false,
             width,
+            last_tool: None,
+            tool_details: std::collections::HashMap::new(),
             spinner: 0,
         }
     }
@@ -88,6 +111,11 @@ impl View {
         }
         if self.queued > 0 {
             parts.push(format!("queued {}", self.queued));
+        }
+        match self.session.as_str() {
+            "Paused" => parts.push("⏸ paused".into()),
+            "Degraded" => parts.push("⚠ degraded".into()),
+            _ => {}
         }
         if let Some((done, total)) = self.plan {
             parts.push(format!("plan {done}/{total}"));
@@ -176,7 +204,9 @@ impl View {
     }
 }
 
-/// The text of one layout row (public so the view and tests agree).
+/// The text of one layout row (public so the view and tests agree). A
+/// newline displays as `⏎` (one column — see `Editor::layout`), never as a
+/// real row break inside the live area.
 fn editor_text_range(editor: &Editor, start: usize, end: usize) -> String {
     // The editor's chars are private; go through the text once.
     editor
@@ -184,6 +214,7 @@ fn editor_text_range(editor: &Editor, start: usize, end: usize) -> String {
         .chars()
         .skip(start)
         .take(end - start)
+        .map(|c| if c == '\n' { '⏎' } else { c })
         .collect()
 }
 
@@ -249,7 +280,7 @@ fn render_markdown_take(partial: &mut String) -> Vec<String> {
         if in_fence {
             if line.trim() == "```" {
                 in_fence = false;
-                out.push("\x1b[2m──\x1b[22m".to_string());
+                out.push(super::paint::dim("──"));
             } else {
                 out.push(render_code_line(line, target));
             }
@@ -264,7 +295,10 @@ fn render_markdown_take(partial: &mut String) -> Vec<String> {
     out
 }
 
-pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
+/// Feed one event into the view state; returns the permanent lines to print
+/// (the caller prints them above the live area). `thinking` is the Ctrl-T
+/// toggle; tool detail rows read `view.verbose` (Ctrl-O).
+pub fn absorb(view: &mut View, ev: &AgentEvent, thinking: bool) -> Vec<String> {
     match ev {
         AgentEvent::TurnStarted { .. } => {
             view.running = true;
@@ -273,6 +307,7 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
             view.tool_count = 0;
             view.activity.clear();
             view.partial.clear();
+            view.tool_details.clear();
         }
         AgentEvent::TurnFinished {
             stop,
@@ -285,8 +320,8 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
             view.activity.clear();
             // The streamed draft becomes a permanent block, then the footer.
             let mut out = render_markdown_take(&mut view.partial);
-            out.push(format!(
-                "\x1b[2m· {:.1}s · ${cost_usd:.4} · {} tok{}\x1b[0m",
+            out.push(super::paint::dim(&format!(
+                "· {:.1}s · ${cost_usd:.4} · {} tok{}",
                 *ms as f64 / 1000.0,
                 tokens,
                 if stop == "done" {
@@ -294,7 +329,7 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
                 } else {
                     format!(" · {stop}")
                 }
-            ));
+            )));
             return out;
         }
         AgentEvent::Delta { text } => {
@@ -304,11 +339,11 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
         }
         AgentEvent::Thought { text } => {
             view.thought_chars += text.chars().count();
-            if verbose {
-                return vec![format!("\x1b[2m{}\x1b[0m", text.trim_end())];
+            if thinking {
+                return vec![super::paint::dim(text.trim_end())];
             }
         }
-        AgentEvent::ToolStarted { tool, detail, .. } => {
+        AgentEvent::ToolStarted { tool, id, detail } => {
             view.tool_count += 1;
             view.saw_answer = false;
             view.activity = if view.tool_count > 1 {
@@ -316,13 +351,18 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
             } else {
                 tool_line(tool, detail)
             };
+            view.tool_details.insert(id.clone(), detail.clone());
+            if view.verbose {
+                return vec![super::paint::dim(&tool_line(tool, detail))];
+            }
         }
         AgentEvent::ToolFinished {
             tool,
+            id,
             ok,
             ms,
             error,
-            ..
+            output,
         } => {
             view.tool_count = view.tool_count.saturating_sub(1);
             view.activity = if view.tool_count > 0 {
@@ -330,15 +370,38 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
             } else {
                 String::new()
             };
-            return vec![if *ok {
+            let detail = view.tool_details.remove(id).unwrap_or_default();
+            let mut out = vec![if *ok {
                 tool_done_line(tool, *ms)
             } else {
                 tool_failed_line(tool, error.as_deref().unwrap_or("failed"))
             }];
+            if view.verbose {
+                if let Some(err) = error {
+                    for line in err.lines().take(20) {
+                        out.push(super::paint::dim(&format!("  {line}")));
+                    }
+                } else if let Some(excerpt) = output {
+                    for line in excerpt.lines().take(20) {
+                        out.push(super::paint::dim(&format!("  {line}")));
+                    }
+                }
+            }
+            view.last_tool = Some(LastTool {
+                tool: tool.clone(),
+                detail,
+                ms: *ms,
+                ok: *ok,
+                error: error.clone(),
+                output: output.clone(),
+            });
+            return out;
         }
         AgentEvent::Plan { items } => {
+            // The engine publishes an empty list before it has a plan:
+            // only a real plan lights the meter.
             let done = items.iter().filter(|i| i.state == "done").count();
-            view.plan = Some((done, items.len()));
+            view.plan = (!items.is_empty()).then_some((done, items.len()));
         }
         AgentEvent::Context { used, window } => {
             if *window > 0 {
@@ -366,10 +429,59 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, verbose: bool) -> Vec<String> {
             }
             view.effort = effort.clone();
         }
-        AgentEvent::File { path, .. } => return vec![format!("📎 {path}")],
+        // A router reply (every `/command`) renders like an answer.
+        AgentEvent::Reply { text } => {
+            let mut partial = text.clone();
+            return render_markdown_take(&mut partial);
+        }
+        AgentEvent::Note { text } => return vec![super::paint::dim(&format!("· {text}"))],
+        AgentEvent::Notice { text } => return vec![format!("· {text}")],
+        AgentEvent::Inbound { source, text } => {
+            // The console's own echo is the submitted-line print; other
+            // channels' messages join the transcript with their origin.
+            if source != "console" {
+                return vec![format!("» you ({source}): {text}")];
+            }
+        }
+        // Only states that need the operator: a settled turn is already
+        // announced by its footer. Paused/Degraded also light the badge.
+        AgentEvent::Session { status } => {
+            view.session = status.clone();
+            return match status.as_str() {
+                "Paused" => {
+                    vec!["· ⏸ paused — /resume to continue (budget or provider key)".into()]
+                }
+                "Degraded" => {
+                    vec!["· ⚠ degraded — the worker keeps crashing; /new starts fresh".into()]
+                }
+                _ => Vec::new(),
+            };
+        }
+        AgentEvent::ApprovalSettled { id, status } => {
+            return vec![format!("· approval {id} → {status}")];
+        }
+        AgentEvent::CronFinished { id, status } => {
+            return vec![super::paint::dim(&format!("· cron {id} → {status}"))];
+        }
+        AgentEvent::File { path, caption, .. } => {
+            let cap = if caption.is_empty() {
+                String::new()
+            } else {
+                format!(" — {caption}")
+            };
+            return vec![format!("📎 {path}{cap}")];
+        }
         AgentEvent::Reminder { text, .. } => return vec![format!("⏰ {text}")],
         AgentEvent::Error { class, message } => {
-            return vec![format!("\x1b[31m! [{class}] {message}\x1b[0m")];
+            let mut rows = vec![super::paint::red(&format!("! [{class}] {message}"))];
+            // A retryable failure names the way back (F2): /retry re-sends
+            // the interrupted question; nothing re-runs on its own.
+            if matches!(class.as_str(), "rate_limit" | "network") {
+                rows.push(super::paint::dim(
+                    "· /retry re-sends the question; nothing runs automatically",
+                ));
+            }
+            return rows;
         }
         _ => {}
     }
@@ -440,6 +552,7 @@ mod tests {
             ok: true,
             ms: 12,
             error: None,
+            output: None,
         };
         let done = absorb(&mut v, &finished("bash"), false);
         assert!(done[0].contains("✓ bash 12ms"), "{:?}", done);
@@ -486,5 +599,217 @@ mod tests {
         // Wide characters count two columns.
         assert_eq!(truncate_display("你好世界", 5), "你好…");
         assert!(truncate_display("你好世界", 5).width() <= 5);
+    }
+
+    /// A1: the transcript no longer drops replies, notes, notices,
+    /// cross-channel inbound, session moves and settled approvals/crons.
+    #[test]
+    fn replies_notes_notices_and_session_moves_print() {
+        let mut v = View::new("Ka".into(), 80);
+        let reply = absorb(
+            &mut v,
+            &AgentEvent::Reply {
+                text: "plain reply".into(),
+            },
+            false,
+        );
+        assert_eq!(reply, vec!["plain reply".to_string(), String::new()]);
+
+        assert_eq!(
+            absorb(
+                &mut v,
+                &AgentEvent::Note {
+                    text: "retrying".into()
+                },
+                false
+            ),
+            vec![crate::term::paint::dim("· retrying")]
+        );
+        assert_eq!(
+            absorb(
+                &mut v,
+                &AgentEvent::Notice {
+                    text: "web UI disabled".into()
+                },
+                false
+            ),
+            vec!["· web UI disabled".to_string()]
+        );
+        assert_eq!(
+            absorb(
+                &mut v,
+                &AgentEvent::Inbound {
+                    source: "telegram:1".into(),
+                    text: "from the phone".into(),
+                },
+                false
+            ),
+            vec!["» you (telegram:1): from the phone".to_string()]
+        );
+        // The console's own inbound is the submitted-line echo, not news.
+        assert!(
+            absorb(
+                &mut v,
+                &AgentEvent::Inbound {
+                    source: "console".into(),
+                    text: "typed here".into(),
+                },
+                false
+            )
+            .is_empty()
+        );
+
+        let paused = absorb(
+            &mut v,
+            &AgentEvent::Session {
+                status: "Paused".into(),
+            },
+            false,
+        );
+        assert_eq!(paused.len(), 1);
+        assert!(paused[0].contains("⏸ paused — /resume"), "{}", paused[0]);
+        assert!(v.status_line().contains("⏸ paused"), "{}", v.status_line());
+        // Resuming clears the badge.
+        absorb(
+            &mut v,
+            &AgentEvent::Session {
+                status: "Idle".into(),
+            },
+            false,
+        );
+        assert!(!v.status_line().contains("paused"), "{}", v.status_line());
+
+        assert_eq!(
+            absorb(
+                &mut v,
+                &AgentEvent::ApprovalSettled {
+                    id: "ap1".into(),
+                    status: "allowed".into(),
+                },
+                false
+            ),
+            vec!["· approval ap1 → allowed".to_string()]
+        );
+        assert_eq!(
+            absorb(
+                &mut v,
+                &AgentEvent::CronFinished {
+                    id: "cron2".into(),
+                    status: "ok".into(),
+                },
+                false
+            ),
+            vec![crate::term::paint::dim("· cron cron2 → ok")]
+        );
+    }
+
+    /// A8: the engine's empty initial plan must not light `plan 0/0`.
+    #[test]
+    fn empty_plans_do_not_light_the_meter() {
+        let mut v = View::new("Ka".into(), 120);
+        absorb(&mut v, &AgentEvent::Plan { items: vec![] }, false);
+        assert!(v.plan.is_none(), "empty plan stored");
+        assert!(!v.status_line().contains("plan"), "{}", v.status_line());
+
+        let items = |state: &str| {
+            vec![ka_agent_runtime::PlanItem {
+                text: "one".into(),
+                state: state.into(),
+            }]
+        };
+        absorb(
+            &mut v,
+            &AgentEvent::Plan {
+                items: items("pending"),
+            },
+            false,
+        );
+        assert!(v.status_line().contains("plan 0/1"), "{}", v.status_line());
+        absorb(
+            &mut v,
+            &AgentEvent::Plan {
+                items: items("done"),
+            },
+            false,
+        );
+        assert!(v.status_line().contains("plan 1/1"), "{}", v.status_line());
+        // A cleared plan takes the meter with it.
+        absorb(&mut v, &AgentEvent::Plan { items: vec![] }, false);
+        assert!(v.plan.is_none());
+    }
+
+    /// A6: Ctrl-O prints tool invocation rows while the detail toggle is
+    /// on, keeps a failed call's excerpt and stores the last tool for
+    /// Ctrl-E.
+    #[test]
+    fn verbose_tool_rows_and_the_stored_last_tool() {
+        let mut v = View::new("Ka".into(), 120);
+        v.verbose = true;
+        let started = absorb(
+            &mut v,
+            &AgentEvent::ToolStarted {
+                id: "c1".into(),
+                tool: "bash".into(),
+                detail: "echo hi".into(),
+            },
+            false,
+        );
+        assert_eq!(
+            started,
+            vec![crate::term::paint::dim(&tool_line("bash", "echo hi"))]
+        );
+
+        let failed = absorb(
+            &mut v,
+            &AgentEvent::ToolFinished {
+                id: "c1".into(),
+                tool: "bash".into(),
+                ok: false,
+                ms: 7,
+                error: Some("boom\nstack".into()),
+                output: None,
+            },
+            false,
+        );
+        assert_eq!(failed[0], "  ✗ bash · boom", "{:?}", failed);
+        assert_eq!(failed[1], crate::term::paint::dim("  boom"), "{:?}", failed);
+        let last = v.last_tool.as_ref().cloned();
+        assert_eq!(last.as_ref().map(|l| l.detail.as_str()), Some("echo hi"));
+        assert_eq!(
+            last.as_ref().and_then(|l| l.error.clone()),
+            Some("boom\nstack".to_string())
+        );
+        assert_eq!(last.as_ref().map(|l| l.ok), Some(false));
+
+        // Toggle off: only the settled row prints.
+        v.verbose = false;
+        absorb(
+            &mut v,
+            &AgentEvent::ToolStarted {
+                id: "c2".into(),
+                tool: "read".into(),
+                detail: "a.rs".into(),
+            },
+            false,
+        );
+        let quiet = absorb(
+            &mut v,
+            &AgentEvent::ToolFinished {
+                id: "c2".into(),
+                tool: "read".into(),
+                ok: true,
+                ms: 3,
+                error: None,
+                // A successful call's output is carried but not printed
+                // unless verbose is on.
+                output: Some("file body".into()),
+            },
+            false,
+        );
+        assert_eq!(quiet, vec!["  ✓ read 3ms".to_string()]);
+        assert_eq!(
+            v.last_tool.as_ref().and_then(|l| l.output.clone()),
+            Some("file body".to_string())
+        );
     }
 }

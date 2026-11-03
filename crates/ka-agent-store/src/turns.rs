@@ -8,8 +8,8 @@ impl Store {
     pub fn insert_turn(&self, t: &Turn) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO turns(id, session, inbound_text, status, stop, error_class, error_message, cost_usd, tokens, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO turns(id, session, inbound_text, status, stop, error_class, error_message, cost_usd, tokens, model, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 t.id.as_str(),
                 t.session.as_str(),
@@ -20,6 +20,7 @@ impl Store {
                 t.error_message,
                 t.cost_usd,
                 t.tokens as i64,
+                t.model,
                 t.created_ms,
                 t.updated_ms
             ],
@@ -118,7 +119,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session, inbound_text, status, stop, error_class, error_message,
-                    cost_usd, tokens, created_ms, updated_ms
+                    cost_usd, tokens, model, created_ms, updated_ms
              FROM turns WHERE session = ?1 ORDER BY created_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session.as_str(), limit as i64], row_to_turn)?;
@@ -133,7 +134,7 @@ impl Store {
         let turn = conn
             .query_row(
                 "SELECT id, session, inbound_text, status, stop, error_class, error_message,
-                        cost_usd, tokens, created_ms, updated_ms
+                        cost_usd, tokens, model, created_ms, updated_ms
                  FROM turns WHERE id = ?1",
                 params![id.as_str()],
                 row_to_turn,
@@ -152,7 +153,7 @@ impl Store {
         let turn = conn
             .query_row(
                 "SELECT id, session, inbound_text, status, stop, error_class, error_message,
-                        cost_usd, tokens, created_ms, updated_ms
+                        cost_usd, tokens, model, created_ms, updated_ms
                  FROM turns
                  WHERE substr(id, 1, length(?1)) = ?1
                     OR substr(id, 6, length(?1)) = ?1
@@ -179,12 +180,12 @@ impl Store {
     }
 
     /// One row per finished turn since `since_ms`: `(created_ms, cost_usd,
-    /// tokens)` — everything `ka-agent usage` needs; the CLI buckets days
-    /// in the operator's timezone.
-    pub fn usage_rows_since(&self, since_ms: i64) -> Result<Vec<(i64, f64, u64)>> {
+    /// tokens, model)` — everything `ka-agent usage` needs; the CLI buckets
+    /// days in the operator's timezone and splits spend per model.
+    pub fn usage_rows_since(&self, since_ms: i64) -> Result<Vec<UsageRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT created_ms, COALESCE(cost_usd, 0), COALESCE(tokens, 0)
+            "SELECT created_ms, COALESCE(cost_usd, 0), COALESCE(tokens, 0), model
              FROM turns WHERE created_ms >= ?1 ORDER BY created_ms",
         )?;
         let rows = stmt
@@ -193,6 +194,7 @@ impl Store {
                     r.get::<_, i64>(0)?,
                     r.get::<_, f64>(1)?,
                     r.get::<_, i64>(2)?.max(0) as u64,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -219,10 +221,17 @@ impl Store {
         Ok(())
     }
 
-    /// Phrase-quoted FTS search (like ka-index: the raw query is wrapped in
-    /// double quotes with inner quotes doubled, so it is never interpreted
-    /// as FTS syntax). Returns hits with a snippet around the match.
+    /// FTS search over episodes. The raw query is tokenized on whitespace
+    /// and each token is double-quoted (inner quotes doubled) and joined
+    /// with `" AND "` — every word must appear, in any order, and nothing
+    /// is ever interpreted as FTS syntax. A double-quoted span in the
+    /// input stays one token, so an exact phrase is still searchable.
+    /// Returns hits with a snippet around the match.
     pub fn search_episodes(&self, query: &str, limit: usize) -> Result<Vec<EpisodeHit>> {
+        let match_expr = fts_and_query(query);
+        if match_expr.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT f.session, f.turn, f.role,
@@ -232,8 +241,7 @@ impl Store {
              WHERE episodes_fts MATCH ?1
              ORDER BY rank LIMIT ?2",
         )?;
-        let quoted = format!("\"{}\"", query.replace('"', "\"\""));
-        let rows = stmt.query_map(params![quoted, limit as i64], |r| {
+        let rows = stmt.query_map(params![match_expr, limit as i64], |r| {
             Ok(EpisodeHit {
                 session: r.get(0)?,
                 turn: r.get(1)?,
@@ -254,6 +262,46 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// One FTS5 phrase per whitespace-separated token, ANDed together; a
+/// double-quoted span of the input is kept as one token (its quotes become
+/// literal characters, which the tokenizer treats as separators). Tokens
+/// that are nothing but quotes are dropped, so an empty or quote-only
+/// query yields no phrases and matches nothing.
+fn fts_and_query(query: &str) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for c in query.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push('"');
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    terms.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        terms.push(cur);
+    }
+    terms
+        .iter()
+        .filter(|t| !t.trim_matches('"').is_empty())
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 #[cfg(test)]
@@ -346,5 +394,80 @@ mod tests {
         store.delete_session_episodes(&s1.id).unwrap();
         assert_eq!(store.search_episodes("mutex", 10).unwrap().len(), 0);
         assert_eq!(store.search_episodes("grocery", 10).unwrap().len(), 1);
+    }
+
+    /// E4: keywords AND together — two words that appear in different
+    /// episodes match, a quoted span stays one phrase, and FTS operators
+    /// in the input never execute.
+    #[test]
+    fn episodes_search_ands_terms_and_keeps_phrases() {
+        let store = Store::open_in_memory().unwrap();
+        let s = session();
+        store.insert_session(&s).unwrap();
+        let t = TurnId::generate();
+        store
+            .index_episode(&s.id, &t, "user", "please deploy nginx to staging")
+            .unwrap();
+        store
+            .index_episode(&s.id, &t, "assistant", "check the cache hit rate first")
+            .unwrap();
+        store
+            .index_episode(&s.id, &t, "assistant", "cache cleared — safe to deploy now")
+            .unwrap();
+
+        // Two keywords, not contiguous: an implicit AND inside one message.
+        assert_eq!(store.search_episodes("deploy cache", 10).unwrap().len(), 1);
+        // A missing keyword narrows to silence.
+        assert_eq!(
+            store.search_episodes("deploy postgres", 10).unwrap().len(),
+            0
+        );
+        // A quoted phrase still matches contiguous words only.
+        assert_eq!(
+            store.search_episodes("\"deploy nginx\"", 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.search_episodes("\"nginx deploy\"", 10).unwrap().len(),
+            0
+        );
+        // FTS syntax in the input is data, never a query operator.
+        assert_eq!(
+            store.search_episodes("nginx OR cache", 10).unwrap().len(),
+            0
+        );
+        assert_eq!(store.search_episodes("ngin*", 10).unwrap().len(), 0);
+        // Nothing searchable: empty, not an error.
+        assert!(store.search_episodes("", 10).unwrap().is_empty());
+        assert!(store.search_episodes("\"\"", 10).unwrap().is_empty());
+    }
+
+    /// E5: the model a turn ran on round-trips through the store, and the
+    /// usage rows carry it for the per-model split.
+    #[test]
+    fn usage_rows_carry_the_turn_model() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.user_version().unwrap(), MIGRATIONS.len());
+        let s = session();
+        store.insert_session(&s).unwrap();
+        let mut a = Turn::new(s.id.clone(), "on the main model".into());
+        a.model = Some("anthropic/claude-sonnet-4-5".into());
+        a.cost_usd = 0.01;
+        let mut b = Turn::new(s.id.clone(), "on the cheap one".into());
+        b.model = Some("google/gemini-2.5-flash".into());
+        b.cost_usd = 0.001;
+        store.insert_turn(&a).unwrap();
+        store.insert_turn(&b).unwrap();
+
+        // Round-trip through every read path.
+        assert_eq!(
+            store.get_turn(&a.id).unwrap().unwrap().model.as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        // Usage rows carry the model per turn.
+        let rows = store.usage_rows_since(0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].3.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(rows[1].3.as_deref(), Some("google/gemini-2.5-flash"));
     }
 }

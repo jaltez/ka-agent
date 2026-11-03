@@ -79,7 +79,17 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         text: item.text.clone(),
     });
     publish_turn_source(&sh.store, &item.source);
+    // Background turns may run on the background model; the selector the
+    // runtime submits on is recorded with the turn (per-model spend).
+    let background = item.source.starts_with("cron")
+        || item.source == "briefing"
+        || item.source.ends_with("-bg");
+    let model = background
+        .then(|| cfg_of(sh).background_model.clone())
+        .flatten()
+        .or_else(|| cfg_of(sh).model.clone());
     let mut turn = Turn::new(sid.clone(), item.text.clone());
+    turn.model = model.clone();
     if let Err(e) = sh.store.insert_turn(&turn) {
         sh.emit(AgentEvent::Error {
             class: "internal".into(),
@@ -107,13 +117,6 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         }
     }
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
-    // Background turns may run on the background model.
-    let background = item.source.starts_with("cron")
-        || item.source == "briefing"
-        || item.source.ends_with("-bg");
-    let model = background
-        .then(|| cfg_of(sh).background_model.clone())
-        .flatten();
     match port
         .submit_with_model(wire, Vec::new(), Vec::new(), model)
         .await
@@ -136,6 +139,32 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
 }
 
 impl Runtime {
+    /// Re-submit the session's newest turn when it ended in `error` or
+    /// `interrupted` (F2): the one-command / one-tap recovery after a
+    /// provider blip or a worker crash. Never automatic (ka-port.md §7):
+    /// only an operator act re-runs a turn that may have had side effects.
+    pub async fn retry_last(&self) -> Result<Option<String>, Error> {
+        let session = { self.lock().session.id.clone() };
+        let Some(turn) = self
+            .sh
+            .store
+            .latest_turns_for_session(&session, 1)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            turn.status,
+            ka_agent_core::TurnStatus::Error | ka_agent_core::TurnStatus::Interrupted
+        ) {
+            return Ok(None);
+        }
+        let text = turn.inbound_text.clone();
+        self.handle_message(&text, "retry").await?;
+        Ok(Some(text))
+    }
+
     /// Inbound message: submit now when idle, otherwise enqueue durably
     /// (gap G4 — ka drops mid-cycle prompts, HTTP 200 notwithstanding).
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
@@ -428,6 +457,12 @@ impl Runtime {
             }
             drop(g);
             self.persist_session_status(SessionStatus::Idle);
+            // The submit was accepted but refused before any turn started:
+            // say the session is idle again, or a busy indicator (and a
+            // waiting `ask --wait`) would never clear.
+            self.sh.emit(AgentEvent::Session {
+                status: "Idle".into(),
+            });
             return Ok(());
         }
         if let Err(e) = self.ensure_worker().await {
@@ -452,8 +487,17 @@ impl Runtime {
             (g.session.id.clone(), Arc::clone(&live.port))
         };
         // Record the turn BEFORE submitting (gap G8: ka persists per cycle,
-        // so Ka Agent's record is the durable one).
+        // so Ka Agent's record is the durable one). Background turns (crons,
+        // the briefing, `-bg` asks) may run on a cheaper model; the selector
+        // this turn is submitted on is recorded with it (per-model spend).
+        let src = source.unwrap_or("");
+        let background = src.starts_with("cron") || src == "briefing" || src.ends_with("-bg");
+        let model = background
+            .then(|| self.cfg().background_model.clone())
+            .flatten()
+            .or_else(|| self.cfg().model.clone());
         let mut turn = Turn::new(sid, text.to_string());
+        turn.model = model.clone();
         self.sh.store.insert_turn(&turn)?;
         turn.transition(TurnStatus::Submitted)
             .map_err(|t| illegal_turn(turn.status, t))?;
@@ -476,13 +520,7 @@ impl Runtime {
             "{}\n{text}",
             context_line(&self.sh, source.unwrap_or("console"))
         );
-        // Background turns (crons, the briefing, `-bg` asks) may run on a
-        // cheaper model; everything operator-driven keeps the session one.
-        let src = source.unwrap_or("");
-        let background = src.starts_with("cron") || src == "briefing" || src.ends_with("-bg");
-        let model = background
-            .then(|| self.cfg().background_model.clone())
-            .flatten();
+        // The selector was resolved before the turn was recorded above.
         match port
             .submit_with_model(wire, Vec::new(), skills, model)
             .await

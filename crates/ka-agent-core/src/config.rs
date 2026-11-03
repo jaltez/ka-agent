@@ -470,6 +470,9 @@ pub struct DaemonConfig {
     /// Operator timezone (IANA name, e.g. `Europe/Madrid`). `None` uses the
     /// system zone (UTC when it cannot be determined).
     pub timezone: Option<String>,
+    /// Operator language for assistant replies and channel chrome
+    /// (`en` | `es`; default `en`).
+    pub language: String,
     pub web: Web,
     pub calendar: Calendar,
     /// Web search for the engine (`None` = the `web_search` tool is off).
@@ -507,6 +510,7 @@ impl Default for DaemonConfig {
             telegram: Telegram::default(),
             matrix: MatrixSettings::default(),
             timezone: None,
+            language: "en".to_string(),
             web: Web::default(),
             calendar: Calendar::default(),
             search: None,
@@ -718,6 +722,9 @@ impl DaemonConfig {
                 "timezone {name:?} is not a known IANA zone (e.g. \"Europe/Madrid\")"
             )));
         }
+        if !matches!(self.language.as_str(), "en" | "es") {
+            return Err(Error::Validate("language must be \"en\" or \"es\"".into()));
+        }
         if self.web.port == 0 {
             return Err(Error::Validate("web.port must not be 0".into()));
         }
@@ -803,6 +810,20 @@ impl DaemonConfig {
             .as_deref()
             .and_then(|name| jiff::tz::TimeZone::get(name).ok())
             .unwrap_or_else(jiff::tz::TimeZone::system)
+    }
+
+    /// The per-turn instruction that pins the model's reply language to
+    /// the operator's choice. It rides the same context the timezone
+    /// does (`memory_preamble`, runtime). English is the engine's
+    /// default and needs no instruction, so existing operators see no
+    /// change.
+    pub fn language_preamble(&self) -> String {
+        match self.language.as_str() {
+            "es" => {
+                "El idioma del operador es el español: responde siempre en español.".to_string()
+            }
+            _ => String::new(),
+        }
     }
 
     /// When the file pins no `workspace`, resolve it inside `root` (the
@@ -1153,5 +1174,23 @@ digest_time = "07:30"
         // Absolute, distinct dirs validate.
         dup.grants.path[1].dir = PathBuf::from("/srv/y");
         assert!(dup.validate().is_ok());
+    }
+
+    #[test]
+    fn language_defaults_en_validates_and_becomes_a_preamble() {
+        let mut cfg = DaemonConfig::default();
+        assert_eq!(cfg.language, "en");
+        // English is the engine's default: no instruction.
+        assert_eq!(cfg.language_preamble(), "");
+        cfg.language = "es".into();
+        cfg.validate().unwrap();
+        assert!(
+            cfg.language_preamble().contains("español"),
+            "{}",
+            cfg.language_preamble()
+        );
+        cfg.language = "fr".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("language must be"), "{err}");
     }
 }

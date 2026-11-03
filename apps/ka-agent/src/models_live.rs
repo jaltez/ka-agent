@@ -189,21 +189,30 @@ fn load_from(root: &Path, force: bool, url: &str) -> Option<Registry> {
 }
 
 /// The one-line footer under a provider's model list: where the live
-/// half came from, or that the provider is catalog-only. `None` when
-/// no registry snapshot exists at all — the listing is then exactly
-/// the old catalog-only output, footer included.
-pub fn footer(reg: Option<&Registry>, vendor: &str) -> Option<String> {
-    let reg = reg?;
+/// half came from, or that the provider is catalog-only. With no
+/// registry snapshot at all (offline, nothing cached) the line says
+/// so instead of passing the pinned catalog off as current; a cache
+/// past its TTL that a refetch failed to replace says its age.
+pub fn footer(reg: Option<&Registry>, vendor: &str) -> String {
+    let Some(reg) = reg else {
+        return "catalog only (live registry unreachable)".to_string();
+    };
     match reg.models.get(vendor) {
         Some(ids) => {
             let hhmm = jiff::Timestamp::from_millisecond(reg.fetched_at_ms)
                 .map(|t| t.to_zoned(jiff::tz::TimeZone::system()))
                 .map(|z| z.strftime("%H:%M").to_string())
                 .unwrap_or_else(|_| "??:??".to_string());
+            // A snapshot this old is only ever served after a failed
+            // refetch (a fresh cache is returned without one), so it
+            // must not dress up as live data.
+            if reg.from_cache && ka_agent_core::now_ms() - reg.fetched_at_ms >= CACHE_TTL_MS {
+                return format!("stale (cached {hhmm})");
+            }
             let cached = if reg.from_cache { " (cached)" } else { "" };
-            Some(format!("live {} from models.dev {hhmm}{cached}", ids.len()))
+            format!("live {} from models.dev {hhmm}{cached}", ids.len())
         }
-        None => Some("catalog only".to_string()),
+        None => "catalog only".to_string(),
     }
 }
 
@@ -303,12 +312,18 @@ pub enum ProbeOutcome {
 
 impl ProbeOutcome {
     /// The report line without its ✓/✗/· mark (the caller — or
-    /// doctor's Report — supplies the mark).
-    pub fn line(&self, model: &str) -> String {
+    /// doctor's Report — supplies the mark). `key_env` is the
+    /// provider's key variable when it has one: a not-probed model
+    /// names it, so the remedy is the same one command as everywhere
+    /// else a missing key is reported.
+    pub fn line(&self, model: &str, key_env: Option<&str>) -> String {
         match self {
             ProbeOutcome::Answers => format!("{model} answers"),
             ProbeOutcome::Refused(msg) => format!("{model}: {msg}"),
-            ProbeOutcome::NotProbed => format!("{model} not probed (no key)"),
+            ProbeOutcome::NotProbed => match key_env {
+                Some(env) => format!("{model} not probed (no key) — ka-agent key set {env}"),
+                None => format!("{model} not probed (no key)"),
+            },
         }
     }
 
@@ -471,25 +486,55 @@ mod tests {
 
     #[test]
     fn footer_says_where_the_live_half_came_from() {
-        let reg = |from_cache: bool| Registry {
+        let now = ka_agent_core::now_ms();
+        let reg = |at: i64, from_cache: bool| Registry {
             models: BTreeMap::from([("opencode-go".to_string(), vec!["glm-5.3".to_string()])]),
-            fetched_at_ms: 1_700_000_000_000,
+            fetched_at_ms: at,
             from_cache,
         };
-        let fresh = footer(Some(&reg(false)), "opencode-go").unwrap();
+        let fresh = footer(Some(&reg(now, false)), "opencode-go");
         assert!(fresh.starts_with("live 1 from models.dev "), "{fresh}");
         assert!(!fresh.contains("(cached)"), "{fresh}");
-        let cached = footer(Some(&reg(true)), "opencode-go").unwrap();
+        let cached = footer(Some(&reg(now - 1_000, true)), "opencode-go");
         assert!(cached.ends_with(" (cached)"), "{cached}");
+
+        // A cache past its TTL only exists after a failed refetch: it
+        // says its age instead of passing for fresh.
+        let stale = footer(Some(&reg(now - CACHE_TTL_MS - 1_000, true)), "opencode-go");
+        assert!(stale.starts_with("stale (cached "), "{stale}");
+        assert!(!stale.contains("models.dev"), "{stale}");
 
         // A vendor the registry does not list says so — but only when
         // a snapshot exists at all.
-        let with_snapshot = reg(false);
+        let with_snapshot = reg(now, false);
+        assert_eq!(footer(Some(&with_snapshot), "ollama"), "catalog only");
+        // No snapshot: the footer names the pinned catalog and says
+        // the live registry did not answer.
         assert_eq!(
-            footer(Some(&with_snapshot), "ollama").as_deref(),
-            Some("catalog only")
+            footer(None, "opencode-go"),
+            "catalog only (live registry unreachable)"
         );
-        assert_eq!(footer(None, "opencode-go"), None);
+    }
+
+    #[test]
+    fn not_probed_line_names_the_key_env_to_set() {
+        // A keyed provider names its variable, in the same wording as
+        // the model-switch and preflight key warnings.
+        assert_eq!(
+            ProbeOutcome::NotProbed.line("claude-sonnet-4-5", Some("ANTHROPIC_API_KEY")),
+            "claude-sonnet-4-5 not probed (no key) — ka-agent key set ANTHROPIC_API_KEY"
+        );
+        // A keyless provider has no variable to name.
+        assert_eq!(
+            ProbeOutcome::NotProbed.line("glm-5.3", None),
+            "glm-5.3 not probed (no key)"
+        );
+        // The hint only concerns the not-probed outcome.
+        assert_eq!(ProbeOutcome::Answers.line("m", Some("K")), "m answers");
+        assert_eq!(
+            ProbeOutcome::Refused("HTTP 503".to_string()).line("m", Some("K")),
+            "m: HTTP 503"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! by the chat loop: y allow · n deny · s allow for this session; memory
 //! and skill proposals: y keep · n discard).
 
+use super::paint;
 use ka_agent_runtime::{AgentEvent, Envelope};
 
 /// Print the card an envelope carries, when it carries one.
@@ -17,21 +18,28 @@ pub fn print_card(env: &Envelope) {
         } => {
             let left = (expires_at_ms - ka_agent_core::now_ms()).max(0) / 60_000;
             println!(
-                "\x1b[2m┌\x1b[0m approval {} \x1b[2m(expires in {left}m)\x1b[0m",
-                ka_agent_core::ids::short_id(id)
+                "{} approval {} {}",
+                paint::dim("┌"),
+                ka_agent_core::ids::short_id(id),
+                paint::dim(&format!("(expires in {left}m)"))
             );
-            println!("│ {}", question);
+            println!("│ {question}");
             if let Some(detail) = detail
                 && !detail.is_empty()
             {
-                println!("\x1b[2m│ {detail}\x1b[0m");
+                println!("{}", paint::dim(&format!("│ {detail}")));
             }
-            println!("\x1b[2m└ y allow · n deny · s allow for this session\x1b[0m");
+            println!(
+                "{}",
+                paint::dim("└ y allow · n deny · s allow for this session")
+            );
         }
         AgentEvent::MemoryProposal { id, text } => {
             println!(
-                "\x1b[2m┌\x1b[0m remember this? \x1b[2m{}\x1b[0m\n│ {text}\n\x1b[2m└ y keep · n discard\x1b[0m",
-                ka_agent_core::ids::short_id(id)
+                "{} remember this? {}\n│ {text}\n{}",
+                paint::dim("┌"),
+                paint::dim(ka_agent_core::ids::short_id(id)),
+                paint::dim("└ y keep · n discard")
             );
         }
         AgentEvent::SkillProposal {
@@ -40,8 +48,10 @@ pub fn print_card(env: &Envelope) {
             description,
         } => {
             println!(
-                "\x1b[2m┌\x1b[0m skill proposal {} · {name}\n│ {description}\n\x1b[2m└ y install · n discard\x1b[0m",
-                ka_agent_core::ids::short_id(id)
+                "{} skill proposal {} · {name}\n│ {description}\n{}",
+                paint::dim("┌"),
+                ka_agent_core::ids::short_id(id),
+                paint::dim("└ y install · n discard")
             );
         }
         _ => {}

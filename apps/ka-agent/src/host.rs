@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ka_agent_core::DaemonConfig;
 use ka_agent_runtime::{
-    Envelope, EventBus, InstanceLock, LockError, Runtime, Surface, paths::Paths,
+    AgentEvent, Envelope, EventBus, InstanceLock, LockError, Runtime, Surface, paths::Paths,
 };
 use ka_agent_store::Store;
 use tokio::sync::broadcast;
@@ -247,6 +247,38 @@ impl Host {
                 .await;
         }));
 
+        // Update discovery (F4): the resident daemon checks the release
+        // metadata on its own — weekly by default — so `status` and a
+        // Notice say a newer release exists even if the operator never
+        // types `update check`. Test seam: KA_AGENT_UPDATE_INTERVAL_SECS.
+        {
+            let updater = runtime.clone();
+            let check_store = Arc::clone(&store);
+            let period = std::env::var("KA_AGENT_UPDATE_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|s| *s > 0)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(std::time::Duration::from_secs(7 * 24 * 3600));
+            tasks.push(tokio::spawn(async move {
+                // First check shortly after boot (bounded by the period so
+                // a test seam stays fast).
+                tokio::time::sleep(period.min(std::time::Duration::from_secs(30))).await;
+                loop {
+                    // `reqwest::blocking` owns a runtime; dropping it inside
+                    // this async task panics, so the fetch runs on the
+                    // blocking pool.
+                    if let Ok(Ok((latest, newer))) =
+                        tokio::task::spawn_blocking(crate::update_cli::latest_release).await
+                    {
+                        crate::update_cli::record_check_in(&check_store, &latest);
+                        updater.set_update_available(newer.then_some(latest));
+                    }
+                    tokio::time::sleep(period).await;
+                }
+            }));
+        }
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Voice-note transcription for the phone channels (key from the
@@ -333,10 +365,15 @@ impl Host {
         }
 
         // Web UI (M7): loopback-only, session auth; `[web]` in the config,
-        // or `--web-port` as an override.
-        let web_port = opts
-            .web_port
-            .or_else(|| cfg.web.enabled.then_some(cfg.web.port));
+        // or `--web-port` as an override. Only the daemon serves it — a
+        // local `chat` is a client and never binds the panel port (an
+        // occupied 8480 on a second profile must not garble its screen).
+        let web_port = if opts.channels {
+            opts.web_port
+                .or_else(|| cfg.web.enabled.then_some(cfg.web.port))
+        } else {
+            None
+        };
         if let Some(web_port) = web_port {
             let web = ka_agent_web::WebServer::new(
                 web_port,
@@ -345,9 +382,18 @@ impl Host {
                 Arc::clone(&bus),
             );
             let web_rx = shutdown_rx.clone();
+            let notice_bus = Arc::clone(&bus);
             tasks.push(tokio::spawn(async move {
                 if let Err(e) = web.run(web_rx).await {
-                    eprintln!("ka-agent: web UI disabled: {e}");
+                    // A failure this late is operational news, not stderr:
+                    // the surfaces the operator already watches carry it
+                    // without corrupting a live terminal area.
+                    notice_bus.emit(&Envelope::new(
+                        0,
+                        AgentEvent::Notice {
+                            text: format!("web UI disabled: {e}"),
+                        },
+                    ));
                 }
             }));
             if opts.channels {

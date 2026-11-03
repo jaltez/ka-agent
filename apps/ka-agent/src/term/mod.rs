@@ -37,6 +37,8 @@ pub enum Action {
 pub struct Terminal {
     _raw: raw::RawMode,
     key_rx: tokio::sync::mpsc::Receiver<Key>,
+    /// Pauses the stdin reader while an external editor runs (Ctrl-G).
+    keys_pause: keys::Pause,
     pub editor: Editor,
     history: History,
     pub view: View,
@@ -45,6 +47,10 @@ pub struct Terminal {
     /// Completion candidates currently shown (Tab again cycles).
     completions: Vec<complete::Completion>,
     completion_idx: usize,
+    /// Where the cycling word starts in the draft (char index).
+    completion_start: Option<usize>,
+    /// Ctrl-R query while the reverse search runs.
+    search: Option<String>,
     pub verbosity: bool,
     /// Where `@path` completion and the editor's cwd resolve.
     workspace: std::path::PathBuf,
@@ -66,15 +72,19 @@ impl Terminal {
         let width = terminal_size_width();
         let mut view = View::new(name, width);
         view.model = model;
+        let (key_rx, keys_pause) = keys::spawn_reader();
         let mut term = Self {
             _raw: raw,
-            key_rx: keys::spawn_reader(),
+            key_rx,
+            keys_pause,
             editor: Editor::default(),
             history: History::load(history_path()),
             view,
             quit_armed: None,
             completions: Vec::new(),
             completion_idx: 0,
+            completion_start: None,
+            search: None,
             verbosity: false,
             workspace,
             width,
@@ -116,6 +126,9 @@ impl Terminal {
     /// as needed. `busy` = a turn is running (Ctrl-C stops it).
     pub async fn next_action(&mut self, busy: bool) -> Option<Action> {
         loop {
+            if self.search.is_some() {
+                self.draw_search();
+            }
             let key = self.key_rx.recv().await?;
             // A resize or focus event only repaints.
             if let Key::Focus(focused) = key {
@@ -124,7 +137,15 @@ impl Terminal {
                 continue;
             }
             self.resize();
-            match key {
+            // Ctrl-R runs as this state machine (never a blocking recv —
+            // the async runtime owns this thread).
+            if self.search.is_some() {
+                if !search_key(&mut self.search, &self.history, &mut self.editor, key) {
+                    self.draw();
+                }
+                continue;
+            }
+            match &key {
                 Key::Enter => {
                     let line = self.editor.text();
                     if line.trim().is_empty() {
@@ -138,16 +159,20 @@ impl Terminal {
                     self.quit_armed = None;
                     // The submitted line enters the transcript permanently.
                     self.begin_permanent();
-                    println!("\x1b[1m»\x1b[0m\x1b[2m {}\x1b[0m", line.trim_end());
+                    println!(
+                        "{}{}",
+                        paint::bold("»"),
+                        paint::dim(&format!(" {}", line.trim_end()))
+                    );
                     self.draw();
                     return Some(Action::Submit(line));
                 }
                 Key::Char(c) => {
-                    self.editor.insert(c);
-                    self.completions.clear();
+                    self.editor.insert(*c);
                 }
                 Key::Newline => {
-                    // Multi-line drafts are folded to spaces (single line).
+                    // A typed newline folds to a space (one-line input);
+                    // pasted newlines survive verbatim in the draft.
                     self.editor.insert(' ');
                 }
                 Key::Backspace => self.editor.backspace(),
@@ -170,10 +195,18 @@ impl Terminal {
                 Key::WordRight => self.editor.word_right(),
                 Key::Tab => self.complete(),
                 Key::BackTab => {}
-                Key::Esc => self.completions.clear(),
-                Key::Paste(text) => self.editor.insert_str(&text),
+                Key::Esc => {
+                    // While a turn runs, Esc stops it (the engine's own
+                    // retry notes say so); idle it dismisses completions.
+                    if busy {
+                        self.draw();
+                        return Some(Action::Interrupt);
+                    }
+                    self.completions.clear();
+                }
+                Key::Paste(text) => self.editor.insert_str(text),
                 Key::Ctrl('a') => self.editor.home(),
-                Key::Ctrl('e') => self.editor.end(),
+                Key::Ctrl('e') => self.expand_tool(),
                 Key::Ctrl('k') => {
                     self.editor.kill_to_end();
                 }
@@ -183,27 +216,30 @@ impl Terminal {
                 Key::Ctrl('w') => {
                     self.editor.kill_word();
                 }
+                Key::Ctrl('y') => self.editor.yank(),
                 Key::Ctrl('l') => {
                     // Clear the screen, keep the live area.
                     print!("\x1b[2J\x1b[H");
                 }
                 Key::Ctrl('o') => {
                     self.view.verbose = !self.view.verbose;
-                    print!(
-                        "\x1b[2m· tool details {}\x1b[0m\r\n",
+                    self.announce(&format!(
+                        "tool details {}",
                         if self.view.verbose { "on" } else { "off" }
-                    );
+                    ));
                 }
                 Key::Ctrl('t') => {
                     self.verbosity = !self.verbosity;
-                    print!(
-                        "\x1b[2m· thinking {}\x1b[0m\r\n",
+                    self.announce(&format!(
+                        "thinking {}",
                         if self.verbosity { "shown" } else { "hidden" }
-                    );
+                    ));
                 }
                 Key::Ctrl('r') => {
-                    // Incremental reverse search over the history.
-                    self.reverse_search();
+                    // Incremental reverse search over the history: the
+                    // `search_key` state machine takes the next keys.
+                    self.search = Some(String::new());
+                    self.editor.searching = true;
                 }
                 Key::Ctrl('g') => {
                     self.edit_in_editor();
@@ -226,7 +262,7 @@ impl Terminal {
                             }
                             _ => {
                                 self.quit_armed = Some(Instant::now());
-                                print!("\r\n\x1b[2m(press Ctrl-C again to quit)\x1b[0m");
+                                print!("\r\n{}", paint::dim("(press Ctrl-C again to quit)"));
                             }
                         }
                     }
@@ -240,24 +276,62 @@ impl Terminal {
                 Key::Ctrl(_) => {}
                 Key::Focus(_) => {}
             }
+            // Any key but Tab ends a completion cycle.
+            if !matches!(key, Key::Tab) {
+                self.completions.clear();
+                self.completion_start = None;
+            }
             self.draw();
         }
     }
 
-    /// Tab: complete the current word; one match inserts, several list.
+    /// One dim line above the live area (survives the next redraw).
+    fn announce(&mut self, text: &str) {
+        self.begin_permanent();
+        println!("{}", paint::dim(&format!("· {text}")));
+    }
+
+    /// Tab: complete the current word. A single match inserts; several
+    /// arm a cycle — the first candidate inserts, further Tabs step through
+    /// the list, and the candidates print as a dim row above the live area
+    /// (so they survive the redraw instead of being erased by it).
     fn complete(&mut self) {
-        let workspace = self.view_workspace();
-        let candidates = complete::complete(&self.editor.text(), &workspace);
-        if candidates.is_empty() {
-            return;
+        if self.completions.is_empty() {
+            let workspace = self.view_workspace();
+            let candidates = complete::complete(&self.editor.text(), &workspace);
+            if candidates.is_empty() {
+                return;
+            }
+            if candidates.len() == 1 {
+                self.replace_word(&candidates[0].insert);
+                return;
+            }
+            let text = self.editor.text();
+            let start = text
+                .rfind(char::is_whitespace)
+                .map_or(0, |i| text[..i + 1].chars().count());
+            self.completions = candidates;
+            self.completion_idx = 0;
+            self.completion_start = Some(start);
+        } else {
+            self.completion_idx = (self.completion_idx + 1) % self.completions.len();
         }
-        if candidates.len() == 1 {
-            self.replace_word(&candidates[0].insert);
-            self.completions.clear();
+        self.insert_completion();
+        self.show_completions();
+    }
+
+    /// Replace the word at `completion_start` with the current candidate.
+    fn insert_completion(&mut self) {
+        let Some(start) = self.completion_start else {
             return;
-        }
-        self.completion_idx = (self.completion_idx + 1) % candidates.len();
-        self.completions = candidates;
+        };
+        let insert = self.completions[self.completion_idx].insert.clone();
+        let head: String = self.editor.text().chars().take(start).collect();
+        self.editor.set(&format!("{head}{insert} "));
+    }
+
+    /// The candidates as one dim row above the live area.
+    fn show_completions(&mut self) {
         let shared = self
             .completions
             .iter()
@@ -270,9 +344,10 @@ impl Terminal {
             })
             .collect::<Vec<_>>()
             .join("  ");
-        print!(
-            "\x1b[2m{}\x1b[0m",
-            view::truncate_display(&shared, self.width)
+        self.begin_permanent();
+        println!(
+            "{}",
+            paint::dim(&view::truncate_display(&shared, self.width))
         );
     }
 
@@ -287,41 +362,73 @@ impl Terminal {
         self.workspace.clone()
     }
 
-    /// Ctrl-R: incremental reverse search; Enter picks, Ctrl-G/Esc cancels.
-    fn reverse_search(&mut self) {
-        let mut query = String::new();
-        loop {
-            let hits = self.history.search(&query);
-            let shown = hits.first().cloned().unwrap_or_default();
-            print!("\r\x1b[2m(reverse-i-search)`{query}':\x1b[0m {shown}\x1b[K");
-            let Some(key) = self.key_rx.blocking_recv() else {
-                return;
-            };
-            match key {
-                Key::Char(c) => query.push(c),
-                Key::Backspace => {
-                    query.pop();
-                }
-                Key::Enter => {
-                    if !shown.is_empty() {
-                        self.editor.set(&shown);
-                    }
-                    return;
-                }
-                Key::Esc | Key::Ctrl('g') | Key::Interrupt => return,
-                _ => {}
+    /// The Ctrl-R prompt: `(reverse-i-search)`query': match` on the
+    /// cursor's row (the live area redraws over it when the search ends).
+    fn draw_search(&self) {
+        let Some(query) = &self.search else {
+            return;
+        };
+        let shown = self
+            .history
+            .search(query)
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        print!(
+            "\r{} {}\x1b[K",
+            paint::dim(&format!("(reverse-i-search)`{query}':")),
+            shown
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Ctrl-E: reprint the last finished tool — its invocation, duration
+    /// and the output the runtime surfaced (a failed call's error lines, a
+    /// successful call's bounded output excerpt).
+    fn expand_tool(&mut self) {
+        let Some(last) = self.view.last_tool.clone() else {
+            self.announce("no tool yet");
+            return;
+        };
+        self.begin_permanent();
+        println!(
+            "{}",
+            paint::dim(&format!(
+                "· {} · {}ms · {}",
+                last.tool,
+                last.ms,
+                if last.ok { "ok" } else { "failed" }
+            ))
+        );
+        if !last.detail.is_empty() {
+            println!(
+                "{}",
+                paint::dim(&format!(
+                    "  ▸ {}",
+                    view::truncate_display(&last.detail, self.width.saturating_sub(4))
+                ))
+            );
+        }
+        if let Some(err) = &last.error {
+            for line in err.lines() {
+                println!("{}", paint::dim(&format!("  {line}")));
             }
-            if query.is_empty() {
-                return;
+        }
+        if let Some(excerpt) = &last.output {
+            for line in excerpt.lines().take(20) {
+                println!("{}", paint::dim(&format!("  {line}")));
             }
         }
     }
 
-    /// Ctrl-G: edit the draft in $VISUAL/$EDITOR (raw mode suspended).
+    /// Ctrl-G: edit the draft in $VISUAL/$EDITOR (raw mode suspended and
+    /// the stdin reader paused, so the editor owns every keystroke).
     fn edit_in_editor(&mut self) {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("ka-draft-{}.md", std::process::id()));
         let _ = std::fs::write(&path, self.editor.text());
+        self.keys_pause.set(true);
         let suspended = raw::Suspended::begin();
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
@@ -334,6 +441,9 @@ impl Terminal {
             });
         let _ = std::process::Command::new(&editor).arg(&path).status();
         suspended.end();
+        self.keys_pause.set(false);
+        // Whatever the reader swallowed around the switch is stale.
+        while self.key_rx.try_recv().is_ok() {}
         if let Ok(text) = std::fs::read_to_string(&path) {
             self.editor.set(text.trim_end());
         }
@@ -342,13 +452,53 @@ impl Terminal {
     }
 }
 
+/// One key inside the Ctrl-R search: `true` while it keeps running.
+/// Enter accepts the current hit into the draft, Esc/Ctrl-G/Ctrl-C cancel,
+/// backspacing the query away ends the search. Free so the state machine
+/// is unit-testable without a terminal.
+fn search_key(
+    search: &mut Option<String>,
+    history: &History,
+    editor: &mut Editor,
+    key: Key,
+) -> bool {
+    let Some(query) = search.as_mut() else {
+        return false;
+    };
+    match key {
+        Key::Char(c) => query.push(c),
+        Key::Backspace => {
+            query.pop();
+        }
+        Key::Enter => {
+            if let Some(line) = history.search(query).into_iter().next() {
+                editor.set(&line);
+            }
+            *search = None;
+            return false;
+        }
+        Key::Esc | Key::Ctrl('g') | Key::Interrupt => {
+            *search = None;
+            return false;
+        }
+        _ => {}
+    }
+    if query.is_empty() {
+        *search = None;
+        return false;
+    }
+    true
+}
+
 /// Terminal width (falls back to 80).
 fn terminal_size_width() -> usize {
     raw::width()
 }
 
 /// Feed one envelope into the view and print its permanent lines above the
-/// live area. Also rings BEL + OSC-9 when a card arrives while unfocused.
+/// live area — cards included, so an approval card is a permanent block
+/// (never overwritten by the redraw its arrival triggers). Also rings BEL
+/// + OSC-9 when a card arrives while unfocused.
 pub fn show_event(term: &mut Terminal, env: &ka_agent_runtime::Envelope) {
     use ka_agent_runtime::AgentEvent;
     let lines = view::absorb(&mut term.view, &env.ev, term.verbosity);
@@ -358,6 +508,7 @@ pub fn show_event(term: &mut Terminal, env: &ka_agent_runtime::Envelope) {
     for line in lines {
         println!("{line}");
     }
+    cards::print_card(env);
     match &env.ev {
         AgentEvent::Approval { question, .. }
         | AgentEvent::MemoryProposal { text: question, .. } => {
@@ -371,4 +522,104 @@ pub fn show_event(term: &mut Terminal, env: &ka_agent_runtime::Envelope) {
         _ => {}
     }
     term.draw();
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// A2: the reverse-search state machine accepts, cancels and exits on
+    /// an emptied query — the same keys the blocking loop served before,
+    /// without ever blocking the runtime thread.
+    #[test]
+    fn reverse_search_state_machine() {
+        let dir = std::env::temp_dir().join(format!("ka-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut history = History::load(dir.join("history"));
+        history.push("hello there");
+        history.push("bye now");
+
+        // `hel` + Enter: the hit lands in the draft, the search ends.
+        let mut editor = Editor::default();
+        let mut search = Some(String::new());
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('h')
+        ));
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('e')
+        ));
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('l')
+        ));
+        assert!(!search_key(&mut search, &history, &mut editor, Key::Enter));
+        assert_eq!(editor.text(), "hello there");
+        assert!(search.is_none());
+
+        // Esc cancels: the draft keeps whatever it held.
+        editor.set("draft");
+        let mut search = Some(String::new());
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('b')
+        ));
+        assert!(!search_key(&mut search, &history, &mut editor, Key::Esc));
+        assert_eq!(editor.text(), "draft");
+
+        // Backspacing the query away exits the search.
+        let mut search = Some(String::new());
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('x')
+        ));
+        assert!(!search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Backspace
+        ));
+        assert!(search.is_none());
+
+        // Ctrl-G and Ctrl-C cancel too.
+        let mut search = Some(String::new());
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('b')
+        ));
+        assert!(!search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Ctrl('g')
+        ));
+        let mut search = Some(String::new());
+        assert!(search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Char('b')
+        ));
+        assert!(!search_key(
+            &mut search,
+            &history,
+            &mut editor,
+            Key::Interrupt
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

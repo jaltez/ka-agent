@@ -64,6 +64,17 @@ impl Store {
         Ok(())
     }
 
+    /// Rewrite a task's payload in place (the cron's stored schedule
+    /// metadata, e.g. a calendar digest retimed by `calendar.digest_time`).
+    pub fn update_task_payload(&self, id: &ka_agent_core::TaskId, payload: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tasks SET payload = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id.as_str(), payload, ka_agent_core::now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Update a task's schedule and status in one write (cron re-arming
     /// after a fire; pausing clears the schedule).
     pub fn update_task_schedule(

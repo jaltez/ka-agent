@@ -20,7 +20,7 @@ aside a.active{background:var(--accent-soft);font-weight:600}\
 aside .badge{background:var(--accent);color:#fff;font-size:.72rem;border-radius:99px;padding:0 .5rem;line-height:1.4}\
 main{flex:1;padding:1.4rem 1.6rem;min-width:0}\
 h1{font-size:1.35rem;margin:.1rem 0 1.1rem}\
-@media(max-width:760px){.layout{flex-direction:column}aside{width:auto;border-right:none;border-bottom:1px solid var(--border);padding:.5rem .6rem}aside .brand{padding:.3rem .6rem}aside a{display:inline-block;margin:.15rem .2rem}main{padding:1rem}}\
+@media(max-width:760px){.layout{flex-direction:column;height:100vh}aside{width:auto;border-right:none;border-bottom:1px solid var(--border);padding:.5rem .6rem}aside .brand{padding:.3rem .6rem}aside a{display:inline-block;margin:.15rem .2rem}main{padding:1rem;flex:1;display:flex;flex-direction:column;min-height:0}}\
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;margin:.7rem 0}\
 button{font:inherit;border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;padding:.35rem .9rem;cursor:pointer}\
 button:hover{border-color:var(--accent)}\
@@ -48,7 +48,9 @@ form#send{display:flex;gap:.5rem;padding:.6rem 0}\
 .statgrid .card{margin:0}\
 .statgrid .k{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}\
 .statgrid .v{font-size:1.15rem;margin-top:.15rem}\
-.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}</style>";
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}\
+/* Mobile: the wrapped nav is part of the viewport, so #chat flexes inside it (placed after the base #chat rule, which would otherwise win by order). */\
+@media(max-width:760px){#chat{flex:1;height:auto;min-height:0}}</style>";
 
 /// The viewport-aware head + sidebar layout (top bar on narrow screens).
 /// Both the page title and the persona name are user-derived and escaped.
@@ -76,7 +78,7 @@ fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Respo
         .map(|c| c.len())
         .unwrap_or(0);
     let review = runtime.pending_candidates().map(|c| c.len()).unwrap_or(0);
-    let items: [(&str, &str, usize); 10] = [
+    let items: [(&str, &str, usize); 11] = [
         ("/", "Chat", 0),
         ("/status", "Status", 0),
         ("/tasks", "Tasks", 0),
@@ -87,6 +89,7 @@ fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Respo
         ("/usage", "Usage", 0),
         ("/contacts", "Contacts", 0),
         ("/audit", "Audit", 0),
+        ("/intents", "Intents", 0),
     ];
     let nav: String = items
         .iter()
@@ -97,7 +100,9 @@ fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Respo
                 String::new()
             };
             let class = if *href == active { "active" } else { "" };
-            format!("<a class=\"{class}\" href=\"{href}\">{label}{badge}</a>")
+            // `data-nav` gives chat.js a stable hook for live badge
+            // updates (approvals, memory review) without a reload.
+            format!("<a class=\"{class}\" data-nav=\"{href}\" href=\"{href}\">{label}{badge}</a>")
         })
         .collect::<Vec<_>>()
         .join("");
@@ -269,6 +274,13 @@ pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
     let now = runtime.now_zoned();
     let mut turns_html = String::new();
     if let Ok(turns) = runtime.recent_turns(20) {
+        if turns.is_empty() {
+            // A blank first visit says nothing: one hint bubble, the same
+            // shape every other empty state in the panel uses.
+            turns_html.push_str(
+                "<div class='bubble system'>Ka is ready — say hi; commands start with /</div>",
+            );
+        }
         for (t, answer) in turns.iter().rev() {
             let at = jiff::Timestamp::from_millisecond(t.created_ms)
                 .map(|ts| ts.to_zoned(now.time_zone().clone()))
@@ -338,7 +350,8 @@ fn form_field_url(body: &str, name: &str) -> String {
     String::new()
 }
 
-/// `GET /tasks`: reminders and crons with cancel buttons.
+/// `GET /tasks`: reminders and crons with snooze (reminders) and cancel
+/// buttons.
 pub fn tasks(runtime: &Runtime) -> crate::Response {
     let now = runtime.now_zoned();
     let rows = match runtime.scheduled_tasks() {
@@ -367,9 +380,23 @@ pub fn tasks(runtime: &Runtime) -> crate::Response {
                 .scheduled_at_ms
                 .map(|at| escape_html(&ka_agent_core::when::describe(at, &now)))
                 .unwrap_or_else(|| "-".into());
+            // Only reminders snooze: a cron's next fire belongs to its
+            // cadence (`ka-agent cron`).
+            let snooze = if t.kind == "reminder" {
+                format!(
+                    "<form method=post action=/tasks/snooze class=inline>\
+                     <input type=hidden name=id value=\"{}\">\
+                     <input name=when placeholder=30m size=7>\
+                     <button>snooze</button></form>",
+                    escape_html(t.id.as_str())
+                )
+            } else {
+                String::new()
+            };
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-                 <td><form method=post action=/tasks/cancel>\
+                 <td>{snooze}</td>\
+                 <td><form method=post action=/tasks/cancel class=inline>\
                  <input type=hidden name=id value=\"{}\"><button>cancel</button></form></td></tr>",
                 escape_html(ka_agent_core::ids::short_id(t.id.as_str())),
                 escape_html(&t.kind),
@@ -384,7 +411,8 @@ pub fn tasks(runtime: &Runtime) -> crate::Response {
         "/tasks",
         "Tasks",
         format!(
-            "<table><tr><th>id</th><th>kind</th><th>next</th><th>title</th><th></th></tr>{}</table>",
+            "<table><tr><th>id</th><th>kind</th><th>next</th><th>title</th><th></th><th></th></tr>{}</table>\
+             <style>form.inline{{display:inline-flex;gap:.3rem;align-items:center}}form.inline input{{font:inherit;padding:.2rem .4rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg);width:auto}}</style>",
             rows_html.join("")
         ),
     )
@@ -419,6 +447,51 @@ pub async fn tasks_cancel(runtime: &Runtime, body: &str) -> crate::Response {
                 "<p>ambiguous — matches: {}</p>",
                 escape_html(&ids.join(", "))
             ),
+        ),
+    }
+}
+
+/// `POST /tasks/snooze`: move one reminder's next fire (`id` + `when` in
+/// the `/remind` grammar: `30m`, `18:30`, `tomorrow 9am`, …). Cron rows
+/// keep their own cadence.
+pub fn tasks_snooze(runtime: &Runtime, body: &str) -> crate::Response {
+    let id = form_field(body, "id");
+    let expr = form_field(body, "when");
+    let now = runtime.now_zoned();
+    let tokens: Vec<&str> = expr.split_whitespace().collect();
+    let Some(when) = ka_agent_core::when::parse_when(&tokens, &now) else {
+        return nav_page(
+            runtime,
+            "/tasks",
+            "Tasks",
+            format!(
+                "<p>could not read {} as a time — try 30m, 18:30 or tomorrow 9am</p>",
+                escape_html(&expr)
+            ),
+        );
+    };
+    match runtime.snooze_reminder(&id, when.at_ms) {
+        Ok(ka_agent_runtime::CancelOutcome::Cancelled(_)) => Response::see_other("/tasks"),
+        Ok(ka_agent_runtime::CancelOutcome::NotFound) => nav_page(
+            runtime,
+            "/tasks",
+            "Tasks",
+            format!("<p>no reminder matches {}</p>", escape_html(&id)),
+        ),
+        Ok(ka_agent_runtime::CancelOutcome::Ambiguous(ids)) => nav_page(
+            runtime,
+            "/tasks",
+            "Tasks",
+            format!(
+                "<p>ambiguous — matches: {}</p>",
+                escape_html(&ids.join(", "))
+            ),
+        ),
+        Err(e) => nav_page(
+            runtime,
+            "/tasks",
+            "Error",
+            format!("<p>{}</p>", escape_html(&e.to_string())),
         ),
     }
 }
@@ -542,8 +615,28 @@ pub fn contacts(runtime: &Runtime, store: &Store) -> crate::Response {
 /// `POST /memory/forget`: remove one accepted entry.
 pub async fn memory_forget(runtime: &Runtime, body: &str) -> crate::Response {
     let id = form_field(body, "id");
-    let _ = runtime.forget(&id);
-    Response::see_other("/memory")
+    match runtime.forget(&id) {
+        Ok(true) => Response::see_other("/memory"),
+        Ok(false) => nav_page(
+            runtime,
+            "/memory",
+            "Memory",
+            format!(
+                "<p>no memory entry matches {} — it may already be gone</p>\
+                 <p><a href=\"/memory\">back</a></p>",
+                escape_html(&id)
+            ),
+        ),
+        Err(e) => nav_page(
+            runtime,
+            "/memory",
+            "Error",
+            format!(
+                "<p>forget not applied: {}</p><p><a href=\"/memory\">back</a></p>",
+                escape_html(&e.to_string())
+            ),
+        ),
+    }
 }
 
 /// The fetch path of the approval card buttons (chat.js).
@@ -562,13 +655,13 @@ pub async fn approvals_decide_json(runtime: &Runtime, body: &str) -> crate::Resp
 pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
     let Some(q) = query.filter(|q| !q.is_empty()) else {
         let body = "<form method=get action=/history><input name=q placeholder='search…'><button>search</button></form>".into();
-        return Response::html(runtime_page(runtime, "History", body));
+        return nav_page(runtime, "/history", "History", body);
     };
     // FTS search is available on the runtime
     match runtime.history_search(q, 20) {
         Ok(hits) if hits.is_empty() => {
             let body = format!("<p>no results for {}</p>", escape_html(q));
-            Response::html(runtime_page(runtime, "History search", body))
+            nav_page(runtime, "/history", "History", body)
         }
         Ok(hits) => {
             let rows: Vec<String> = hits
@@ -590,13 +683,14 @@ pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
 "
                 )
             );
-            Response::html(runtime_page(runtime, "History search", body))
+            nav_page(runtime, "/history", "History", body)
         }
-        Err(e) => Response::html(runtime_page(
+        Err(e) => nav_page(
             runtime,
+            "/history",
             "Error",
             format!("<p>{}</p>", escape_html(&e.to_string())),
-        )),
+        ),
     }
 }
 
@@ -615,7 +709,7 @@ pub fn history_show(runtime: &Runtime, store: &Store, turn_id: &str) -> crate::R
         escape_html(&turn.inbound_text),
         escape_html(&answer)
     );
-    Response::html(runtime_page(runtime, "Turn", body))
+    nav_page(runtime, "/history", "Turn", body)
 }
 
 pub fn memory(runtime: &Runtime) -> crate::Response {
@@ -863,11 +957,7 @@ pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response 
 pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
     let records = store.recent_audit(50).unwrap_or_default();
     if records.is_empty() {
-        return Response::html(runtime_page(
-            runtime,
-            "Audit",
-            "<p>no audit records</p>".into(),
-        ));
+        return nav_page(runtime, "/audit", "Audit", "<p>no audit records</p>".into());
     }
     let rows: Vec<String> = records
         .iter()
@@ -899,7 +989,7 @@ pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
         "<table><tr><th>seq</th><th>at</th><th>actor</th><th>action</th><th>subject</th></tr>{}</table>",
         rows.join("")
     );
-    Response::html(runtime_page(runtime, "Audit", body))
+    nav_page(runtime, "/audit", "Audit", body)
 }
 
 pub fn intents(runtime: &Runtime, store: &Store) -> crate::Response {
@@ -920,10 +1010,11 @@ pub fn intents(runtime: &Runtime, store: &Store) -> crate::Response {
         "<table><tr><th>id</th><th>tool</th><th>status</th><th>summary</th></tr>{}</table>",
         rows.join("")
     );
-    Response::html(runtime_page(runtime, "Intents", body))
+    nav_page(runtime, "/intents", "Intents", body)
 }
 
-/// `GET /usage`: spend per day, CSS bars, today against the budget.
+/// `GET /usage`: spend per day and model, CSS bars, today against the
+/// budget.
 pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
     let cfg = runtime.config();
     let since = jiff::Timestamp::now()
@@ -931,37 +1022,39 @@ pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
         .map(|t| t.as_millisecond())
         .unwrap_or(0);
     let rows = store.usage_rows_since(since).unwrap_or_default();
-    // Bucket by local day (a turn lands on the day it started).
+    // Bucket by local day and model (a turn lands on the day it started).
     let tz = runtime.now_zoned().time_zone().clone();
-    let mut buckets: Vec<(String, u64, u64, f64)> = Vec::new();
-    for (at_ms, cost, tokens) in rows {
+    let mut buckets: Vec<(String, String, u64, u64, f64)> = Vec::new();
+    for (at_ms, cost, tokens, model) in rows {
         let day = jiff::Timestamp::from_millisecond(at_ms)
             .map(|t| t.to_zoned(tz.clone()).strftime("%Y-%m-%d").to_string())
             .unwrap_or_default();
+        let model = model.unwrap_or_else(|| "(not recorded)".into());
         match buckets.last_mut() {
-            Some(last) if last.0 == day => {
-                last.1 += 1;
-                last.2 += tokens;
-                last.3 += cost;
+            Some(last) if last.0 == day && last.1 == model => {
+                last.2 += 1;
+                last.3 += tokens;
+                last.4 += cost;
             }
-            _ => buckets.push((day, 1, tokens, cost)),
+            _ => buckets.push((day, model, 1, tokens, cost)),
         }
     }
     let max = buckets
         .iter()
-        .map(|b| b.3)
+        .map(|b| b.4)
         .fold(0.0_f64, f64::max)
         .max(0.01);
     let cap = cfg.budgets.daily_usd;
     let rows_html: String = buckets
         .iter()
         .rev()
-        .map(|(day, turns, tokens, cost)| {
+        .map(|(day, model, turns, tokens, cost)| {
             let pct = (cost / max * 100.0).clamp(1.0, 100.0);
             let over = cap.is_some_and(|c| *cost > c);
             format!(
-                "<tr><td>{day}</td><td>{turns}</td><td>{tokens}</td>\
+                "<tr><td>{day}</td><td><code>{}</code></td><td>{turns}</td><td>{tokens}</td>\
                  <td><span class='bar{}' style='width:{}em'></span> <span class='{}'>${:.4}</span></td></tr>",
+                escape_html(model),
                 if over { " over" } else { "" },
                 (pct / 4.0) as u32,
                 if over { "bad" } else { "" },
@@ -969,14 +1062,14 @@ pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
             )
         })
         .collect();
-    let today = buckets.last().map(|b| b.3).unwrap_or(0.0);
+    let today = buckets.last().map(|b| b.4).unwrap_or(0.0);
     let budget_note = match cap {
         Some(c) => format!("${today:.4} of ${c:.2} today"),
         None => format!("${today:.4} today (no cap set)"),
     };
     let body = format!(
         "<p class='muted'>{budget_note}</p>\
-         <table><tr><th>day</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table>\
+         <table><tr><th>day</th><th>model</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table>\
          <style>.bar{{display:inline-block;height:0.8em;background:var(--accent);border-radius:3px;vertical-align:middle}}.bar.over{{background:var(--bad)}}</style>"
     );
     nav_page(runtime, "/usage", "Usage", body)

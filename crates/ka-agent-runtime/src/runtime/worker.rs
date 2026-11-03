@@ -51,6 +51,13 @@ impl Runtime {
         )
         .spawn_delay(self.lock().restart_attempt);
         if !wait.is_zero() {
+            // A crash-loop backoff can freeze the next message for tens of
+            // seconds; say so instead of looking hung.
+            if wait >= Duration::from_secs(2) {
+                self.sh.emit(AgentEvent::Note {
+                    text: format!("respawning worker in {}s (backoff)", wait.as_secs()),
+                });
+            }
             tokio::time::sleep(wait).await;
         }
         let (session, env, engine_layer_toml) = {
@@ -230,8 +237,13 @@ pub(super) async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>
         let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.live.as_ref().is_some_and(|l| l.deliberate_close)
     };
-    let (status, note) = {
+    let (status, note, lost_turn) = {
         let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let lost_turn = if deliberate {
+            None
+        } else {
+            g.live.as_ref().and_then(|l| l.current_turn.clone())
+        };
         g.live = None;
         if !deliberate {
             g.crashes.retain(|t| now - *t < window_ms);
@@ -257,7 +269,31 @@ pub(super) async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>
             .transition(target)
             .map_err(|t| illegal_session(from, t))
             .ok();
-        (target, note)
+        (target, note, lost_turn)
+    };
+    // A crash mid-turn must say *what* died, not just that something did:
+    // the prompt is still in the store, so name it (and how to re-send it).
+    let note = if !deliberate && status != SessionStatus::Degraded {
+        if let Some(id) = lost_turn {
+            let first = sh
+                .store
+                .get_turn(&id)
+                .ok()
+                .flatten()
+                .map(|t| t.inbound_text)
+                .unwrap_or_default();
+            let first_line = first.lines().next().unwrap_or("").trim();
+            if first_line.is_empty() {
+                note
+            } else {
+                let head: String = first_line.chars().take(80).collect();
+                format!("engine closed mid-answer; \"{head}\" was interrupted — /retry re-sends it")
+            }
+        } else {
+            note
+        }
+    } else {
+        note
     };
     for id in sh.store.expire_pending(now).unwrap_or_default() {
         sh.emit(AgentEvent::ApprovalSettled {

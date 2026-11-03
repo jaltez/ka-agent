@@ -378,7 +378,12 @@ fn render(env: &Envelope, out: &mut Term) {
             "Degraded" => println!("· ⚠ degraded — the worker keeps crashing; /new starts fresh"),
             _ => {}
         },
-        AgentEvent::Error { class, message } => println!("\n! [{class}] {message}"),
+        AgentEvent::Error { class, message } => {
+            println!("\n! [{class}] {message}");
+            if matches!(class.as_str(), "rate_limit" | "network") {
+                println!("· /retry re-sends the question; nothing runs automatically");
+            }
+        }
         // Thinking, tool structure, plans and context meters are not drawn
         // here yet (today's console fidelity).
         AgentEvent::Thought { .. }
@@ -404,7 +409,7 @@ fn banner(model: Option<&str>, attached: bool, extra: &[String]) {
     let name = persona_name();
     let mode = mode_badge();
     println!(
-        "☥ {name}{profile} · {}{mode} · {} · /help · Ctrl-C stops a reply, Ctrl-D quits",
+        "☥ {name}{profile} · {}{mode} · {} · /help · /keys · Ctrl-C stops a reply, Ctrl-D quits",
         model.unwrap_or("no model"),
         if attached {
             "connected to the background service"
@@ -591,6 +596,10 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
     let mut greeted = !attached;
     let mut busy = false;
     let mut eof_deadline: Option<tokio::time::Instant> = None;
+    // Last queue depth reported by the backend (`hello.report.queue`): at
+    // stdin EOF the loop must drain queued turns before exiting, and must
+    // not linger once nothing is left to run.
+    let mut queued_now: usize = 0;
     // The attach server greets with one `hello`; every later `hello` is a
     // reply to an explicit status request. Only those may end the EOF wait.
     let mut hello_seen = !attached;
@@ -605,6 +614,7 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                     let ev = &env.ev;
                     match ev {
                         AgentEvent::Hello { report } => {
+                            queued_now = report.queue;
                             if !greeted {
                                 greeted = true;
                                 banner(
@@ -627,15 +637,27 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                             if matches!(status.as_str(), "Idle" | "Paused" | "Degraded") {
                                 busy = false;
                             }
-                            awaiting_status = eof_deadline.is_some()
-                                && backend.request_status().await.is_ok();
+                            // At stdin EOF an idle session with an empty
+                            // queue has nothing left to deliver: exit now
+                            // (the old wait lingered up to EOF_WAIT here).
+                            if eof_deadline.is_some()
+                                && matches!(status.as_str(), "Idle" | "Paused" | "Degraded")
+                                && queued_now == 0
+                            {
+                                break;
+                            }
+                            awaiting_status =
+                                eof_deadline.is_some() && backend.request_status().await.is_ok();
                             if !awaiting_status && eof_deadline.is_some() {
                                 break;
                             }
                         }
                         AgentEvent::TurnFinished { .. } => {
-                            awaiting_status = eof_deadline.is_some()
-                                && backend.request_status().await.is_ok();
+                            if eof_deadline.is_some() && queued_now == 0 {
+                                break;
+                            }
+                            awaiting_status =
+                                eof_deadline.is_some() && backend.request_status().await.is_ok();
                             if !awaiting_status && eof_deadline.is_some() {
                                 break;
                             }
@@ -661,7 +683,6 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                     }
                     if let Some(t) = terminal.as_mut() {
                         crate::term::show_event(t, &env);
-                        crate::term::cards::print_card(&env);
                     } else {
                         render(&env, &mut term);
                     }

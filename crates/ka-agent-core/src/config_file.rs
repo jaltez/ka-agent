@@ -116,14 +116,23 @@ pub fn get(path: &Path, key: &str) -> Result<Option<String>, Error> {
 }
 
 /// Validate `doc` as a full config and atomically replace `path` with it
-/// (parent dirs created, `path.tmp` + rename, mode 0600 on Unix). On a
-/// validation error nothing is written.
+/// (parent dirs created, `path.tmp` + rename, mode 0600 on Unix). The
+/// previous file, when one exists, is kept one generation as
+/// `<config>.bak` (each write overwrites it — D10). On a validation
+/// error nothing is written.
 pub fn write_doc(path: &Path, doc: &DocumentMut) -> Result<DaemonConfig, Error> {
     let cfg = parse_validate(path, doc)?;
     let text = doc.to_string();
     let write_err = |e: std::io::Error| Error::Edit(format!("write {}: {e}", path.display()));
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(write_err)?;
+    }
+    // One-generation snapshot of the pre-edit file: a semantically bad
+    // value stays recoverable even after the operator closed the editor.
+    if let Ok(previous) = std::fs::read(path) {
+        let mut bak_name = path.as_os_str().to_os_string();
+        bak_name.push(".bak");
+        write_private(std::path::Path::new(&bak_name), &previous).map_err(write_err)?;
     }
     let mut tmp_name = path.as_os_str().to_os_string();
     tmp_name.push(".tmp");
@@ -395,5 +404,26 @@ mod tests {
         let dir = tmp_config("unset-missing", None);
         unset(&dir, "model").unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn writes_keep_one_generation_backup() {
+        let p = tmp_config("bak", Some(BASE));
+        set(&p, "mode", "allow").unwrap();
+        let bak = std::path::PathBuf::from(format!("{}.bak", p.display()));
+        let first = std::fs::read_to_string(&bak).unwrap();
+        assert!(first.contains("mode = \"guarded\""), "{first}");
+        assert!(first.contains("# keep me"), "{first}");
+        // A second write rotates: .bak now holds the previous state.
+        set(&p, "mode", "readonly").unwrap();
+        let second = std::fs::read_to_string(&bak).unwrap();
+        assert!(second.contains("mode = \"allow\""), "{second}");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("readonly"));
+        // unset rotates too; a fresh file never creates one.
+        unset(&p, "mode").unwrap();
+        assert!(std::fs::read_to_string(&bak).unwrap().contains("readonly"));
+        let fresh = tmp_config("bak-fresh", None);
+        set(&fresh, "budgets.daily_tokens", "1000").unwrap();
+        assert!(!std::path::PathBuf::from(format!("{}.bak", fresh.display())).exists());
     }
 }

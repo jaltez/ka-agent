@@ -111,6 +111,26 @@
   var currentText = ""; // its raw text, re-rendered when the turn ends
   var notes = [];
 
+  // Keep a sidebar badge (approvals, memory review) in step with the
+  // live stream, so the persistent "N waiting" signal does not go stale
+  // until the next reload. `data-nav` comes from the server-rendered nav.
+  function bumpBadge(href, delta) {
+    var link = document.querySelector("a[data-nav='" + href + "']");
+    if (!link) return;
+    var badge = link.querySelector(".badge");
+    var n = (badge ? parseInt(badge.textContent, 10) || 0 : 0) + delta;
+    if (n <= 0) {
+      if (badge) badge.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "badge";
+      link.appendChild(badge);
+    }
+    badge.textContent = String(n);
+  }
+
   function assistant() {
     if (!current) {
       current = bubble("assistant");
@@ -196,6 +216,7 @@
         line(bubble("system"), ev.text, "muted").style.textAlign = "center";
         break;
       case "approval":
+        bumpBadge("/approvals", 1);
         finish();
         current = bubble("approval");
         line(current, "approval " + ev.id);
@@ -216,6 +237,7 @@
         current.appendChild(actions);
         break;
       case "approval_settled":
+        bumpBadge("/approvals", -1);
         finish();
         var cards = log.querySelectorAll(".approval");
         for (var i = cards.length - 1; i >= 0; i--) {
@@ -227,6 +249,23 @@
             label.className = "settled muted";
           }
         }
+        break;
+      case "final_chunk":
+        // The settled answer, whole: whatever partial stream we hold is
+        // replaced (a reconnect that missed the deltas still ends with
+        // the full text). Chunks after the first append.
+        if (!current) current = bubble("assistant");
+        if ((ev.index || 1) <= 1) currentText = ev.text || "";
+        else currentText += ev.text || "";
+        var dot = current.querySelector(".pending");
+        if (dot) dot.remove();
+        break;
+      case "memory_proposal":
+        // The review inbox grows; the Memory badge says so live.
+        bumpBadge("/memory", 1);
+        break;
+      case "session":
+        // Status-only (idle/running); the turn events carry the story.
         break;
       case "turn_finished":
         finish();

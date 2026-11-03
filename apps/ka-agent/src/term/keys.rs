@@ -3,8 +3,25 @@
 //! editor binds, and forwards [`Key`] events. Split reads are buffered; a
 //! lone ESC is only emitted after a short pause (an arrow key arrives whole),
 //! and control bytes the editor binds nothing to are consumed and ignored.
+//!
+//! The reader cooperatively pauses ([`Pause`]) while an external editor owns
+//! the terminal (Ctrl-G): it neither polls nor reads stdin until released,
+//! so $EDITOR gets every keystroke.
 
 use tokio::sync::mpsc;
+
+/// Cooperative pause for the reader thread: while set, the reader sleeps
+/// instead of polling or reading stdin (an external editor owns the
+/// terminal). Cloned handles share one flag.
+#[derive(Clone)]
+pub struct Pause(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Pause {
+    /// Set (pause) or clear (resume) the reader.
+    pub fn set(&self, on: bool) {
+        self.0.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// One decoded key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,15 +55,24 @@ pub enum Key {
     /// The terminal gained/lost focus.
     Focus(bool),
 }
-
-/// Decode console input until EOF; every complete key is sent. The
-/// channel closes when the input ends.
+/// Decode console input until EOF; every complete key is sent. The channel
+/// closes when the input ends. While the returned [`Pause`] is set the
+/// reader sleeps instead of reading — an external editor owns the console.
 #[cfg(windows)]
-pub fn spawn_reader() -> mpsc::Receiver<Key> {
+pub fn spawn_reader() -> (mpsc::Receiver<Key>, Pause) {
     use crossterm::event::{Event, KeyEvent, KeyEventKind};
     let (tx, rx) = mpsc::channel(256);
+    let pause = Pause(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let paused = std::sync::Arc::clone(&pause.0);
     std::thread::spawn(move || {
         loop {
+            // Paused: the external editor owns the console input.
+            if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
             let event = match crossterm::event::read() {
                 Ok(event) => event,
                 Err(_) => return,
@@ -75,7 +101,7 @@ pub fn spawn_reader() -> mpsc::Receiver<Key> {
             }
         }
     });
-    rx
+    (rx, pause)
 }
 
 /// A Windows console key event → the shared [`Key`] vocabulary.
@@ -153,19 +179,29 @@ const ESC_PAUSE: rustix::event::Timespec = rustix::event::Timespec {
 };
 
 /// Decode stdin until EOF; every complete key is sent. `None` payload means
-/// the stream closed.
+/// the stream closed. While the returned [`Pause`] is set the reader neither
+/// polls nor reads stdin — an external editor owns the terminal.
 #[cfg(unix)]
-pub fn spawn_reader() -> mpsc::Receiver<Key> {
+pub fn spawn_reader() -> (mpsc::Receiver<Key>, Pause) {
     let (tx, rx) = mpsc::channel(256);
+    let pause = Pause(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let paused = std::sync::Arc::clone(&pause.0);
     std::thread::spawn(move || {
         use rustix::event::{PollFd, PollFlags, poll};
         // Read the descriptor directly: `std::io::Stdin` buffers, so `poll`
         // could time out while bytes sit in that buffer. The terminal owns
-        // stdin while it is active, so no other reader competes.
+        // stdin while it is active, so no other reader competes — except an
+        // external editor, which the pause flag yields to.
         let stdin = rustix::stdio::stdin();
         let mut buf = [0u8; 1024];
         let mut pending: Vec<u8> = Vec::new();
         loop {
+            if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
             // Wait for bytes; with a partial buffer, only for the ESC pause.
             let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
             let timeout = (!pending.is_empty()).then_some(&ESC_PAUSE);
@@ -186,6 +222,11 @@ pub fn spawn_reader() -> mpsc::Receiver<Key> {
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(_) => break,
+            }
+            // The pause may have landed while poll waited: leave the bytes
+            // in the kernel buffer for the editor.
+            if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
             }
             let n = match rustix::io::read(stdin, &mut buf) {
                 Ok(0) => break,
@@ -216,7 +257,7 @@ pub fn spawn_reader() -> mpsc::Receiver<Key> {
             }
         }
     });
-    rx
+    (rx, pause)
 }
 
 #[cfg(unix)]

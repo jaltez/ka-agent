@@ -20,6 +20,10 @@ workspace = "~/.ka-agent/profiles/default/workspace"
 # Operator timezone (IANA name). Default: the system zone. Every reminder
 # and cron time is interpreted here. (Top-level keys go before any [table].)
 # timezone = "Europe/Madrid"
+# Operator language: assistant replies and channel chrome follow it.
+# en | es (default: en).
+# language = "en"
+
 
 # Permission mode for new sessions: "ask" (default) | "accept_edits" |
 # "allow" | "readonly". The old names (guarded/free/plan) still work.
@@ -36,7 +40,7 @@ turn_grace_secs = 10
 
 # Stop an engine worker after this many idle seconds to release its
 # process; the next message restarts it and resumes the strand. 0 keeps
-# the worker forever (default: 900).
+# the worker forever (default: 900; ceiling one week = 604800).
 worker_idle_timeout_secs = 900
 
 [worker_restart]
@@ -79,8 +83,9 @@ enabled = false
 # enabled = true
 # port = 8480
 
-# Daily calendar digest time, local wall clock (what `/calendar add`
-# schedules). Defaults to "08:00".
+# Daily calendar digest time, local wall clock — what `/calendar add`
+# schedules, and what a live change moves existing digest crons to.
+# Defaults to "08:00".
 # [calendar]
 # digest_time = "08:00"
 

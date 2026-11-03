@@ -11,6 +11,9 @@ pub struct Editor {
     cursor: usize,
     /// True while Ctrl-R searches (the prompt is drawn by the driver).
     pub searching: bool,
+    /// The last killed text (Ctrl-Y yanks it back; an empty kill does not
+    /// replace it, like readline).
+    last_kill: String,
 }
 
 impl Editor {
@@ -44,10 +47,24 @@ impl Editor {
         self.cursor += 1;
     }
 
+    /// Insert text verbatim — pasted content keeps its real newlines (the
+    /// draft displays them as `⏎` and submits them as-is); only a *typed*
+    /// newline folds to a space (the driver's `Key::Newline` arm). A
+    /// pasted `\r`/`\r\n` normalizes to `\n` (terminals send CR), and
+    /// other C0 controls are dropped: they would move the cursor for real.
     pub fn insert_str(&mut self, text: &str) {
-        for c in text.chars() {
-            // Pasted newlines become spaces: one line input, Enter submits.
-            let c = if c == '\n' || c == '\r' { ' ' } else { c };
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            let c = match c {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    '\n'
+                }
+                c if c.is_control() && c != '\n' => continue,
+                c => c,
+            };
             self.insert(c);
         }
         self.after_edit();
@@ -106,9 +123,10 @@ impl Editor {
         }
     }
 
-    /// Ctrl-K: kill to the end.
+    /// Ctrl-K: kill to the end (the kill ring remembers it).
     pub fn kill_to_end(&mut self) -> String {
         let killed: String = self.chars.drain(self.cursor..).collect();
+        self.remember_kill(&killed);
         killed
     }
 
@@ -116,6 +134,7 @@ impl Editor {
     pub fn kill_to_start(&mut self) -> String {
         let killed: String = self.chars.drain(..self.cursor).collect();
         self.cursor = 0;
+        self.remember_kill(&killed);
         killed
     }
 
@@ -124,12 +143,28 @@ impl Editor {
         let end = self.cursor;
         self.word_left();
         let killed: String = self.chars.drain(self.cursor..end).collect();
+        self.remember_kill(&killed);
         killed
+    }
+
+    fn remember_kill(&mut self, killed: &str) {
+        if !killed.is_empty() {
+            self.last_kill = killed.to_string();
+        }
+    }
+
+    /// Ctrl-Y: yank the last kill back at the cursor.
+    pub fn yank(&mut self) {
+        let text = self.last_kill.clone();
+        self.insert_str(&text);
     }
 
     // ---- display geometry -------------------------------------------
 
     /// Visual rows for `width` columns (wide chars count 2, wrapping by
+    /// width; a newline counts one column — it displays as `⏎`, never as a
+    /// real row break inside the live area). Returns the rows' char ranges
+    /// plus the cursor's (row, col).
     /// width). Returns the rows' char ranges plus the cursor's (row, col).
     pub fn layout(&self, width: usize) -> (Vec<(usize, usize)>, (usize, usize)) {
         let width = width.max(1);
@@ -138,7 +173,11 @@ impl Editor {
         let mut col = 0usize;
         let mut cursor_pos = (0usize, 0usize);
         for (i, c) in self.chars.iter().enumerate() {
-            let w = c.width().unwrap_or(0);
+            let w = if *c == '\n' {
+                1
+            } else {
+                c.width().unwrap_or(0)
+            };
             if col + w > width && col > 0 {
                 rows.push((row_start, i));
                 row_start = i;
@@ -155,7 +194,17 @@ impl Editor {
             let col = self
                 .chars
                 .get(rows[last].0..self.cursor)
-                .map(|s| s.iter().map(|c| c.width().unwrap_or(0)).sum())
+                .map(|s| {
+                    s.iter()
+                        .map(|c| {
+                            if *c == '\n' {
+                                1
+                            } else {
+                                c.width().unwrap_or(0)
+                            }
+                        })
+                        .sum()
+                })
                 .unwrap_or(0);
             cursor_pos = (last, col);
         }
@@ -331,6 +380,43 @@ mod tests {
         w.insert_str("你好世界");
         let (rows, _) = w.layout(4);
         assert_eq!(rows, vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn paste_keeps_newlines_and_yank_restores_kills() {
+        let mut e = Editor::default();
+        // A pasted multi-line buffer keeps its real newlines (A10): the
+        // draft submits them verbatim.
+        e.insert_str("line one\nline two\nline three");
+        assert_eq!(e.text(), "line one\nline two\nline three");
+        // One column per newline, so the live-area row math stays exact.
+        let (rows, cursor) = e.layout(80);
+        assert_eq!(rows, vec![(0, 28)]);
+        assert_eq!(cursor, (0, 28));
+        // Ctrl-U then Ctrl-Y round-trips the draft (A11).
+        e.kill_to_start();
+        assert_eq!(e.text(), "");
+        e.yank();
+        assert_eq!(e.text(), "line one\nline two\nline three");
+        // An empty kill (cursor already at the end) does not clobber the
+        // ring: the yank still returns the pasted text.
+        e.clear();
+        e.insert_str("x");
+        e.kill_to_end();
+        assert_eq!(e.text(), "x");
+        e.clear();
+        e.yank();
+        assert_eq!(e.text(), "line one\nline two\nline three");
+    }
+
+    #[test]
+    fn kill_word_is_yankable_too() {
+        let mut e = Editor::default();
+        e.insert_str("abc def");
+        assert_eq!(e.kill_word(), "def");
+        assert_eq!(e.text(), "abc ");
+        e.yank();
+        assert_eq!(e.text(), "abc def");
     }
 
     #[test]

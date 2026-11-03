@@ -167,8 +167,8 @@ by `turn_finished{stop:"error"}` and reacts by class (SEED §3.8
 | `ErrorClass` | Ka Agent reaction |
 |---|---|
 | `auth` | Pause the instance; alert the operator via Telegram and the CLI. |
-| `rate_limit` | Report it; offer a **Retry** button (no auto-retry). |
-| `network` | Report it; offer a **Retry** button (no auto-retry). |
+| `rate_limit` | Report it; offer a **Retry** affordance (no auto-retry): `/retry` on every surface, the ↻ inline button on Telegram, and `ka-agent ask --wait` for scripts. `Runtime::retry_last` re-submits the stored `inbound_text` of the newest `error`/`interrupted` turn only — never automatically. |
+| `network` | Report it; offer the same **Retry** affordance (no auto-retry). |
 | `overflow` | Offer `/compact` (Ka's `compact`) or `/new`. |
 | `protocol`, `unsupported`, `internal` | Report a short summary; log details. |
 

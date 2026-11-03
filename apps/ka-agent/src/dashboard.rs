@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use ka_agent_core::DaemonConfig;
+
 use ka_agent_runtime::paths::Paths;
 
 use crate::admin;
@@ -14,7 +16,7 @@ fn fail(msg: &str) -> std::process::ExitCode {
 
 /// The daemon is the source of truth: it publishes `web.url` when the UI
 /// bound, so no config read is needed here.
-pub fn dashboard(_config: PathBuf, no_open: bool) -> std::process::ExitCode {
+pub fn dashboard(config: PathBuf, no_open: bool) -> std::process::ExitCode {
     let paths = Paths::new(Paths::default_root());
     if !admin::is_running(&paths) {
         return fail("start Ka Agent first: ka-agent service install (or ka-agent run)");
@@ -24,7 +26,22 @@ pub fn dashboard(_config: PathBuf, no_open: bool) -> std::process::ExitCode {
     };
     let url = match store.meta_get("web.url").ok().flatten() {
         Some(u) if !u.is_empty() => u,
-        _ => return fail("the web UI is off — ka-agent config set web.enabled true"),
+        _ => {
+            // The daemon only publishes `web.url` when the listener bound:
+            // with web enabled in the config, a missing URL means the
+            // bind failed (port busy), not that the UI is off.
+            let enabled = DaemonConfig::load(&config)
+                .map(|c| c.web.enabled)
+                .unwrap_or(true);
+            return if enabled {
+                fail(
+                    "the web UI failed to start (port busy?) — try `ka-agent config set web.port <n>`, \
+                     then `ka-agent restart`; details: `ka-agent logs`",
+                )
+            } else {
+                fail("the web UI is off — ka-agent config set web.enabled true")
+            };
+        }
     };
     match ka_agent_web::issue_auth_url(&store, url_port(&url)) {
         Ok(link) => {

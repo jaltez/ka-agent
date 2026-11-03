@@ -32,6 +32,14 @@ const START_REPLY_INTERVAL_MS: i64 = 60 * 60 * 1000;
 const MAX_MESSAGE_CHARS: usize = 4096;
 const START_REPLY: &str = "This is a private assistant. If you are its owner, run `ka-agent pair telegram` on your computer and send the code here.";
 
+/// The bot's "What can this bot do?" text (`setMyDescription`, ≤ 512
+/// chars) — the empty-chat screen before the first message.
+pub(crate) const BOT_DESCRIPTION: &str = "Ka Agent — a resident personal assistant. \
+This private chat answers its paired operator; run `ka-agent pair telegram` \
+on your computer to pair.";
+/// The chat-list blurb (`setMyShortDescription`, ≤ 120 chars).
+pub(crate) const BOT_SHORT_DESCRIPTION: &str = "Resident personal assistant daemon";
+
 #[derive(Debug, Error)]
 pub(crate) enum ChannelError {
     #[error("telegram api: {description}")]

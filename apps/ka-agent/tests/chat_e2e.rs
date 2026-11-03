@@ -1330,3 +1330,33 @@ fn allow_for_session_skips_identical_asks_only() {
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A9: `/keys` lists the terminal bindings (the piped console sees the
+/// same table as the TUI), the banner names it, and `/help` lists it like
+/// every other command.
+#[test]
+fn keys_command_lists_the_terminal_bindings() {
+    let root = temp_root("keys");
+    let sc = scenario_file(
+        &root,
+        "keys.json",
+        r#"{ "steps": [ {"text": "ok"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    // The banner advertises both discovery commands.
+    chat.expect("/help · /keys", Duration::from_secs(10));
+    chat.send("/keys");
+    chat.expect("Ctrl-O", Duration::from_secs(10));
+    chat.expect("Tab", Duration::from_secs(10));
+    chat.expect("Ctrl-Y", Duration::from_secs(10));
+    chat.expect("Esc", Duration::from_secs(10));
+    // `/help` lists it like every other command.
+    chat.send("/help");
+    chat.expect(
+        "/keys — the terminal client's key bindings",
+        Duration::from_secs(10),
+    );
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}

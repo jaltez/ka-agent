@@ -79,6 +79,10 @@ pub fn ask(
         eprintln!("ka-agent: not running — start it with `ka-agent run`");
         return std::process::ExitCode::FAILURE;
     }
+    // A script asking a question wants the answer: without a TTY on
+    // stdout (a pipe, a CI job), wait for the turn instead of returning
+    // silently (F1). `--wait` is still honored on a terminal.
+    let wait = wait || !std::io::IsTerminal::is_terminal(&std::io::stdout());
     let request = serde_json::json!({
         "op": "ask",
         "text": text,
@@ -87,6 +91,19 @@ pub fn ask(
     });
     match admin::request(&paths, &request) {
         Ok(v) if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
+            if let Some(reply) = v.get("reply").and_then(|r| r.as_str())
+                && !reply.trim().is_empty()
+            {
+                println!("{reply}");
+            } else if v.get("queued").and_then(|q| q.as_bool()) == Some(true) {
+                println!(
+                    "· queued behind the running turn — the reply lands in your chat/Telegram; --wait prints it here"
+                );
+            } else if !wait {
+                println!(
+                    "· submitted — the reply lands in your chat/Telegram; --wait prints it here"
+                );
+            }
             std::process::ExitCode::SUCCESS
         }
         Ok(v) => {

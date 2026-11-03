@@ -317,7 +317,23 @@ fn main() -> std::process::ExitCode {
         } => triggers_cli::ask(&text, wait, background, config_path(&config)),
         Command::Hooks { action, config } => triggers_cli::hooks(action, config_path(&config)),
         Command::Restart => daemon::restart_client(),
-        Command::Status { json } => daemon::status_client(json),
+        Command::Status { json } => {
+            // C2: a fresh root learns about `setup` first, not `service
+            // install` — same guard the plain `ka-agent` path uses for
+            // chat, and only when nothing is running on this root.
+            if !json {
+                let paths = ka_agent_runtime::paths::Paths::new(
+                    ka_agent_runtime::paths::Paths::default_root(),
+                );
+                if !crate::admin::is_running(&paths) && !config_path(&None).exists() {
+                    eprintln!(
+                        "ka-agent: Ka Agent isn't set up yet — run `ka-agent setup` (about 3 minutes)"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            daemon::status_client(json)
+        }
         Command::Completions { shell } => completions(shell),
         Command::Pair { channel, config } => pair::pair(channel, config_path(&config)),
         Command::Model { selector, config } => {
@@ -412,6 +428,7 @@ fn main() -> std::process::ExitCode {
             config,
             online,
             json,
-        } => doctor::doctor(config_path(&config), online, json),
+            fix,
+        } => doctor::doctor(config_path(&config), online, json, fix),
     }
 }

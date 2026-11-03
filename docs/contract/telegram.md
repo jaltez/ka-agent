@@ -25,9 +25,17 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   /reminders /cron /calendar /skills /skill /approvals /y /n /steer`
   (the shared table's `telegram` flag); `/persona /effort /undo /queue
   /tools` also work from the phone but stay out of the menu, and `/quit`
-  refuses from any remote channel. `/start` is an alias of `/help` and
-  ignores a deep-link payload: `/start <payload>` answers the command
-  list (never `unknown command /<payload>`). Any other `/word` gets
+  refuses from any remote channel.
+- `/start` from a linked chat is an alias of `/help` and ignores a
+  deep-link payload: `/start <payload>` answers the command list (never
+  `unknown command /<payload>`). From an **unlinked** private chat,
+  `/start <payload>` redeems the payload as a pairing code — the one-tap
+  form of `/pair` that `ka-agent pair telegram` and setup print as
+  `https://t.me/<bot>?start=<code>` — with `/pair`'s exact semantics
+  (10-min TTL, 5 attempts, constant-time compare). A wrong payload burns
+  an attempt and is answered like a wrong `/pair` (nothing), never with
+  the hourly owner hint; plain `/start` from an unlinked chat gets that
+  hint at most once an hour. Any other `/word` gets
   `unknown command /word — /help lists them`. Free text expands
   `@references` and goes to `runtime.handle_message`.
 - Callback queries are answered exactly once. Data this build does not
@@ -36,18 +44,41 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   callback also gets only an empty answer (it closes the spinner and
   reveals nothing), plus the audit row every unauthorized update gets.
 - On startup (after the `getMe` token check) the channel registers the
-  command list via `setMyCommands` so clients autocomplete it;
-  best-effort — a refusal never disables the channel.
+  command list via `setMyCommands` so clients autocomplete it, and sets
+  the bot profile via `setMyDescription` (the empty-chat "What can this
+  bot do?" screen) and `setMyShortDescription` (the chat-list blurb);
+  all best-effort — a refusal never disables the channel.
 - Files/photos (SEED.md §5.4): the largest photo variant or the document
   is downloaded (`getFile` + `/file/bot<token>/<path>`, 20 MB cap) into
   `<workspace>/attachments/` — filenames sanitized to `[A-Za-z0-9._-]`
   (no leading dot, no `..` runs, ≤ 64 chars), collisions get `-N`
-  suffixes, never overwrite. The reply names the file as an
-  `@attachments/…` reference the operator can paste into the next
-  message (`@` expansion resolves against the workspace). A failed
-  download is a visible `! [attachment] …` reply, never a silent drop.
+  suffixes, never overwrite. **Without a caption** the reply names the
+  file as an `@attachments/…` reference the operator can paste into the
+  next message (`@` expansion resolves against the workspace). **With a
+  caption** the caption is the operator's message: it is submitted as a
+  turn (👀 receipt, router, `@reference` expansion, engine) with every
+  saved file riding along as `caption\n@attachments/…` refs — there is
+  no bare ack to lose the question. A failed download is a visible
+  `! [attachment] …` reply, never a silent drop.
+- Albums (media groups): messages sharing a `media_group_id` are each
+  saved at once, then answered **once** after a 750 ms debounce (the
+  group map is in-memory; a restart re-delivers via the offset).
+  Caption-less albums get one `saved N files — reference them with @…`
+  ack naming every ref; an album with a caption on any member becomes
+  one caption turn carrying all the refs.
+- Unsupported media kinds (`video_note`, `video`, `animation`,
+  `sticker`, `location`, `contact`) get an explicit
+  `! [media] <kind> isn't supported yet` reply (human kind names, e.g.
+  `video note`) — no turn, no 👀, never a silent drop.
 - Accepted free text gets a `👀` reaction (`setMessageReaction`) at once —
   a receipt, kept after the answer (clearing costs a call per message).
+- Errors with class `rate_limit` or `network` carry a `↻ Retry` inline
+  button (`callback_data = retry:last`); pressing it answers the callback
+  with a toast and re-submits the newest `error`/`interrupted` turn's
+  stored text through `Runtime::retry_last` — never automatically. A press
+  with nothing to retry answers `nothing to retry` and changes nothing.
+  In-turn notes have the engine's local `(esc cancels)` hint stripped:
+  Esc does nothing on the phone; `/stop` is the remote interrupt.
 - Voice notes / audio (`voice`, `audio`): with `[voice]` configured the file
   is downloaded (20 MB / 10 min caps), sent to the OpenAI-compatible
   `/audio/transcriptions` endpoint, echoed back as `🎙 “…”`, and handled
@@ -102,14 +133,21 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   surface uses) through the same 1 s / growth throttle as answer text; the
   first streamed delta replaces it. Scheduled turns (`cron`, `cron:*`,
   `briefing`) never open a draft.
-- Files the operator asks for (`AgentEvent::File`): jpg/jpeg/png/webp up to
-  10 MB go out as `sendPhoto` (multipart with the caption), everything else
-  as `sendDocument`. The tool cap is 50 MB, so uploads use a dedicated
-  10-minute HTTP timeout (`MEDIA_HTTP_TIMEOUT`, not the 40 s polling
-  timeout). A caption longer than Telegram's 1024-character limit is
-  truncated before the request to 1023 characters plus `…` — the file
-  still goes out; an empty caption sends no caption field. A read error or
-  a refused send falls back to a notice carrying the file's absolute path.
+- Files the operator asks for (`AgentEvent::File`): jpg/jpeg/png/webp up
+  to 10 MB go out as `sendPhoto`; mp4/m4v/webm/mkv and gif up to 50 MB go
+  out inline as `sendVideo` / `sendAnimation` (multipart part `video` /
+  `animation`, so they play in the chat instead of downloading);
+  everything else — and any refused or over-limit inline send — falls
+  back to `sendDocument`, so the file is never lost. Each file first
+  fires one matching `sendChatAction` (`upload_photo` for the photo
+  split, `upload_document` otherwise): the phone shows an upload
+  indicator instead of "typing…" while a big file goes out. The tool cap
+  is 50 MB, so uploads use a dedicated 10-minute HTTP timeout
+  (`MEDIA_HTTP_TIMEOUT`, not the 40 s polling timeout). A caption longer
+  than Telegram's 1024-character limit is truncated before the request
+  to 1023 characters plus `…` — the file still goes out; an empty
+  caption sends no caption field. A read error or a refused send falls
+  back to a notice carrying the file's absolute path.
 - Skill proposals: `skill_propose` posts a card with `✅ Accept` /
   `✖ Reject` (`callback_data = sk:a|r:<id>`, verdict first, then the full
   id or its short suffix; ≤ 64 bytes), routed through the same

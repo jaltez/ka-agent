@@ -149,7 +149,12 @@ fn config_set_fallback_validates_against_the_catalog() {
 #[test]
 fn commands_on_a_fresh_machine_say_not_set_up_yet() {
     let root = temp_root("fresh");
-    for args in [&["chat"][..], &["run"][..], &["mcp", "list"][..]] {
+    for args in [
+        &["chat"][..],
+        &["run"][..],
+        &["mcp", "list"][..],
+        &["status"][..],
+    ] {
         let o = ka(&root, args);
         assert!(!o.status.success(), "{args:?}");
         let t = text(&o);
@@ -186,11 +191,16 @@ fn help_lists_the_everyday_commands_and_hides_the_rest() {
         .lines()
         .filter(|l| l.starts_with("  ") && !l.trim().is_empty())
         .count();
-    // Everyday commands: the core set + persona/notify/ask/hooks.
-    assert!(n <= 21, "{n} commands listed:\n{t}");
+    // C1: the everyday set stays ≤ 16 rows; the rest moved to the footer.
+    assert!(n <= 16, "{n} commands listed:\n{t}");
     assert!(!t.contains("SEED.md"), "{t}");
     assert!(t.contains("More commands:"), "{t}");
-    for hidden in ["grant", "plugin", "purge", "identity", "run"] {
+    // C3: `import` is named in the footer, not left undocumented.
+    assert!(t.contains("import"), "{t}");
+    for hidden in [
+        "grant", "plugin", "purge", "identity", "run", "notify", "hooks", "persona", "mcp",
+        "usage", "memory", "import",
+    ] {
         let o = ka(&root, &[hidden, "--help"]);
         assert!(o.status.success(), "{hidden}: {}", text(&o));
         assert!(!text(&o).contains("SEED.md"), "{hidden}: {}", text(&o));
@@ -663,8 +673,8 @@ fn models_merges_the_registry_and_writes_the_cache() {
 }
 
 /// Offline, the cached registry keeps answering (marked `(cached)`),
-/// and with no cache at all the listing is exactly the old
-/// catalog-only output — default first, no footer line.
+/// and with no cache at all the listing is the pinned catalog —
+/// default first, footer saying the live registry did not answer.
 #[test]
 fn models_serves_the_cache_when_the_registry_is_unreachable() {
     let root = temp_root("reg-cache");
@@ -698,8 +708,9 @@ fn models_serves_the_cache_when_the_registry_is_unreachable() {
         "cached footer: {out}"
     );
 
-    // Offline with no cache at all: byte-identical to the catalog-only
-    // listing (header, default model first, no footer of any kind).
+    // Offline with no cache at all: the pinned catalog listing
+    // (header, default model first) plus a footer saying the live
+    // registry did not answer.
     let bare = temp_root("reg-none");
     let o = ka_env(
         &bare,
@@ -719,8 +730,13 @@ fn models_serves_the_cache_when_the_registry_is_unreachable() {
         "the default leads as before: {out}"
     );
     assert!(
-        !out.contains("models.dev") && !out.contains("catalog only"),
-        "no footer when offline without a cache: {out}"
+        !out.contains("models.dev"),
+        "no live-registry footer when offline without a cache: {out}"
+    );
+    assert!(
+        out.trim_end()
+            .ends_with("catalog only (live registry unreachable)"),
+        "the offline footer says so: {out}"
     );
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&bare);
@@ -767,7 +783,8 @@ fn probe_reports_a_dead_model_with_the_gateway_message() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `models --probe` without a key sends nothing and says so.
+/// `models --probe` without a key sends nothing and says so, naming
+/// the env var that fixes it.
 #[test]
 fn probe_without_a_key_is_not_probed() {
     let root = temp_root("probe-nokey");
@@ -781,8 +798,9 @@ fn probe_without_a_key_is_not_probed() {
     let out = text(&o);
     assert!(o.status.success(), "{out}");
     assert!(
-        out.trim_end()
-            .ends_with("· opencode-go/glm-5.3 not probed (no key)"),
+        out.trim_end().ends_with(
+            "· opencode-go/glm-5.3 not probed (no key) — ka-agent key set OPENCODE_API_KEY"
+        ),
         "{out}"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -840,4 +858,264 @@ fn setup_picker_offers_registry_models_first() {
         "the registry's first model is the default pick: {cfg}"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// D1: `grant path add|list|rm` edits `[[grants.path]]` row by row, and
+/// `config unset grants.path` never bulk-deletes silently.
+#[test]
+fn grant_path_add_list_rm_round_trip() {
+    let root = temp_root("grantpath");
+    std::fs::write(root.join("config.toml"), "# keep\nmode = \"ask\"\n").unwrap();
+
+    let o = ka(&root, &["grant", "path", "add", "/tmp/proj"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = ka(
+        &root,
+        &["grant", "path", "add", "/tmp/other", "--access", "ask"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(cfg.grants.path.len(), 2);
+    assert_eq!(cfg.grants.path[0].dir, std::path::Path::new("/tmp/proj"));
+    assert!(o.status.success());
+
+    let out = text(&ka(&root, &["config", "get", "grants.path"]));
+    assert!(out.contains("/tmp/proj") && out.contains("allow"), "{out}");
+    let out = text(&ka(&root, &["grant", "path", "list"]));
+    assert!(out.contains("ask   /tmp/other"), "{out}");
+    // The operator's comment survives every write.
+    assert!(
+        std::fs::read_to_string(root.join("config.toml"))
+            .unwrap()
+            .contains("# keep")
+    );
+
+    // Re-adding the same dir re-aims it (validation forbids duplicates).
+    assert!(
+        ka(
+            &root,
+            &["grant", "path", "add", "/tmp/proj", "--access", "deny"]
+        )
+        .status
+        .success()
+    );
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(cfg.grants.path.len(), 2);
+    assert_eq!(
+        cfg.grants.path[0].access,
+        ka_agent_core::config::Access::Deny
+    );
+
+    // rm removes exactly one row.
+    assert!(
+        ka(&root, &["grant", "path", "rm", "/tmp/proj"])
+            .status
+            .success()
+    );
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(cfg.grants.path.len(), 1);
+    assert_eq!(cfg.grants.path[0].dir, std::path::Path::new("/tmp/other"));
+    assert!(
+        !ka(&root, &["grant", "path", "rm", "/nope"])
+            .status
+            .success()
+    );
+
+    // D1: unset of the table key lists what it would remove and refuses
+    // without a terminal.
+    let o = ka(&root, &["config", "unset", "grants.path"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    let out = text(&o);
+    assert!(out.contains("1 row") && out.contains("/tmp/other"), "{out}");
+    assert!(out.contains("without a terminal"), "{out}");
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(cfg.grants.path.len(), 1, "the refusal left the file alone");
+
+    // D12: the scope store's empty state points at the config grants.
+    let out = text(&ka(&root, &["grant", "list"]));
+    assert!(out.contains("no tool scopes"), "{out}");
+    assert!(out.contains("[[grants.path]]"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// D2: the schema's bounds are exactly what `config set` accepts; D9:
+/// `config get` names the default; D8: `language` is a validated enum.
+#[test]
+fn schema_bounds_defaults_and_language() {
+    let root = temp_root("bounds");
+    std::fs::write(root.join("config.toml"), "mode = \"ask\"\n").unwrap();
+
+    // The old registry bound (30) refused this; validate() accepts it.
+    let o = ka(&root, &["config", "set", "approval_ttl_secs", "10"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let schema = text(&ka(&root, &["config", "schema"]));
+    assert!(
+        schema.contains("approval_ttl_secs · int 1..=86400"),
+        "{schema}"
+    );
+    assert!(
+        schema.contains("worker_idle_timeout_secs · int 0..=604800"),
+        "{schema}"
+    );
+
+    // D9: unset keys name their default from the registry.
+    let out = text(&ka(&root, &["config", "get", "mode"]));
+    // mode IS set here; use a key that is not.
+    assert!(out.trim() == "ask", "{out}");
+    let out = text(&ka(&root, &["config", "get", "effort"]));
+    assert!(
+        out.contains("effort is not set (default: unset (model default))"),
+        "{out}"
+    );
+
+    // D8: language accepts en|es and nothing else.
+    let o = ka(&root, &["config", "set", "language", "es"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(cfg.language, "es");
+    assert!(cfg.language_preamble().contains("español"));
+    let o = ka(&root, &["config", "set", "language", "fr"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("language must be"), "{}", text(&o));
+    let cfg = ka_agent_core::DaemonConfig::load(&root.join("config.toml")).unwrap();
+    assert_eq!(cfg.language, "es", "the refusal left the file alone");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// D5: a broken engine layer is refused at set time; D10: every write
+/// keeps the previous file one generation as `<config>.bak`.
+#[test]
+fn engine_layer_checked_at_set_time_and_writes_keep_a_backup() {
+    let root = temp_root("englayer");
+    std::fs::write(root.join("config.toml"), "mode = \"ask\"\n").unwrap();
+
+    let o = ka(
+        &root,
+        &["config", "set", "ka.engine_layer", "/nonexistent/ka.toml"],
+    );
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(
+        text(&o).contains("cannot read /nonexistent/ka.toml"),
+        "{}",
+        text(&o)
+    );
+    assert!(
+        !std::fs::read_to_string(root.join("config.toml"))
+            .unwrap()
+            .contains("engine_layer")
+    );
+
+    // A present but broken TOML layer is refused too.
+    std::fs::write(root.join("bad.toml"), "not toml =").unwrap();
+    let o = ka(
+        &root,
+        &[
+            "config",
+            "set",
+            "ka.engine_layer",
+            &root.join("bad.toml").display().to_string(),
+        ],
+    );
+    assert!(!o.status.success(), "{}", text(&o));
+
+    // D10: one-generation backup on every config write.
+    let o = ka(&root, &["config", "set", "mode", "allow"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let bak = root.join("config.toml.bak");
+    assert!(
+        std::fs::read_to_string(&bak)
+            .unwrap()
+            .contains("mode = \"ask\"")
+    );
+    let o = ka(&root, &["config", "set", "mode", "readonly"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        std::fs::read_to_string(&bak)
+            .unwrap()
+            .contains("mode = \"allow\"")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// D4: `mcp test` proves a server answers at setup time — a live stdio
+/// server reports its tools, a dead URL fails naming the server.
+#[test]
+fn mcp_test_probes_servers_and_names_failures() {
+    let root = temp_root("mcptest");
+    std::fs::write(root.join("config.toml"), "mode = \"ask\"\n").unwrap();
+
+    let o = ka(
+        &root,
+        &["mcp", "add", "dead", "--url", "http://127.0.0.1:1/mcp"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let o = ka(&root, &["mcp", "test", "dead"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    let out = text(&o);
+    assert!(out.contains("dead") && out.contains("FAILED"), "{out}");
+
+    let o = ka(&root, &["mcp", "test", "nope"]);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("no MCP server \"nope\""), "{}", text(&o));
+
+    // A minimal line-oriented MCP server: initialize + tools/list.
+    let script = root.join("mcp-server.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *initialize*) echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"t\",\"version\":\"0\"}}}';;\n    *tools/list*) echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\"},{\"name\":\"note\"}]}}';;\n  esac\ndone\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let o = ka(
+            &root,
+            &["mcp", "add", "demo", "--", &script.display().to_string()],
+        );
+        assert!(o.status.success(), "{}", text(&o));
+        let o = ka(&root, &["mcp", "test", "demo"]);
+        assert!(o.status.success(), "{}", text(&o));
+        assert!(text(&o).contains("2 tool"), "{}", text(&o));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C2: fresh-root `status` points at `setup` (not `service install`), rc 1.
+#[test]
+fn fresh_status_points_at_setup_not_the_service() {
+    let root = temp_root("fresh-status");
+    let o = ka(&root, &["status"]);
+    let t = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{t}");
+    assert!(t.contains("isn't set up yet"), "{t}");
+    assert!(!t.contains("service install"), "{t}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// D13: `doctor --fix` tightens loose data/secrets permissions and says so.
+#[test]
+fn doctor_fix_tightens_loose_permissions() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("doctor-fix");
+        let secrets = root.join("data/secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let token = secrets.join("telegram.bot_token");
+        std::fs::write(&token, "1:test").unwrap();
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let o = ka(&root, &["doctor", "--fix"]);
+        let t = text(&o);
+        assert!(t.contains("fixed: chmod 700"), "{t}");
+        assert!(t.contains("chmod 600"), "{t}");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+        assert_eq!(mode(&secrets) & 0o777, 0o700);
+        assert_eq!(mode(&token) & 0o777, 0o600);
+        // The next plain run is green on that line.
+        let t = text(&ka(&root, &["doctor"]));
+        assert!(!t.contains("readable by other users"), "{t}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

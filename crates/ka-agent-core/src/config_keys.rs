@@ -142,7 +142,7 @@ pub static KEYS: &[KeySpec] = &[
     KeySpec {
         path: "approval_ttl_secs",
         kind: Kind::Int {
-            min: 30,
+            min: 1,
             max: 86_400,
         },
         default: "900",
@@ -162,7 +162,7 @@ pub static KEYS: &[KeySpec] = &[
         path: "worker_idle_timeout_secs",
         kind: Kind::Int {
             min: 0,
-            max: 86_400,
+            max: 604_800,
         },
         default: "900",
         apply: Apply::Live,
@@ -318,6 +318,14 @@ pub static KEYS: &[KeySpec] = &[
         doc: "operator IANA timezone (e.g. Europe/Madrid)",
     },
     KeySpec {
+        path: "language",
+        kind: Kind::Enum(&["en", "es"]),
+        default: "en",
+        apply: Apply::Live,
+        web: true,
+        doc: "operator language for assistant replies and channel chrome (en|es)",
+    },
+    KeySpec {
         path: "web.enabled",
         kind: Kind::Bool,
         default: "true",
@@ -342,7 +350,7 @@ pub static KEYS: &[KeySpec] = &[
         default: "08:00",
         apply: Apply::Live,
         web: true,
-        doc: "local clock time of the daily calendar digest (HH:MM)",
+        doc: "local clock time of the daily calendar digest (HH:MM); applies live to existing digest crons",
     },
     KeySpec {
         path: "search.provider",
@@ -662,5 +670,42 @@ mod tests {
         assert_eq!(paths, vec!["mode", "web.port"]);
         assert!(changed[0].apply == Apply::Worker);
         assert!(changed[1].apply == Apply::Restart);
+    }
+
+    /// D2: the registry is the schema's one source of truth (`config
+    /// schema`, the web form) — its int bounds must equal the edges
+    /// `DaemonConfig::validate` accepts, or the file/CLI and the schema
+    /// disagree.
+    #[test]
+    fn registry_int_bounds_match_validate_edges() {
+        let approval = lookup("approval_ttl_secs").unwrap();
+        assert!(matches!(
+            approval.kind,
+            Kind::Int {
+                min: 1,
+                max: 86_400
+            }
+        ));
+        let mut cfg = DaemonConfig {
+            approval_ttl_secs: 1,
+            ..DaemonConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+        cfg.approval_ttl_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let idle = lookup("worker_idle_timeout_secs").unwrap();
+        assert!(matches!(
+            idle.kind,
+            Kind::Int {
+                min: 0,
+                max: 604_800
+            }
+        ));
+        cfg.approval_ttl_secs = 900;
+        cfg.worker_idle_timeout_secs = 604_800;
+        assert!(cfg.validate().is_ok());
+        cfg.worker_idle_timeout_secs = 604_801;
+        assert!(cfg.validate().is_err());
     }
 }

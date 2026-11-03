@@ -56,8 +56,19 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         .header("User-Agent", "ka-agent-updater")
         .send()
         .map_err(|e| format!("{e}"))?;
+    let status = resp.status();
     let mut buf = Vec::new();
     resp.read_to_end(&mut buf).map_err(|e| format!("{e}"))?;
+    if !status.is_success() {
+        // The API answers errors with `{"message": "..."}`; a rate limit or
+        // a bad tag must read as "403 …: rate limit exceeded", never as a
+        // serde error about a missing `tag_name`.
+        let message = serde_json::from_slice::<serde_json::Value>(&buf)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+            .unwrap_or_else(|| String::from_utf8_lossy(&buf).trim().to_string());
+        return Err(format!("{status} {url}: {message}"));
+    }
     Ok(buf)
 }
 
@@ -95,6 +106,24 @@ fn is_newer(latest: &str, current: &str) -> bool {
             .collect()
     };
     num(latest) > num(current)
+}
+
+/// The newest release tag from the metadata endpoint (no install) and
+/// whether it is newer than this binary: the daemon's periodic check (F4)
+/// uses it so `status`/`doctor` learn about a release without a manual
+/// `update check`. Errors carry the same wording `update check` prints.
+pub fn latest_release() -> Result<(String, bool), String> {
+    let release = fetch_release(None)?;
+    let latest = release.tag_name.trim_start_matches('v').to_string();
+    let newer = is_newer(&latest, env!("CARGO_PKG_VERSION"));
+    Ok((latest, newer))
+}
+
+/// Record a check result in the runtime's own store: the daemon-side
+/// counterpart of the CLI's `record_check` (same `update.checked` meta
+/// `doctor` reads).
+pub fn record_check_in(store: &ka_agent_store::Store, latest: &str) {
+    let _ = store.meta_set(CHECK_META, &format!("{latest}|{}", ka_agent_core::now_ms()));
 }
 
 fn sha256_of(bytes: &[u8]) -> String {

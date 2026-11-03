@@ -511,3 +511,44 @@ fn setup_write_failure_says_what_landed_and_that_a_re_run_is_safe() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// C3: a fresh setup ends with the import hint when HOME holds a known
+/// agent tree; no tree, no line.
+#[test]
+fn setup_hints_at_import_when_a_source_exists() {
+    let root = temp_root("import-hint");
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".hermes/memories")).unwrap();
+    std::fs::write(home.join(".hermes/memories/MEMORY.md"), "- prefers tea\n").unwrap();
+    let empty_home = root.join("home-empty");
+    std::fs::create_dir_all(&empty_home).unwrap();
+    let run = |root: &std::path::Path, home: &std::path::Path| -> String {
+        let mut child = ka(root)
+            .env("HOME", home)
+            .args([
+                "setup",
+                "--provider",
+                "anthropic",
+                "--model",
+                "anthropic/claude-sonnet-5",
+                "--key-stdin",
+                "--no-verify",
+                "--no-service",
+                "--yes",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"sk-test\n").unwrap();
+        String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+    };
+    let with = run(&root, &home);
+    assert!(with.contains("ka-agent import hermes --dry-run"), "{with}");
+    let root2 = temp_root("import-hint-none");
+    let plain = run(&root2, &empty_home);
+    assert!(!plain.contains("ka-agent import"), "{plain}");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}

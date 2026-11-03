@@ -20,15 +20,17 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
 /// A port that was free when checked and is unlikely to be handed out
 /// again: the tests run in parallel, so binding :0 and releasing it (the
 /// usual trick) can give two of them the same port before either daemon
-/// binds. Each call walks its own slice of 20000-31999, below the usual
-/// ephemeral range, and re-checks bindability.
+/// binds. Each call takes a unique slot: within one test binary the
+/// candidate ports never repeat (`slot * 11`), and the per-process base
+/// (20 apart) keeps adjacent processes' 10-port check windows disjoint.
 fn free_port() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
     let slot = NEXT.fetch_add(1, Ordering::Relaxed) as u32;
-    let base = 20_000 + (std::process::id() % 400) * 10;
-    for i in 0..300 {
-        let port = (base + (slot * 37 + i) % 1_000) as u16;
+    let base = 20_000 + (std::process::id() % 400) * 20;
+    let candidate = (base + slot * 11) as u16;
+    for i in 0..10 {
+        let port = candidate + i;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
@@ -79,8 +81,13 @@ impl Daemon {
             if out.status.success() {
                 break out;
             }
+            // Both wordings mean "the URL is not published yet": the old
+            // "off" one (web.enabled false) and the C4 one (enabled but the
+            // listener has not bound). A real bind failure keeps the same
+            // C4 wording and fails after the deadline.
             assert!(
-                stderr.contains("web UI is off") && Instant::now() < deadline,
+                (stderr.contains("web UI is off") || stderr.contains("web UI failed to start"))
+                    && Instant::now() < deadline,
                 "dashboard exited {:?} stderr={stderr}",
                 out.status
             );
@@ -797,6 +804,7 @@ fn user_derived_text_is_html_escaped() {
         error_message: None,
         cost_usd: 0.0,
         tokens: 0,
+        model: None,
         created_ms: ka_agent_core::now_ms(),
         updated_ms: ka_agent_core::now_ms(),
     };
@@ -870,6 +878,7 @@ fn approvals_card_renders_escaped_and_only_live_asks_decide() {
             error_message: None,
             cost_usd: 0.0,
             tokens: 0,
+            model: None,
             created_ms: ka_agent_core::now_ms(),
             updated_ms: ka_agent_core::now_ms(),
         })
@@ -1078,14 +1087,16 @@ fn settings_form_and_usage_page() {
             .contains("nonsense")
     );
     // Registry bounds are enforced server-side, not just by HTML: the
-    // registry declares approval_ttl_secs min 30, so 1 is refused — and the
-    // valid key submitted alongside it is not written either.
+    // registry declares approval_ttl_secs max 86_400, so 999_999 is
+    // refused — and the valid key submitted alongside it is not written
+    // either. (min is 1 since the registry was widened; the old `=1`
+    // refusal case moved with it.)
     let refused = request_h(
         port,
         "POST",
         "/settings",
         Some(&cookie),
-        "approval_ttl_secs=1&budgets_daily_usd=9",
+        "approval_ttl_secs=999999&budgets_daily_usd=9",
         &[("X-Ka-Agent", "1")],
     );
     assert_eq!(refused.status, 200, "{}", refused.body);
@@ -1101,7 +1112,7 @@ fn settings_form_and_usage_page() {
     );
     let cfg = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
     assert!(
-        !cfg.contains("approval_ttl_secs = 1"),
+        !cfg.contains("approval_ttl_secs = 999999"),
         "out-of-range value written: {cfg}"
     );
     assert!(
@@ -1244,4 +1255,351 @@ fn api_requires_the_bearer_token() {
     // Dropping the daemon kills it.
     drop(daemon);
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// E2/E3: every page renders inside the sidebar — including the four that
+/// used to dead-end — and the Intents page is linked from the nav.
+#[test]
+fn every_page_keeps_the_sidebar_and_intents_is_linked() {
+    let root = temp_root("nav");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    // Seed one turn + episode so /history has a row to render.
+    {
+        let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
+        seed_session(&store, "web-nav", &root.join("ws"));
+        let turn = ka_agent_core::Turn::new(
+            ka_agent_core::SessionId("web-nav".to_string()),
+            "nav seed".into(),
+        );
+        store.insert_turn(&turn).unwrap();
+        store
+            .index_episode(
+                &ka_agent_core::SessionId("web-nav".to_string()),
+                &turn.id,
+                "user",
+                "nav seed turn",
+            )
+            .unwrap();
+    }
+
+    for path in [
+        "/",
+        "/status",
+        "/tasks",
+        "/memory",
+        "/skills",
+        "/approvals",
+        "/history",
+        "/usage",
+        "/contacts",
+        "/audit",
+        "/intents",
+    ] {
+        let resp = request(port, "GET", path, Some(&cookie), "");
+        assert_eq!(resp.status, 200, "{path}");
+        assert_eq!(
+            resp.body.matches("<aside>").count(),
+            1,
+            "{path} must render the sidebar exactly once"
+        );
+    }
+
+    // E3: the intents page is reachable from the nav on the chat page.
+    let chat = request(port, "GET", "/", Some(&cookie), "");
+    assert_eq!(
+        chat.body.matches("href=\"/intents\"").count(),
+        1,
+        "intents link: {}",
+        chat.body
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// E8: a brand-new root's chat page has guidance inside `#log`, not an
+/// empty box.
+#[test]
+fn fresh_chat_page_shows_a_first_visit_hint() {
+    let root = temp_root("fresh");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    let resp = request(port, "GET", "/", Some(&cookie), "");
+    assert_eq!(resp.status, 200);
+    let log = resp
+        .body
+        .split("<div id='log'>")
+        .nth(1)
+        .and_then(|rest| rest.split("</div>").next())
+        .unwrap_or_default();
+    assert!(
+        log.trim().contains("bubble system"),
+        "the fresh #log must carry the system hint, got: {log}"
+    );
+    assert!(
+        log.contains("say hi"),
+        "the hint must say what to do, got: {log}"
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// E4: two keywords that only appear together non-contiguously in one
+/// message match; a missing term finds nothing.
+#[test]
+fn history_search_ands_keywords() {
+    let root = temp_root("search");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    {
+        let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
+        seed_session(&store, "web-search", &root.join("ws"));
+        let sid = ka_agent_core::SessionId("web-search".to_string());
+        let turn = ka_agent_core::Turn::new(sid.clone(), "deploy please".into());
+        store.insert_turn(&turn).unwrap();
+        store
+            .index_episode(&sid, &turn.id, "user", "please deploy nginx to staging")
+            .unwrap();
+        store
+            .index_episode(
+                &sid,
+                &turn.id,
+                "assistant",
+                "the cache is warm — safe to deploy now",
+            )
+            .unwrap();
+    }
+
+    // Two words, one message, not contiguous: both must be required.
+    let both = request(port, "GET", "/history?q=deploy+cache", Some(&cookie), "");
+    assert_eq!(both.status, 200);
+    assert!(
+        both.body.contains("/history/show/"),
+        "deploy+cache must hit the turn that mentions both: {}",
+        both.body
+    );
+    // A word that appears nowhere narrows to the no-results copy.
+    let none = request(port, "GET", "/history?q=deploy+postgres", Some(&cookie), "");
+    assert!(
+        none.body.contains("no results"),
+        "a missing term must find nothing: {}",
+        none.body
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// E5: usage splits per model — two seeded turns under different models
+/// render as two rows on the same day.
+#[test]
+fn usage_page_splits_spend_per_model() {
+    let root = temp_root("usage-models");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+    {
+        let store = ka_agent_store::Store::open(&daemon.data.join("state.db")).unwrap();
+        let session = ka_agent_core::Session::new(root.join("ws"));
+        store.insert_session(&session).unwrap();
+        for (model, cost) in [
+            ("anthropic/claude-sonnet-4-5", 0.0123_f64),
+            ("google/gemini-2.5-flash", 0.0456_f64),
+        ] {
+            let mut t = ka_agent_core::Turn::new(session.id.clone(), "q".into());
+            t.model = Some(model.to_string());
+            t.cost_usd = cost;
+            store.insert_turn(&t).unwrap();
+        }
+    }
+    let usage = request(port, "GET", "/usage", Some(&cookie), "");
+    assert_eq!(usage.status, 200);
+    assert!(
+        usage.body.contains("anthropic/claude-sonnet-4-5"),
+        "usage page must list the model: {}",
+        usage.body
+    );
+    assert!(
+        usage.body.contains("google/gemini-2.5-flash"),
+        "usage page must split per model: {}",
+        usage.body
+    );
+    assert!(
+        usage.body.contains("0.0123") && usage.body.contains("0.0456"),
+        "each model's cost stands on its own row: {}",
+        usage.body
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// E7: forgetting an unknown id reports the failure instead of a silent
+/// redirect.
+#[test]
+fn memory_forget_unknown_id_says_so() {
+    let root = temp_root("forget");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    let resp = request(port, "POST", "/memory/forget", Some(&cookie), "id=bogus123");
+    assert_eq!(resp.status, 200, "an error page, not a bare 303");
+    assert_ne!(resp.status, 303);
+    assert!(
+        resp.body.contains("no memory entry matches bogus123"),
+        "the failure must be spelled out: {}",
+        resp.body
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// E11: a reminder can be postponed from the tasks page — the snooze form
+/// posts a when expression and the next column shows the new time.
+#[test]
+fn reminder_snooze_moves_the_next_fire() {
+    let root = temp_root("snooze");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    // Schedule through the same /remind command path the operator uses.
+    let resp = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%2Fremind+in+1h+stretch",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert!(
+        resp.body.contains("id "),
+        "the reply carries the reminder id: {}",
+        resp.body
+    );
+    // "⏰ <when> — stretch · id abc12345" → take the id after "· id ".
+    let id = resp
+        .body
+        .rsplit("· id ")
+        .next()
+        .and_then(|rest| rest.split('"').next().map(str::to_string))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(!id.is_empty(), "reminder id from /remind reply");
+
+    // The tasks page renders the snooze form for the reminder row.
+    let tasks = request(port, "GET", "/tasks", Some(&cookie), "");
+    assert!(
+        tasks.body.contains("action=/tasks/snooze"),
+        "snooze form on the row: {}",
+        tasks.body
+    );
+
+    // Snooze it by 30 minutes and read the new time back.
+    let snoozed = request_h(
+        port,
+        "POST",
+        "/tasks/snooze",
+        Some(&cookie),
+        &format!("id={id}&when=30m"),
+        &[],
+    );
+    assert_eq!(
+        snoozed.status, 303,
+        "snooze redirects back: {}",
+        snoozed.body
+    );
+    let after = request(port, "GET", "/tasks", Some(&cookie), "");
+    assert!(
+        after.body.contains("(in 29m)") || after.body.contains("(in 30m)"),
+        "the next column must show the snoozed time: {}",
+        after.body
+    );
+
+    // An unparseable expression is refused with help, not a redirect.
+    let bad = request_h(
+        port,
+        "POST",
+        "/tasks/snooze",
+        Some(&cookie),
+        &format!("id={id}&when=sometime"),
+        &[],
+    );
+    assert_eq!(bad.status, 200);
+    assert!(
+        bad.body.contains("could not read"),
+        "bad when expression: {}",
+        bad.body
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// E9: the settled answer rides the stream as `final_chunk` — the event
+/// chat.js now consumes so a reconnect that missed the deltas still ends
+/// with the full text.
+#[test]
+fn events_stream_carries_the_final_chunk() {
+    let root = temp_root("final-chunk");
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+    let cookie = login(&daemon);
+
+    // First turn against the scripted speaker streams real text.
+    let (events, ready) = open_events(port, &cookie);
+    let sent = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=hello+settled",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(sent.status, 200);
+    let stream = read_events_until(
+        events,
+        ready,
+        &["\"ev\":\"final_chunk\"", "\"ev\":\"turn_finished\""],
+        Duration::from_secs(120),
+    );
+    assert!(
+        stream.contains("\"ev\":\"final_chunk\""),
+        "the settled text must ride the stream: {stream}"
+    );
+    // The final chunk carries the scripted answer whole.
+    let chunk_line = stream
+        .lines()
+        .find(|l| l.contains("\"ev\":\"final_chunk\""))
+        .unwrap_or_default();
+    assert!(
+        chunk_line.contains("web-hello"),
+        "final_chunk carries the full answer: {chunk_line}"
+    );
+    assert!(
+        stream.contains("\"ev\":\"turn_finished\""),
+        "the turn settles: {stream}"
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -21,10 +21,12 @@ pub(super) fn publish_timezone(store: &Store, cfg: &DaemonConfig) {
 
 /// The memory preamble tells the model which zone to schedule in: every
 /// clock time the operator writes is local, never UTC.
-pub fn memory_preamble(_cfg: &DaemonConfig) -> String {
+pub fn memory_preamble(cfg: &DaemonConfig) -> String {
     // The operator's clock context rides the per-turn `<ctx .../>` line
-    // (step 2.2); the compiled MEMORY.md carries facts only.
-    String::new()
+    // (step 2.2); the compiled MEMORY.md carries facts only. The operator
+    // language (D8) is the one instruction that belongs here: it holds
+    // for every turn regardless of the memory contents.
+    cfg.language_preamble()
 }
 
 impl Runtime {
@@ -75,6 +77,13 @@ impl Runtime {
             g.budget.daily_token_cap = new.budgets.daily_tokens;
         }
         publish_timezone(&self.sh.store, &new);
+        // `calendar.digest_time` is Apply::Live: an existing digest cron
+        // bakes its wall-clock time into the stored `at_local`, so retime
+        // it here or the digest keeps firing at the old hour. (Before the
+        // swap: `new` is moved into the shared config below.)
+        if changed.iter().any(|k| k.path == "calendar.digest_time") {
+            self.retime_calendar_crons(&new);
+        }
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
         // remember the file's current mtime: the hot-reload watcher must
         // not re-announce this swap (config set / IPC reload land here)
@@ -83,6 +92,50 @@ impl Runtime {
             self.stop_idle_worker().await;
         }
         report
+    }
+
+    /// Rewrite every existing calendar-digest cron's `at_local` (and its
+    /// next fire, when it is live) to the configured `calendar.digest_time`.
+    fn retime_calendar_crons(&self, new: &DaemonConfig) {
+        let Some((hh, mm)) = ka_agent_core::when::parse_hhmm(&new.calendar.digest_time) else {
+            return;
+        };
+        let Ok(tasks) = self.sh.store.cron_tasks() else {
+            return;
+        };
+        let now_zoned = jiff::Timestamp::now().to_zoned(new.time_zone());
+        let mut retimed = false;
+        for task in tasks {
+            let Some(mut spec) = task
+                .payload
+                .as_deref()
+                .and_then(ka_agent_core::CronSpec::from_payload)
+            else {
+                continue;
+            };
+            if spec.mode != ka_agent_core::CronMode::NoAgent("calendar".into()) {
+                continue;
+            }
+            if spec.at_local.as_deref() == Some(new.calendar.digest_time.as_str()) {
+                continue;
+            }
+            spec.at_local = Some(new.calendar.digest_time.clone());
+            let _ = self
+                .sh
+                .store
+                .update_task_payload(&task.id, &spec.to_payload());
+            if task.status == ka_agent_core::TaskStatus::Queued {
+                let next = ka_agent_core::when::next_local(hh, mm, &spec.day_rule(), &now_zoned);
+                let _ = self
+                    .sh
+                    .store
+                    .update_task_schedule(&task.id, Some(next), "queued");
+                retimed = true;
+            }
+        }
+        if retimed {
+            self.sh.scheduler_tick.notify_one();
+        }
     }
 
     /// Record the config file's current mtime as "seen" (called by every

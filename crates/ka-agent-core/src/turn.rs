@@ -74,6 +74,11 @@ pub struct Turn {
     pub cost_usd: f64,
     /// input + output + cache tokens.
     pub tokens: u64,
+    /// The model selector the runtime submitted this turn on (the
+    /// background model for background turns, else the configured one) —
+    /// recorded at intake for the per-model spend split; `None` for rows
+    /// written before the column existed.
+    pub model: Option<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
 }
@@ -91,6 +96,7 @@ impl Turn {
             error_message: None,
             cost_usd: 0.0,
             tokens: 0,
+            model: None,
             created_ms: now,
             updated_ms: now,
         }

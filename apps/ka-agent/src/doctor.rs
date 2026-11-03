@@ -177,7 +177,7 @@ fn grants_lines(cfg: &DaemonConfig) -> Vec<(&'static str, String)> {
     out
 }
 
-pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCode {
+pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::process::ExitCode {
     let mut rep = Report::new(json);
     let paths = Paths::new(Paths::default_root());
     let header = format!(
@@ -331,8 +331,14 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
 
     // Daemon.
     let daemon_up = crate::admin::is_running(&paths);
+    // C5: with KA_AGENT_DATA_DIR pointing elsewhere, the profile's service
+    // unit and its nightly backup timer describe another instance, not
+    // this data dir — say so instead of contradicting it.
+    let scoped_data_dir = std::env::var_os("KA_AGENT_DATA_DIR").is_some_and(|v| !v.is_empty());
     if daemon_up {
         rep.ok("daemon running".into());
+    } else if scoped_data_dir {
+        rep.warn("not running in this data dir — ka-agent run");
     } else {
         rep.warn("not running — ka-agent service install (or ka-agent run)");
     }
@@ -340,11 +346,18 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
     // Service definition installed?
     if crate::service::supported() {
         if crate::service::is_installed() {
-            rep.ok("background service installed".into());
-            if !daemon_up && crate::service::is_active() {
-                rep.warn(
-                    "service is active but the daemon does not answer — check `ka-agent logs`",
-                );
+            if scoped_data_dir {
+                rep.info(&format!(
+                    "service check is for profile `{}`, not this data dir",
+                    ka_agent_core::layout::profile_name()
+                ));
+            } else {
+                rep.ok("background service installed".into());
+                if !daemon_up && crate::service::is_active() {
+                    rep.warn(
+                        "service is active but the daemon does not answer — check `ka-agent logs`",
+                    );
+                }
             }
         } else {
             rep.warn("background service not installed — ka-agent service install");
@@ -485,11 +498,17 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
         }
     }
 
-    if let Some(dir) = paths.loose_permissions() {
+    if fix {
+        // D13: apply the safe repairs the check above diagnoses; anything
+        // else stays advisory.
+        let repaired = tighten_permissions(&paths);
+        if !repaired.is_empty() {
+            rep.ok(format!("fixed: {}", repaired.join(", ")));
+        }
+    } else if let Some(dir) = paths.loose_permissions() {
         rep.warn(&format!(
-            "{} is readable by other users — fixed on the next start, or now: chmod 700 {}",
+            "{} is readable by other users — fixed on the next start, or now: ka-agent doctor --fix",
             dir.display(),
-            dir.display()
         ));
     }
 
@@ -585,7 +604,17 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
                 }
             }
             None => {
-                rep.warn("no backup yet — ka-agent backup (or install the service for the nightly timer)");
+                if crate::service::supported() && crate::service::is_installed() && scoped_data_dir
+                {
+                    // The installed service (and its timer) belongs to the
+                    // profile's root, not this data dir: don't send the
+                    // operator to a timer that would never back this up.
+                    rep.warn("no backup yet — ka-agent backup");
+                } else {
+                    rep.warn(
+                        "no backup yet — ka-agent backup (or install the service for the nightly timer)",
+                    );
+                }
             }
         }
     }
@@ -666,6 +695,59 @@ pub fn doctor(config: PathBuf, online: bool, json: bool) -> std::process::ExitCo
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
+    }
+}
+
+/// D13: the repairs `doctor --fix` applies — data/secrets dirs to 0700,
+/// secret files to 0600. Returns one line per change ("chmod 700 …").
+fn tighten_permissions(paths: &Paths) -> Vec<String> {
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        Vec::new()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let is_loose = |m: &std::fs::Metadata| m.permissions().mode() & 0o077 != 0;
+        let mut dirs = vec![paths.root().to_path_buf()];
+        let base = ka_agent_core::layout::base_dir();
+        if paths.root().starts_with(&base) {
+            dirs.push(base);
+        }
+        let secrets = paths.root().join("secrets");
+        if secrets.is_dir() {
+            dirs.push(secrets.clone());
+        }
+        let mut done = Vec::new();
+        for dir in dirs {
+            let Ok(meta) = std::fs::metadata(&dir) else {
+                continue;
+            };
+            if is_loose(&meta)
+                && std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).is_ok()
+            {
+                done.push(format!("chmod 700 {}", dir.display()));
+            }
+        }
+        if secrets.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&secrets)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if meta.is_file()
+                    && is_loose(&meta)
+                    && std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .is_ok()
+                {
+                    done.push(format!("chmod 600 {}", path.display()));
+                }
+            }
+        }
+        done
     }
 }
 

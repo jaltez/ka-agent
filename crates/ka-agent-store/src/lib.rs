@@ -88,6 +88,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v6.sql"),
     include_str!("schema_v7.sql"),
     include_str!("schema_v8.sql"),
+    include_str!("schema_v9.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -121,6 +122,11 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         ended_ms: r.get(10)?,
     })
 }
+
+/// One finished turn for usage accounting: `(created_ms, cost_usd,
+/// tokens, model)` — the model is `None` for rows written before the
+/// column existed.
+pub type UsageRow = (i64, f64, u64, Option<String>);
 
 /// One FTS hit from [`Store::search_episodes`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,8 +351,9 @@ fn row_to_turn(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
         error_message: r.get(6)?,
         cost_usd: r.get(7)?,
         tokens: r.get::<_, i64>(8)?.max(0) as u64,
-        created_ms: r.get(9)?,
-        updated_ms: r.get(10)?,
+        model: r.get(9)?,
+        created_ms: r.get(10)?,
+        updated_ms: r.get(11)?,
     })
 }
 

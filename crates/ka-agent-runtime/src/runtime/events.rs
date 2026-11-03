@@ -193,6 +193,18 @@ pub(super) async fn drive(
             }
         }
         match ev {
+            PortEvent::ModelChanged(selector) => {
+                // The engine is answering with a different model than the
+                // configured one (a fallback hop): remember it for
+                // status/doctor and tell surfaces, which show the live
+                // model in their status line (F3).
+                *sh.live_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(selector.clone());
+                sh.emit(AgentEvent::Settings {
+                    model: Some(selector),
+                    mode: None,
+                    effort: None,
+                });
+            }
             PortEvent::Bootstrap {
                 strand_id,
                 strand_path,
@@ -311,19 +323,24 @@ pub(super) async fn drive(
                         .and_then(|e| e.lines().next())
                         .map(str::to_string)
                 };
+                // A successful call's output excerpt rides the event so
+                // surfaces can show what the tool actually printed (on
+                // demand in the TUI; failures carry their first line).
+                let output = excerpt.clone().filter(|_| ok);
                 sh.emit(AgentEvent::ToolFinished {
                     id,
                     tool,
                     ok,
                     ms,
                     error,
+                    output,
                 });
             }
             PortEvent::CallOutput { excerpt, id, .. } => {
                 // Keep the last excerpt per call: a failed call's first
-                // line rides its `ToolFinished` (visibility is the
-                // structured event, not a formatted note).
-                let capped: String = excerpt.chars().take(300).collect();
+                // line rides its `ToolFinished`, and a successful call's
+                // excerpt rides it too (surfaces render it on demand).
+                let capped: String = excerpt.chars().take(2000).collect();
                 let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(live) = g.live.as_mut() {
                     live.tool_excerpt.insert(id, capped);

@@ -53,7 +53,12 @@ engine provider-key count (ka's `.env` tier — `ka-agent key set`), git
 presence (memory is git-backed; a missing git is a FAIL), bubblewrap
 version (the plugin sandbox prerequisite), enabled skills, linked
 identities, installed/enabled plugins, and the last backup age. Read-only;
-every check names what to do about it.
+every check names what to do about it. Two scoping rules: the service,
+timer and `ka-agent logs` lines describe the profile's unit — when
+`KA_AGENT_DATA_DIR` points at another root, doctor says so instead of
+reporting that unit's state as this root's; and `ka-agent doctor --fix`
+applies the safe repairs only (data/secrets dirs to 0700, secret files to
+0600, one line per change) — everything else stays advisory.
 
 ## First-run setup
 

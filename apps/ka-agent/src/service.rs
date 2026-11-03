@@ -506,6 +506,12 @@ mod imp {
             }
         }
     }
+
+    /// The unit `logs` reads (named when the data root belongs to another
+    /// instance).
+    pub(super) fn unit_name() -> String {
+        names().daemon_unit
+    }
 }
 
 // ---------------------------------------------------------------- macOS
@@ -995,6 +1001,24 @@ pub fn service_action(action: ServiceAction, config: PathBuf) -> ExitCode {
 /// `ka-agent logs [-f] [-n N]`.
 pub fn logs(follow: bool, n: usize) -> ExitCode {
     let root = absolute(&Paths::default_root());
+    // The journal is the ambient profile's unit — say which one when the
+    // data root in scope belongs to another instance (a second profile or
+    // a KA_AGENT_DATA_DIR root), or the operator reads another daemon's
+    // log without knowing it.
+    let profile_root = ka_agent_core::layout::compose_profile_root(
+        &ka_agent_core::layout::base_dir(),
+        &ka_agent_core::layout::profile_name(),
+    );
+    if absolute(&profile_root) != root {
+        #[cfg(target_os = "linux")]
+        let unit_label = imp::unit_name();
+        #[cfg(not(target_os = "linux"))]
+        let unit_label = "daemon log".to_string();
+        eprintln!(
+            "ka-agent: this data root is not the `{}` profile — reading the `{unit_label}`",
+            ka_agent_core::layout::profile_name(),
+        );
+    }
     imp::logs(&root, follow, n)
 }
 

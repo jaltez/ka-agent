@@ -49,7 +49,27 @@ pub struct TelegramChannel {
     /// Chunks recovered at startup while no chat was known; delivered on
     /// the first `set_chat`.
     undelivered: Mutex<Vec<OutboxChunk>>,
+    /// `media_group_id` → files saved so far (an album in flight). The
+    /// first member schedules one flush a debounce later, so an N-file
+    /// album gets a single ack naming every file.
+    media_groups: Arc<Mutex<HashMap<String, MediaGroup>>>,
 }
+
+/// One album being debounced: the saved `@attachments/…` refs, and the
+/// caption (on whichever member carried one) that turns the flush into a
+/// caption turn instead of a plain ack.
+#[derive(Default)]
+struct MediaGroup {
+    refs: Vec<String>,
+    caption: Option<String>,
+    caption_message_id: Option<i64>,
+}
+
+/// How long the channel waits for further members of a media group
+/// before answering once for the whole album. Telegram delivers an
+/// album's messages back-to-back; the window only needs to span the
+/// batches, not human typing.
+const MEDIA_GROUP_DEBOUNCE: Duration = Duration::from_millis(750);
 
 /// What one callback press produced: the toast for
 /// `answerCallbackQuery` (empty = just close the spinner) and, when the
@@ -95,6 +115,7 @@ impl TelegramChannel {
             store,
             start_replied: Mutex::new(HashMap::new()),
             undelivered: Mutex::new(Vec::new()),
+            media_groups: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -150,6 +171,7 @@ impl TelegramChannel {
         if let Err(e) = client.get_me().await {
             if e.is_auth_failure() {
                 eprintln!("telegram: auth failure: {e}");
+                self.runtime.note_channel_err("telegram", &e.to_string());
                 if let Some(chat) = surface.chat() {
                     let _ = client
                         .send_message(chat, &format!("! [auth] {e}"), None)
@@ -165,6 +187,15 @@ impl TelegramChannel {
         if let Err(e) = client.set_my_commands().await {
             eprintln!("telegram: setMyCommands: {e} (continuing)");
         }
+        // Same policy for the profile texts: the empty-chat "What can
+        // this bot do?" screen and the chat-list blurb are set best-effort
+        // beside the command menu.
+        if let Err(e) = client.set_my_description(BOT_DESCRIPTION).await {
+            eprintln!("telegram: setMyDescription: {e} (continuing)");
+        }
+        if let Err(e) = client.set_my_short_description(BOT_SHORT_DESCRIPTION).await {
+            eprintln!("telegram: setMyShortDescription: {e} (continuing)");
+        }
 
         let mut backoff_secs = 1u64;
         loop {
@@ -174,6 +205,9 @@ impl TelegramChannel {
             match client.get_updates(offset, POLL_TIMEOUT_SECS).await {
                 Ok(updates) => {
                     backoff_secs = 1;
+                    // A recovering or healthy poll clears the health line
+                    // `status` shows for a dead phone link (F8).
+                    self.runtime.note_channel_ok("telegram");
                     // dedupe against the offset this batch was fetched
                     // with, not the running one: every update in the batch
                     // is new relative to the batch start
@@ -214,6 +248,7 @@ impl TelegramChannel {
                 }
                 Err(e) => {
                     eprintln!("telegram: poll error: {e}; backing off {backoff_secs}s");
+                    self.runtime.note_channel_err("telegram", &e.to_string());
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).clamp(1, 60);
                 }
@@ -312,8 +347,9 @@ impl TelegramChannel {
     }
 
     /// Unlinked private messages that may still get an answer: a correct
-    /// `/pair <code>` links the sender; `/start` gets the one-line owner
-    /// hint at most once an hour per uid. `true` = handled (linked).
+    /// `/pair <code>` (or a `/start <code>` deep link, the one-tap form
+    /// the CLI prints) links the sender; plain `/start` gets the one-line
+    /// owner hint at most once an hour per uid. `true` = handled (linked).
     async fn unlinked_private(
         &self,
         message: &Value,
@@ -333,8 +369,28 @@ impl TelegramChannel {
             }
             return false;
         }
-        let first = text.split_whitespace().next().unwrap_or("");
+        let mut words = text.split_whitespace();
+        let first = words.next().unwrap_or("");
         if first.split('@').next() == Some("/start") {
+            // `/start <payload>` from a `t.me/<bot>?start=<code>` deep
+            // link redeems the payload as a pairing code with `/pair`'s
+            // exact semantics (10-min TTL, 5 attempts, constant-time
+            // compare). A wrong payload burns an attempt and is answered
+            // like a wrong `/pair` — never with the hourly owner hint.
+            if let Some(payload) = words.next().filter(|p| !p.is_empty()) {
+                return if pairing::redeem_code(&self.store, "telegram", &uid.to_string(), payload)
+                    == Redeem::Linked
+                {
+                    self.adopt_chat(surface, chat_id).await;
+                    let _ = surface
+                        .client
+                        .send_message(chat_id, pairing::TELEGRAM_WELCOME, None)
+                        .await;
+                    true
+                } else {
+                    false
+                };
+            }
             let now = now_ms();
             let reply = {
                 let mut replied = self.start_replied.lock().unwrap_or_else(|e| e.into_inner());
@@ -396,17 +452,62 @@ impl TelegramChannel {
         if transcript.is_none()
             && (message.get("photo").is_some() || message.get("document").is_some())
         {
-            let reply = match crate::attachments::save_attachment(
-                &client,
-                &self.runtime.workspace(),
-                message,
-            )
-            .await
+            // An album member (a `media_group_id` shared with its
+            // siblings): save now, answer once for the whole group after
+            // a short debounce.
+            if message["media_group_id"].as_str().is_some() {
+                self.group_media_message(&client, chat_id, uid, message)
+                    .await;
+                return;
+            }
+            // A single photo/document: saved and acknowledged. A caption
+            // is the operator's message — it becomes the turn, the file
+            // riding along as an `@reference` instead of a bare ack.
+            match crate::attachments::save_attachment(&client, &self.runtime.workspace(), message)
+                .await
             {
-                Ok(rel) => format!("saved {rel} — reference it with @{rel} in your next message"),
-                Err(e) => format!("! [attachment] {e}"),
-            };
-            let _ = client.send_message(chat_id, &reply, None).await;
+                Ok(rel) => {
+                    let caption = message["caption"].as_str().map(str::trim).unwrap_or("");
+                    if caption.is_empty() {
+                        let reply =
+                            format!("saved {rel} — reference it with @{rel} in your next message");
+                        let _ = client.send_message(chat_id, &reply, None).await;
+                    } else {
+                        submit_caption_turn(
+                            &client,
+                            &self.runtime,
+                            &self.store,
+                            chat_id,
+                            uid,
+                            message["message_id"].as_i64(),
+                            caption,
+                            &[rel],
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    let _ = client
+                        .send_message(chat_id, &format!("! [attachment] {e}"), None)
+                        .await;
+                }
+            }
+            return;
+        }
+
+        // Media kinds with no handler (a video note, a sticker, …) get an
+        // explicit refusal instead of a silent drop: no turn, no 👀.
+        if transcript.is_none()
+            && message["text"].as_str().is_none()
+            && let Some(kind) = unsupported_media_kind(message)
+        {
+            let _ = client
+                .send_message(
+                    chat_id,
+                    &format!("! [media] {kind} isn't supported yet"),
+                    None,
+                )
+                .await;
             return;
         }
 
@@ -444,6 +545,93 @@ impl TelegramChannel {
                 }
             }
         }
+    }
+
+    /// One member of a media group (a Telegram album): the file is saved
+    /// at once — bytes never wait in memory — and recorded under the
+    /// group's id. The first member schedules a single flush one
+    /// [`MEDIA_GROUP_DEBOUNCE`] later, which answers once for the whole
+    /// album: one ack naming every `@attachments/…` ref, or, when any
+    /// member carried a caption, one caption turn with all the refs.
+    async fn group_media_message(
+        &self,
+        client: &TelegramClient,
+        chat_id: i64,
+        uid: i64,
+        message: &Value,
+    ) {
+        let Some(group_id) = message["media_group_id"].as_str() else {
+            return;
+        };
+        let rel =
+            match crate::attachments::save_attachment(client, &self.runtime.workspace(), message)
+                .await
+            {
+                Ok(rel) => rel,
+                Err(e) => {
+                    let _ = client
+                        .send_message(chat_id, &format!("! [attachment] {e}"), None)
+                        .await;
+                    return;
+                }
+            };
+        let first = {
+            let mut groups = self.media_groups.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = groups.entry(group_id.to_string()).or_default();
+            if entry.caption.is_none()
+                && message["caption"]
+                    .as_str()
+                    .is_some_and(|c| !c.trim().is_empty())
+            {
+                entry.caption = message["caption"].as_str().map(|c| c.trim().to_string());
+                entry.caption_message_id = message["message_id"].as_i64();
+            }
+            entry.refs.push(rel);
+            entry.refs.len() == 1
+        };
+        if !first {
+            return;
+        }
+        let client = client.clone();
+        let runtime = self.runtime.clone();
+        let store = Arc::clone(&self.store);
+        let groups = Arc::clone(&self.media_groups);
+        let group_id = group_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(MEDIA_GROUP_DEBOUNCE).await;
+            let Some(group) = groups
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&group_id)
+            else {
+                return;
+            };
+            match group.caption {
+                Some(caption) => {
+                    submit_caption_turn(
+                        &client,
+                        &runtime,
+                        &store,
+                        chat_id,
+                        uid,
+                        group.caption_message_id,
+                        &caption,
+                        &group.refs,
+                    )
+                    .await;
+                }
+                None => {
+                    let mentions: Vec<String> =
+                        group.refs.iter().map(|r| format!("@{r}")).collect();
+                    let reply = format!(
+                        "saved {} files — reference them with {} in your next message",
+                        group.refs.len(),
+                        mentions.join(" ")
+                    );
+                    let _ = client.send_message(chat_id, &reply, None).await;
+                }
+            }
+        });
     }
 
     /// ✅ / ✖ on a memory proposal: accept or reject, then turn the card
@@ -550,6 +738,17 @@ impl TelegramChannel {
         let Some(data) = data else {
             return CallbackReply::none();
         };
+        // `retry:last` — the ↻ button on a rate_limit/network error.
+        if data == "retry:last" {
+            return match self.runtime.retry_last().await {
+                Ok(Some(text)) => {
+                    let head: String = text.lines().next().unwrap_or("").chars().take(60).collect();
+                    CallbackReply::toast(&format!("↻ re-sending \"{head}\""))
+                }
+                Ok(None) => CallbackReply::toast("nothing to retry"),
+                Err(e) => CallbackReply::toast(&format!("! [retry] {e}")),
+            };
+        }
         // `m:<short>:y|n` — a memory proposal card.
         if let Some(rest) = data.strip_prefix("m:") {
             return self.memory_callback(cb, rest).await;
@@ -657,4 +856,61 @@ impl TelegramChannel {
                 .await;
         }
     }
+}
+
+/// Submit a captioned media message as the operator's turn: 👀 on the
+/// message, the caption as free text (the router answers anything that
+/// looks like a command), and every saved file as an `@reference` — the
+/// same path a typed `caption @attachments/…` message takes.
+#[allow(clippy::too_many_arguments)]
+async fn submit_caption_turn(
+    client: &TelegramClient,
+    runtime: &Runtime,
+    store: &Store,
+    chat_id: i64,
+    uid: i64,
+    message_id: Option<i64>,
+    caption: &str,
+    refs: &[String],
+) {
+    let mentions: Vec<String> = refs.iter().map(|r| format!("@{r}")).collect();
+    let text = if mentions.is_empty() {
+        caption.to_string()
+    } else {
+        format!("{caption}\n{}", mentions.join(" "))
+    };
+    let source = format!("telegram:{uid}");
+    match crate::commands::route(runtime, &source, &text).await {
+        crate::commands::Outcome::Reply(reply) => {
+            let _ = client.send_message(chat_id, &reply, None).await;
+        }
+        crate::commands::Outcome::Silent => {}
+        crate::commands::Outcome::NotACommand => {
+            if let Some(message_id) = message_id {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let _ = client.set_message_reaction(chat_id, message_id, "👀").await;
+                });
+            }
+            let text = crate::refs::expand(store, &runtime.workspace(), &text).await;
+            if let Err(e) = runtime.handle_message(&text, &source).await {
+                eprintln!("telegram: handle_message: {e}");
+            }
+        }
+    }
+}
+
+/// The human name of the first unsupported media kind `message` carries,
+/// if any — used for the `! [media] … isn't supported yet` refusal.
+fn unsupported_media_kind(message: &Value) -> Option<&'static str> {
+    [
+        ("video_note", "video note"),
+        ("video", "video"),
+        ("animation", "animation"),
+        ("sticker", "sticker"),
+        ("location", "location"),
+        ("contact", "contact"),
+    ]
+    .into_iter()
+    .find_map(|(key, kind)| message.get(key).is_some().then_some(kind))
 }

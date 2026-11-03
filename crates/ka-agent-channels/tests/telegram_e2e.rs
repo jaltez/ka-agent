@@ -16,6 +16,7 @@ use ka_agent_port::WorkerPort;
 use ka_agent_runtime::Envelope;
 use ka_agent_runtime::event::AgentEvent;
 use ka_agent_runtime::surface::Surface;
+use serde_json::json;
 
 /// A numbered envelope (seqs only matter to the bus, not the surface).
 fn env(seq: u64, ev: AgentEvent) -> Envelope {
@@ -1110,6 +1111,7 @@ async fn draft_shows_tool_progress_and_skips_scheduled_turns() {
             ok: true,
             ms: 3,
             error: None,
+            output: None,
         },
     ));
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -1309,4 +1311,470 @@ async fn skill_proposal_accept_body() {
         .unwrap();
     assert_eq!(accepted, 1, "one install, not two");
     stop(&mut stack).await;
+}
+
+// ---------------------------------------------------------------------------
+// v2 B1–B7: captions, albums, unsupported media, deep-link pairing,
+// upload actions, inline video, bot profile.
+// ---------------------------------------------------------------------------
+
+/// A private photo message with an optional caption and media group, as
+/// the Bot API shapes it (size-ascending variants).
+fn push_photo_message(
+    server: &FakeBotServer,
+    update_id: i64,
+    chat_id: i64,
+    user_id: i64,
+    file_id: &str,
+    caption: Option<&str>,
+    media_group_id: Option<&str>,
+) {
+    let mut message = json!({
+        "message_id": update_id,
+        "from": { "id": user_id, "is_bot": false },
+        "chat": { "id": chat_id, "type": "private" },
+        "date": 0,
+        "photo": [
+            { "file_id": format!("{file_id}-small"), "width": 90, "height": 90 },
+            { "file_id": file_id, "width": 1280, "height": 720 },
+        ],
+    });
+    if let Some(caption) = caption {
+        message["caption"] = json!(caption);
+    }
+    if let Some(group) = media_group_id {
+        message["media_group_id"] = json!(group);
+    }
+    server.push_update(json!({ "update_id": update_id, "message": message }));
+}
+
+/// B5: startup sets the bot profile beside the command menu — the
+/// empty-chat "What can this bot do?" text and the chat-list blurb.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_sets_the_bot_profile_descriptions() {
+    let mut stack = spawn_channel(vec![42], "tok-profile").await;
+    let description = stack
+        .server
+        .await_capture(|c| c.method == "setMyDescription", Duration::from_secs(5))
+        .expect("setMyDescription at startup");
+    assert!(
+        !description.body["description"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "non-empty description: {:?}",
+        description.body
+    );
+    let short = stack
+        .server
+        .await_capture(
+            |c| c.method == "setMyShortDescription",
+            Duration::from_secs(5),
+        )
+        .expect("setMyShortDescription at startup");
+    let blurb = short.body["description"].as_str().unwrap_or("");
+    assert!(!blurb.is_empty(), "non-empty blurb: {blurb:?}");
+    assert!(blurb.chars().count() <= 120, "blurb over the 120 cap");
+    stop(&mut stack).await;
+}
+
+/// B2: a video note is refused with a visible `! [media] …` reply — no
+/// turn, no 👀 receipt, never a silent drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn video_note_gets_an_unsupported_reply_and_no_turn() {
+    let mut stack = spawn_channel(vec![42], "tok-vnote").await;
+    stack.server.push_update(json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "from": { "id": 42, "is_bot": false },
+            "chat": { "id": 7, "type": "private" },
+            "date": 0,
+            "video_note": { "file_id": "vn-1", "duration": 8, "length": 240 },
+        }
+    }));
+    let reply = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").contains("video note")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("unsupported media refusal");
+    assert_eq!(
+        reply.body["text"].as_str(),
+        Some("! [media] video note isn't supported yet")
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reacted = stack
+        .server
+        .captured()
+        .iter()
+        .any(|c| c.method == "setMessageReaction");
+    assert!(!reacted, "no 👀 receipt for unsupported media");
+    stop(&mut stack).await;
+}
+
+/// B1: a captioned photo is the operator's message — 👀 receipt and a
+/// submitted turn — not a bare "saved" ack. (The engine turn itself is
+/// asserted app-level; here the submission path is.)
+#[tokio::test(flavor = "multi_thread")]
+async fn captioned_photo_is_submitted_not_acked() {
+    let mut stack = spawn_channel(vec![42], "tok-cap").await;
+    stack
+        .server
+        .push_file("f-cap-1", "photos/f-cap-1.jpg", b"jpegbytes");
+    push_photo_message(
+        &stack.server,
+        1,
+        7,
+        42,
+        "f-cap-1",
+        Some("what is this?"),
+        None,
+    );
+    let reaction = stack
+        .server
+        .await_capture(|c| c.method == "setMessageReaction", Duration::from_secs(5))
+        .expect("👀 on the captioned photo");
+    assert_eq!(reaction.body["message_id"].as_i64(), Some(1));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let acked = stack.server.captured().into_iter().any(|c| {
+        c.method == "sendMessage"
+            && c.body["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("saved attachments/")
+    });
+    assert!(!acked, "a captioned photo is not answered with a bare ack");
+    stop(&mut stack).await;
+}
+
+/// B7: a three-photo album (one `media_group_id`) is saved in full and
+/// answered once, naming every `@attachments/…` ref.
+#[tokio::test(flavor = "multi_thread")]
+async fn album_of_three_photos_gets_one_ack_naming_every_ref() {
+    let mut stack = spawn_channel(vec![42], "tok-album").await;
+    for i in 1..=3 {
+        stack.server.push_file(
+            &format!("f-alb-{i}"),
+            &format!("photos/alb{i}.jpg"),
+            b"jpeg",
+        );
+    }
+    for i in 1..=3 {
+        push_photo_message(
+            &stack.server,
+            i,
+            7,
+            42,
+            &format!("f-alb-{i}"),
+            None,
+            Some("mg-1"),
+        );
+    }
+    let ack = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("saved 3 files")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("one ack for the whole album");
+    let text = ack.body["text"].as_str().unwrap_or("");
+    assert_eq!(
+        text.matches("attachments/photo-").count(),
+        3,
+        "names every ref: {text}"
+    );
+    // The debounce must fold the whole album into that one reply.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let acks = stack
+        .server
+        .captured()
+        .into_iter()
+        .filter(|c| {
+            c.method == "sendMessage" && c.body["text"].as_str().unwrap_or("").contains("saved")
+        })
+        .count();
+    assert_eq!(acks, 1, "exactly one ack for the album");
+    let dir = stack.runtime.workspace().join("attachments");
+    let files = std::fs::read_dir(&dir).unwrap().flatten().count();
+    assert_eq!(files, 3, "every album member lands on disk");
+    stop(&mut stack).await;
+}
+
+/// B7+B1: a caption on any album member turns the single flush into one
+/// caption turn (one 👀 on the captioned member) — never per-photo acks.
+#[tokio::test(flavor = "multi_thread")]
+async fn album_with_caption_submits_one_turn_not_per_photo_acks() {
+    let mut stack = spawn_channel(vec![42], "tok-alb-cap").await;
+    for i in 1..=3 {
+        stack
+            .server
+            .push_file(&format!("f-ac-{i}"), &format!("photos/ac{i}.jpg"), b"jpeg");
+    }
+    push_photo_message(&stack.server, 1, 7, 42, "f-ac-1", None, Some("mg-2"));
+    push_photo_message(
+        &stack.server,
+        2,
+        7,
+        42,
+        "f-ac-2",
+        Some("look at these three"),
+        Some("mg-2"),
+    );
+    push_photo_message(&stack.server, 3, 7, 42, "f-ac-3", None, Some("mg-2"));
+    let reaction = stack
+        .server
+        .await_capture(|c| c.method == "setMessageReaction", Duration::from_secs(5))
+        .expect("one 👀 for the album's caption");
+    // The receipt lands on the captioned member, not the first one.
+    assert_eq!(reaction.body["message_id"].as_i64(), Some(2));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let reactions = stack
+        .server
+        .captured()
+        .iter()
+        .filter(|c| c.method == "setMessageReaction")
+        .count();
+    assert_eq!(reactions, 1, "the album is one turn, not three");
+    let acks = stack.server.captured().into_iter().any(|c| {
+        c.method == "sendMessage" && c.body["text"].as_str().unwrap_or("").contains("saved")
+    });
+    assert!(!acks, "a captioned album is not answered with acks");
+    let dir = stack.runtime.workspace().join("attachments");
+    let files = std::fs::read_dir(&dir).unwrap().flatten().count();
+    assert_eq!(files, 3, "every album member lands on disk");
+    stop(&mut stack).await;
+}
+
+/// B3: a `t.me/<bot>?start=<code>` deep link pairs the sender — no
+/// `/pair` typing needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_deep_link_pairs_the_sender() {
+    let mut stack = spawn_channel(vec![], "tok-deep-ok").await;
+    let code = ka_agent_channels::pairing::issue(&stack.store, "telegram").unwrap();
+    stack
+        .server
+        .push_text_message(1, 7, 55, &format!("/start {code}"));
+    let welcome = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").contains("✓ Paired")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("the deep link pairs and welcomes");
+    assert_eq!(welcome.body["chat_id"].as_i64(), Some(7));
+    assert!(stack.store.is_linked("telegram", "55").unwrap());
+    stop(&mut stack).await;
+}
+
+/// B3: a wrong deep-link payload burns an attempt exactly like a wrong
+/// `/pair` — no welcome, never the hourly owner hint — and the code
+/// still redeems afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_deep_link_wrong_payload_burns_an_attempt() {
+    let mut stack = spawn_channel(vec![], "tok-deep-bad").await;
+    let code = ka_agent_channels::pairing::issue(&stack.store, "telegram").unwrap();
+    stack
+        .server
+        .push_text_message(1, 7, 56, "/start WRONGWRONG");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !stack.store.is_linked("telegram", "56").unwrap(),
+        "a wrong payload never links"
+    );
+    let raw = stack
+        .store
+        .meta_get(ka_agent_channels::pairing::PAIRING_KEY)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        raw.contains("\"attempts\":1"),
+        "the wrong payload burned one attempt: {raw}"
+    );
+    let answered = stack.server.captured().into_iter().any(|c| {
+        c.method == "sendMessage"
+            && c.body["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("✓ Paired") || t.contains("private assistant"))
+    });
+    assert!(
+        !answered,
+        "neither the welcome nor the hourly START_REPLY answers a failed deep link"
+    );
+    // One burned attempt leaves four: the right code still pairs.
+    stack
+        .server
+        .push_text_message(2, 7, 56, &format!("/start {code}"));
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").contains("✓ Paired")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("the code still redeems after a burned attempt");
+    assert!(stack.store.is_linked("telegram", "56").unwrap());
+    stop(&mut stack).await;
+}
+
+/// B4: outgoing files fire the matching `upload_*` chat action once,
+/// before the send — the phone shows an upload instead of "typing…".
+#[tokio::test(flavor = "multi_thread")]
+async fn file_event_fires_the_upload_action_before_the_send() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-upload".to_string(), Some(7));
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let png = dir.join("pixel.png");
+    std::fs::write(&png, b"\x89PNG fake").unwrap();
+    surface.emit(&env(
+        1,
+        AgentEvent::File {
+            path: png.to_string_lossy().into_owned(),
+            name: "pixel.png".into(),
+            caption: String::new(),
+        },
+    ));
+    server
+        .await_capture(
+            |c| c.method == "sendChatAction" && c.body["action"].as_str() == Some("upload_photo"),
+            Duration::from_secs(30),
+        )
+        .expect("upload_photo action");
+    server
+        .await_capture(|c| c.method == "sendPhoto", Duration::from_secs(30))
+        .expect("photo goes out");
+    let positions = server.captured();
+    let action = positions
+        .iter()
+        .position(|c| {
+            c.method == "sendChatAction" && c.body["action"].as_str() == Some("upload_photo")
+        })
+        .unwrap();
+    let sent = positions
+        .iter()
+        .position(|c| c.method == "sendPhoto")
+        .unwrap();
+    assert!(action < sent, "upload_photo precedes sendPhoto");
+
+    let txt = dir.join("notes.txt");
+    std::fs::write(&txt, b"words").unwrap();
+    surface.emit(&env(
+        2,
+        AgentEvent::File {
+            path: txt.to_string_lossy().into_owned(),
+            name: "notes.txt".into(),
+            caption: String::new(),
+        },
+    ));
+    server
+        .await_capture(
+            |c| {
+                c.method == "sendChatAction" && c.body["action"].as_str() == Some("upload_document")
+            },
+            Duration::from_secs(30),
+        )
+        .expect("upload_document action");
+    let doc = server
+        .await_capture(|c| c.method == "sendDocument", Duration::from_secs(30))
+        .expect("document goes out");
+    let raw = doc.raw.as_deref().unwrap_or("");
+    assert!(
+        raw.contains("name=\"document\"; filename=\"notes.txt\""),
+        "{raw}"
+    );
+}
+
+/// B6: videos and GIFs go out inline (`sendVideo` / `sendAnimation`) with
+/// their captions; a refused inline send falls back to a document, so the
+/// file is never lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn video_and_gif_go_out_inline_with_document_fallback() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-video".to_string(), Some(7));
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mp4 = dir.join("clip.mp4");
+    std::fs::write(&mp4, b"\0\0\0\x18ftypmp42fake").unwrap();
+    surface.emit(&env(
+        1,
+        AgentEvent::File {
+            path: mp4.to_string_lossy().into_owned(),
+            name: "clip.mp4".into(),
+            caption: "the recording".into(),
+        },
+    ));
+    let video = server
+        .await_capture(|c| c.method == "sendVideo", Duration::from_secs(30))
+        .expect("mp4 goes out via sendVideo");
+    let raw = video.raw.as_deref().unwrap_or("");
+    assert!(
+        raw.contains("name=\"video\"; filename=\"clip.mp4\""),
+        "video part: {raw}"
+    );
+    assert!(raw.contains("video/mp4"), "video content type: {raw}");
+    assert!(raw.contains("the recording"), "caption rides along: {raw}");
+
+    let gif = dir.join("loop.gif");
+    std::fs::write(&gif, b"GIF89a fake").unwrap();
+    surface.emit(&env(
+        2,
+        AgentEvent::File {
+            path: gif.to_string_lossy().into_owned(),
+            name: "loop.gif".into(),
+            caption: String::new(),
+        },
+    ));
+    let animation = server
+        .await_capture(|c| c.method == "sendAnimation", Duration::from_secs(30))
+        .expect("gif goes out via sendAnimation");
+    let raw = animation.raw.as_deref().unwrap_or("");
+    assert!(
+        raw.contains("name=\"animation\"; filename=\"loop.gif\""),
+        "animation part: {raw}"
+    );
+
+    // A refused sendVideo must not lose the file: the document fallback.
+    server.fail_method("sendVideo", 400, None, 1);
+    let mp4b = dir.join("clip2.mp4");
+    std::fs::write(&mp4b, b"\0\0\0\x18ftypmp42fake").unwrap();
+    surface.emit(&env(
+        3,
+        AgentEvent::File {
+            path: mp4b.to_string_lossy().into_owned(),
+            name: "clip2.mp4".into(),
+            caption: String::new(),
+        },
+    ));
+    let doc = server
+        .await_capture(
+            |c| {
+                c.method == "sendDocument"
+                    && c.raw.as_deref().is_some_and(|r| r.contains("clip2.mp4"))
+            },
+            Duration::from_secs(30),
+        )
+        .expect("refused sendVideo falls back to a document");
+    let raw = doc.raw.as_deref().unwrap_or("");
+    assert!(
+        raw.contains("name=\"document\"; filename=\"clip2.mp4\""),
+        "{raw}"
+    );
 }

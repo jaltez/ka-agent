@@ -46,6 +46,11 @@ fn run(channel: String, config: PathBuf) -> Result<std::process::ExitCode, PairE
     let store = Store::open(&paths.state_db()).map_err(|_| PairError::NoDaemon)?;
     let code = ka_agent_channels::pairing::issue(&store, &channel)
         .map_err(|e| PairError::NotEnabled(format!("{channel} ({e})")))?;
+    let telegram_link = if channel == "telegram" {
+        telegram_deep_link(&cfg, &paths, &code)
+    } else {
+        None
+    };
     if channel == "telegram" && !admin::is_running(&paths) {
         // Standalone wait: talk to Bot API directly, no daemon needed.
         let base = cfg.telegram.api_base().to_string();
@@ -57,7 +62,7 @@ fn run(channel: String, config: PathBuf) -> Result<std::process::ExitCode, PairE
             &paths.root().join("secrets"),
         )
         .map_err(|_| PairError::NotEnabled("telegram (no bot token resolved)".into()))?;
-        println!("Send this to your bot within 10 minutes:  /pair {code}");
+        print_pair_instructions(&code, telegram_link.as_deref());
         match standalone_wait(&base, &token, &store) {
             Ok((uid, name)) => {
                 println!("✓ paired {uid}:{name}");
@@ -72,7 +77,7 @@ fn run(channel: String, config: PathBuf) -> Result<std::process::ExitCode, PairE
     if !admin::is_running(&paths) {
         return Err(PairError::NoDaemon);
     }
-    println!("Send this to your bot within 10 minutes:  /pair {code}");
+    print_pair_instructions(&code, telegram_link.as_deref());
     // The running daemon redeems the code; watch for the new identity row.
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
     while std::time::Instant::now() < deadline {
@@ -91,6 +96,39 @@ fn run(channel: String, config: PathBuf) -> Result<std::process::ExitCode, PairE
     }
     println!("code expired — run `ka-agent pair {channel}` again");
     Ok(std::process::ExitCode::FAILURE)
+}
+
+/// The `t.me/<bot>?start=<code>` deep link, when the bot's username can
+/// be resolved: pairing from the phone is one tap instead of a copied
+/// code. `None` (token or `getMe` unavailable) just omits the link.
+fn telegram_deep_link(
+    cfg: &ka_agent_core::DaemonConfig,
+    paths: &Paths,
+    code: &str,
+) -> Option<String> {
+    let base = cfg.telegram.api_base().to_string();
+    let token = ka_agent_core::secret::resolve(
+        cfg.telegram
+            .token_secret
+            .as_deref()
+            .unwrap_or("telegram.bot_token"),
+        &paths.root().join("secrets"),
+    )
+    .ok()?;
+    let user = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?
+        .block_on(ka_agent_channels::telegram::telegram_get_me(&base, &token))
+        .ok()?;
+    Some(format!("https://t.me/{user}?start={code}"))
+}
+
+fn print_pair_instructions(code: &str, deep_link: Option<&str>) {
+    println!("Send this to your bot within 10 minutes:  /pair {code}");
+    if let Some(link) = deep_link {
+        println!("Or tap the deep link:  {link}");
+    }
 }
 
 /// The standalone telegram wait on the caller's runtime (main runs `pair`

@@ -25,7 +25,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Post a notice to the running agent's surfaces (no model turn).
+    #[command(hide = true)]
     Notify {
         /// The text (`-` reads stdin).
         #[arg(required = true)]
@@ -47,8 +47,7 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Operator hooks: list them, or run the matching ones against a
-    /// synthetic event.
+    #[command(hide = true)]
     Hooks {
         #[command(subcommand)]
         action: HooksAction,
@@ -56,6 +55,7 @@ pub(crate) enum Command {
         config: Option<PathBuf>,
     },
     /// Show, edit or reset the assistant's persona.
+    #[command(hide = true)]
     Persona {
         #[command(subcommand)]
         action: Option<PersonaAction>,
@@ -123,7 +123,8 @@ pub(crate) enum Command {
         /// Hidden test hook: run the engine worker with a scripted speaker.
         #[arg(long, hide = true)]
         scenario: Option<PathBuf>,
-        /// Enable the loopback-only web UI on this port (default: disabled).
+        /// Web panel port for this run (`run` serves it on the [web] port
+        /// by default; `chat` never serves it).
         #[arg(long)]
         web_port: Option<u16>,
     },
@@ -202,6 +203,7 @@ pub(crate) enum Command {
         action: Option<BriefingAction>,
     },
     /// Connect MCP servers: their tools become the agent's tools.
+    #[command(hide = true)]
     Mcp {
         #[command(subcommand)]
         action: McpAction,
@@ -214,6 +216,7 @@ pub(crate) enum Command {
         action: ProfileAction,
     },
     /// What Ka spent, per day.
+    #[command(hide = true)]
     Usage {
         /// How many days back (1-366, default 30).
         #[arg(long, default_value_t = 30)]
@@ -257,6 +260,7 @@ pub(crate) enum Command {
         action: SecretAction,
     },
     /// What Ka remembers (plain Markdown you can edit).
+    #[command(hide = true)]
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
@@ -282,6 +286,9 @@ pub(crate) enum Command {
         /// Also check the provider key and channel tokens live.
         #[arg(long)]
         online: bool,
+        /// Apply the safe repairs (data/secrets dir 0700, secret files 0600).
+        #[arg(long)]
+        fix: bool,
         /// One JSON document (`{ok, checks: [{level, text}]}`).
         #[arg(long)]
         json: bool,
@@ -304,7 +311,8 @@ pub(crate) enum Command {
     Guard,
     #[command(name = "__mcp", hide = true)]
     McpBridge,
-    /// Manage tool grants (what the agent may reach: hosts, repos, …).
+    /// Manage connector tool scopes (hosts, repos a connector may reach)
+    /// and directory grants ([[grants.path]] in the config).
     #[command(hide = true)]
     Grant {
         #[command(subcommand)]
@@ -434,6 +442,11 @@ pub(crate) enum McpAction {
     },
     /// Remove a server.
     Rm { name: String },
+    /// Probe server(s): initialize and list tools (exit 1 on failure).
+    Test {
+        /// Only this server (default: every configured one).
+        name: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -446,7 +459,8 @@ pub(crate) enum ProfileAction {
     },
     /// Rename a profile (data, config, units, the active pointer).
     Rename { from: String, to: String },
-    /// Create a profile (config copied from another, minus channels).
+    /// Create a profile (config copied once from another — it never
+    /// tracks later changes there; minus channels).
     Create {
         name: String,
         /// Profile whose config to start from.
@@ -524,6 +538,11 @@ pub(crate) enum GrantAction {
     Remove { scope: String },
     /// List all grant scopes.
     List,
+    /// Directory access grants ([[grants.path]] in the config).
+    Path {
+        #[command(subcommand)]
+        action: crate::grant::PathGrantAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -652,6 +671,7 @@ pub(crate) enum SkillsAction {
 /// The footer of `ka-agent --help`: the commands kept out of the main list
 /// (they all work; `ka-agent <command> --help` explains each).
 const ADVANCED_HELP: &str = "\
-More commands: logs briefing run restart pair models key secret identity grant
-               plugin skills backup restore export purge completions
+More commands: notify hooks persona usage memory mcp import logs briefing
+               run restart pair models key secret identity grant plugin
+               skills backup restore export purge completions
                — `ka-agent <command> --help`";

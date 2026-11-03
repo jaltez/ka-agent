@@ -6,6 +6,7 @@
 //!
 //! Keeping one op list means the layout is tested once and both printers
 //! stay trivial.
+use std::sync::LazyLock;
 
 /// One drawing command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,13 +31,61 @@ pub enum Op {
     SyncEnd,
 }
 
-/// Print the ops (one buffered write, one flush).
+/// Whether the `NO_COLOR` convention disables styling (checked once).
+pub fn no_color() -> bool {
+    *NO_COLOR
+}
+
+static NO_COLOR: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NO_COLOR").is_some());
+
+/// Dim inline text — plain when `NO_COLOR` is set.
+pub fn dim(s: &str) -> String {
+    style(s, "\x1b[2m")
+}
+
+/// Bold inline text — plain when `NO_COLOR` is set.
+pub fn bold(s: &str) -> String {
+    style(s, "\x1b[1m")
+}
+
+/// Red inline text (errors) — plain when `NO_COLOR` is set.
+pub fn red(s: &str) -> String {
+    style(s, "\x1b[31m")
+}
+
+fn style(s: &str, sgr: &str) -> String {
+    if no_color() {
+        s.to_string()
+    } else {
+        format!("{sgr}{s}\x1b[0m")
+    }
+}
+
+/// Style-neutral ops: `Dim`/`Bold` become plain text under `NO_COLOR`.
+fn neutral(ops: &[Op]) -> Vec<Op> {
+    neutral_with(no_color(), ops)
+}
+
+fn neutral_with(no_color: bool, ops: &[Op]) -> Vec<Op> {
+    if !no_color {
+        return ops.to_vec();
+    }
+    ops.iter()
+        .map(|op| match op {
+            Op::Dim(s) | Op::Bold(s) => Op::Text(s.clone()),
+            other => other.clone(),
+        })
+        .collect()
+}
+/// Print the ops (one buffered write, one flush). Styling ops print as
+/// plain text under `NO_COLOR` (the layout itself never changes).
 pub fn emit(ops: &[Op]) {
+    let ops = neutral(ops);
     #[cfg(unix)]
     {
         use std::io::Write as _;
         let mut out = String::new();
-        for op in ops {
+        for op in &ops {
             match op {
                 Op::Text(s) => out.push_str(s),
                 Op::Dim(s) => {
@@ -65,8 +114,7 @@ pub fn emit(ops: &[Op]) {
     {
         use crossterm::style::{Attribute, SetAttribute};
         use crossterm::{cursor, queue, terminal};
-        let mut stdout = std::io::stdout();
-        for op in ops {
+        for op in &ops {
             let _ = match op {
                 Op::Text(s) => queue!(stdout, crossterm::style::Print(s)),
                 Op::Dim(s) => queue!(
@@ -146,5 +194,26 @@ mod tests {
             ]),
             "\x1b[?2026h\x1b[2A\r\x1b[J\x1b[2mstatus\x1b[0m\r\n\x1b[1m»\x1b[0m hi\x1b[3C\x1b[?2026l"
         );
+    }
+
+    #[test]
+    fn no_color_neutralizes_styling_ops_only() {
+        // Under NO_COLOR the styling ops become plain text; everything
+        // that positions the cursor is untouched.
+        assert_eq!(
+            neutral_with(
+                true,
+                &[Op::Dim("a".into()), Op::Up(1), Op::Bold("b".into()), Op::Cr]
+            ),
+            vec![
+                Op::Text("a".into()),
+                Op::Up(1),
+                Op::Text("b".into()),
+                Op::Cr
+            ]
+        );
+        // Color on: the ops pass through unchanged.
+        let ops = [Op::Dim("a".into()), Op::Cr];
+        assert_eq!(neutral_with(false, &ops), ops.to_vec());
     }
 }

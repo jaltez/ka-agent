@@ -96,6 +96,10 @@ fn draft_text(full: &str) -> (String, usize) {
 /// Telegram caps an uploaded photo at 10 MB; bigger images go as documents.
 const PHOTO_MAX_BYTES: usize = 10 * 1024 * 1024;
 
+/// Telegram caps an uploaded video/animation at 50 MB; bigger ones go as
+/// documents (the tool cap is 50 MB too).
+const VIDEO_MAX_BYTES: usize = 50 * 1024 * 1024;
+
 impl SurfaceInner {
     fn new(client: TelegramClient) -> Self {
         Self {
@@ -407,7 +411,7 @@ impl Surface for TelegramSurface {
                 let client = self.inner.client.clone();
                 *typing = Some(tokio::spawn(async move {
                     loop {
-                        let _ = client.send_chat_action(chat).await;
+                        let _ = client.send_chat_action(chat, "typing").await;
                         tokio::time::sleep(TYPING_INTERVAL).await;
                     }
                 }));
@@ -422,6 +426,10 @@ impl Surface for TelegramSurface {
                 let Some(chat) = self.inner.chat() else {
                     return;
                 };
+                // The engine's retry note ends "(esc cancels)" — a local
+                // keyboard hint with no meaning on the phone (there Esc
+                // does nothing; /stop is the remote interrupt).
+                let text = &text.replace(" (esc cancels)", "");
                 let shown = {
                     let mut notes = self
                         .inner
@@ -594,6 +602,15 @@ impl Surface for TelegramSurface {
                 let client = self.inner.client.clone();
                 let (path, name, caption) = (path.clone(), name.clone(), caption.clone());
                 tokio::spawn(async move {
+                    // The phone shows an upload indicator instead of a
+                    // minutes-long "typing…" while a big file goes out;
+                    // one action covers the whole upload.
+                    let action = if photo_mime(&name).is_some() {
+                        "upload_photo"
+                    } else {
+                        "upload_document"
+                    };
+                    let _ = client.send_chat_action(chat, action).await;
                     if let Err(e) = deliver_file(&client, chat, &path, &name, &caption).await {
                         eprintln!("telegram: file {name}: {e}");
                         let notice = format!("! [file] {name}: {e}\n{path}");
@@ -657,7 +674,25 @@ impl Surface for TelegramSurface {
                 self.inner.settle_card(&short_id(id, 12), parsed);
             }
             AgentEvent::Error { class, message } => {
-                self.inner.spawn_send(format!("! [{class}] {message}"));
+                let text = format!("! [{class}] {message}");
+                // ka-port.md §7: rate_limit/network errors offer a Retry
+                // affordance (never automatic). One tap re-sends the
+                // interrupted question via the shared /retry path.
+                if matches!(class.as_str(), "rate_limit" | "network") {
+                    let markup = json!({
+                        "inline_keyboard": [[
+                            { "text": "↻ Retry", "callback_data": "retry:last" }
+                        ]]
+                    });
+                    let inner = Arc::clone(&self.inner);
+                    tokio::spawn(async move {
+                        if let Some(chat) = inner.chat() {
+                            let _ = inner.client.send_message(chat, &text, Some(markup)).await;
+                        }
+                    });
+                } else {
+                    self.inner.spawn_send(text);
+                }
             }
             // While tools run and no answer text has streamed, the draft
             // shows the newest tool call; the text replaces it later.
@@ -691,9 +726,13 @@ impl Surface for TelegramSurface {
     }
 }
 
-/// Send one event file: `sendPhoto` for an image Telegram accepts (jpg,
-/// jpeg, png, webp ≤ 10 MB), `sendDocument` otherwise. The caption rides
-/// along when non-empty.
+/// Send one event file as the inline method Telegram can play/show:
+/// `sendPhoto` for an image Telegram accepts (jpg, jpeg, png, webp
+/// ≤ 10 MB), `sendVideo` for a video (mp4, m4v, webm, mkv ≤ 50 MB),
+/// `sendAnimation` for a GIF, `sendDocument` otherwise. A refused inline
+/// send (a server that predates the method, a codec Telegram rejects,
+/// an over-limit file) falls back to `sendDocument`, so the file is
+/// never lost. The caption rides along when non-empty.
 async fn deliver_file(
     client: &TelegramClient,
     chat: i64,
@@ -701,19 +740,58 @@ async fn deliver_file(
     name: &str,
     caption: &str,
 ) -> Result<(), ChannelError> {
-    let read = path.to_string();
-    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&read))
-        .await
-        .map_err(|e| ChannelError::api(format!("read task: {e}")))?
-        .map_err(|e| ChannelError::api(format!("{path}: {e}")))?;
-    let (method, field, mime) = match photo_mime(name) {
-        Some(mime) if bytes.len() <= PHOTO_MAX_BYTES => ("sendPhoto", "photo", Some(mime)),
-        _ => ("sendDocument", "document", None),
-    };
+    let bytes = read_file(path).await?;
+    if let Some((method, field, mime)) = inline_send(name, bytes.len()) {
+        if let Err(e) = client
+            .send_media(chat, method, field, name, mime, bytes, caption)
+            .await
+        {
+            eprintln!("telegram: {method} refused ({e}); sending as a document");
+            let bytes = read_file(path).await?;
+            return client
+                .send_media(chat, "sendDocument", "document", name, None, bytes, caption)
+                .await
+                .map(|_| ());
+        }
+        return Ok(());
+    }
     client
-        .send_media(chat, method, field, name, mime, bytes, caption)
+        .send_media(chat, "sendDocument", "document", name, None, bytes, caption)
         .await
         .map(|_| ())
+}
+
+/// Read one outbound file off the runtime thread.
+async fn read_file(path: &str) -> Result<Vec<u8>, ChannelError> {
+    let read = path.to_string();
+    tokio::task::spawn_blocking(move || std::fs::read(&read))
+        .await
+        .map_err(|e| ChannelError::api(format!("read task: {e}")))?
+        .map_err(|e| ChannelError::api(format!("{path}: {e}")))
+}
+
+/// The inline send (`method`, multipart `field`, MIME) Telegram accepts
+/// for `name` at `len` bytes, if any — else the caller sends a document.
+fn inline_send(
+    name: &str,
+    len: usize,
+) -> Option<(&'static str, &'static str, Option<&'static str>)> {
+    if let Some(mime) = photo_mime(name)
+        && len <= PHOTO_MAX_BYTES
+    {
+        return Some(("sendPhoto", "photo", Some(mime)));
+    }
+    if let Some(mime) = video_mime(name)
+        && len <= VIDEO_MAX_BYTES
+    {
+        let (method, field) = if mime == "image/gif" {
+            ("sendAnimation", "animation")
+        } else {
+            ("sendVideo", "video")
+        };
+        return Some((method, field, Some(mime)));
+    }
+    None
 }
 
 /// The image MIME type Telegram accepts for `sendPhoto`, by extension.
@@ -723,6 +801,20 @@ fn photo_mime(name: &str) -> Option<&'static str> {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "png" => Some("image/png"),
         "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// The video/animation MIME type, by extension: `sendVideo` plays mp4/
+/// m4v/webm/mkv inline, `sendAnimation` plays a GIF — both up to 50 MB
+/// (bigger files go out as documents, the tool cap is 50 MB).
+fn video_mime(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" | "m4v" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mkv" => Some("video/x-matroska"),
+        "gif" => Some("image/gif"),
         _ => None,
     }
 }
