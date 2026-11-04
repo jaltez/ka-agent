@@ -114,6 +114,7 @@ pub fn emit(ops: &[Op]) {
     {
         use crossterm::style::{Attribute, SetAttribute};
         use crossterm::{cursor, queue, terminal};
+        let mut stdout = std::io::stdout();
         for op in &ops {
             let _ = match op {
                 Op::Text(s) => queue!(stdout, crossterm::style::Print(s)),
