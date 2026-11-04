@@ -394,6 +394,12 @@ impl Runtime {
             .config_path
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(path);
+        // The file as it exists now is the config this runtime was built
+        // from — nothing reloaded. Seeding the watcher's mtime here keeps
+        // the first maintenance tick from announcing "config reloaded"
+        // on every boot (a PC that starts periodically would notify the
+        // phone each time for no change at all).
+        self.remember_config_mtime();
     }
 
     pub fn config_path(&self) -> Option<std::path::PathBuf> {

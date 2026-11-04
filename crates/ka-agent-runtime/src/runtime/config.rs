@@ -140,7 +140,7 @@ impl Runtime {
 
     /// Record the config file's current mtime as "seen" (called by every
     /// reload path), and return the previous value for the watcher.
-    fn remember_config_mtime(&self) {
+    pub(super) fn remember_config_mtime(&self) {
         let Some(path) = self.config_path() else {
             return;
         };
