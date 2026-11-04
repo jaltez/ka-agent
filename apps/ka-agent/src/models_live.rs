@@ -28,20 +28,36 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const CACHE_TTL_MS: i64 = 24 * 3_600_000;
 
-/// Registry provider id → ka vendor prefix. Only these vendors are
-/// merged; every other registry entry (and every ka vendor absent from
-/// the registry) stays catalog-only.
+/// Registry provider id → ka vendor prefix. Several registry ids share
+/// one ka vendor (the registry lists the Zen gateway as "opencode" and
+/// the Go plan as "opencode-go"; the Zhipu company as "zai"/"zhipuai"
+/// with a separate coding-plan endpoint; Moonshot and Alibaba under
+/// their company names). Every other registry entry (and every ka
+/// vendor absent from the registry — the local servers) stays
+/// catalog-only.
 fn ka_vendor(registry_id: &str) -> Option<&'static str> {
     match registry_id {
-        // The registry lists the OpenCode gateway as "opencode"; ka
-        // registers the Go subscription plan as "opencode-go".
-        "opencode" => Some("opencode-go"),
+        // The gateway lists both the Zen pool ("opencode") and the Go
+        // subscription plan ("opencode-go"); ka registers the plan.
+        "opencode" | "opencode-go" => Some("opencode-go"),
         "anthropic" => Some("anthropic"),
         "openai" => Some("openai"),
         "google" => Some("google"),
-        "zai" => Some("zai"),
+        "zai" | "zhipuai" => Some("zai"),
+        // The coding-plan endpoint is its own ka vendor.
+        "zai-coding-plan" | "zhipuai-coding-plan" => Some("zai-plan"),
         "deepseek" => Some("deepseek"),
         "openrouter" => Some("openrouter"),
+        "mistral" => Some("mistral"),
+        "groq" => Some("groq"),
+        "cerebras" => Some("cerebras"),
+        "xai" => Some("xai"),
+        "nvidia" => Some("nvidia"),
+        // Company ids the registry uses for the ka vendors below.
+        "moonshotai" | "moonshotai-cn" => Some("moonshot"),
+        "alibaba" | "alibaba-cn" => Some("qwen"),
+        "togetherai" => Some("together"),
+        "fireworks-ai" => Some("fireworks"),
         _ => None,
     }
 }
@@ -401,6 +417,7 @@ mod tests {
     #[test]
     fn registry_provider_ids_map_to_ka_vendors() {
         assert_eq!(ka_vendor("opencode"), Some("opencode-go"));
+        assert_eq!(ka_vendor("opencode-go"), Some("opencode-go"));
         for id in [
             "anthropic",
             "openai",
@@ -408,12 +425,48 @@ mod tests {
             "zai",
             "deepseek",
             "openrouter",
+            "mistral",
+            "groq",
+            "cerebras",
+            "xai",
+            "nvidia",
         ] {
             assert_eq!(ka_vendor(id), Some(id));
         }
+        // Registry company ids alias onto the ka vendor names.
+        assert_eq!(ka_vendor("zhipuai"), Some("zai"));
+        assert_eq!(ka_vendor("zai-coding-plan"), Some("zai-plan"));
+        assert_eq!(ka_vendor("zhipuai-coding-plan"), Some("zai-plan"));
+        assert_eq!(ka_vendor("moonshotai"), Some("moonshot"));
+        assert_eq!(ka_vendor("moonshotai-cn"), Some("moonshot"));
+        assert_eq!(ka_vendor("alibaba"), Some("qwen"));
+        assert_eq!(ka_vendor("alibaba-cn"), Some("qwen"));
+        assert_eq!(ka_vendor("togetherai"), Some("together"));
+        assert_eq!(ka_vendor("fireworks-ai"), Some("fireworks"));
         // Unknown to ka: skipped, never merged.
         assert_eq!(ka_vendor("azure"), None);
         assert_eq!(ka_vendor(""), None);
+    }
+
+    #[test]
+    fn a_vendor_with_no_catalog_rows_lists_registry_models() {
+        // The pinned catalog carries no groq rows; the live registry is
+        // the only source of models, and the setup picker must not be
+        // empty for a provider it offers.
+        assert!(catalog::catalog_models("groq").is_empty());
+        let body = br#"{"groq": {"models": {"llama-3.3-70b-versatile": {}, "gpt-oss-120b": {}}}}"#;
+        let reg = Registry {
+            models: parse_registry(body),
+            fetched_at_ms: 0,
+            from_cache: false,
+        };
+        assert_eq!(
+            merged("groq", Some(&reg)),
+            vec![
+                "groq/gpt-oss-120b".to_string(),
+                "groq/llama-3.3-70b-versatile".to_string()
+            ]
+        );
     }
 
     #[test]

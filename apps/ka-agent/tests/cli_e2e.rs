@@ -806,11 +806,12 @@ fn probe_without_a_key_is_not_probed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The setup picker offers the registry's models ahead of the catalog
-/// (its default pick becomes the registry's first model), and the
+/// The setup picker offers the registry's models (ahead of the catalog in
+/// the list) while preselecting the vendor's recommended model — the
+/// registry is alphabetical, so its first id is not a good default. The
 /// answer still goes through the catalog's selector validation.
 #[test]
-fn setup_picker_offers_registry_models_first() {
+fn setup_picker_preselects_the_recommended_model() {
     use std::io::Write as _;
     let root = temp_root("pick-reg");
     let reg = fake_http(vec![(
@@ -853,9 +854,15 @@ fn setup_picker_offers_registry_models_first() {
     );
     assert!(out.status.success(), "{text}");
     let cfg = std::fs::read_to_string(root.join("config.toml")).unwrap();
+    // The registry model is offered in the list ...
     assert!(
-        cfg.contains("model = \"anthropic/claude-super-9\""),
-        "the registry's first model is the default pick: {cfg}"
+        text.contains("anthropic/claude-super-9"),
+        "the registry's model must be offered: {text}"
+    );
+    // ... but the recommended default is the preselected pick.
+    assert!(
+        cfg.contains("model = \"anthropic/claude-sonnet-5\""),
+        "the recommended model is the default pick: {cfg}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

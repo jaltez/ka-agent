@@ -39,6 +39,17 @@ fn key_url(name: &str) -> Option<&'static str> {
         "anthropic" => Some("https://console.anthropic.com/settings/keys"),
         "openai" => Some("https://platform.openai.com/api-keys"),
         "google" => Some("https://aistudio.google.com/apikey"),
+        "zai" | "zai-plan" => Some("https://z.ai/manage-apikey/apikey-list"),
+        "deepseek" => Some("https://platform.deepseek.com/api_keys"),
+        "xai" => Some("https://console.x.ai"),
+        "mistral" => Some("https://console.mistral.ai/api-keys"),
+        "groq" => Some("https://console.groq.com/keys"),
+        "cerebras" => Some("https://cloud.cerebras.ai"),
+        "moonshot" => Some("https://platform.moonshot.ai/console/api-keys"),
+        "qwen" => Some("https://bailian.console.aliyun.com/"),
+        "together" => Some("https://api.together.ai/settings/api-keys"),
+        "fireworks" => Some("https://fireworks.ai/account/api-keys"),
+        "nvidia" => Some("https://build.nvidia.com"),
         "openrouter" => Some("https://openrouter.ai/keys"),
         // Both plans share one console and one key.
         "opencode" | "opencode-go" => Some("https://opencode.ai/console"),
@@ -91,10 +102,25 @@ pub fn default_model(vendor: &str) -> Option<&'static str> {
         "anthropic" => Some("anthropic/claude-sonnet-5"),
         "openai" => Some("openai/gpt-5.1"),
         "zai" => Some("zai/glm-5.3"),
+        // The coding-plan endpoint serves the same GLM models.
+        "zai-plan" => Some("zai-plan/glm-5.3"),
         "deepseek" => Some("deepseek/deepseek-flash"),
         "openrouter" => Some("openrouter/z-ai/glm-5.3"),
         "ollama" => Some("ollama/qwen3-32b"),
         "opencode-go" => Some("opencode-go/glm-5.3"),
+        // Vendors the pinned catalog does not carry: the default is a
+        // live-registry id (verified against models.dev), so `models`
+        // and `setup --yes` have a recommended pick instead of failing
+        // or defaulting to an arbitrary alphabetically-first id.
+        "groq" => Some("groq/llama-3.3-70b-versatile"),
+        "xai" => Some("xai/grok-4.7"),
+        "mistral" => Some("mistral/mistral-large-latest"),
+        "cerebras" => Some("cerebras/gpt-oss-120b"),
+        "moonshot" => Some("moonshot/kimi-k3.1-pro"),
+        "qwen" => Some("qwen/qwen3.8-max"),
+        "together" => Some("together/MiniMaxAI/MiniMax-M3"),
+        "fireworks" => Some("fireworks/accounts/fireworks/models/glm-5p3"),
+        "nvidia" => Some("nvidia/deepseek-ai/deepseek-v4.1-flash"),
         _ => None,
     }
 }

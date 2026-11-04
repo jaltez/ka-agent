@@ -202,6 +202,17 @@ impl Setup {
                 options.push(full);
             }
         }
+        // Preselect the recommended model: registry lists are
+        // alphabetical, so without this the picker would propose whatever
+        // id sorts first (a TTS or image model on some vendors). Moving it
+        // to the front keeps it inside the 12-entry window.
+        if let Some(d) = catalog::default_model(p.name)
+            && let Some(pos) = options.iter().position(|o| o == d)
+            && pos > 0
+        {
+            let recommended = options.remove(pos);
+            options.insert(0, recommended);
+        }
         options.truncate(12);
         options.push("Type a model id".to_string());
         loop {
