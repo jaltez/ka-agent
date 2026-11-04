@@ -25,6 +25,7 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 fs2 = { workspace = true }
 toml = { workspace = true }
+jiff = { workspace = true }
 
 [features]
 # Builds the scripted-speaker test worker binary (`ka-port-test-worker`)

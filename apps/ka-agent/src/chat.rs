@@ -580,7 +580,11 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
                 .map(|c| c.workspace_path())
                 .unwrap_or_else(|_| std::path::PathBuf::from(".")),
         };
-        crate::term::Terminal::start(ws, persona_name(), String::new())
+        // The `/model` completion table, read once from the registry
+        // cache (no fetch; empty without one — Tab then offers
+        // commands only).
+        let models = crate::term::complete::Models::from_registry_cache(paths.root());
+        crate::term::Terminal::start(ws, persona_name(), String::new(), models)
     } else {
         None
     };

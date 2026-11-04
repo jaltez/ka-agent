@@ -186,6 +186,9 @@ struct Shared {
     /// The newest release seen by the daemon's periodic check (F4); the
     /// status line and one Notice surface it.
     update_available: Mutex<Option<String>>,
+    /// The models.dev snapshot for the interactive `/model` listing,
+    /// refreshed by the host's periodic task (cache-first, 24 h TTL).
+    model_registry: Mutex<Option<ka_agent_port::registry::Registry>>,
 }
 
 impl Shared {
@@ -345,6 +348,7 @@ impl Runtime {
                 channel_health: Mutex::new(HashMap::new()),
                 live_model: Mutex::new(None),
                 update_available: Mutex::new(None),
+                model_registry: Mutex::new(None),
                 inner: Mutex::new(Inner {
                     session,
                     session_allow: std::collections::HashSet::new(),
@@ -546,6 +550,34 @@ impl Runtime {
                 text: format!("update available: {v} — ka-agent update"),
             });
         }
+    }
+
+    /// Publish the models.dev snapshot the interactive `/model` listing
+    /// reads (the host's periodic task refreshes it; `None` clears).
+    pub fn set_model_registry(&self, reg: Option<ka_agent_port::registry::Registry>) {
+        *self
+            .sh
+            .model_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = reg;
+    }
+
+    /// The published models.dev snapshot, when there is one.
+    pub fn model_registry(&self) -> Option<ka_agent_port::registry::Registry> {
+        self.sh
+            .model_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The grouped, current-first listing `/model` with no argument
+    /// shows on every surface (registry models merged over the catalog,
+    /// recommended model first per provider).
+    pub fn models_listing(&self) -> ka_agent_port::registry::ModelsListing {
+        let reg = self.model_registry();
+        let current = self.cfg().model.clone();
+        ka_agent_port::registry::listing(reg.as_ref(), current.as_deref())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

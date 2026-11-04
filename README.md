@@ -53,7 +53,7 @@ in your terminal too.
 |---|---|
 | `/status` | model, spend vs limits, queue, next task |
 | `/mode [m]` | ask (default, asks) · accept_edits · allow · readonly (read-only) — badge when not ask; the old names guarded/free/plan still work |
-| `/model provider/model` | switch model, applied live |
+| `/model [provider/model]` | switch model, applied live — bare `/model` lists providers, `/model <provider>` its models, `/model <n>` picks; Tab completes selectors |
 | `/new` · `/stop` · `/resume` | fresh session · abort reply · lift a pause |
 | `/retry` | re-send the last failed or interrupted question (also the ↻ button on Telegram) |
 | `/remember <fact>` · `/forget <id>` | durable memory (git-backed; `/memory` lists ids) |

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ka_agent_core::audit::AuditRecord;
 use ka_agent_core::{ApprovalDecision, ApprovalStatus, DaemonConfig, OutboxChunk};
+use ka_agent_runtime::registry::{ModelsListing, ProviderModels};
 use ka_agent_runtime::{Error as RtError, Runtime};
 use ka_agent_store::Store;
 use serde_json::{Value, json};
@@ -71,12 +72,26 @@ struct MediaGroup {
 /// batches, not human typing.
 const MEDIA_GROUP_DEBOUNCE: Duration = Duration::from_millis(750);
 
+/// The native pickers (bare `/model` `/mode` `/effort`): the provider
+/// grid and each vendor page cap how many buttons one card shows.
+const PROVIDER_COLS: usize = 3;
+const PROVIDER_PAGE: usize = 24;
+const MODEL_COLS: usize = 2;
+const MODEL_PAGE: usize = 12;
+/// Lines of the shared vendor listing a picker card carries (the
+/// keyboard pages the models; the text is a window, not the catalogue).
+const PICKER_TEXT_LINES: usize = 12;
+/// `answerCallbackQuery` toasts cap at 200 characters.
+const TOAST_CHARS: usize = 200;
+
 /// What one callback press produced: the toast for
 /// `answerCallbackQuery` (empty = just close the spinner) and, when the
-/// card must change, its new text.
+/// card must change, its new text plus the keyboard to render under it
+/// (`None` drops the keyboard — a settled card).
 struct CallbackReply {
     toast: String,
     edit: Option<String>,
+    markup: Option<Value>,
 }
 
 impl CallbackReply {
@@ -85,6 +100,7 @@ impl CallbackReply {
         Self {
             toast: String::new(),
             edit: None,
+            markup: None,
         }
     }
 
@@ -93,6 +109,27 @@ impl CallbackReply {
         Self {
             toast: text.to_string(),
             edit: None,
+            markup: None,
+        }
+    }
+
+    /// Answer with `toast`, replace the card's text and drop its keyboard
+    /// (the outcome of a decided card).
+    fn settle(toast: &str, text: String) -> Self {
+        Self {
+            toast: toast.to_string(),
+            edit: Some(text),
+            markup: None,
+        }
+    }
+
+    /// Replace the card's text AND keyboard (a picker page): no toast,
+    /// the spinner closes and the card becomes the new page.
+    fn page(text: String, markup: Value) -> Self {
+        Self {
+            toast: String::new(),
+            edit: Some(text),
+            markup: Some(markup),
         }
     }
 }
@@ -515,6 +552,13 @@ impl TelegramChannel {
             return;
         };
 
+        // A bare `/model` / `/mode` / `/effort` renders as a native
+        // Telegram picker (an inline keyboard) instead of the router's
+        // text listing; every argument form still routes below.
+        if let Some(cmd) = bare_picker_command(text) {
+            self.send_picker(&client, chat_id, cmd).await;
+            return;
+        }
         // Commands route through the shared router; replies go to the same
         // chat. Approvals additionally offer the inline keyboard below.
         // Only free text reaches the engine (the router's contract): a
@@ -659,10 +703,7 @@ impl TelegramChannel {
             },
             _ => return CallbackReply::none(),
         };
-        CallbackReply {
-            toast: toast.to_string(),
-            edit: Some(outcome),
-        }
+        CallbackReply::settle(toast, outcome)
     }
 
     /// ✅ / ✖ on a skill proposal: accept (install + enable) or reject it
@@ -719,10 +760,7 @@ impl TelegramChannel {
                     (format!("! [skills] no outcome for {id}"), "error")
                 }
             };
-        CallbackReply {
-            toast: toast.to_string(),
-            edit: Some(outcome),
-        }
+        CallbackReply::settle(toast, outcome)
     }
 
     /// Resolve one callback press: the toast for `answerCallbackQuery` and,
@@ -738,6 +776,67 @@ impl TelegramChannel {
         let Some(data) = data else {
             return CallbackReply::none();
         };
+        // The native `/model` `/mode` `/effort` pickers (checked first:
+        // `mm:`/`mo:` would not collide with `m:`, but the picker owns
+        // its prefixes as a block).
+        // `mx` — the ✕ on a `/model` card: collapse it to the current
+        // model line, keyboard gone.
+        if data == "mx" {
+            let head = crate::commands::model_header(&self.runtime).await;
+            let line = head.lines().next().unwrap_or("model:").to_string();
+            return CallbackReply::settle("", line);
+        }
+        // `mp:<vendor>[:<off>]` — open a provider's models (paged) in the
+        // `/model` card; `mp:<off>` (digits only) pages the provider grid.
+        if let Some(rest) = data.strip_prefix("mp:") {
+            if let Ok(off) = rest.parse::<usize>() {
+                return self.provider_page_reply(off).await;
+            }
+            return match rest.split_once(':') {
+                None => self.vendor_page_reply(rest, 0).await,
+                Some((vendor, off)) => match off.parse::<usize>() {
+                    Ok(off) => self.vendor_page_reply(vendor, off).await,
+                    Err(_) => CallbackReply::none(),
+                },
+            };
+        }
+        // `mm:<vendor>:<idx>` — pick `models[idx]` of the provider.
+        if let Some(rest) = data.strip_prefix("mm:") {
+            return self.model_pick_callback(rest).await;
+        }
+        // `mo:<mode>` — a `/mode` button. The phone may only tighten;
+        // the refusal is the outcome (H1, same as `/mode <name>`).
+        if let Some(mode) = data.strip_prefix("mo:") {
+            if !crate::commands::MODES.iter().any(|(name, _)| *name == mode) {
+                return CallbackReply::none();
+            }
+            let uid = cb["from"]["id"].as_i64().unwrap_or(0);
+            return match self
+                .runtime
+                .set_mode(mode, &format!("telegram:{uid}"))
+                .await
+            {
+                Ok(m) => {
+                    let text = format!("mode → {m}");
+                    CallbackReply::settle(&text, text.clone())
+                }
+                Err(e) => {
+                    CallbackReply::settle(&toast_cap(&e.to_string()), format!("! [mode] {e}"))
+                }
+            };
+        }
+        // `ef:<level>` — an `/effort` button.
+        if let Some(level) = data.strip_prefix("ef:") {
+            if !crate::commands::EFFORTS.contains(&level) {
+                return CallbackReply::none();
+            }
+            return match self.runtime.set_effort(level).await {
+                Ok(reply) => CallbackReply::settle(&toast_cap(&reply), reply),
+                Err(e) => {
+                    CallbackReply::settle(&toast_cap(&e.to_string()), format!("! [effort] {e}"))
+                }
+            };
+        }
         // `retry:last` — the ↻ button on a rate_limit/network error.
         if data == "retry:last" {
             return match self.runtime.retry_last().await {
@@ -811,6 +910,104 @@ impl TelegramChannel {
         }
     }
 
+    /// Send the native picker card for a bare `/model` / `/mode` /
+    /// `/effort` from the operator: the current value plus an inline
+    /// keyboard instead of the router's text listing. Best-effort — a
+    /// refused send logs and drops the card, the command stays answered.
+    async fn send_picker(&self, client: &TelegramClient, chat_id: i64, cmd: &str) {
+        let (text, markup) = match cmd {
+            "/mode" => {
+                let current = self.runtime.config().mode.clone();
+                (format!("mode: {current}"), mode_keyboard(&current))
+            }
+            "/effort" => {
+                let current = self
+                    .runtime
+                    .effort()
+                    .unwrap_or_else(|| "model default".into());
+                (format!("effort: {current}"), effort_keyboard(&current))
+            }
+            _ => {
+                let listing = self.runtime.models_listing();
+                let line = if listing.providers.is_empty() {
+                    "no models known — ka-agent models --refresh pulls the live list"
+                } else {
+                    "pick a provider:"
+                };
+                let text = format!(
+                    "{}\n{line}",
+                    crate::commands::model_header(&self.runtime).await
+                );
+                (text, provider_grid(&listing, 0))
+            }
+        };
+        if let Err(e) = client.send_message(chat_id, &text, Some(markup)).await {
+            eprintln!("telegram: {cmd} picker: {e}");
+        }
+    }
+
+    /// `mp:<off>` — the provider grid page `off` of the `/model` card.
+    async fn provider_page_reply(&self, off: usize) -> CallbackReply {
+        let listing = self.runtime.models_listing();
+        if off >= listing.providers.len() {
+            return CallbackReply::none();
+        }
+        let text = format!(
+            "{}\npick a provider:",
+            crate::commands::model_header(&self.runtime).await
+        );
+        CallbackReply::page(text, provider_grid(&listing, off))
+    }
+
+    /// `mp:<vendor>[:<off>]` — one page of a provider's models in the
+    /// `/model` card: the shared vendor listing text (capped) over a
+    /// keyboard of its models.
+    async fn vendor_page_reply(&self, vendor: &str, off: usize) -> CallbackReply {
+        let listing = self.runtime.models_listing();
+        let Some(p) = listing.providers.iter().find(|p| p.name == vendor) else {
+            return CallbackReply::none();
+        };
+        if off >= p.models.len() {
+            return CallbackReply::none();
+        }
+        let text = cap_lines(
+            &crate::commands::model_vendor_listing(&self.runtime, vendor).await,
+            PICKER_TEXT_LINES,
+        );
+        CallbackReply::page(text, model_grid(p, off))
+    }
+
+    /// `mm:<vendor>:<idx>` — switch to `models[idx]` and settle the card
+    /// to the same reply the router's `/model <selector>` produces.
+    async fn model_pick_callback(&self, rest: &str) -> CallbackReply {
+        let Some((vendor, idx)) = rest.rsplit_once(':') else {
+            return CallbackReply::none();
+        };
+        let Ok(idx) = idx.parse::<usize>() else {
+            return CallbackReply::none();
+        };
+        let listing = self.runtime.models_listing();
+        let Some(p) = listing.providers.iter().find(|p| p.name == vendor) else {
+            return CallbackReply::none();
+        };
+        let Some(sel) = p.models.get(idx) else {
+            return CallbackReply::none();
+        };
+        let sel = sel.clone();
+        match self.runtime.set_model(&sel).await {
+            Ok(id) => {
+                let mut reply = format!("model → {id} (next message uses it)");
+                if let Ok(Some((_, ka_agent_runtime::ModelKeyState::Missing(env)))) =
+                    self.runtime.model_key_state()
+                {
+                    reply.push_str(&format!("\n✗ {env} missing — ka-agent key set {env}"));
+                }
+                CallbackReply::settle(&toast_cap(&format!("model → {id}")), reply)
+            }
+            Err(e) => CallbackReply::settle(&toast_cap(&e.to_string()), format!("! [model] {e}")),
+        }
+    }
+
     async fn dispatch_callback(
         &self,
         cb: &Value,
@@ -846,13 +1043,13 @@ impl TelegramChannel {
         if let Some(text) = reply.edit
             && let Some(message_id) = cb["message"]["message_id"].as_i64()
         {
+            // A picker page carries its own keyboard; every other edit
+            // removes it (a decided card cannot be pressed again).
+            let markup = reply
+                .markup
+                .unwrap_or_else(|| json!({ "inline_keyboard": [] }));
             let _ = client
-                .edit_message_text(
-                    chat_id,
-                    message_id,
-                    &text,
-                    Some(json!({ "inline_keyboard": [] })),
-                )
+                .edit_message_text(chat_id, message_id, &text, Some(markup))
                 .await;
         }
     }
@@ -900,6 +1097,157 @@ async fn submit_caption_turn(
     }
 }
 
+/// The lone words that open a native picker instead of the router's
+/// text listing: `/model`, `/mode` or `/effort`, optionally
+/// `@botname`-suffixed (Telegram appends it), with nothing after.
+fn bare_picker_command(text: &str) -> Option<&'static str> {
+    let mut words = text.split_whitespace();
+    let first = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    match first.split('@').next().unwrap_or(first) {
+        "/model" => Some("/model"),
+        "/mode" => Some("/mode"),
+        "/effort" => Some("/effort"),
+        _ => None,
+    }
+}
+
+/// One inline-keyboard button.
+fn kb_button(text: &str, data: &str) -> Value {
+    json!({ "text": text, "callback_data": data })
+}
+
+/// Buttons laid out in rows of `cols`.
+fn kb_rows(buttons: Vec<Value>, cols: usize) -> Vec<Vec<Value>> {
+    buttons.chunks(cols).map(<[Value]>::to_vec).collect()
+}
+
+/// `s` capped at `max` characters, an ellipsis marking the cut.
+fn trunc_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// A toast (`answerCallbackQuery` text): capped at Telegram's 200 chars.
+fn toast_cap(text: &str) -> String {
+    trunc_chars(text, TOAST_CHARS)
+}
+
+/// The provider grid of the `/model` picker: one `name (N)` button per
+/// provider (the current vendor dotted), rows of 3, `‹ prev` / `… more`
+/// paging past 24, and the ✕ that collapses the card.
+fn provider_grid(listing: &ModelsListing, off: usize) -> Value {
+    let current = listing.current_vendor();
+    let buttons: Vec<Value> = listing
+        .providers
+        .iter()
+        .skip(off)
+        .take(PROVIDER_PAGE)
+        .map(|p| {
+            let dot = if Some(p.name.as_str()) == current {
+                "· "
+            } else {
+                ""
+            };
+            kb_button(
+                &format!("{dot}{} ({})", p.name, p.models.len()),
+                &format!("mp:{}", p.name),
+            )
+        })
+        .collect();
+    let mut rows = kb_rows(buttons, PROVIDER_COLS);
+    let mut nav = Vec::new();
+    if off > 0 {
+        nav.push(kb_button(
+            "‹ prev",
+            &format!("mp:{}", off.saturating_sub(PROVIDER_PAGE)),
+        ));
+    }
+    if off + PROVIDER_PAGE < listing.providers.len() {
+        nav.push(kb_button("… more", &format!("mp:{}", off + PROVIDER_PAGE)));
+    }
+    if !nav.is_empty() {
+        rows.push(nav);
+    }
+    rows.push(vec![kb_button("✕", "mx")]);
+    json!({ "inline_keyboard": rows })
+}
+
+/// One page of a provider's models in the `/model` picker: rows of 2,
+/// the bare model id on each button (≤24 chars, the index global so a
+/// later page still names a real model), `‹ prev` / `more ›` over the
+/// full list, `‹ providers` back to the grid.
+fn model_grid(p: &ProviderModels, off: usize) -> Value {
+    let buttons: Vec<Value> = p
+        .models
+        .iter()
+        .enumerate()
+        .skip(off)
+        .take(MODEL_PAGE)
+        .map(|(i, m)| {
+            let id = m.strip_prefix(&format!("{}/", p.name)).unwrap_or(m);
+            kb_button(&trunc_chars(id, 24), &format!("mm:{}:{i}", p.name))
+        })
+        .collect();
+    let mut rows = kb_rows(buttons, MODEL_COLS);
+    let mut nav = Vec::new();
+    if off > 0 {
+        nav.push(kb_button(
+            "‹ prev",
+            &format!("mp:{}:{}", p.name, off.saturating_sub(MODEL_PAGE)),
+        ));
+    }
+    if off + MODEL_PAGE < p.models.len() {
+        nav.push(kb_button(
+            "more ›",
+            &format!("mp:{}:{}", p.name, off + MODEL_PAGE),
+        ));
+    }
+    if !nav.is_empty() {
+        rows.push(nav);
+    }
+    rows.push(vec![kb_button("‹ providers", "mp:0"), kb_button("✕", "mx")]);
+    json!({ "inline_keyboard": rows })
+}
+
+/// The `/mode` keyboard: one row per mode, `name — desc` (the desc
+/// capped at 20 chars), the current mode dotted.
+fn mode_keyboard(current: &str) -> Value {
+    let rows: Vec<Vec<Value>> = crate::commands::MODES
+        .iter()
+        .map(|(name, desc)| {
+            let dot = if *name == current { "· " } else { "" };
+            vec![kb_button(
+                &format!("{dot}{name} — {}", trunc_chars(desc, 20)),
+                &format!("mo:{name}"),
+            )]
+        })
+        .collect();
+    json!({ "inline_keyboard": rows })
+}
+
+/// The `/effort` keyboard: one row of the five levels, current dotted.
+fn effort_keyboard(current: &str) -> Value {
+    let buttons: Vec<Value> = crate::commands::EFFORTS
+        .iter()
+        .map(|level| {
+            let dot = if *level == current { "· " } else { "" };
+            kb_button(&format!("{dot}{level}"), &format!("ef:{level}"))
+        })
+        .collect();
+    json!({ "inline_keyboard": [buttons] })
+}
+
+/// The first `n` lines of `text` — a picker card caps its listing.
+fn cap_lines(text: &str, n: usize) -> String {
+    text.lines().take(n).collect::<Vec<_>>().join("\n")
+}
 /// The human name of the first unsupported media kind `message` carries,
 /// if any — used for the `! [media] … isn't supported yet` refusal.
 fn unsupported_media_kind(message: &Value) -> Option<&'static str> {

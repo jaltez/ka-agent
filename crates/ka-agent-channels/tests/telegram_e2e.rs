@@ -958,6 +958,422 @@ async fn phone_cannot_allow_for_the_session() {
     stop(&mut stack).await;
 }
 
+// ---------------------------------------------------------------------------
+// Native pickers: bare `/model` `/mode` `/effort` render as inline
+// keyboards instead of the router's text listing.
+// ---------------------------------------------------------------------------
+
+/// Every `(text, callback_data)` pair on a captured keyboard, row-major.
+fn keyboard_buttons(req: &ka_agent_channels::fake::CapturedRequest) -> Vec<(String, String)> {
+    req.body["reply_markup"]["inline_keyboard"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_array())
+                .flatten()
+                .filter_map(|b| {
+                    Some((
+                        b["text"].as_str()?.to_string(),
+                        b["callback_data"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every `callback_data` on a captured keyboard, row-major.
+fn keyboard_datas(req: &ka_agent_channels::fake::CapturedRequest) -> Vec<String> {
+    keyboard_buttons(req).into_iter().map(|(_, d)| d).collect()
+}
+
+/// Whether a captured edit removed the keyboard (settled card).
+fn keyboard_is_gone(req: &ka_agent_channels::fake::CapturedRequest) -> bool {
+    req.body["reply_markup"]["inline_keyboard"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().all(|r| r.as_array().is_some_and(Vec::is_empty)))
+}
+
+/// A bare `/model` (the `@botname` spelling included) answers with the
+/// shared header plus a provider keyboard; argument forms still answer
+/// through the shared router, with no keyboard.
+#[tokio::test(flavor = "multi_thread")]
+async fn bare_model_sends_the_provider_keyboard() {
+    let mut stack = spawn_channel(vec![42], "tok-pick0").await;
+    stack.server.push_text_message(1, 7, 42, "/model");
+    let sent = stack
+        .server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["reply_markup"].is_object(),
+            Duration::from_secs(5),
+        )
+        .expect("picker card sent");
+    let text = sent.body["text"].as_str().unwrap_or("");
+    assert!(text.contains("model:"), "header first: {text}");
+    assert!(text.contains("pick a provider:"), "{text}");
+    let datas = keyboard_datas(&sent);
+    assert!(
+        datas.contains(&"mp:anthropic".to_string()),
+        "a provider button: {datas:?}"
+    );
+    assert!(datas.contains(&"mx".to_string()), "the ✕ button: {datas:?}");
+    assert!(
+        datas.iter().all(|d| d.len() <= 64),
+        "callback data fits 64 bytes: {datas:?}"
+    );
+    // `/model@bot` is the same bare command.
+    stack
+        .server
+        .push_text_message(2, 7, 42, "/mode@ka_agent_bot");
+    let mode_card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").starts_with("mode:")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("@botname spelling opens the /mode picker");
+    assert!(mode_card.body["reply_markup"].is_object());
+    // `/model <provider>` keeps routing through the shared router.
+    stack.server.push_text_message(3, 7, 42, "/model anthropic");
+    let routed = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().unwrap_or("").contains("anthropic")
+                    && c.body["reply_markup"].is_null()
+            },
+            Duration::from_secs(5),
+        )
+        .expect("argument forms stay with the router");
+    assert!(
+        routed.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("anthropic — 1 model"),
+        "the router's vendor listing: {:?}",
+        routed.body["text"]
+    );
+    stop(&mut stack).await;
+}
+
+/// `mp:<vendor>` swaps the card to that provider's models; a model
+/// button switches the config model and settles the card keyboard-free
+/// with the router's own switch reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn model_picker_opens_a_vendor_and_switches_the_model() {
+    let mut stack = spawn_channel(vec![42], "tok-pick1").await;
+    // set_model writes the config file: give the runtime one.
+    let cfg_path = stack.db_path.parent().unwrap().join("ka-agent.toml");
+    std::fs::write(&cfg_path, "model = \"openai/gpt-5.1\"\n").unwrap();
+    stack.runtime.set_config_path(cfg_path.clone());
+
+    stack.server.push_text_message(1, 7, 42, "/model");
+    stack
+        .server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["reply_markup"].is_object(),
+            Duration::from_secs(5),
+        )
+        .expect("picker card sent");
+    stack.server.push_callback(2, 7, 42, "mp:anthropic");
+    let page = stack
+        .server
+        .await_capture(
+            |c| c.method == "editMessageText" && c.body["reply_markup"].is_object(),
+            Duration::from_secs(5),
+        )
+        .expect("vendor page edited in");
+    assert!(
+        page.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("anthropic"),
+        "vendor listing text"
+    );
+    let sonnet = keyboard_buttons(&page)
+        .into_iter()
+        .find(|(t, _)| t.contains("claude-sonnet-5"))
+        .expect("claude-sonnet-5 on a button");
+    assert_eq!(sonnet.1, "mm:anthropic:0");
+
+    stack.server.push_callback(3, 7, 42, &sonnet.1);
+    let answered = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "answerCallbackQuery"
+                    && c.body["text"].as_str().unwrap_or("").contains("model →")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("press answered with a toast");
+    assert!(
+        answered.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("anthropic/claude-sonnet-5")
+    );
+    let settled = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("model → anthropic/claude-sonnet-5")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("card settles to the switch reply");
+    assert!(keyboard_is_gone(&settled), "keyboard removed on settle");
+    assert!(
+        std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .contains("model = \"anthropic/claude-sonnet-5\""),
+        "config model switched"
+    );
+    stop(&mut stack).await;
+}
+
+/// A vendor with more than 12 models pages: `more ›` edits in the next
+/// window, `‹ prev` walks back, `‹ providers` returns to the grid.
+#[tokio::test(flavor = "multi_thread")]
+async fn model_picker_pages_a_big_vendor() {
+    let mut stack = spawn_channel(vec![42], "tok-pick2").await;
+    stack.server.push_callback(1, 7, 42, "mp:openrouter");
+    let page1 = stack
+        .server
+        .await_capture(
+            |c| c.method == "editMessageText" && c.body["reply_markup"].is_object(),
+            Duration::from_secs(5),
+        )
+        .expect("first page");
+    let datas = keyboard_datas(&page1);
+    assert!(
+        datas.contains(&"mm:openrouter:0".to_string()),
+        "models from index 0: {datas:?}"
+    );
+    assert!(
+        datas.contains(&"mp:openrouter:12".to_string()),
+        "a more button: {datas:?}"
+    );
+    assert!(
+        datas.contains(&"mp:0".to_string()),
+        "back to the providers: {datas:?}"
+    );
+    stack.server.push_callback(2, 7, 42, "mp:openrouter:12");
+    let page2 = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && keyboard_datas(c).contains(&"mm:openrouter:12".to_string())
+            },
+            Duration::from_secs(5),
+        )
+        .expect("second page");
+    let datas2 = keyboard_datas(&page2);
+    assert!(
+        datas2.contains(&"mp:openrouter:0".to_string())
+            && datas2.contains(&"mp:openrouter:24".to_string()),
+        "prev and more walk the list: {datas2:?}"
+    );
+    stop(&mut stack).await;
+}
+
+/// The bare `/mode` keyboard tightens (`mo:readonly`) and refuses to
+/// loosen from the phone (`mo:allow`) with the same text as `/mode`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mode_picker_tightens_and_refuses_to_loosen() {
+    let mut stack = spawn_channel(vec![42], "tok-pick3").await;
+    let cfg_path = stack.db_path.parent().unwrap().join("ka-agent.toml");
+    std::fs::write(&cfg_path, "mode = \"ask\"\n").unwrap();
+    stack.runtime.set_config_path(cfg_path.clone());
+    stack.server.push_text_message(1, 7, 42, "/mode");
+    let sent = stack
+        .server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["reply_markup"].is_object(),
+            Duration::from_secs(5),
+        )
+        .expect("mode card sent");
+    assert!(
+        sent.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("mode:"),
+        "current mode first"
+    );
+    let buttons = keyboard_buttons(&sent);
+    for name in ["ask", "accept_edits", "allow", "readonly"] {
+        assert!(
+            buttons.iter().any(|(_, d)| *d == format!("mo:{name}")),
+            "the {name} button: {buttons:?}"
+        );
+    }
+    assert!(
+        buttons
+            .iter()
+            .any(|(t, d)| d == "mo:ask" && t.starts_with("· ")),
+        "the current mode is dotted: {buttons:?}"
+    );
+
+    stack.server.push_callback(2, 7, 42, "mo:readonly");
+    let settled = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("mode → readonly")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("tightening settles the card");
+    assert!(keyboard_is_gone(&settled));
+    assert!(
+        std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .contains("mode = \"readonly\"")
+    );
+
+    // The phone may only tighten: allow is refused, card shows why.
+    stack.server.push_callback(3, 7, 42, "mo:allow");
+    let refused = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "answerCallbackQuery"
+                    && c.body["text"].as_str().unwrap_or("").contains("stricter")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("refusal toast");
+    assert_eq!(refused.body["callback_query_id"].as_str(), Some("cq3"));
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("! [mode]")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("refusal on the card");
+    assert!(
+        card.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("stricter")
+    );
+    assert!(
+        std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .contains("mode = \"readonly\""),
+        "the mode is unchanged"
+    );
+    stop(&mut stack).await;
+}
+
+/// The bare `/effort` keyboard: `ef:high` answers, settles the card and
+/// sets the session effort.
+#[tokio::test(flavor = "multi_thread")]
+async fn effort_picker_sets_the_level() {
+    let mut stack = spawn_channel(vec![42], "tok-pick4").await;
+    stack.server.push_text_message(1, 7, 42, "/effort");
+    let sent = stack
+        .server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["reply_markup"].is_object(),
+            Duration::from_secs(5),
+        )
+        .expect("effort card sent");
+    assert!(
+        sent.body["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("effort:"),
+        "current effort first"
+    );
+    let datas = keyboard_datas(&sent);
+    for level in ["off", "low", "medium", "high", "max"] {
+        assert!(
+            datas.contains(&format!("ef:{level}")),
+            "the {level} button: {datas:?}"
+        );
+    }
+    stack.server.push_callback(2, 7, 42, "ef:high");
+    let settled = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("effort → high (this session)")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("level settles the card");
+    assert!(keyboard_is_gone(&settled));
+    assert_eq!(stack.runtime.effort(), Some("high".to_string()));
+    stop(&mut stack).await;
+}
+
+/// Picker callback data naming something unknown (`mm:nope:1`) is
+/// answered exactly once and changes nothing — same as any other
+/// unknown prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_picker_callback_is_answered_once_and_changes_nothing() {
+    let mut stack = spawn_channel(vec![42], "tok-pick5").await;
+    // Learn the chat first so the callback takes the normal dispatch path.
+    stack.server.push_text_message(1, 7, 42, "/status");
+    stack
+        .server
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(5))
+        .expect("status reply");
+    let before = stack.server.captured().len();
+    stack.server.push_callback(2, 7, 42, "mm:nope:1");
+    let answered = stack
+        .server
+        .await_capture(
+            |c| c.method == "answerCallbackQuery",
+            Duration::from_secs(5),
+        )
+        .expect("callback answered");
+    assert_eq!(
+        answered.body["text"].as_str(),
+        Some(""),
+        "an empty answer still closes the spinner"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after: Vec<_> = stack.server.captured()[before..].to_vec();
+    assert_eq!(
+        after
+            .iter()
+            .filter(|c| c.method == "answerCallbackQuery")
+            .count(),
+        1,
+        "answered exactly once: {after:?}"
+    );
+    assert!(
+        after.iter().all(|c| c.method != "editMessageText"),
+        "no card is touched: {after:?}"
+    );
+    stop(&mut stack).await;
+}
+
 /// 3.3: files leave as `sendPhoto` (jpg/jpeg/png/webp ≤ 10 MB) or
 /// `sendDocument`, with the caption; a file that cannot be sent falls back
 /// to a notice carrying the absolute path.

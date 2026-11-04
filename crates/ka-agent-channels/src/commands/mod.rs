@@ -13,6 +13,10 @@ mod memory;
 mod misc;
 mod schedule;
 mod session;
+/// The interactive pickers (`/model`, `/mode`, `/effort`) exported for
+/// the surfaces that render them natively (Telegram's keyboards build
+/// on the same strings).
+pub use session::{EFFORTS, MODES, model_header, model_picker, model_vendor_listing};
 mod skills;
 
 pub use misc::{fmt_interval, local_compact};
@@ -594,5 +598,100 @@ mod tests {
     fn telegram_menu_only_lists_flagged_commands() {
         assert!(COMMANDS.iter().filter(|c| c.telegram).count() >= 10);
         assert!(COMMANDS.iter().all(|c| c.summary.len() <= 256));
+    }
+
+    #[tokio::test]
+    async fn model_command_is_an_interactive_picker() {
+        let runtime = test_runtime();
+        // No arguments: the current model plus the numbered providers.
+        let Outcome::Reply(listing) = route(&runtime, "console", "/model").await else {
+            panic!("expected a reply");
+        };
+        assert!(listing.contains("model: none"), "{listing}");
+        assert!(listing.contains("1. anthropic — "), "{listing}");
+        assert!(
+            listing.contains("/model <n|provider> lists its models"),
+            "{listing}"
+        );
+
+        // A provider argument: its models, numbered, recommended first.
+        let Outcome::Reply(models) = route(&runtime, "console", "/model anthropic").await else {
+            panic!("expected a reply");
+        };
+        assert!(models.contains("anthropic — "), "{models}");
+        assert!(models.contains("1. anthropic/claude-sonnet-5"), "{models}");
+        assert!(models.contains("/model anthropic <n> switches"), "{models}");
+
+        // `/model <provider> <n>` switches through the same path as a
+        // full selector (needs a config file to write).
+        let cfg = std::env::temp_dir().join(format!("ka-cmd-model-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&cfg);
+        runtime.set_config_path(cfg.clone());
+        let Outcome::Reply(switch) = route(&runtime, "console", "/model anthropic 1").await else {
+            panic!("expected a reply");
+        };
+        assert!(
+            switch.contains("model → anthropic/claude-sonnet-5"),
+            "{switch}"
+        );
+        assert_eq!(
+            runtime.config().model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+
+        // Out-of-range numbers are refused, never silently re-listed.
+        let Outcome::Reply(oob) = route(&runtime, "console", "/model anthropic 999").await else {
+            panic!("expected a reply");
+        };
+        assert!(oob.starts_with("! [model]"), "{oob}");
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[tokio::test]
+    async fn mode_and_effort_pick_by_number() {
+        let runtime = test_runtime();
+        let cfg = std::env::temp_dir().join(format!("ka-cmd-mode-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&cfg);
+        runtime.set_config_path(cfg.clone());
+
+        let Outcome::Reply(modes) = route(&runtime, "console", "/mode").await else {
+            panic!("expected a reply");
+        };
+        assert!(modes.contains("mode: ask"), "{modes}");
+        assert!(modes.contains("1. ask — asks before acting ←"), "{modes}");
+        assert!(modes.contains("4. readonly"), "{modes}");
+        let Outcome::Reply(switch) = route(&runtime, "console", "/mode 4").await else {
+            panic!("expected a reply");
+        };
+        assert_eq!(switch, "mode → readonly");
+        // Out of range names the bound.
+        let Outcome::Reply(oob) = route(&runtime, "console", "/mode 9").await else {
+            panic!("expected a reply");
+        };
+        assert!(oob.contains("no option 9"), "{oob}");
+
+        let Outcome::Reply(levels) = route(&runtime, "console", "/effort").await else {
+            panic!("expected a reply");
+        };
+        assert!(levels.contains("effort: model default"), "{levels}");
+        assert!(levels.contains("3. medium"), "{levels}");
+        let Outcome::Reply(effort) = route(&runtime, "console", "/effort 3").await else {
+            panic!("expected a reply");
+        };
+        assert_eq!(effort, "effort → medium (this session)");
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[tokio::test]
+    async fn skill_with_no_arguments_lists_the_library() {
+        let runtime = test_runtime();
+        let Outcome::Reply(reply) = route(&runtime, "console", "/skill").await else {
+            panic!("expected a reply");
+        };
+        assert!(reply.contains("no skills enabled"), "{reply}");
+        assert!(
+            reply.contains("/skill <name> <text>") || reply.contains("skills enable"),
+            "{reply}"
+        );
     }
 }

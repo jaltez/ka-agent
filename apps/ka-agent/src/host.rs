@@ -279,6 +279,27 @@ impl Host {
             }));
         }
 
+        // The interactive `/model` listing reads the models.dev snapshot
+        // from the runtime: load it at boot and refresh daily (a fresh
+        // cache costs no request; a fetch only happens past 24 h).
+        {
+            let loader = runtime.clone();
+            let reg_root = paths.root().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let rt = loader.clone();
+                    let root = reg_root.clone();
+                    if let Ok(reg) =
+                        tokio::task::spawn_blocking(move || crate::models_live::load(&root, false))
+                            .await
+                    {
+                        rt.set_model_registry(reg);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                }
+            }));
+        }
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Voice-note transcription for the phone channels (key from the

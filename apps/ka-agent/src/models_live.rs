@@ -9,58 +9,27 @@
 //! the cache, and with no cache at all callers show exactly the
 //! catalog. No function raises an error surface of its own.
 //!
-//! Registry: `https://models.dev/api.json` (no auth), shape
-//! `{provider_id: {"models": {model_id: …}}}`, cached raw (plus a
-//! fetched-at marker) for 24 h under `<data root>/cache/`.
+//! The registry's pure half (parse, cache files, per-vendor merge, the
+//! grouped listing the chat pickers show) lives in
+//! `ka_agent_port::registry` so the runtime can serve `/model` on every
+//! surface; this module keeps the fetch (`https://models.dev/api.json`,
+//! no auth, 24 h cache under `<data root>/cache/`) and the probe.
 //! `KA_AGENT_MODELS_REGISTRY` overrides the URL; `KA_AGENT_PROBE_URL`
 //! overrides the probe's base URL — both for fixture servers in tests.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use ka_agent_port::catalog::{self, ProviderInfo, WireKind};
+use ka_agent_port::registry;
+
+pub use ka_agent_port::registry::{Registry, footer, merged};
 
 const DEFAULT_REGISTRY_URL: &str = "https://models.dev/api.json";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// A cold model can queue at the gateway before the first byte; the
 /// probe's single request gets more rope than the listing fetch.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-const CACHE_TTL_MS: i64 = 24 * 3_600_000;
-
-/// Registry provider id → ka vendor prefix. Several registry ids share
-/// one ka vendor (the registry lists the Zen gateway as "opencode" and
-/// the Go plan as "opencode-go"; the Zhipu company as "zai"/"zhipuai"
-/// with a separate coding-plan endpoint; Moonshot and Alibaba under
-/// their company names). Every other registry entry (and every ka
-/// vendor absent from the registry — the local servers) stays
-/// catalog-only.
-fn ka_vendor(registry_id: &str) -> Option<&'static str> {
-    match registry_id {
-        // The gateway lists both the Zen pool ("opencode") and the Go
-        // subscription plan ("opencode-go"); ka registers the plan.
-        "opencode" | "opencode-go" => Some("opencode-go"),
-        "anthropic" => Some("anthropic"),
-        "openai" => Some("openai"),
-        "google" => Some("google"),
-        "zai" | "zhipuai" => Some("zai"),
-        // The coding-plan endpoint is its own ka vendor.
-        "zai-coding-plan" | "zhipuai-coding-plan" => Some("zai-plan"),
-        "deepseek" => Some("deepseek"),
-        "openrouter" => Some("openrouter"),
-        "mistral" => Some("mistral"),
-        "groq" => Some("groq"),
-        "cerebras" => Some("cerebras"),
-        "xai" => Some("xai"),
-        "nvidia" => Some("nvidia"),
-        // Company ids the registry uses for the ka vendors below.
-        "moonshotai" | "moonshotai-cn" => Some("moonshot"),
-        "alibaba" | "alibaba-cn" => Some("qwen"),
-        "togetherai" => Some("together"),
-        "fireworks-ai" => Some("fireworks"),
-        _ => None,
-    }
-}
 
 /// The registry URL (`KA_AGENT_MODELS_REGISTRY` overrides the default —
 /// tests point it at a fixture server).
@@ -69,87 +38,6 @@ fn registry_url() -> String {
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string())
-}
-
-/// One registry snapshot: per-vendor model ids, when they were
-/// learned, and whether that was this process or an earlier cache.
-#[derive(Debug, Clone, Default)]
-pub struct Registry {
-    /// ka vendor → registry model ids (bare — no vendor prefix,
-    /// sorted). Invariant: every list is non-empty and sorted.
-    pub models: BTreeMap<String, Vec<String>>,
-    fetched_at_ms: i64,
-    from_cache: bool,
-}
-
-/// `<data root>/cache/models-dev.json` — the raw registry body.
-pub fn cache_path(root: &Path) -> PathBuf {
-    root.join("cache").join("models-dev.json")
-}
-
-/// The fetched-at marker sitting next to the cache.
-fn marker_path(root: &Path) -> PathBuf {
-    root.join("cache").join("models-dev.json.at")
-}
-
-fn read_cache(root: &Path) -> Option<(Vec<u8>, i64)> {
-    let body = std::fs::read(cache_path(root)).ok()?;
-    let at = std::fs::read_to_string(marker_path(root))
-        .ok()
-        .and_then(|t| t.trim().parse::<i64>().ok())?;
-    Some((body, at))
-}
-
-fn write_cache(root: &Path, body: &[u8], at: i64) {
-    if std::fs::create_dir_all(root.join("cache")).is_err() {
-        return;
-    }
-    // Best-effort: a read-only root only costs the next run a refetch.
-    let _ = std::fs::write(cache_path(root), body);
-    let _ = std::fs::write(marker_path(root), at.to_string());
-}
-
-/// Build a snapshot from a raw body (`None`-equivalent: an empty model
-/// map when the body parses to nothing). `from_cache` marks one read
-/// back from disk rather than fetched by this process.
-fn snapshot(body: &[u8], at: i64, from_cache: bool) -> Registry {
-    Registry {
-        models: parse_registry(body),
-        fetched_at_ms: at,
-        from_cache,
-    }
-}
-
-/// Parse the registry document into per-ka-vendor model id lists:
-/// `{provider_id: {"models": {model_id: …}}}`; providers ka does not
-/// know are skipped. Invalid JSON → empty map (callers treat that as
-/// "no data"). Sorts and dedups each list; vendors with nothing left
-/// are dropped.
-pub fn parse_registry(body: &[u8]) -> BTreeMap<String, Vec<String>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return out;
-    };
-    let Some(providers) = doc.as_object() else {
-        return out;
-    };
-    for (pid, entry) in providers {
-        let Some(vendor) = ka_vendor(pid) else {
-            continue;
-        };
-        let Some(models) = entry.get("models").and_then(|m| m.as_object()) else {
-            continue;
-        };
-        out.entry(vendor.to_string())
-            .or_default()
-            .extend(models.keys().filter(|id| !id.is_empty()).cloned());
-    }
-    for ids in out.values_mut() {
-        ids.sort();
-        ids.dedup();
-    }
-    out.retain(|_, ids| !ids.is_empty());
-    out
 }
 
 fn fetch_registry(url: &str) -> Result<Vec<u8>, String> {
@@ -184,80 +72,24 @@ pub fn load(root: &Path, force: bool) -> Option<Registry> {
 }
 
 fn load_from(root: &Path, force: bool, url: &str) -> Option<Registry> {
-    let cached = read_cache(root);
+    let cached = registry::read_cache(root);
     if !force
         && let Some((body, at)) = &cached
-        && ka_agent_core::now_ms() - at < CACHE_TTL_MS
+        && ka_agent_core::now_ms() - at < registry::CACHE_TTL_MS
     {
-        return Some(snapshot(body, *at, true));
+        return Some(registry::snapshot(body, *at, true));
     }
     match fetch_registry(url) {
         // Only a body that is valid JSON is worth caching (a captive
         // portal's HTML must not poison the cache for 24 h).
         Ok(body) if serde_json::from_slice::<serde_json::Value>(&body).is_ok() => {
             let at = ka_agent_core::now_ms();
-            write_cache(root, &body, at);
-            return Some(snapshot(&body, at, false));
+            registry::write_cache(root, &body, at);
+            return Some(registry::snapshot(&body, at, false));
         }
         _ => {}
     }
-    cached.map(|(body, at)| snapshot(&body, at, true))
-}
-
-/// The one-line footer under a provider's model list: where the live
-/// half came from, or that the provider is catalog-only. With no
-/// registry snapshot at all (offline, nothing cached) the line says
-/// so instead of passing the pinned catalog off as current; a cache
-/// past its TTL that a refetch failed to replace says its age.
-pub fn footer(reg: Option<&Registry>, vendor: &str) -> String {
-    let Some(reg) = reg else {
-        return "catalog only (live registry unreachable)".to_string();
-    };
-    match reg.models.get(vendor) {
-        Some(ids) => {
-            let hhmm = jiff::Timestamp::from_millisecond(reg.fetched_at_ms)
-                .map(|t| t.to_zoned(jiff::tz::TimeZone::system()))
-                .map(|z| z.strftime("%H:%M").to_string())
-                .unwrap_or_else(|_| "??:??".to_string());
-            // A snapshot this old is only ever served after a failed
-            // refetch (a fresh cache is returned without one), so it
-            // must not dress up as live data.
-            if reg.from_cache && ka_agent_core::now_ms() - reg.fetched_at_ms >= CACHE_TTL_MS {
-                return format!("stale (cached {hhmm})");
-            }
-            let cached = if reg.from_cache { " (cached)" } else { "" };
-            format!("live {} from models.dev {hhmm}{cached}", ids.len())
-        }
-        None => "catalog only".to_string(),
-    }
-}
-
-/// The model list every surface shows for a vendor: registry models
-/// (sorted) first, then catalog models the registry does not list.
-/// Without a registry snapshot the order is today's — recommended
-/// default first, then catalog order.
-pub fn merged(vendor: &str, reg: Option<&Registry>) -> Vec<String> {
-    let mut catalog_list = Vec::new();
-    if let Some(d) = catalog::default_model(vendor) {
-        catalog_list.push(d.to_string());
-    }
-    for m in catalog::catalog_models(vendor) {
-        if !catalog_list.contains(&m) {
-            catalog_list.push(m);
-        }
-    }
-    let Some(ids) = reg.and_then(|r| r.models.get(vendor)) else {
-        return catalog_list;
-    };
-    // `ids` is sorted (parse_registry's invariant) and the vendor
-    // prefix is constant, so the full selectors keep that order.
-    let mut out: Vec<String> = ids.iter().map(|id| format!("{vendor}/{id}")).collect();
-    for m in catalog_list {
-        if !out.contains(&m) {
-            out.push(m);
-        }
-    }
-    out
+    cached.map(|(body, at)| registry::snapshot(&body, at, true))
 }
 
 /// The model name that goes on the wire for a selector: the catalog
@@ -415,161 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_provider_ids_map_to_ka_vendors() {
-        assert_eq!(ka_vendor("opencode"), Some("opencode-go"));
-        assert_eq!(ka_vendor("opencode-go"), Some("opencode-go"));
-        for id in [
-            "anthropic",
-            "openai",
-            "google",
-            "zai",
-            "deepseek",
-            "openrouter",
-            "mistral",
-            "groq",
-            "cerebras",
-            "xai",
-            "nvidia",
-        ] {
-            assert_eq!(ka_vendor(id), Some(id));
-        }
-        // Registry company ids alias onto the ka vendor names.
-        assert_eq!(ka_vendor("zhipuai"), Some("zai"));
-        assert_eq!(ka_vendor("zai-coding-plan"), Some("zai-plan"));
-        assert_eq!(ka_vendor("zhipuai-coding-plan"), Some("zai-plan"));
-        assert_eq!(ka_vendor("moonshotai"), Some("moonshot"));
-        assert_eq!(ka_vendor("moonshotai-cn"), Some("moonshot"));
-        assert_eq!(ka_vendor("alibaba"), Some("qwen"));
-        assert_eq!(ka_vendor("alibaba-cn"), Some("qwen"));
-        assert_eq!(ka_vendor("togetherai"), Some("together"));
-        assert_eq!(ka_vendor("fireworks-ai"), Some("fireworks"));
-        // Unknown to ka: skipped, never merged.
-        assert_eq!(ka_vendor("azure"), None);
-        assert_eq!(ka_vendor(""), None);
-    }
-
-    #[test]
-    fn a_vendor_with_no_catalog_rows_lists_registry_models() {
-        // The pinned catalog carries no groq rows; the live registry is
-        // the only source of models, and the setup picker must not be
-        // empty for a provider it offers.
-        assert!(catalog::catalog_models("groq").is_empty());
-        let body = br#"{"groq": {"models": {"llama-3.3-70b-versatile": {}, "gpt-oss-120b": {}}}}"#;
-        let reg = Registry {
-            models: parse_registry(body),
-            fetched_at_ms: 0,
-            from_cache: false,
-        };
-        assert_eq!(
-            merged("groq", Some(&reg)),
-            vec![
-                "groq/gpt-oss-120b".to_string(),
-                "groq/llama-3.3-70b-versatile".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn registry_parse_keeps_known_vendors_sorted_and_skips_the_rest() {
-        let body = br#"{
-            "opencode": {"models": {"zeta": {}, "alpha": {}, "glm-5.3": {}}},
-            "anthropic": {"models": {"claude-sonnet-5": {}}},
-            "unknown-vendor": {"models": {"x": {}}},
-            "empty": {"models": {}}
-        }"#;
-        let parsed = parse_registry(body);
-        assert_eq!(
-            parsed.get("opencode-go").unwrap(),
-            &["alpha", "glm-5.3", "zeta"],
-            "ids are bare and sorted"
-        );
-        assert_eq!(
-            parsed.get("anthropic").unwrap(),
-            &["claude-sonnet-5".to_string()]
-        );
-        assert!(!parsed.contains_key("unknown-vendor"));
-        assert!(
-            !parsed.contains_key("empty"),
-            "vendors with no models drop out"
-        );
-        assert_eq!(parsed.len(), 2);
-    }
-
-    #[test]
-    fn registry_parse_rejects_garbage_quietly() {
-        assert!(parse_registry(b"<html>captive portal</html>").is_empty());
-        assert!(parse_registry(b"[]").is_empty());
-    }
-
-    #[test]
-    fn merged_list_puts_registry_models_first_then_catalog_only() {
-        let reg = Registry {
-            models: BTreeMap::from([(
-                "opencode-go".to_string(),
-                vec!["new-shiny".to_string(), "glm-5.3".to_string()],
-            )]),
-            fetched_at_ms: 0,
-            from_cache: false,
-        };
-        let list = merged("opencode-go", Some(&reg));
-        assert_eq!(list[0], "opencode-go/new-shiny");
-        assert_eq!(list[1], "opencode-go/glm-5.3");
-        // Catalog models the registry lists are not repeated after it.
-        assert_eq!(
-            list.iter().filter(|m| *m == "opencode-go/glm-5.3").count(),
-            1
-        );
-        // A catalog-only model keeps its place after the registry block.
-        let catalog = catalog::catalog_models("opencode-go");
-        assert!(list.len() > 2, "the catalog contributes its own models");
-        assert!(
-            list.iter()
-                .any(|m| catalog.contains(m) && !list[..2].contains(m)),
-            "catalog-only models follow the registry models: {list:?}"
-        );
-
-        // No snapshot: today's order — default first, then catalog.
-        let plain = merged("opencode-go", None);
-        assert_eq!(
-            plain.first().map(String::as_str),
-            catalog::default_model("opencode-go"),
-            "the recommended default leads the catalog-only list"
-        );
-    }
-
-    #[test]
-    fn footer_says_where_the_live_half_came_from() {
-        let now = ka_agent_core::now_ms();
-        let reg = |at: i64, from_cache: bool| Registry {
-            models: BTreeMap::from([("opencode-go".to_string(), vec!["glm-5.3".to_string()])]),
-            fetched_at_ms: at,
-            from_cache,
-        };
-        let fresh = footer(Some(&reg(now, false)), "opencode-go");
-        assert!(fresh.starts_with("live 1 from models.dev "), "{fresh}");
-        assert!(!fresh.contains("(cached)"), "{fresh}");
-        let cached = footer(Some(&reg(now - 1_000, true)), "opencode-go");
-        assert!(cached.ends_with(" (cached)"), "{cached}");
-
-        // A cache past its TTL only exists after a failed refetch: it
-        // says its age instead of passing for fresh.
-        let stale = footer(Some(&reg(now - CACHE_TTL_MS - 1_000, true)), "opencode-go");
-        assert!(stale.starts_with("stale (cached "), "{stale}");
-        assert!(!stale.contains("models.dev"), "{stale}");
-
-        // A vendor the registry does not list says so — but only when
-        // a snapshot exists at all.
-        let with_snapshot = reg(now, false);
-        assert_eq!(footer(Some(&with_snapshot), "ollama"), "catalog only");
-        // No snapshot: the footer names the pinned catalog and says
-        // the live registry did not answer.
-        assert_eq!(
-            footer(None, "opencode-go"),
-            "catalog only (live registry unreachable)"
-        );
-    }
-
-    #[test]
     fn not_probed_line_names_the_key_env_to_set() {
         // A keyed provider names its variable, in the same wording as
         // the model-switch and preflight key warnings.
@@ -600,16 +277,20 @@ mod tests {
         let gone = "http://127.0.0.1:9/api.json";
         assert!(load_from(&root, false, gone).is_none());
         // A fresh cache is served without any request (URL unreachable).
-        write_cache(&root, body, ka_agent_core::now_ms() - 1_000);
+        registry::write_cache(&root, body, ka_agent_core::now_ms() - 1_000);
         let fresh = load_from(&root, false, gone).unwrap();
         assert!(fresh.from_cache);
         assert!(fresh.models.contains_key("opencode-go"));
         // Stale cache + unreachable registry: still served, marked cached.
-        write_cache(&root, body, ka_agent_core::now_ms() - CACHE_TTL_MS - 1_000);
+        registry::write_cache(
+            &root,
+            body,
+            ka_agent_core::now_ms() - registry::CACHE_TTL_MS - 1_000,
+        );
         let stale = load_from(&root, false, gone).unwrap();
         assert!(stale.from_cache, "a dead network never hides the cache");
         // A forced refetch that fails still shows the cache.
-        write_cache(&root, body, ka_agent_core::now_ms());
+        registry::write_cache(&root, body, ka_agent_core::now_ms());
         let forced = load_from(&root, true, gone).unwrap();
         assert!(
             forced.from_cache,

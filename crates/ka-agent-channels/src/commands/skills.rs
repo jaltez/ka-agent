@@ -44,7 +44,26 @@ pub(super) fn run_skill<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                     Err(e) => Outcome::Reply(format!("! [skill] {e}")),
                 }
             }
-            _ => Outcome::Reply("usage: /skill <name> <text>".into()),
+            _ => {
+                // No usable arguments: list what a `/skill <name> <text>`
+                // turn can load (the same inventory `/skills` shows).
+                let enabled = ctx.runtime.skills_enabled();
+                if enabled.is_empty() {
+                    return Outcome::Reply(
+                        "no skills enabled — `ka-agent skills enable <name>` provisions one".into(),
+                    );
+                }
+                let mut lines =
+                    vec!["one turn with a skill loaded: /skill <name> <text>".to_string()];
+                for s in enabled {
+                    if s.description.is_empty() {
+                        lines.push(format!("  {}", s.name));
+                    } else {
+                        lines.push(format!("  {} — {}", s.name, s.description));
+                    }
+                }
+                Outcome::Reply(lines.join("\n"))
+            }
         }
     })
 }

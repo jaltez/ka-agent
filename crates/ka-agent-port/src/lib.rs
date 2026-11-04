@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod engine_layer;
 pub mod port;
 pub mod proto;
+pub mod registry;
 pub mod scenario;
 pub mod token_lock;
 pub mod worker;

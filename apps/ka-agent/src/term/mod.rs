@@ -54,6 +54,9 @@ pub struct Terminal {
     pub verbosity: bool,
     /// Where `@path` completion and the editor's cwd resolve.
     workspace: std::path::PathBuf,
+    /// The `/model` completion table (vendors and their selectors),
+    /// built once at construction.
+    models: complete::Models,
     width: usize,
     /// Rows between the live area's first row and the cursor (0 = the
     /// cursor is on the first row): the next redraw moves up exactly this
@@ -64,7 +67,13 @@ pub struct Terminal {
 impl Terminal {
     /// Enter the terminal. `None` when the session is not a TTY or raw mode
     /// cannot be enabled (the caller falls back to the line path).
-    pub fn start(workspace: std::path::PathBuf, name: String, model: String) -> Option<Self> {
+    /// `models` is the precomputed `/model` completion table.
+    pub fn start(
+        workspace: std::path::PathBuf,
+        name: String,
+        model: String,
+        models: complete::Models,
+    ) -> Option<Self> {
         if !raw::is_tty() {
             return None;
         }
@@ -87,6 +96,7 @@ impl Terminal {
             search: None,
             verbosity: false,
             workspace,
+            models,
             width,
             cursor_up: 0,
         };
@@ -298,7 +308,7 @@ impl Terminal {
     fn complete(&mut self) {
         if self.completions.is_empty() {
             let workspace = self.view_workspace();
-            let candidates = complete::complete(&self.editor.text(), &workspace);
+            let candidates = complete::complete(&self.editor.text(), &workspace, &self.models);
             if candidates.is_empty() {
                 return;
             }
@@ -327,7 +337,10 @@ impl Terminal {
         };
         let insert = self.completions[self.completion_idx].insert.clone();
         let head: String = self.editor.text().chars().take(start).collect();
-        self.editor.set(&format!("{head}{insert} "));
+        // A candidate ending in `/` (a directory, a model vendor) keeps
+        // the cursor attached, so the next Tab completes inside it.
+        let pad = if insert.ends_with('/') { "" } else { " " };
+        self.editor.set(&format!("{head}{insert}{pad}"));
     }
 
     /// The candidates as one dim row above the live area.
@@ -355,7 +368,10 @@ impl Terminal {
         let text = self.editor.text();
         let start = text.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
         let head = &text[..start];
-        self.editor.set(&format!("{head}{insert} "));
+        // A candidate ending in `/` keeps the cursor attached for the
+        // next completion; everything else readies the next word.
+        let pad = if insert.ends_with('/') { "" } else { " " };
+        self.editor.set(&format!("{head}{insert}{pad}"));
     }
 
     fn view_workspace(&self) -> std::path::PathBuf {

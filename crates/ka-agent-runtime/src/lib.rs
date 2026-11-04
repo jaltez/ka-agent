@@ -15,6 +15,9 @@ pub mod surface;
 
 pub use bus::EventBus;
 pub use event::{AgentEvent, Envelope, PlanItem};
+/// The model catalog and the models.dev registry, re-exported so the
+/// channels crate reaches them without a direct ka-agent-port edge.
+pub use ka_agent_port::{catalog, registry};
 pub use paths::{InstanceLock, LockError, Paths};
 pub use runtime::compile_identity;
 pub use runtime::{CancelOutcome, Error, ModelKeyState, ReloadReport, Runtime, memory_preamble};

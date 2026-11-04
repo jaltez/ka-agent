@@ -56,7 +56,7 @@ pong                                                                          �
 | Ctrl-Y | yank the last kill back into the draft |
 | ↑/↓ | history; the walk filters by the draft it started with, and ↓ past the newest entry restores that draft |
 | Ctrl-R | incremental reverse search (Enter accepts the hit into the draft; Esc or Ctrl-G cancels) |
-| Tab | complete `/command` names and aliases, or `@path` in the workspace (≤ 10 candidates; a single match inserts, several print above the live area and each further Tab cycles through them) |
+| Tab | complete `/command` names and aliases, `@path` in the workspace, or — for the word right after `/model ` — model selectors: vendors first (`vendor/`), then that vendor's full `vendor/model` ids with the recommended one flagged (≤ 10 candidates; a single match inserts, several print above the live area and each further Tab cycles through them) |
 | Ctrl-C | a non-empty draft is cleared; on an empty draft a running turn is stopped; twice on an idle prompt (within 2 s) quits |
 | Esc | while a turn runs, stop it (the same as `/stop` — the engine's retry notes name this key); idle, dismiss the completion list |
 | Ctrl-D | quit on an empty draft (EOF) |
@@ -96,7 +96,10 @@ turn's stored text (never automatically).
 `apps/ka-agent/src/term/`: `raw.rs` (termios guard), `keys.rs` (byte decoder
 with split-read buffering, the ESC pause, the control-byte skip, and the
 cooperative pause the external editor needs), `editor.rs` (chars, cursor,
-wrapping, history, kill ring, the verbatim paste insert), `complete.rs`,
+wrapping, history, kill ring, the verbatim paste insert), `complete.rs`
+(commands, `@paths`, and the `/model` selector table — vendors and
+models in the picker's display order, built once at startup from the
+models.dev registry cache, catalog fallback, no fetch),
 `view.rs` (status line, activity, redraw, Markdown flush, the absorb arms
 for every event the transcript shows), `cards.rs`, `paint.rs` (drawing ops
 plus the `NO_COLOR` styling switch), `mod.rs` (the driver the chat loop
@@ -111,7 +114,9 @@ unbound control bytes, the ESC-pause flush), the editor (kills, yank,
 wrapping by display width, pasted newlines, history walk and search,
 newest-entry load, draft restore), the view (activity steps, status
 truncation, tool rows, reply/note/notice/session arms, the empty-plan
-guard, verbose tool rows), the reverse-search state machine, the paint
+guard, verbose tool rows), the completion of commands, paths and
+`/model` selectors (vendor order, recommended flag, prefix filtering,
+first-argument-only), the reverse-search state machine, the paint
 `NO_COLOR` op map, and the chat's one-letter card answers (rewritten only
 while the card is armed). The real binary is smoked in a tmux pane: banner,
 draft, Enter, tool row, answer, footer — and the same session under

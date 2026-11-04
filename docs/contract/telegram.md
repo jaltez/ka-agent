@@ -38,6 +38,45 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   hint at most once an hour. Any other `/word` gets
   `unknown command /word — /help lists them`. Free text expands
   `@references` and goes to `runtime.handle_message`.
+
+- Native pickers: a **bare** `/model`, `/mode` or `/effort` (a lone
+  word, `@botname` stripped like the router does) from a linked private
+  chat answers with ONE card message carrying an inline keyboard instead
+  of the router's text listing — every argument form (`/model
+  <selector>`, `/mode <n>`, …) still routes through the shared router
+  unchanged. Sends/edits are best-effort: a refusal logs to stderr and
+  drops the card. Callback data shapes (all ≤ 64 bytes; unknown data
+  under these prefixes — `mm:nope:1`, an out-of-range index — gets the
+  empty answer and no state change, like any other unknown prefix):
+  - `/model`: the shared `model_header` (current model + key state) plus
+    `pick a provider:`, one button per provider of
+    `Runtime::models_listing` — text `name (N)`, the current vendor
+    dotted (`· anthropic (17)`), rows of 3, at most 24 per page with
+    `‹ prev` / `… more` paging (`mp:<off>`, digits only). A `✕` button
+    (`mx`) collapses the card to its `model: <current>` line.
+  - `mp:<vendor>` swaps the card to that provider's models: the shared
+    `model_vendor_listing` text capped at 12 lines over rows of 2 model
+    buttons (12 per page) — button text is the bare model id truncated
+    to 24 chars, `callback_data = mm:<vendor>:<idx>` where `<idx>`
+    indexes the provider's **full** models list, so later pages still
+    pick real models. `‹ prev` / `more ›` page via `mp:<vendor>:<off>`;
+    `‹ providers` (`mp:0`) returns to the provider grid.
+  - `mm:<vendor>:<idx>` picks `models[idx]` through `Runtime::set_model`:
+    the toast says `model → <selector>` (or the error text), and the
+    card settles to the same reply the router's switch produces
+    (`model → … (next message uses it)` / `! [model] …`) with the
+    keyboard removed.
+  - `/mode`: `mode: <current>` plus one row per mode (`name — desc`,
+    the desc capped at 20 chars, current dotted), `callback_data =
+    mo:<mode>`. The press runs `Runtime::set_mode` with source
+    `telegram:<uid>` exactly as `/mode <name>` would — the phone may
+    only tighten; a loosening press toasts the refusal text and settles
+    the card to `! [mode] …`.
+  - `/effort`: `effort: <current>` (or `effort: model default`) plus one
+    row of the five levels, `callback_data = ef:<level>`. The press runs
+    `Runtime::set_effort` and settles the card to its reply with the
+    keyboard removed.
+
 - Callback queries are answered exactly once. Data this build does not
   understand (unknown prefix, malformed payload, unknown verdict) gets an
   empty `answerCallbackQuery` and no state change; an unauthorized

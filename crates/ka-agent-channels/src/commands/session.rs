@@ -56,8 +56,20 @@ pub(super) fn run_retry<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     })
 }
 
-/// The operator's answer to `/model` with no argument.
-async fn model_status(runtime: &Runtime) -> Outcome {
+/// The modes `/mode` offers, in pick order (`/mode <n>` resolves here).
+pub const MODES: &[(&str, &str)] = &[
+    ("ask", "asks before acting"),
+    ("accept_edits", "edits without asking"),
+    ("allow", "acts without asking"),
+    ("readonly", "read and plan only"),
+];
+
+/// The reasoning-effort levels `/effort` offers, in pick order.
+pub const EFFORTS: &[&str] = &["off", "low", "medium", "high", "max"];
+
+/// The `/model` header: the current model and its key state. Shared by
+/// every surface's picker (Telegram builds its keyboard under it).
+pub async fn model_header(runtime: &Runtime) -> String {
     let current = runtime.config().model.clone();
     let key = match runtime.model_key_state() {
         Ok(Some((_, state))) => match state {
@@ -68,7 +80,7 @@ async fn model_status(runtime: &Runtime) -> Outcome {
             ka_agent_runtime::ModelKeyState::Keyless => None,
         },
         Ok(None) => None,
-        Err(e) => return Outcome::Reply(format!("! [model] {e}")),
+        Err(e) => return format!("! [model] {e}"),
     };
     let mut lines = vec![match &current {
         Some(m) => format!("model: {m}"),
@@ -77,44 +89,194 @@ async fn model_status(runtime: &Runtime) -> Outcome {
     if let Some(k) = key {
         lines.push(k);
     }
-    lines.push("switch: ka-agent model provider/model · list: ka-agent models".into());
-    Outcome::Reply(lines.join("\n"))
+    lines.join("\n")
+}
+
+/// `/model` with no argument: the current model plus every provider
+/// that has models to offer, numbered (`/model <n|provider>` opens one).
+pub async fn model_picker(runtime: &Runtime) -> String {
+    let listing = runtime.models_listing();
+    let current_vendor = listing.current_vendor().map(str::to_string);
+    let mut lines = vec![model_header(runtime).await];
+    for (i, p) in listing.providers.iter().enumerate() {
+        let mark = if Some(p.name.as_str()) == current_vendor.as_deref() {
+            " ←"
+        } else {
+            ""
+        };
+        let n = if p.models.len() == 1 {
+            "1 model".to_string()
+        } else {
+            format!("{} models", p.models.len())
+        };
+        lines.push(format!("{}. {} — {n}{mark}", i + 1, p.name));
+    }
+    if listing.providers.is_empty() {
+        lines.push("no models known — ka-agent models --refresh pulls the live list".into());
+    }
+    lines.push("/model <n|provider> lists its models · /model provider/model switches".into());
+    lines.join("\n")
+}
+
+/// `/model <provider>`: that provider's models, numbered over the full
+/// list — the display is capped, the numbers still reach the tail.
+pub async fn model_vendor_listing(runtime: &Runtime, vendor: &str) -> String {
+    let reg = runtime.model_registry();
+    let listing = runtime.models_listing();
+    let Some(p) = listing.providers.iter().find(|p| p.name == vendor) else {
+        if ka_agent_runtime::catalog::provider(vendor).is_some() {
+            return format!("no models listed for {vendor} — type the id: /model {vendor}/<model>");
+        }
+        return format!("unknown provider {vendor:?} — /model lists them");
+    };
+    let current = listing.current.clone();
+    let n = if p.models.len() == 1 {
+        "1 model".to_string()
+    } else {
+        format!("{} models", p.models.len())
+    };
+    let mut lines = vec![format!(
+        "{} — {n} · {}",
+        p.name,
+        ka_agent_runtime::registry::footer(reg.as_ref(), vendor)
+    )];
+    const SHOW: usize = 20;
+    for (i, m) in p.models.iter().enumerate().take(SHOW) {
+        let mark = if Some(m.as_str()) == current.as_deref() {
+            " ←"
+        } else {
+            ""
+        };
+        lines.push(format!("  {}. {m}{mark}", i + 1));
+    }
+    if p.models.len() > SHOW {
+        lines.push(format!(
+            "  +{} more — /model {vendor} <n> still picks them",
+            p.models.len() - SHOW
+        ));
+    }
+    lines.push(format!(
+        "/model {vendor} <n> switches · /model lists providers"
+    ));
+    lines.join("\n")
+}
+
+/// Resolve a provider argument: its name or its number in the listing.
+fn resolve_vendor_in(
+    listing: &ka_agent_runtime::registry::ModelsListing,
+    arg: &str,
+) -> Option<String> {
+    if let Some(p) = listing.providers.iter().find(|p| p.name == arg) {
+        return Some(p.name.clone());
+    }
+    if let Ok(n) = arg.parse::<usize>() {
+        return listing
+            .providers
+            .get(n.wrapping_sub(1))
+            .map(|p| p.name.clone());
+    }
+    None
+}
+
+/// `/model <provider> <n>`: the n-th model of the provider's full list.
+/// `Err` carries the operator-facing reason (unknown provider, option
+/// out of range) — a bad number must not silently fall back to a list.
+fn model_pick(
+    listing: &ka_agent_runtime::registry::ModelsListing,
+    vendor_arg: &str,
+    n: usize,
+) -> Result<String, String> {
+    let vendor = resolve_vendor_in(listing, vendor_arg)
+        .ok_or_else(|| format!("unknown provider {vendor_arg:?} — /model lists them"))?;
+    let provider = listing
+        .providers
+        .iter()
+        .find(|p| p.name == vendor)
+        .unwrap_or_else(|| unreachable!("resolve_vendor_in returned a listed provider"));
+    provider
+        .models
+        .get(n.wrapping_sub(1))
+        .cloned()
+        .ok_or_else(|| format!("no model {n} for {vendor} (1..={})", provider.models.len()))
+}
+
+/// The switch path every pick funnels into (selector validation, live
+/// reload, the missing-key warning).
+async fn switch_model(runtime: &Runtime, sel: &str) -> Outcome {
+    match runtime.set_model(sel).await {
+        Ok(id) => {
+            let mut reply = format!("model → {id} (next message uses it)");
+            if let Ok(Some((_, ka_agent_runtime::ModelKeyState::Missing(env)))) =
+                runtime.model_key_state()
+            {
+                reply.push_str(&format!("\n✗ {env} missing — ka-agent key set {env}"));
+            }
+            Outcome::Reply(reply)
+        }
+        Err(e) => Outcome::Reply(format!("! [model] {e}")),
+    }
 }
 
 pub(super) fn run_model<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let runtime = ctx.runtime;
-        let rest = ctx.args;
+        let rest = ctx.args.trim();
         if rest.is_empty() {
-            model_status(runtime).await
-        } else {
-            match runtime.set_model(rest).await {
-                Ok(id) => {
-                    let mut reply = format!("model → {id} (next message uses it)");
-                    if let Ok(Some((_, ka_agent_runtime::ModelKeyState::Missing(env)))) =
-                        runtime.model_key_state()
-                    {
-                        reply.push_str(&format!("\n✗ {env} missing — ka-agent key set {env}"));
-                    }
-                    Outcome::Reply(reply)
-                }
+            return Outcome::Reply(model_picker(runtime).await);
+        }
+        let mut words = rest.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        // `/model <provider> <n>` (the provider may be its number too):
+        // pick the n-th model of the full list, or say why not.
+        if let Some(second) = words.next()
+            && words.next().is_none()
+            && !first.contains('/')
+            && let Ok(n) = second.parse::<usize>()
+        {
+            let listing = runtime.models_listing();
+            return match model_pick(&listing, first, n) {
+                Ok(sel) => switch_model(runtime, &sel).await,
                 Err(e) => Outcome::Reply(format!("! [model] {e}")),
+            };
+        }
+        // `/model <provider>` (or its number): the provider's models.
+        if !first.contains('/') {
+            let listing = runtime.models_listing();
+            if let Some(vendor) = resolve_vendor_in(&listing, first) {
+                return Outcome::Reply(model_vendor_listing(runtime, &vendor).await);
             }
         }
+        switch_model(runtime, rest).await
     })
 }
 
 pub(super) fn run_mode<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let runtime = ctx.runtime;
-        let rest = ctx.args;
+        let rest = ctx.args.trim();
         if rest.is_empty() {
             let current = runtime.config().mode.clone();
-            return Outcome::Reply(format!(
-                "mode {current} — /mode ask (asks before acting) · accept_edits (edits without asking) · allow (acts without asking) · readonly (read and plan only); the old names guarded/free/plan still work"
-            ));
+            let mut lines = vec![format!("mode: {current}")];
+            for (i, (name, desc)) in MODES.iter().enumerate() {
+                let mark = if *name == current { " ←" } else { "" };
+                lines.push(format!("{}. {name} — {desc}{mark}", i + 1));
+            }
+            lines.push(
+                "/mode <n|name> switches · the old names guarded/free/plan still work".into(),
+            );
+            return Outcome::Reply(lines.join("\n"));
         }
-        match runtime.set_mode(rest, ctx.source).await {
+        // `/mode <n>`: pick by number.
+        let arg = match rest.parse::<usize>() {
+            Ok(n) => match MODES.get(n.wrapping_sub(1)) {
+                Some((name, _)) => (*name).to_string(),
+                None => {
+                    return Outcome::Reply(format!("! [mode] no option {n} (1..={})", MODES.len()));
+                }
+            },
+            Err(_) => rest.to_string(),
+        };
+        match runtime.set_mode(&arg, ctx.source).await {
             Ok(mode) => Outcome::Reply(format!("mode → {mode}")),
             Err(e) => Outcome::Reply(format!("! [mode] {e}")),
         }
@@ -138,7 +300,32 @@ pub(super) fn run_persona<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_effort<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.set_effort(ctx.args).await {
+        let runtime = ctx.runtime;
+        let rest = ctx.args.trim();
+        if rest.is_empty() {
+            let current = runtime.effort().unwrap_or_else(|| "model default".into());
+            let mut lines = vec![format!("effort: {current}")];
+            for (i, level) in EFFORTS.iter().enumerate() {
+                let mark = if *level == current { " ←" } else { "" };
+                lines.push(format!("{}. {level}{mark}", i + 1));
+            }
+            lines.push("/effort <n|level> switches (this session)".into());
+            return Outcome::Reply(lines.join("\n"));
+        }
+        // `/effort <n>`: pick by number.
+        let arg = match rest.parse::<usize>() {
+            Ok(n) => match EFFORTS.get(n.wrapping_sub(1)) {
+                Some(level) => (*level).to_string(),
+                None => {
+                    return Outcome::Reply(format!(
+                        "! [effort] no option {n} (1..={})",
+                        EFFORTS.len()
+                    ));
+                }
+            },
+            Err(_) => rest.to_string(),
+        };
+        match runtime.set_effort(&arg).await {
             Ok(reply) => Outcome::Reply(reply),
             Err(e) => Outcome::Reply(format!("! [effort] {e}")),
         }
