@@ -45,7 +45,7 @@ requires a valid session cookie.
 |---|---|---|
 | GET | `/healthz` | `ok` (unauthenticated liveness) |
 | GET | `/auth?token=…` | login, sets the cookie |
-| GET | `/` | chat: bubbles (last 20 turns, a first-visit hint when there are none), SSE live updates, Markdown rendered |
+| GET | `/` | chat: bubbles (last 20 turns, a first-visit hint when there are none), SSE live updates, Markdown rendered; the composer carries a `🕶` button that starts a private conversation (`/new private`) |
 | GET | `/static/chat.js` | the one script (same-origin, CSP-gated, `no-store`) |
 | POST | `/chat/send` | a chat message or command (`text=`; requires the `X-Ka-Agent: 1` header, so only the panel's own JS can post) → JSON `{"reply"}` or `{"ok":true}` |
 | GET | `/events` | the SSE stream (one `data:` frame per sequenced bus envelope; `id:` carries the `seq` so a reconnect with `Last-Event-ID` replays exactly the gap) |

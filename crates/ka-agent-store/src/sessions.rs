@@ -8,14 +8,15 @@ impl Store {
     pub fn insert_session(&self, s: &Session) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO sessions(id, workspace, strand_id, strand_path, status, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions(id, workspace, strand_id, strand_path, status, private, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 s.id.as_str(),
                 s.workspace.to_string_lossy(),
                 s.strand_id,
                 s.strand_path.as_deref().map(|p| p.to_string_lossy()),
                 status_str(&s.status),
+                s.private as i64,
                 s.created_ms,
                 s.updated_ms
             ],
@@ -69,7 +70,7 @@ impl Store {
     pub fn get_session(&self, id: &SessionId) -> Result<Session> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private
              FROM sessions WHERE id = ?1",
             params![id.as_str()],
             row_to_session,
@@ -82,7 +83,7 @@ impl Store {
     pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private
              FROM sessions ORDER BY updated_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_session)?;
@@ -105,6 +106,35 @@ impl Store {
             return Err(StoreError::NotFound(format!("session {}", id)));
         }
         Ok(())
+    }
+
+    /// Every private (incognito) session on record, after deleting the
+    /// rows that still carry private conversation content: queued
+    /// messages (their delivery text) and approval cards (whose
+    /// question/detail embed the private turn's tool arguments).
+    /// Callers decide which sessions' remnants to destroy: a private
+    /// conversation that resumes across a daemon restart keeps its
+    /// context until it is superseded. The trailing checkpoint truncates
+    /// the WAL so the deleted text leaves the journal too
+    /// (`secure_delete` zeroes the freed pages).
+    pub fn private_sessions_purge_queue(&self) -> Result<Vec<Session>> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM queue WHERE session IN (SELECT id FROM sessions WHERE private = 1)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM approvals WHERE session IN (SELECT id FROM sessions WHERE private = 1)",
+            [],
+        )?;
+        // Best-effort: a concurrent reader can hold the checkpoint busy.
+        let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private
+             FROM sessions WHERE private = 1",
+        )?;
+        let rows = stmt.query_map([], row_to_session)?;
+        collect_rows(rows)
     }
 }
 
@@ -142,5 +172,55 @@ mod tests {
         let got = store.get_session(&s.id).unwrap();
         assert_eq!(got.strand_id.as_deref(), Some("str-1"));
         assert_eq!(store.list_recent_sessions(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn private_flag_roundtrips_and_purge_returns_them() {
+        let store = Store::open_in_memory().unwrap();
+        let normal = session();
+        let mut private = session();
+        private.private = true;
+        store.insert_session(&normal).unwrap();
+        store.insert_session(&private).unwrap();
+
+        assert!(!store.get_session(&normal.id).unwrap().private);
+        assert!(store.get_session(&private.id).unwrap().private);
+
+        // A queued message in the private session still carries text.
+        store
+            .enqueue(&ka_agent_core::QueueItem::new(
+                private.id.clone(),
+                "queued private text".into(),
+                "telegram",
+            ))
+            .unwrap();
+        assert!(store.next_queued(&private.id).unwrap().is_some());
+        // An approval card in the private session embeds tool arguments.
+        store
+            .insert_approval(&ka_agent_core::Approval::new(
+                private.id.clone(),
+                ka_agent_core::TurnId::generate(),
+                ka_agent_core::ApprovalKind::KaAsk {
+                    ask_id: "ask-1".into(),
+                    question: "run rm -rf secret-project".into(),
+                    detail: None,
+                    options: vec!["allow".into(), "deny".into()],
+                },
+                60,
+            ))
+            .unwrap();
+        assert!(!store.pending_approvals(&private.id).unwrap().is_empty());
+
+        // The purge deletes private queue rows and approval cards, and
+        // lists every private session; the caller decides which
+        // remnants to destroy.
+        let purged = store.private_sessions_purge_queue().unwrap();
+        assert_eq!(purged.len(), 1, "only the private session: {purged:?}");
+        assert_eq!(purged[0].id, private.id);
+        assert!(store.next_queued(&private.id).unwrap().is_none());
+        assert!(
+            store.pending_approvals(&private.id).unwrap().is_empty(),
+            "the private session's approval cards are purged"
+        );
     }
 }

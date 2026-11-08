@@ -16,7 +16,19 @@ pub(super) fn run_status<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_new<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.new_session().await {
+        let arg = ctx.args.trim();
+        let private = match arg {
+            "" => false,
+            "private" | "incognito" => true,
+            other => {
+                return Outcome::Reply(format!("usage: /new [private] — unknown option {other:?}"));
+            }
+        };
+        match ctx.runtime.new_session(private).await {
+            Ok(id) if private => Outcome::Reply(format!(
+                "🕶 private session {} — this conversation won't be remembered: no history, memory, skills or attachments; nothing it schedules outlives it",
+                short_id(id.as_str())
+            )),
             Ok(id) => Outcome::Reply(format!("new session {}", short_id(id.as_str()))),
             Err(e) => Outcome::Reply(format!("! [session] {e}")),
         }

@@ -1360,3 +1360,41 @@ fn keys_command_lists_the_terminal_bindings() {
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Private conversations on the console surface: `/new private` answers
+/// with the incognito notice, the turn's usage row carries no text,
+/// `/history` finds nothing from it, and `/new` ends it.
+#[test]
+fn private_session_on_the_console() {
+    let root = temp_root("private");
+    let sc = scenario_file(
+        &root,
+        "private.json",
+        r#"{ "steps": [ {"text": "private console answer"} ], "stop": "done", "cost_usd": 0.0, "tokens": 3 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+    chat.send("/new private");
+    chat.expect("private session", Duration::from_secs(30));
+    chat.expect("won't be remembered", Duration::from_secs(10));
+    chat.send("tell me a secret");
+    chat.expect("private console answer", Duration::from_secs(60));
+    // Nothing from the private conversation is searchable afterwards.
+    chat.send("/history secret");
+    chat.expect("no history matches", Duration::from_secs(30));
+    // The usage row exists and carries no text.
+    let conn = rusqlite::Connection::open(root.join("data/state.db")).unwrap();
+    let (inbound, tokens): (String, i64) = conn
+        .query_row(
+            "SELECT inbound_text, tokens FROM turns ORDER BY created_ms DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(inbound, "", "the private turn row carries no text");
+    assert!(tokens > 0, "usage accounting survives");
+    chat.send("/new");
+    chat.expect("new session", Duration::from_secs(30));
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}

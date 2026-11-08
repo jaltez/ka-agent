@@ -236,6 +236,7 @@ fn seed_session(store: &ka_agent_store::Store, id: &str, workspace: &std::path::
             strand_id: None,
             strand_path: None,
             status: ka_agent_core::SessionStatus::Idle,
+            private: false,
             created_ms: ka_agent_core::now_ms(),
             updated_ms: ka_agent_core::now_ms(),
         })
@@ -335,6 +336,11 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     assert!(
         chat.body.contains("script src=\"/static/chat.js\""),
         "chat page body: {}",
+        chat.body
+    );
+    assert!(
+        chat.body.contains("id='private'"),
+        "the composer carries the private-conversation toggle: {}",
         chat.body
     );
     let csp = chat
@@ -447,6 +453,50 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     );
     // (The reply body carries the rendered status; the queue line proves it.)
     assert!(cmd.body.contains("queue"), "status JSON: {}", cmd.body);
+
+    // The private toggle's command path: `/new private` answers with the
+    // incognito notice, `/status` reports it, and `/new` returns to a
+    // normal conversation before the turn tests below.
+    let priv_new = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%2Fnew+private",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(priv_new.status, 200);
+    assert!(
+        priv_new.body.contains("private session"),
+        "private reply: {}",
+        priv_new.body
+    );
+    let priv_status = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%2Fstatus",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert!(
+        priv_status.body.contains("private"),
+        "status reports the private conversation: {}",
+        priv_status.body
+    );
+    let back = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%2Fnew",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert!(
+        back.body.contains("new session"),
+        "back to normal: {}",
+        back.body
+    );
 
     // Non-ASCII form input arrives intact (percent-decoded as UTF-8).
     let accented = request_h(

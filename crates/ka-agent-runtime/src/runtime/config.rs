@@ -319,6 +319,7 @@ impl Runtime {
             model: cfg.model.clone(),
             mode: Some(cfg.mode.clone()),
             effort: self.effort(),
+            private: Some(self.session_private()),
         });
     }
 

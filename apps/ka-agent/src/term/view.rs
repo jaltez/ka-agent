@@ -29,6 +29,8 @@ pub struct View {
     /// The session status (`Paused`/`Degraded` show a status-line badge).
     pub session: String,
     pub mode: String,
+    /// Private (incognito) conversation — `🕶 private` in the status line.
+    pub private: bool,
     pub focused: bool,
     pub verbose: bool,
     pub width: usize,
@@ -74,6 +76,7 @@ impl View {
             plan: None,
             session: String::new(),
             mode: "ask".into(),
+            private: false,
             focused: true,
             verbose: false,
             width,
@@ -96,6 +99,9 @@ impl View {
             String::new()
         };
         parts.push(format!("{spin}☥ {}", self.name));
+        if self.private {
+            parts.push("🕶 private".into());
+        }
         if !self.model.is_empty() {
             parts.push(self.model.clone());
         }
@@ -420,6 +426,7 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, thinking: bool) -> Vec<String> {
             model,
             mode,
             effort,
+            private,
         } => {
             if let Some(m) = model {
                 view.model = m.clone();
@@ -428,6 +435,14 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, thinking: bool) -> Vec<String> {
                 view.mode = m.clone();
             }
             view.effort = effort.clone();
+            if let Some(p) = private {
+                view.private = *p;
+            }
+        }
+        // The attach greeting carries the authoritative session report —
+        // the privacy marker must not wait for the next Settings event.
+        AgentEvent::Hello { report } => {
+            view.private = report.private;
         }
         // A router reply (every `/command`) renders like an answer.
         AgentEvent::Reply { text } => {

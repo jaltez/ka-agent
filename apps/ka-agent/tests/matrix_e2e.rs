@@ -279,3 +279,24 @@ async fn unlinked_senders_are_ignored_and_audited() {
         .expect("the linked operator must be served");
     daemon.sigterm_wait(Duration::from_secs(10));
 }
+
+/// `/new private` over Matrix: the confirmation reply arrives in the
+/// room, and `/new` ends the private conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_session_reply_reaches_the_room() {
+    let root = temp_root("private");
+    let (fake, base) = FakeHomeserver::spawn();
+    let cfg = write_config(&root, &base);
+    let sc = scenario_file(&root, "private.json", r#"{ "steps": [ ], "stop": "done" }"#);
+    let data = root.join("data");
+    link_operator(&data);
+
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    fake.push_room_message(ROOM, OPERATOR, "/new private");
+    fake.await_sent("private session", Duration::from_secs(30))
+        .expect("the private confirmation reached the room");
+    fake.push_room_message(ROOM, OPERATOR, "/new");
+    fake.await_sent("new session", Duration::from_secs(30))
+        .expect("the normal-session reply reached the room");
+    daemon.sigterm_wait(Duration::from_secs(10));
+}

@@ -30,6 +30,12 @@ impl Runtime {
     /// Schedule a reminder at an absolute time (parsing is the router's
     /// job: every surface shares one grammar).
     pub fn add_reminder_at(&self, at_ms: i64, text: &str) -> Result<ka_agent_core::TaskId, Error> {
+        if self.session_private() {
+            return Err(Error::Refused(
+                "this is a private conversation — nothing it schedules may outlive it; /new first"
+                    .into(),
+            ));
+        }
         if text.trim().is_empty() {
             return Err(Error::Refused("a reminder needs a text".into()));
         }
@@ -48,6 +54,12 @@ impl Runtime {
         spec: ka_agent_core::CronSpec,
         first_at_ms: i64,
     ) -> Result<ka_agent_core::TaskId, Error> {
+        if self.session_private() {
+            return Err(Error::Refused(
+                "this is a private conversation — nothing it schedules may outlive it; /new first"
+                    .into(),
+            ));
+        }
         let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
         task.scheduled_at_ms = Some(first_at_ms);
         task.payload = Some(spec.to_payload());

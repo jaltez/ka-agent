@@ -88,7 +88,10 @@ token_secret = "matrix.access_token"   # KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN
   minted from the message type and mxc id. Both are sanitized
   (`[A-Za-z0-9._-]`, no leading dot, ≤ 64 bytes), so an mxc id tail cannot
   steer the write outside the inbox; collisions get a `-N` suffix and are
-  created exclusively (never overwrite, even for concurrent saves).
+  created exclusively (never overwrite, even for concurrent saves). In a
+  private conversation (`/new private`) media lands under
+  `attachments/.private-<short-id>/` instead, destroyed when the
+  conversation ends (see `telegram.md` and `memory.md`).
 - **Attachments out**: `AgentEvent::File` uploads via
   `POST /_matrix/media/v3/upload` and posts `m.image`/`m.file` with the
   caption as the body. The 50 MB size limit is checked from the file's

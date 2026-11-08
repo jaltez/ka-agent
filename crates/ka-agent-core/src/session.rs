@@ -72,6 +72,11 @@ pub struct Session {
     /// materialized yet (ka creates it on first append).
     pub strand_path: Option<PathBuf>,
     pub status: SessionStatus,
+    /// A private (incognito) conversation: turn text is never recorded,
+    /// memory/skill proposals are suppressed, attachments and the strand
+    /// are destroyed when the session ends. Usage rows stay anonymous.
+    #[serde(default)]
+    pub private: bool,
     pub created_ms: i64,
     pub updated_ms: i64,
 }
@@ -85,6 +90,7 @@ impl Session {
             strand_id: None,
             strand_path: None,
             status: SessionStatus::Idle,
+            private: false,
             created_ms: now,
             updated_ms: now,
         }

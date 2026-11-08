@@ -113,6 +113,10 @@ pub enum AgentEvent {
         model: Option<String>,
         mode: Option<String>,
         effort: Option<String>,
+        /// Set when the privacy kind of the live session changed: a
+        /// private (incognito) conversation started or ended.
+        #[serde(default)]
+        private: Option<bool>,
     },
     /// The session's status moved.
     Session { status: String },

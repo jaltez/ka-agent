@@ -500,8 +500,13 @@ impl TelegramChannel {
             // A single photo/document: saved and acknowledged. A caption
             // is the operator's message — it becomes the turn, the file
             // riding along as an `@reference` instead of a bare ack.
-            match crate::attachments::save_attachment(&client, &self.runtime.workspace(), message)
-                .await
+            match crate::attachments::save_attachment(
+                &client,
+                &self.runtime.workspace(),
+                message,
+                || self.runtime.private_session_token(),
+            )
+            .await
             {
                 Ok(rel) => {
                     let caption = message["caption"].as_str().map(str::trim).unwrap_or("");
@@ -607,18 +612,22 @@ impl TelegramChannel {
         let Some(group_id) = message["media_group_id"].as_str() else {
             return;
         };
-        let rel =
-            match crate::attachments::save_attachment(client, &self.runtime.workspace(), message)
-                .await
-            {
-                Ok(rel) => rel,
-                Err(e) => {
-                    let _ = client
-                        .send_message(chat_id, &format!("! [attachment] {e}"), None)
-                        .await;
-                    return;
-                }
-            };
+        let rel = match crate::attachments::save_attachment(
+            client,
+            &self.runtime.workspace(),
+            message,
+            || self.runtime.private_session_token(),
+        )
+        .await
+        {
+            Ok(rel) => rel,
+            Err(e) => {
+                let _ = client
+                    .send_message(chat_id, &format!("! [attachment] {e}"), None)
+                    .await;
+                return;
+            }
+        };
         let first = {
             let mut groups = self.media_groups.lock().unwrap_or_else(|e| e.into_inner());
             let entry = groups.entry(group_id.to_string()).or_default();

@@ -50,6 +50,23 @@ operator accepts stable-memory writes.
   (2) acceptance of a candidate via `/memory accept` — or the web review
   inbox (`POST /memory/edit` stages, `POST /memory/candidate` decides), the
   same runtime paths as the console commands.
+- **Private conversations** (`/new private`) write nothing: `memory_propose`
+  and `skill_propose` are refused for the session's turns, `/remember`,
+  `notes_append` and every scheduling path (`/remind`, `/cron`, the
+  `cron_manage` tool) answer with a refusal, and no episode rows are
+  indexed — usage accounting (model, tokens, cost) still records, with
+  no text. The conversation's engine state is contained too: its worker
+  runs with a per-session scratch `KA_DATA_DIR` and `XDG_STATE_HOME`
+  (`<root>/tmp/private-engine-<short-id>/`) so strands, waypoints and spilled
+  tool outputs stay out of the shared engine dirs; the directory is
+  destroyed when the conversation ends (and swept at boot). When a
+  private conversation ends, its queued messages and approval cards
+  (which embed tool arguments) are deleted from the store — with
+  `secure_delete` on and a WAL checkpoint, so the text leaves the
+  database file. One boundary stays: the in-memory event ring (256
+  envelopes) may re-deliver a just-ended private conversation's last
+  frames to a reconnecting surface until they age out — process memory
+  only, never on disk.
 - The model-side producer (`memory.propose` through the connector bridge)
   arrives with the MCP bridge in the next milestone.
 

@@ -277,6 +277,31 @@ impl Runtime {
             );
             store.append_audit(&mut rec)?;
         }
+
+        // Private conversations that ended before this boot (superseded,
+        // crashed, daemon stopped) leave nothing behind: their queued
+        // text is purged and their strands and ephemeral attachments
+        // destroyed. The resumed session keeps its context while the
+        // conversation itself stays live.
+        let ended_private: Vec<_> = store
+            .private_sessions_purge_queue()?
+            .into_iter()
+            .filter(|s| s.id != session.id)
+            .collect();
+        destroy_private_remnants(paths.root(), &ended_private);
+        sweep_orphan_private_engine_dirs(paths.root(), &session);
+        // A daemon that resumes a live private conversation must say so:
+        // surfaces that attached before the runtime existed (the TUI
+        // subscribes through the early event rx) would otherwise start
+        // with a stale, normal-looking status line.
+        if session.private {
+            emit(AgentEvent::Settings {
+                model: None,
+                mode: None,
+                effort: None,
+                private: Some(true),
+            });
+        }
         // An adopted session can carry a status from a previous process whose
         // turn died with it (`running`, `awaiting_approval`, `stopping`):
         // those states make `handle_message` queue instead of submit, and the
@@ -432,7 +457,7 @@ impl Runtime {
     /// Everything `/status` shows, in one struct.
     pub fn status_report(&self) -> Result<crate::status::StatusReport, Error> {
         let cfg = self.cfg();
-        let (sid, status, strand, worker_running, budget, crashes) = {
+        let (sid, status, strand, worker_running, budget, crashes, private) = {
             let g = self.lock();
             (
                 g.session.id.clone(),
@@ -441,6 +466,7 @@ impl Runtime {
                 g.live.is_some(),
                 g.budget.clone(),
                 g.crashes.len(),
+                g.session.private,
             )
         };
         let queue = self.sh.store.queue_len(&sid)?;
@@ -468,6 +494,7 @@ impl Runtime {
             persona: self.persona_name(),
             awake_since_ms: self.sh.started_ms,
             status: format!("{status:?}"),
+            private,
             strand_id: strand,
             model: cfg.model.clone(),
             mode: cfg.mode.clone(),
@@ -593,11 +620,17 @@ impl Runtime {
     // ---- operator operations -------------------------------------------
 
     /// `/new`: drop the live worker and start a fresh session/strand.
-    pub async fn new_session(&self) -> Result<SessionId, Error> {
+    /// `private` starts an incognito conversation instead: turn text is
+    /// never recorded, memory/skill proposals are refused, and the
+    /// strand plus ephemeral attachments are destroyed when it ends.
+    pub async fn new_session(&self, private: bool) -> Result<SessionId, Error> {
         // `/new` kills the worker on purpose: its exit is not a crash, and a
         // fresh session starts with a clean crash history (five `/new` in ten
         // minutes used to degrade the brand-new session).
-        {
+        // One critical section: mark the worker deliberately closed, take
+        // the port, and swap the session — nothing can submit onto or
+        // enqueue against the ended session once the guard releases.
+        let (superseded, live_port, session) = {
             let mut g = self.lock();
             if let Some(live) = g.live.as_mut() {
                 live.deliberate_close = true;
@@ -606,26 +639,71 @@ impl Runtime {
             // "Allow for this session" and the session effort end with it.
             g.session_allow.clear();
             *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        }
-        let live_port = {
-            let mut g = self.lock();
-            g.live.take().map(|l| l.port)
+            let superseded = g.session.private.then(|| g.session.id.clone());
+            let live_port = g.live.take().map(|l| l.port);
+            let mut s = Session::new(self.cfg().workspace_path());
+            s.private = private;
+            g.session = s;
+            g.restart_attempt = 0;
+            (superseded, live_port, g.session.clone())
         };
+        // A private conversation ends here: destroy its queued text,
+        // approval cards, strand and ephemeral attachments.
+        if superseded.is_some() {
+            self.purge_private_remnants();
+        }
         if let Some(port) = live_port {
             port.kill().await;
         }
-        let session = {
-            let mut g = self.lock();
-            g.session = Session::new(self.cfg().workspace_path());
-            g.restart_attempt = 0;
-            g.session.clone()
-        };
         self.sh.store.insert_session(&session)?;
-        self.audit(audit_actions::SESSION_NEW, session.id.as_str(), None)?;
+        // A message racing this `/new` can still have enqueued onto the
+        // ended session during the kill await; nothing can target it
+        // anymore, so the idempotent sweep now catches every straggler.
+        if superseded.is_some() {
+            self.purge_private_remnants();
+        }
+        self.audit(
+            audit_actions::SESSION_NEW,
+            session.id.as_str(),
+            private.then(|| "private".to_string()),
+        )?;
+        self.sh.emit(AgentEvent::Settings {
+            model: None,
+            mode: None,
+            effort: None,
+            private: Some(private),
+        });
         self.sh.emit(AgentEvent::Session {
             status: format!("{:?}", SessionStatus::Idle),
         });
         Ok(session.id)
+    }
+
+    /// Whether the live session is a private (incognito) conversation.
+    pub fn session_private(&self) -> bool {
+        self.lock().session.private
+    }
+
+    /// The ephemeral-storage token for a private session (`Some(short
+    /// id)`), naming its `.private-<token>` attachment directory; `None`
+    /// for a normal session.
+    pub fn private_session_token(&self) -> Option<String> {
+        // Both under one guard: a `/new` between two locks could pair the
+        // old session's privacy with the new session's id.
+        let g = self.lock();
+        g.session
+            .private
+            .then(|| ka_agent_core::ids::short_id(g.session.id.as_str()).to_string())
+    }
+
+    /// One idempotent private-remnant sweep: purge the store rows
+    /// (queued text, approval cards) and destroy the on-disk remnants
+    /// (scratch engine homes, strand files, ephemeral media) of every
+    /// private session on record. Safe to re-run.
+    fn purge_private_remnants(&self) {
+        if let Ok(remnants) = self.sh.store.private_sessions_purge_queue() {
+            destroy_private_remnants(self.sh.paths.root(), &remnants);
+        }
     }
 
     /// `/resume`: lift a pause (budget override or a fixed auth key) back to
@@ -769,6 +847,62 @@ impl Runtime {
         Ok(())
     }
     // ---- submission ------------------------------------------------------
+}
+
+/// The per-session scratch engine home of a private (incognito)
+/// conversation: the worker's `KA_DATA_DIR`, so its strands and waypoints
+/// never mix into the shared engine home.
+fn private_engine_dir(root: &std::path::Path, session_short: &str) -> std::path::PathBuf {
+    root.join("tmp")
+        .join(format!("private-engine-{session_short}"))
+}
+
+/// Destroy the durable remnants of ended private (incognito)
+/// conversations: each session's scratch engine directory (strands,
+/// waypoints), its recorded strand file and every ephemeral `.private-*`
+/// attachment directory under its workspace. Idempotent and best-effort —
+/// anything already gone is success, and the next sweep retries what
+/// failed.
+fn destroy_private_remnants(root: &std::path::Path, sessions: &[Session]) {
+    for s in sessions {
+        let short = ka_agent_core::ids::short_id(s.id.as_str());
+        let _ = std::fs::remove_dir_all(private_engine_dir(root, short));
+        if let Some(strand) = &s.strand_path {
+            let _ = std::fs::remove_file(strand);
+        }
+        let attachments = s.workspace.join("attachments");
+        let Ok(entries) = std::fs::read_dir(&attachments) else {
+            continue;
+        };
+        // Exact-name match: sessions share one workspace, so a prefix
+        // glob would also destroy a *live* private session's media.
+        let private_dir = format!(".private-{short}");
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy() == private_dir {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
+/// Remove scratch engine directories no live private session owns — a
+/// crash can orphan them (the session row is the sweeper's usual source,
+/// but a wiped store or a copied root should not keep conversation
+/// strands either). The adopted session's directory survives while that
+/// conversation stays live.
+fn sweep_orphan_private_engine_dirs(root: &std::path::Path, keep: &Session) {
+    let keep_short = ka_agent_core::ids::short_id(keep.id.as_str());
+    let parent = root.join("tmp");
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("private-engine-") && name != format!("private-engine-{keep_short}") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]

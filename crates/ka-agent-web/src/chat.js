@@ -327,6 +327,15 @@
     e.preventDefault();
     send();
   });
+  var privateBtn = document.getElementById("private");
+  if (privateBtn)
+    privateBtn.addEventListener("click", function () {
+      // Send the command without spending the operator's draft.
+      var draft = input.value;
+      input.value = "/new private";
+      send();
+      input.value = draft;
+    });
   input.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();

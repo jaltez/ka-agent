@@ -50,6 +50,10 @@ pub struct StatusReport {
     /// reading `● idle`.
     #[serde(default)]
     pub channels: Vec<ChannelHealth>,
+    /// The live session is a private (incognito) conversation: nothing it
+    /// says or is told persists beyond it.
+    #[serde(default)]
+    pub private: bool,
 }
 
 /// One channel's poll health (`status` renders failing channels).
@@ -214,6 +218,11 @@ impl StatusReport {
         } else {
             mode
         };
+        let state = if self.private {
+            format!("{state} · 🕶 private")
+        } else {
+            state
+        };
         let mut out = format!(
             "☥ {persona} · awake since {since} · {state} · {model} · {mode}\n{worker}\ntoday: {usd} · {tokens}\n{counters}\nsession {} · strand {strand} · {}",
             ka_agent_core::ids::short_id(&self.session_id),
@@ -311,6 +320,7 @@ mod tests {
             next_task: None,
             timezone: "Europe/Madrid".into(),
             capabilities: Capabilities::default(),
+            private: false,
             memory: None,
             live_model: None,
             update_available: None,

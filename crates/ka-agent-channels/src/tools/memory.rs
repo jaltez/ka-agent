@@ -19,6 +19,9 @@ pub(crate) fn propose_schema() -> Value {
 pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
         let _ = Effect::Propose;
+        if ctx.runtime.session_private() {
+            return Err("this is a private conversation — memory proposals are off here".into());
+        }
         let text = args["text"].as_str().ok_or("missing 'text'")?;
         if text.is_empty() || text.len() > 300 {
             return Err("text must be 1-300 chars".into());

@@ -221,6 +221,10 @@ impl MatrixChannel {
 
     /// An `m.image`/`m.file`/`m.video` message → a workspace attachment.
     async fn save_media(&self, content: &Value) -> Result<String, String> {
+        // Resolved around the download, like Telegram's `save_attachment`:
+        // a privacy change mid-download discards the file rather than
+        // writing it to the wrong (or a destroyed) directory.
+        let before = self.runtime.private_session_token();
         let mxc = content["url"]
             .as_str()
             .filter(|u| !u.is_empty())
@@ -228,7 +232,27 @@ impl MatrixChannel {
             .ok_or_else(|| "message has no media url".to_string())?;
         let name = attachment_name(content, mxc);
         let bytes = self.surface.client.download_media(mxc).await?;
-        crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
+        let after = self.runtime.private_session_token();
+        match (&before, &after) {
+            (None, None) => {
+                crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
+            }
+            (Some(short), Some(now)) if short == now => {
+                crate::attachments::save_private_attachment_bytes(
+                    &self.runtime.workspace(),
+                    short,
+                    &name,
+                    &bytes,
+                )
+            }
+            (Some(_), _) => Err(
+                "the private conversation ended while this file was downloading — it was not saved"
+                    .into(),
+            ),
+            (None, Some(_)) => {
+                crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
+            }
+        }
     }
 
     /// An `m.audio` message → its transcript (echoed back); `None` when

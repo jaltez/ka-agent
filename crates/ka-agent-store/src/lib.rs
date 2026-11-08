@@ -89,6 +89,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v7.sql"),
     include_str!("schema_v8.sql"),
     include_str!("schema_v9.sql"),
+    include_str!("schema_v10.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -207,6 +208,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        // Deleted rows are zeroed in place: private-conversation purges
+        // (queue text, approval cards) must not survive in freed pages.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -337,6 +341,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status: parse_session_status(&r.get::<_, String>(4)?).unwrap_or(SessionStatus::Degraded),
         created_ms: r.get(5)?,
         updated_ms: r.get(6)?,
+        private: r.get::<_, i64>(7)? != 0,
     })
 }
 

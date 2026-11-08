@@ -53,6 +53,14 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         let action = args["action"].as_str().ok_or("missing 'action'")?;
         match action {
             "schedule" => {
+                // A private conversation schedules nothing: the task row
+                // (and its agent turn) would outlive the session.
+                if ctx.runtime.session_private() {
+                    return Err(
+                        "this is a private conversation — nothing it schedules may outlive it; /new first"
+                            .into(),
+                    );
+                }
                 // Loop guard: a scheduled run may not schedule more jobs
                 // (a cron that creates crons runs away). The turn source
                 // is the live one — no store meta row in between.

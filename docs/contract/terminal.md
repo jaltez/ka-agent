@@ -28,7 +28,8 @@ pong                                                                          �
 - Activity: `▸ <tool label> <detail>` steps to `▸ N tools running` for
   concurrent tools; `∴ thinking… <chars>` while reasoning streams before any
   answer text. Thinking text itself prints only with toggle (Ctrl-T) on.
-- Status line: spinner while a turn runs, the persona name, the model or
+- Status line: spinner while a turn runs, the persona name, `🕶 private`
+  while the conversation is a private one (`/new private`), the model or
   context percentage, today's spend, `⏸ paused`/`⚠ degraded` while the
   session sits in that state, and `plan done/total` when the model
   published one (an empty plan shows nothing). Truncated to the terminal

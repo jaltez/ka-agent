@@ -26,6 +26,11 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   (the shared table's `telegram` flag); `/persona /effort /undo /queue
   /tools` also work from the phone but stay out of the menu, and `/quit`
   refuses from any remote channel.
+- `/new private` starts an incognito conversation from the phone: the
+  reply confirms it (`🕶 private session …`), inbound media lands under
+  `attachments/.private-<short-id>/` instead of the shared inbox, and the
+  runtime records usage but no text (see `memory.md`). The directory is
+  destroyed when the conversation ends.
 - `/start` from a linked chat is an alias of `/help` and ignores a
   deep-link payload: `/start <payload>` answers the command list (never
   `unknown command /<payload>`). From an **unlinked** private chat,

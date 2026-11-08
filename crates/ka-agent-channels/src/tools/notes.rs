@@ -82,6 +82,12 @@ pub(crate) fn append_schema() -> Value {
 
 pub(crate) fn append<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
+        // Notes are shared durable state — a private conversation writes
+        // nothing to them (the tool is auto-allowed, so no card would
+        // otherwise stand between the model and the file).
+        if ctx.runtime.session_private() {
+            return Err("this is a private conversation — notes are off here; /new first".into());
+        }
         let file = args["file"].as_str().ok_or("missing 'file'")?;
         let text = args["text"].as_str().ok_or("missing 'text'")?;
         let name = sanitize_note_name(file)?;

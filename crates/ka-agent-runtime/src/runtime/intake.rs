@@ -54,13 +54,12 @@ fn ctx_line(now: &jiff::Zoned, source: &str) -> String {
 }
 
 pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
-    let sid = {
-        sh.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .session
-            .id
-            .clone()
+    let (sid, private) = {
+        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Same guard as the session id (see submit_text_with): a `/new`
+        // between two locks could pair the ended private session's id
+        // with the new session's privacy flag.
+        (g.session.id.clone(), g.session.private)
     };
     let Some(item) = sh.store.next_queued(&sid).ok().flatten() else {
         return false;
@@ -88,7 +87,16 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         .then(|| cfg_of(sh).background_model.clone())
         .flatten()
         .or_else(|| cfg_of(sh).model.clone());
-    let mut turn = Turn::new(sid.clone(), item.text.clone());
+    // (privacy captured with `sid` above)
+    // A private conversation records usage only: the row carries no text.
+    let mut turn = Turn::new(
+        sid.clone(),
+        if private {
+            String::new()
+        } else {
+            item.text.clone()
+        },
+    );
     turn.model = model.clone();
     if let Err(e) = sh.store.insert_turn(&turn) {
         sh.emit(AgentEvent::Error {
@@ -144,6 +152,12 @@ impl Runtime {
     /// provider blip or a worker crash. Never automatic (ka-port.md §7):
     /// only an operator act re-runs a turn that may have had side effects.
     pub async fn retry_last(&self) -> Result<Option<String>, Error> {
+        if self.session_private() {
+            return Err(Error::Refused(
+                "this is a private conversation — its turns are not kept; /new starts a normal one"
+                    .into(),
+            ));
+        }
         let session = { self.lock().session.id.clone() };
         let Some(turn) = self
             .sh
@@ -261,15 +275,22 @@ impl Runtime {
                         && port.steer(text.to_string()).await.is_ok()
                     {
                         // Record it on the turn (the durable transcript)
-                        // and in the live stream the surfaces show.
-                        let turn_id = self
-                            .lock()
-                            .live
-                            .as_ref()
-                            .and_then(|l| l.current_turn.clone());
-                        if let Some(id) = turn_id {
+                        // and in the live stream the surfaces show. A
+                        // private conversation records usage only, so
+                        // the durable append is skipped — the live
+                        // stream (memory only) still shows it.
+                        let (turn_id, private) = {
+                            let g = self.lock();
+                            // One guard: the turn identity and the
+                            // privacy flag must not mix across a `/new`.
+                            (
+                                g.live.as_ref().and_then(|l| l.current_turn.clone()),
+                                g.session.private,
+                            )
+                        };
+                        if let (Some(id), false) = (&turn_id, private) {
                             let _ = self.sh.store.append_turn_inbound(
-                                &id,
+                                id,
                                 &format!("\n\n[added while working] {text}"),
                             );
                         }
@@ -479,12 +500,19 @@ impl Runtime {
                 .map_err(|t| illegal_session(from, t))?;
             return Ok(());
         }
-        let (sid, port) = {
+        let (sid, private, port) = {
             let g = self.lock();
             let Some(live) = g.live.as_ref() else {
                 return Ok(());
             };
-            (g.session.id.clone(), Arc::clone(&live.port))
+            // Same guard as the session id: a `/new` between two locks
+            // could pair the ended private session's id with the new
+            // session's privacy flag.
+            (
+                g.session.id.clone(),
+                g.session.private,
+                Arc::clone(&live.port),
+            )
         };
         // Record the turn BEFORE submitting (gap G8: ka persists per cycle,
         // so Ka Agent's record is the durable one). Background turns (crons,
@@ -496,7 +524,15 @@ impl Runtime {
             .then(|| self.cfg().background_model.clone())
             .flatten()
             .or_else(|| self.cfg().model.clone());
-        let mut turn = Turn::new(sid, text.to_string());
+        // A private conversation records usage only: the row carries no text.
+        let mut turn = Turn::new(
+            sid,
+            if private {
+                String::new()
+            } else {
+                text.to_string()
+            },
+        );
         turn.model = model.clone();
         self.sh.store.insert_turn(&turn)?;
         turn.transition(TurnStatus::Submitted)

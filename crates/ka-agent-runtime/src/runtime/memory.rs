@@ -9,6 +9,11 @@ impl Runtime {
     /// `/remember <fact>`: explicit operator acceptance (SEED.md §4.4 path
     /// 1) — append, recompile the engine's MEMORY.md, git-commit.
     pub fn remember(&self, text: &str, source: &str) -> Result<String, Error> {
+        if self.session_private() {
+            return Err(Error::Refused(
+                "this is a private conversation — memory is off; /new starts a normal one".into(),
+            ));
+        }
         let id = self
             .sh
             .memory

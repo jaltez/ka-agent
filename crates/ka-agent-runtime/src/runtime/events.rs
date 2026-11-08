@@ -203,6 +203,7 @@ pub(super) async fn drive(
                     model: Some(selector),
                     mode: None,
                     effort: None,
+                    private: None,
                 });
             }
             PortEvent::Bootstrap {
@@ -589,7 +590,7 @@ pub(super) async fn drive(
             PortEvent::Idle => {
                 // Delivery boundary (SEED.md §3.7): flush the buffered final
                 // answer through the outbox, then drain the durable queue.
-                let (text, turn_id, sid) = {
+                let (text, turn_id, sid, private) = {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     let mut text = String::new();
                     let mut turn_id = None;
@@ -597,7 +598,11 @@ pub(super) async fn drive(
                         text = std::mem::take(&mut live.live_text);
                         turn_id = live.current_turn.clone();
                     }
-                    (text, turn_id, g.session.id.clone())
+                    // Captured under the same guard as the turn identity:
+                    // a `/new` racing this boundary can no longer flip the
+                    // flag between the capture and the writes below.
+                    let private = g.session.private;
+                    (text, turn_id, g.session.id.clone(), private)
                 };
                 // `[SILENT]`: a scheduled turn with nothing to say
                 // delivers nothing (the turn still finishes).
@@ -626,21 +631,27 @@ pub(super) async fn drive(
                     }
                     let parts = split_final_text(&text, FINAL_CHUNK_MAX);
                     for (i, chunk) in parts.iter().enumerate() {
-                        let mut oc = OutboxChunk::new(tid.clone(), i as u32, chunk.clone());
-                        sh.store.push_chunk(&oc).ok();
+                        // The outbox is the durable crash-recovery copy of
+                        // the answer — a private conversation delivers
+                        // through the FinalChunk events only.
+                        if !private {
+                            let mut oc = OutboxChunk::new(tid.clone(), i as u32, chunk.clone());
+                            sh.store.push_chunk(&oc).ok();
+                            oc.status = ka_agent_core::OutboxStatus::Sent;
+                            oc.channel_message_id = Some(i as i64);
+                            sh.store.mark_sent(&oc.turn, oc.chunk_index, i as i64).ok();
+                        }
                         let index = if parts.len() > 1 { i as u32 + 1 } else { 1 };
                         sh.emit(AgentEvent::FinalChunk {
                             index,
                             text: chunk.clone(),
                         });
-                        oc.status = ka_agent_core::OutboxStatus::Sent;
-                        oc.channel_message_id = Some(i as i64);
-                        sh.store.mark_sent(&oc.turn, oc.chunk_index, i as i64).ok();
                     }
                 }
                 // Episodic index (SEED.md §4.5): one user and one assistant
-                // row per prompt cycle, at the delivery boundary.
-                if let Some(tid) = &turn_id {
+                // row per prompt cycle, at the delivery boundary. Private
+                // conversations never enter it.
+                if let (false, Some(tid)) = (private, &turn_id) {
                     let inbound = sh
                         .store
                         .get_turn(tid)

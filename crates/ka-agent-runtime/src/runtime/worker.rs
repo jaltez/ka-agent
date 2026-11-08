@@ -62,10 +62,25 @@ impl Runtime {
         }
         let (session, env, engine_layer_toml) = {
             let g = self.lock();
+            // A private conversation's engine state (strands, waypoints,
+            // and the spill files oversized tool outputs park under
+            // XDG_STATE_HOME) lives in a per-session scratch directory
+            // the runtime destroys when the session ends — nothing
+            // durable of the conversation stays in shared engine dirs.
+            let scratch = g.session.private.then(|| {
+                let dir = private_engine_dir(
+                    self.sh.paths.root(),
+                    ka_agent_core::ids::short_id(g.session.id.as_str()),
+                );
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            });
+            let data_dir = scratch.clone().unwrap_or_else(|| self.sh.paths.ka_data());
+            let state_dir = scratch.unwrap_or_else(|| self.sh.paths.engine_state());
             let env = WorkerEnv {
                 home: self.sh.paths.engine_home(),
-                data_dir: self.sh.paths.ka_data(),
-                state_dir: self.sh.paths.engine_state(),
+                data_dir,
+                state_dir,
                 cache_dir: self.sh.paths.engine_cache(),
                 agent_data_root: self.sh.paths.root().to_path_buf(),
                 guard_write: self.guard_write_paths(),

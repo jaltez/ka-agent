@@ -252,6 +252,9 @@ pub(crate) fn skill_propose_schema() -> Value {
 
 pub(crate) fn skill_propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
+        if ctx.runtime.session_private() {
+            return Err("this is a private conversation — skill proposals are off here".into());
+        }
         let name = args["name"].as_str().unwrap_or("").trim();
         let description = args["description"].as_str().unwrap_or("").trim();
         let body = args["body"].as_str().unwrap_or("");

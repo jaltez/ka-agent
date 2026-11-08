@@ -471,3 +471,115 @@ async fn captioned_photo_becomes_a_turn_with_caption_and_ref() {
     daemon.sigterm_wait(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `/new private` from the phone: the reply says so, a captioned photo's
+/// turn records usage but no text, the media lands in the ephemeral
+/// `.private-*` directory, and ending the conversation destroys it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_session_leaves_no_trace_on_the_phone_path() {
+    let root = temp_root("private");
+    let (fake, base) = FakeBotServer::spawn();
+    let cfg = write_config(&root, &base);
+    let sc = scenario_file(
+        &root,
+        "private.json",
+        r#"{ "steps": [ {"text": "Private noted"} ], "stop": "done", "cost_usd": 0.0, "tokens": 3 }"#,
+    );
+    let data = root.join("data");
+    fake.push_file("p-priv-1", "photos/p-priv-1.jpg", b"private jpeg payload");
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    wait_polling(&fake);
+
+    // Enter the private conversation; the reply must say what it is.
+    fake.push_update(serde_json::json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "chat": { "id": 42, "type": "private" },
+            "date": 0,
+            "text": "/new private",
+        }
+    }));
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("private session")),
+        Duration::from_secs(30),
+    )
+    .expect("the private session reply arrived");
+
+    // A captioned photo in the private conversation becomes a turn.
+    fake.push_update(serde_json::json!({
+        "update_id": 2,
+        "message": {
+            "message_id": 2,
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "chat": { "id": 42, "type": "private" },
+            "date": 0,
+            "photo": [
+                { "file_id": "p-priv-1-small", "width": 90, "height": 90 },
+                { "file_id": "p-priv-1", "width": 1280, "height": 720 },
+            ],
+            "caption": "my sensitive caption",
+        }
+    }));
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("Private noted")),
+        Duration::from_secs(30),
+    )
+    .expect("the private turn answered");
+
+    let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    let (inbound, tokens): (String, i64) = conn
+        .query_row(
+            "SELECT inbound_text, tokens FROM turns ORDER BY created_ms DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(inbound, "", "the private turn row carries no text");
+    assert!(tokens > 0, "usage accounting survives");
+    let episodes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM episodes_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(episodes, 0, "nothing entered the episodic index");
+
+    // The media landed in the ephemeral directory, not the shared inbox.
+    let attachments = root.join("ws").join("attachments");
+    let private_dirs: Vec<_> = std::fs::read_dir(&attachments)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".private-"))
+        .collect();
+    assert_eq!(private_dirs.len(), 1, "one ephemeral media directory");
+    assert!(
+        std::fs::read_dir(&private_dirs[0].path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("photo-")),
+        "the photo is inside it"
+    );
+
+    // Ending the conversation destroys the ephemeral directory.
+    fake.push_update(serde_json::json!({
+        "update_id": 3,
+        "message": {
+            "message_id": 3,
+            "from": { "id": 42, "is_bot": false, "first_name": "Tester" },
+            "chat": { "id": 42, "type": "private" },
+            "date": 0,
+            "text": "/new",
+        }
+    }));
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.starts_with("new session")),
+        Duration::from_secs(30),
+    )
+    .expect("the normal session reply arrived");
+    assert!(
+        !private_dirs[0].path().exists(),
+        "the ephemeral media directory was destroyed"
+    );
+
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}

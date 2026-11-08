@@ -90,9 +90,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "new",
-        args: "",
-        summary: "start a fresh session (stops the current worker)",
-        example: "/new",
+        args: "[private]",
+        summary: "start a fresh session (stops the current worker); `private` = incognito — nothing is remembered",
+        example: "/new private",
         telegram: true,
         aliases: &[],
         reach: Reach::Everywhere,

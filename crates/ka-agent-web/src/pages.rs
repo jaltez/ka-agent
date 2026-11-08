@@ -282,6 +282,11 @@ pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
             );
         }
         for (t, answer) in turns.iter().rev() {
+            // A private conversation's usage-only row carries no text —
+            // render nothing rather than a pair of blank bubbles.
+            if t.inbound_text.is_empty() && answer.is_empty() {
+                continue;
+            }
             let at = jiff::Timestamp::from_millisecond(t.created_ms)
                 .map(|ts| ts.to_zoned(now.time_zone().clone()))
                 .unwrap_or_else(|_| now.clone());
@@ -304,7 +309,7 @@ pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
     let _ = store;
     let body = format!(
         "<div id='chat'><div id='log'>{turns_html}</div>\
-         <form id='send'><textarea id='text' rows='2' placeholder='talk to ka (Enter sends, Shift+Enter newline)'></textarea><button class='primary'>send</button></form></div>\
+         <form id='send'><textarea id='text' rows='2' placeholder='talk to ka (Enter sends, Shift+Enter newline)'></textarea><button type='button' id='private' title='start a private conversation (nothing is remembered)'>🕶</button><button class='primary'>send</button></form></div>\
          <script src=\"/static/chat.js\" defer></script>"
     );
     nav_page(runtime, "/", "Chat", body)

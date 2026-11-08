@@ -18,7 +18,14 @@ pub(crate) async fn save_attachment(
     client: &TelegramClient,
     workspace: &Path,
     message: &Value,
+    private_session: impl Fn() -> Option<String>,
 ) -> Result<String, String> {
+    // Resolved twice, around the download: the privacy kind must be the
+    // same on both sides of the network round-trip. A `/new` ending the
+    // private session mid-download must neither resurrect the destroyed
+    // ephemeral directory (write to it) nor drop the bytes into the
+    // shared inbox — the file is discarded.
+    let before = private_session();
     // Photos arrive as size-ascending variants; the last is the best.
     let (file_id, name): (String, String) = if let Some(sizes) = message["photo"].as_array() {
         let best = sizes
@@ -51,7 +58,31 @@ pub(crate) async fn save_attachment(
         .download_file(&file_path)
         .await
         .map_err(|e| e.to_string())?;
-    save_attachment_bytes(workspace, &name, &bytes)
+    let after = private_session();
+    match (&before, &after) {
+        (None, None) => save_attachment_bytes(workspace, &name, &bytes),
+        (Some(short), Some(now)) if short == now => {
+            save_private_attachment_bytes(workspace, short, &name, &bytes)
+        }
+        (Some(_), _) => Err(
+            "the private conversation ended while this file was downloading — it was not saved"
+                .into(),
+        ),
+        (None, Some(_)) => save_attachment_bytes(workspace, &name, &bytes),
+    }
+}
+
+/// Private-conversation variant of [`save_attachment_bytes`]: media lands
+/// under `<workspace>/attachments/.private-<session>/`, which the runtime
+/// destroys when the session ends (and sweeps at boot).
+pub(crate) fn save_private_attachment_bytes(
+    workspace: &Path,
+    session_short: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let dir = Path::new("attachments").join(format!(".private-{session_short}"));
+    save_bytes_under(workspace, &dir, name, bytes)
 }
 
 /// Write `bytes` to `<workspace>/attachments/<name>` and return the
@@ -67,11 +98,28 @@ pub(crate) fn save_attachment_bytes(
     name: &str,
     bytes: &[u8],
 ) -> Result<String, String> {
+    save_bytes_under(workspace, Path::new("attachments"), name, bytes)
+}
+
+/// Write `bytes` under `<workspace>/<dir>` and return the
+/// workspace-relative path. Collisions never overwrite: the first free
+/// `-N` suffix wins.
+///
+/// The name is sanitized here before anything is created: it alone decides
+/// where the bytes land, so the destination is validated before the write
+/// instead of after it. Files are created exclusively (`create_new`), so
+/// two writers racing for one name cannot clobber each other.
+fn save_bytes_under(
+    workspace: &Path,
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
     let Some(name) = sanitize_attachment_name(name) else {
         return Err(format!("unusable attachment name {name:?}"));
     };
-    let dir = workspace.join("attachments");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let full = workspace.join(dir);
+    std::fs::create_dir_all(&full).map_err(|e| e.to_string())?;
     let mut n = 1;
     loop {
         let candidate = if n == 1 {
@@ -80,7 +128,7 @@ pub(crate) fn save_attachment_bytes(
             suffixed(&name, n)
         };
         // A single sanitized component: `dir.join` cannot leave `dir`.
-        let rel = Path::new("attachments").join(&candidate);
+        let rel = dir.join(&candidate);
         let path = workspace.join(&rel);
         match std::fs::OpenOptions::new()
             .write(true)
