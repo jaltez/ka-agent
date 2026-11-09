@@ -592,9 +592,27 @@ impl Surface for MatrixSurface {
                     self.enqueue(text);
                 }
             }
-            AgentEvent::Error { class, message } => {
+            AgentEvent::Error {
+                class,
+                message,
+                retryable,
+            } => {
                 self.inner.stop_typing(true);
-                self.enqueue(&format!("! [{class}] {message}"));
+                // The same card as Telegram in plain form, with the
+                // Telegram-only button hints replaced by the text
+                // command (Matrix has no callback buttons).
+                let card = crate::errfmt::friendly_error(class, message);
+                let mut text = card
+                    .plain()
+                    .replace("tap ↻ Retry in a minute", "/retry re-sends it in a minute")
+                    .replace(
+                        "↻ Retry once you're back online",
+                        "/retry re-sends it once you're back online",
+                    );
+                if *retryable {
+                    text.push_str("\n/retry re-sends it");
+                }
+                self.enqueue(&text);
             }
             // A file for the operator: uploaded and posted as media.
             AgentEvent::File {

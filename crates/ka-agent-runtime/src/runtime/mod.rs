@@ -108,6 +108,9 @@ struct Live {
     /// Last time anything happened on this session (event, submit, ask) —
     /// the idle reap's clock. `now_ms` while a turn is in flight.
     last_activity_ms: i64,
+    /// The "still working" notice for the current silent stretch already
+    /// went out (the watchdog notifies once per stretch).
+    watchdog_notified: bool,
     /// The latest tool call (name, argument summary): the engine's
     /// permission question for MCP tools carries no command, so the card
     /// names the call instead of reading "run ``?".
@@ -129,6 +132,14 @@ struct Inner {
 
 /// A no-agent cron handler: input is the spec text, output the digest text.
 pub type NoAgentFn = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+/// The host-provided self-update entry (`/update`): `true` = check only,
+/// `false` = install. Returns the operator-facing reply, or an error
+/// message that already names the remedy. Registered by the app binary
+/// (the release machinery lives there), exactly like the no-agent
+/// handlers.
+pub type UpdateFn = Arc<dyn Fn(bool) -> Result<String, String> + Send + Sync>;
+
 
 struct Shared {
     /// The live configuration; swapped whole by [`Runtime::reload_config`].
@@ -186,6 +197,12 @@ struct Shared {
     /// The newest release seen by the daemon's periodic check (F4); the
     /// status line and one Notice surface it.
     update_available: Mutex<Option<String>>,
+    /// The host's `/update` implementation (`None` where self-update is
+    /// unavailable — tests, embedders).
+    updater: Mutex<Option<UpdateFn>>,
+    /// `/update` install in flight (single-flight guard: the install
+    /// child and the delayed self-restart must never run twice at once).
+    updating: std::sync::atomic::AtomicBool,
     /// The models.dev snapshot for the interactive `/model` listing,
     /// refreshed by the host's periodic task (cache-first, 24 h TTL).
     model_registry: Mutex<Option<ka_agent_port::registry::Registry>>,
@@ -201,6 +218,14 @@ impl Shared {
 
 fn cfg_of(sh: &Shared) -> Arc<DaemonConfig> {
     Arc::clone(&sh.cfg.read().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Whether an error of this class is worth a manual retry (↻): transient
+/// provider-side conditions only. The engine's own report always wins
+/// ([`AgentEvent::Error::retryable`] passes through); this maps the
+/// runtime-emitted classes.
+pub(crate) fn retryable_class(class: &str) -> bool {
+    matches!(class, "rate_limit" | "network" | "overflow")
 }
 
 /// Whether the engine can resolve the configured model's provider key.
@@ -373,6 +398,8 @@ impl Runtime {
                 channel_health: Mutex::new(HashMap::new()),
                 live_model: Mutex::new(None),
                 update_available: Mutex::new(None),
+                updater: Mutex::new(None),
+                updating: std::sync::atomic::AtomicBool::new(false),
                 model_registry: Mutex::new(None),
                 inner: Mutex::new(Inner {
                     session,
@@ -580,9 +607,45 @@ impl Runtime {
         drop(g);
         if let Some(v) = announce {
             self.sh.emit(AgentEvent::Notice {
-                text: format!("update available: {v} — ka-agent update"),
+                text: format!("update available: {v} — /update installs it"),
             });
         }
+    }
+
+    /// Register the host's `/update` implementation (the app binary; the
+    /// release machinery lives there, not in the runtime).
+    pub fn set_updater(&self, f: UpdateFn) {
+        *self
+            .sh
+            .updater
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    /// The registered `/update` implementation, if this host can
+    /// self-update.
+    pub fn updater(&self) -> Option<UpdateFn> {
+        self.sh
+            .updater
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Claim the single `/update` install slot: `false` when one is
+    /// already in flight.
+    pub fn try_begin_update(&self) -> bool {
+        !self
+            .sh
+            .updating
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Release the `/update` install slot.
+    pub fn end_update(&self) {
+        self.sh
+            .updating
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Publish the models.dev snapshot the interactive `/model` listing
@@ -739,6 +802,7 @@ impl Runtime {
         if let Err(e) = self.sh.store.update_session_status(&id, status) {
             self.sh.emit(AgentEvent::Error {
                 class: "internal".into(),
+                retryable: retryable_class("internal"),
                 message: format!("session status persist: {e}"),
             });
         }

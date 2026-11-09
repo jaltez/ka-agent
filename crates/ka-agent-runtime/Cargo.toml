@@ -19,6 +19,10 @@ jiff = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Feature-enabled so `ka-port-test-worker` builds for this crate's
+# integration tests (same self-dev-dep trick ka-agent-port uses); the
+# watchdog test spawns it as the scripted engine worker.
+ka-agent-port = { path = "../ka-agent-port", features = ["test-support"] }
 tempfile = { workspace = true }
 
 [lints]

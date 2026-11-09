@@ -80,6 +80,13 @@ token_secret = "matrix.access_token"   # KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN
   pinned room.
 - **Reminders**: `AgentEvent::Reminder` is posted as its own message,
   `⏰ <text>` (the same prefix the console and terminal use).
+- **Errors**: engine errors render as the plain form of the shared
+  error card (`errfmt::friendly_error`: `emoji title`, one explanation
+  line, one remedy hint, and the first 300 characters of the raw
+  message) — the same mapping Telegram's HTML card uses, without the
+  `<code>` wrapping. A retryable error appends `/retry re-sends it`
+  (Matrix has no callback buttons, so the retry affordance is the
+  text command).
 - **Attachments in**: `m.image`/`m.file`/`m.video` download through
   `/_matrix/client/v1/media/download/<server>/<id>` (falling back to
   `/_matrix/media/v3/download/…` on 404) into `<workspace>/attachments/`,

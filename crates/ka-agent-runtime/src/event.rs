@@ -95,7 +95,13 @@ pub enum AgentEvent {
         caption: String,
     },
     /// One chunk of the final answer at the `idle` delivery boundary.
-    FinalChunk { index: u32, text: String },
+    /// `turn` names the outbox row the chunk came from, so a surface
+    /// that fails to deliver it can requeue exactly that row.
+    FinalChunk {
+        index: u32,
+        turn: String,
+        text: String,
+    },
     /// The turn settled. `text` is the final answer capped at 4 KiB.
     TurnFinished {
         stop: String,
@@ -121,7 +127,13 @@ pub enum AgentEvent {
     /// The session's status moved.
     Session { status: String },
     /// Engine-level error (class + human message); presentation only.
-    Error { class: String, message: String },
+    /// `retryable` marks transient classes worth a manual ↻ Retry.
+    Error {
+        class: String,
+        message: String,
+        #[serde(default)]
+        retryable: bool,
+    },
 }
 
 /// One sequenced event on the wire: a monotonically increasing `seq`

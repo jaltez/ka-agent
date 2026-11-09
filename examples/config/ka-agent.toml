@@ -53,6 +53,15 @@ backoff_max_ms = 60000
 crash_window_secs = 600
 crash_max = 5
 
+[turn_watchdog]
+# A turn that is open but silent (engine alive, nothing emitted) is a
+# wedge: notify once after this many seconds, abort like /stop after
+# this many. 0 disables either stage (range 0..=86400); when both are
+# armed, abort_secs must exceed silent_secs. A pending approval gate
+# never triggers the watchdog.
+silent_secs = 180
+abort_secs = 900
+
 [budgets]
 # Daily USD cap across sessions (ka usage accounting). Positive; omit = none.
 # daily_usd = 5.0

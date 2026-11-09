@@ -258,7 +258,7 @@ impl StatusReport {
             }
         }
         if let Some(version) = &self.update_available {
-            out.push_str(&format!("\nupdate available: {version} — ka-agent update"));
+            out.push_str(&format!("\nupdate available: {version} — /update"));
         }
         out
     }

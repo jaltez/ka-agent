@@ -303,6 +303,30 @@ impl Runtime {
         Ok(items.len())
     }
 
+    /// Remove one queued message by id prefix (the `/queue` picker's ✕):
+    /// `Ok(true)` removed, `Ok(false)` no such item, `Err` ambiguous.
+    pub fn remove_queued(&self, id_prefix: &str) -> Result<bool, Error> {
+        let sid = self.session_id();
+        let hits: Vec<_> = self
+            .sh
+            .store
+            .queued_items(&sid)?
+            .into_iter()
+            .filter(|i| {
+                ka_agent_core::ids::id_matches(i.id.as_str(), id_prefix.trim())
+            })
+            .collect();
+        match hits.as_slice() {
+            [one] => self.sh.store.queue_remove(&one.id).map_err(Error::Store),
+            [] => Ok(false),
+            many => Err(Error::Refused(format!(
+                "ambiguous id — {} matches ({} …)",
+                many.len(),
+                ka_agent_core::ids::short_id(many[0].id.as_str())
+            ))),
+        }
+    }
+
     /// The engine's tool inventory, grouped as the engine discovered it.
     pub fn tools(&self) -> Vec<String> {
         self.lock()
@@ -388,6 +412,7 @@ impl Runtime {
         if let Err(e) = self.refresh_identity() {
             self.sh.emit(crate::event::AgentEvent::Error {
                 class: "internal".into(),
+                retryable: retryable_class("internal"),
                 message: format!("persona: {e}"),
             });
         }

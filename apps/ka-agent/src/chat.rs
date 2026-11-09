@@ -144,6 +144,7 @@ impl Backend {
                                 AgentEvent::Error {
                                     class: "internal".into(),
                                     message: e.to_string(),
+                                    retryable: false,
                                 },
                             ));
                         }
@@ -378,9 +379,13 @@ fn render(env: &Envelope, out: &mut Term) {
             "Degraded" => println!("· ⚠ degraded — the worker keeps crashing; /new starts fresh"),
             _ => {}
         },
-        AgentEvent::Error { class, message } => {
+        AgentEvent::Error {
+            class,
+            message,
+            retryable,
+        } => {
             println!("\n! [{class}] {message}");
-            if matches!(class.as_str(), "rate_limit" | "network") {
+            if *retryable {
                 println!("· /retry re-sends the question; nothing runs automatically");
             }
         }

@@ -101,6 +101,7 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
     if let Err(e) = sh.store.insert_turn(&turn) {
         sh.emit(AgentEvent::Error {
             class: "internal".into(),
+            retryable: retryable_class("internal"),
             message: format!("queue drain: {e}"),
         });
         return false;
@@ -121,6 +122,12 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
             live.current_turn = Some(turn.id.clone());
             live.current_turn_source = Some(item.source.clone());
             live.turn_started_at = Some(Instant::now());
+            // The turn's own clock starts here: the watchdog measures
+            // silence from the last activity, which without this would
+            // be the PREVIOUS turn's last event (a long idle gap would
+            // read as an already-stalled turn seconds in).
+            live.last_activity_ms = ka_agent_core::now_ms();
+            live.watchdog_notified = false;
             live.live_text.clear();
         }
     }
@@ -162,7 +169,7 @@ impl Runtime {
         let Some(turn) = self
             .sh
             .store
-            .latest_turns_for_session(&session, 1)?
+            .latest_turns_for_session(&session, 1, 0)?
             .into_iter()
             .next()
         else {
@@ -491,6 +498,7 @@ impl Runtime {
             // surface it, never auto-retry (SEED.md §3.8).
             self.sh.emit(AgentEvent::Error {
                 class: "internal".into(),
+                retryable: retryable_class("internal"),
                 message: format!("worker start failed: {e}"),
             });
             let mut g = self.lock();
@@ -549,7 +557,10 @@ impl Runtime {
                 live.current_turn = Some(turn.id.clone());
                 live.current_turn_source = source.map(str::to_string);
                 live.turn_started_at = Some(Instant::now());
-                live.live_text.clear();
+                // Same as the drain claim: silence starts at the turn,
+                // not at whatever the worker last emitted.
+                live.last_activity_ms = ka_agent_core::now_ms();
+                live.watchdog_notified = false;
             }
         }
         let wire = format!(

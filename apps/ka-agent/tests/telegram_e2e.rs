@@ -84,6 +84,15 @@ fn write_config(root: &Path, api_base: &str) -> PathBuf {
 }
 
 fn spawn_daemon(cfg: &Path, data: &Path, scenario: Option<&Path>) -> Daemon {
+    spawn_daemon_with_env(cfg, data, scenario, &[])
+}
+
+fn spawn_daemon_with_env(
+    cfg: &Path,
+    data: &Path,
+    scenario: Option<&Path>,
+    extra_env: &[(&str, &str)],
+) -> Daemon {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ka-agent"));
     cmd.arg("run")
         .arg("--config")
@@ -103,6 +112,9 @@ fn spawn_daemon(cfg: &Path, data: &Path, scenario: Option<&Path>) -> Daemon {
         .env_remove("KA_MODEL")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     if let Some(sc) = scenario {
         cmd.arg("--scenario").arg(sc);
     }
@@ -579,6 +591,134 @@ async fn private_session_leaves_no_trace_on_the_phone_path() {
         !private_dirs[0].path().exists(),
         "the ephemeral media directory was destroyed"
     );
+
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Full error-card loop: a scripted engine failure reaches the phone as
+/// the structured card; the ↻ callback (`retry:last`) re-sends the
+/// question; the successful retry deletes the stale card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_card_retry_and_auto_clean() {
+    let root = temp_root("errcard");
+    let (fake, base) = FakeBotServer::spawn();
+    let cfg = write_config(&root, &base);
+    // `protocol` is non-retryable, so the engine fails fast (no wire
+    // retries); the recovery text then serves the re-sent question.
+    let sc = scenario_file(
+        &root,
+        "errcard.json",
+        r#"{
+            "steps": [
+                {"fail": {"class": "protocol", "retryable": false, "message": "wire glitch <tag>"}},
+                {"text": "recovered answer"}
+            ],
+            "stop": "done", "cost_usd": 0.0, "tokens": 5
+        }"#,
+    );
+    let data = root.join("data");
+    let mut daemon = spawn_daemon(&cfg, &data, Some(&sc));
+    wait_polling(&fake);
+
+    // The failing turn surfaces as the structured card (HTML, escaped
+    // detail, no retry keyboard on a non-retryable class).
+    fake.push_text_message(1, 42, 42, "please answer");
+    let card = fake
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["parse_mode"].as_str() == Some("HTML")
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("Engine protocol error"))
+            },
+            Duration::from_secs(30),
+        )
+        .expect("the structured error card reached the phone");
+    let card_text = card.body["text"].as_str().unwrap();
+    assert!(
+        card_text.contains("&lt;tag&gt;"),
+        "raw detail is escaped: {card_text}"
+    );
+    assert!(
+        card_text.contains("<code>"),
+        "detail rides in a code block: {card_text}"
+    );
+    assert!(
+        card.body["reply_markup"].is_null(),
+        "no retry keyboard on a non-retryable class"
+    );
+
+    // The ↻ affordance (`retry:last`) re-sends the question; the scripted
+    // recovery answers it.
+    fake.push_callback(2, 42, 42, "retry:last");
+    fake.await_capture(
+        |c| send_message_text(c).is_some_and(|t| t.contains("recovered answer")),
+        Duration::from_secs(30),
+    )
+    .expect("the retried turn answered");
+
+    // The successful turn cleans the stale card up.
+    fake.await_capture(|c| c.method == "deleteMessage", Duration::from_secs(30))
+        .expect("the error card was deleted after the successful retry");
+
+    daemon.sigterm_wait(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `/update` from the phone: the busy gate (an update restarts the
+/// daemon — never mid-turn) and the check path against a dead release
+/// endpoint (the error reaches the operator, nothing is attempted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_command_busy_gate_and_error_surface() {
+    let root = temp_root("upd");
+    let (fake, base) = FakeBotServer::spawn();
+    let cfg = write_config(&root, &base);
+    let sc = scenario_file(
+        &root,
+        "stall.json",
+        r#"{ "steps": [ {"sleep_ms": 60000} ], "stop": "done", "cost_usd": 0.0, "tokens": 0 }"#,
+    );
+    let data = root.join("data");
+    // A dead release endpoint: deterministic, no network.
+    let mut daemon = spawn_daemon_with_env(
+        &cfg,
+        &data,
+        Some(&sc),
+        &[("KA_AGENT_UPDATE_API", "http://127.0.0.1:1/dead")],
+    );
+    wait_polling(&fake);
+
+    // Busy gate: a stalling turn is running; /update must refuse and
+    // name the way out.
+    fake.push_text_message(1, 42, 42, "stall a moment");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fake.push_text_message(2, 42, 42, "/update");
+    fake.await_capture(
+        |c| {
+            send_message_text(c)
+                .is_some_and(|t| t.starts_with("! [update] a turn is running"))
+        },
+        Duration::from_secs(30),
+    )
+    .expect("the busy gate refused the update");
+
+    // After the turn is stopped the check path runs — against the dead
+    // endpoint the operator gets the release error, not the busy-gate
+    // refusal (which also starts with "! [update]") or a stack trace.
+    fake.push_text_message(3, 42, 42, "/stop");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fake.push_text_message(4, 42, 42, "/update check");
+    fake.await_capture(
+        |c| {
+            send_message_text(c).is_some_and(|t| {
+                t.starts_with("! [update]") && !t.contains("a turn is running")
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .expect("the release-check error reached the phone");
 
     daemon.sigterm_wait(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&root);

@@ -143,6 +143,7 @@ pub(super) fn rt_persist_status(sh: &Arc<Shared>, status: SessionStatus) {
     if let Err(e) = sh.store.update_session_status(&sid, status) {
         sh.emit(AgentEvent::Error {
             class: "internal".into(),
+            retryable: retryable_class("internal"),
             message: format!("session status persist: {e}"),
         });
     }
@@ -190,6 +191,7 @@ pub(super) async fn drive(
             let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(live) = g.live.as_mut() {
                 live.last_activity_ms = ka_agent_core::now_ms();
+                live.watchdog_notified = false;
             }
         }
         match ev {
@@ -227,6 +229,7 @@ pub(super) async fn drive(
                 {
                     sh.emit(AgentEvent::Error {
                         class: "internal".into(),
+                        retryable: retryable_class("internal"),
                         message: format!("strand persist: {e}"),
                     });
                 }
@@ -436,6 +439,7 @@ pub(super) async fn drive(
                 if let Err(e) = sh.store.insert_approval(&approval) {
                     sh.emit(AgentEvent::Error {
                         class: "internal".into(),
+                        retryable: retryable_class("internal"),
                         message: format!("approval persist: {e}"),
                     });
                 }
@@ -481,6 +485,7 @@ pub(super) async fn drive(
                 ) {
                     sh.emit(AgentEvent::Error {
                         class: "internal".into(),
+                        retryable: retryable_class("internal"),
                         message: format!("ask deny persist: {e}"),
                     });
                 }
@@ -531,6 +536,7 @@ pub(super) async fn drive(
                     if let Err(e) = sh.store.update_turn(&t) {
                         sh.emit(AgentEvent::Error {
                             class: "internal".into(),
+                            retryable: retryable_class("internal"),
                             message: format!("turn persist: {e}"),
                         });
                     }
@@ -644,6 +650,7 @@ pub(super) async fn drive(
                         let index = if parts.len() > 1 { i as u32 + 1 } else { 1 };
                         sh.emit(AgentEvent::FinalChunk {
                             index,
+                            turn: tid.as_str().to_string(),
                             text: chunk.clone(),
                         });
                     }
@@ -704,10 +711,15 @@ pub(super) async fn drive(
                 rt_maybe_idle(&sh);
             }
             PortEvent::Note(t) => sh.emit(AgentEvent::Note { text: t }),
-            PortEvent::EngineError { class, message, .. } => {
+            PortEvent::EngineError {
+                class,
+                message,
+                retryable,
+            } => {
                 sh.emit(AgentEvent::Error {
                     class: class.clone(),
                     message: message.clone(),
+                    retryable,
                 });
                 if class == "auth" {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());

@@ -52,7 +52,7 @@ impl ka_agent_runtime::surface::Surface for Notes {
             AgentEvent::Reminder { text, .. } => {
                 self.0.lock().unwrap().push(text.clone());
             }
-            AgentEvent::Error { class, message } => {
+            AgentEvent::Error { class, message, .. } => {
                 self.0
                     .lock()
                     .unwrap()

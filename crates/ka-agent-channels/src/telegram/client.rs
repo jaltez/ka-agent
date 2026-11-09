@@ -55,6 +55,31 @@ impl TelegramClient {
         }
     }
 
+    /// One send with flood-control tolerance: on a 429 the call sleeps
+    /// what Telegram asked for (clamped 1..=60 s) and retries exactly
+    /// once — a second refusal returns the error to the caller. Sends
+    /// (answers, notices, cards) must not be dropped to flood control;
+    /// the long-poll `getUpdates` stays untouched.
+    async fn send_with_flood_retry(
+        &self,
+        method: &str,
+        body: Value,
+    ) -> Result<Value, ChannelError> {
+        match self.call(method, body.clone()).await {
+            Err(ChannelError::Api {
+                error_code: Some(429),
+                retry_after,
+                ..
+            }) => {
+                let wait = retry_after.unwrap_or(1).clamp(1, 60);
+                eprintln!("telegram: {method} flood control; retrying in {wait}s");
+                tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+                self.call(method, body).await
+            }
+            other => other,
+        }
+    }
+
     pub(crate) async fn get_me(&self) -> Result<Value, ChannelError> {
         self.call("getMe", json!({})).await
     }
@@ -87,7 +112,7 @@ impl TelegramClient {
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup;
         }
-        let result = self.call("sendMessage", body).await?;
+        let result = self.send_with_flood_retry("sendMessage", body).await?;
         Ok(result["message_id"].as_i64().unwrap_or(0))
     }
 
@@ -103,7 +128,7 @@ impl TelegramClient {
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup;
         }
-        let result = self.call("sendMessage", body).await?;
+        let result = self.send_with_flood_retry("sendMessage", body).await?;
         Ok(result["message_id"].as_i64().unwrap_or(0))
     }
 

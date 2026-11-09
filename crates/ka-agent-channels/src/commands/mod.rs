@@ -13,6 +13,7 @@ mod memory;
 mod misc;
 mod schedule;
 mod session;
+mod update;
 /// The interactive pickers (`/model`, `/mode`, `/effort`) exported for
 /// the surfaces that render them natively (Telegram's keyboards build
 /// on the same strings).
@@ -127,6 +128,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         reach: Reach::Everywhere,
         run: session::run_retry,
+    },
+    CommandSpec {
+        name: "cleanup",
+        args: "",
+        summary: "remove the bot's recent error and status notices",
+        example: "/cleanup",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: misc::run_cleanup,
+    },
+    CommandSpec {
+        name: "update",
+        args: "[check]",
+        summary: "install the newest release (needs write access to the binary; restarts the daemon)",
+        example: "/update",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: update::run_update,
     },
     CommandSpec {
         name: "model",

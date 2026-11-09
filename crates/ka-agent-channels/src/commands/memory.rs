@@ -150,7 +150,7 @@ pub(super) fn run_history<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 Err(e) => format!("! [history] {e}"),
             }
         } else if rest.is_empty() {
-            match runtime.recent_turns(5) {
+            match runtime.recent_turns(5, 0) {
                 Ok(turns) if turns.is_empty() => "no history yet — say something first".into(),
                 Ok(turns) => {
                     let now = runtime.now_zoned();

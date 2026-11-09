@@ -81,7 +81,11 @@ async fn ask_and_wait(ctx: &AdminCtx, text: &str, source: &str) -> serde_json::V
                 }
                 return out;
             }
-            AgentEvent::Error { class, message } if ours => {
+            AgentEvent::Error {
+                class,
+                message,
+                ..
+            } if ours => {
                 return serde_json::json!({
                     "ok": false,
                     "queued": queued,
@@ -328,6 +332,7 @@ async fn serve_attach(
                     AgentEvent::Error {
                         class: "internal".into(),
                         message: format!("status: {e}"),
+                        retryable: false,
                     },
                 ),
             );
@@ -414,6 +419,7 @@ async fn serve_attach(
                             AgentEvent::Error {
                                 class: "internal".into(),
                                 message: e.to_string(),
+                                retryable: false,
                             },
                         ),
                     );

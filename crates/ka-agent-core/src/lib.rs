@@ -30,7 +30,7 @@ pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
 pub use config::{
     Approvals, Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Notify,
-    Search, Voice, Web,
+    Search, TurnWatchdog, Voice, Web, WorkerRestart,
 };
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};

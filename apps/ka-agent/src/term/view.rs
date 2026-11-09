@@ -487,11 +487,15 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, thinking: bool) -> Vec<String> {
             return vec![format!("📎 {path}{cap}")];
         }
         AgentEvent::Reminder { text, .. } => return vec![format!("⏰ {text}")],
-        AgentEvent::Error { class, message } => {
+        AgentEvent::Error {
+            class,
+            message,
+            retryable,
+        } => {
             let mut rows = vec![super::paint::red(&format!("! [{class}] {message}"))];
             // A retryable failure names the way back (F2): /retry re-sends
             // the interrupted question; nothing re-runs on its own.
-            if matches!(class.as_str(), "rate_limit" | "network") {
+            if *retryable {
                 rows.push(super::paint::dim(
                     "· /retry re-sends the question; nothing runs automatically",
                 ));

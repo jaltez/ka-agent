@@ -2,7 +2,7 @@
 
 use super::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -62,7 +62,35 @@ pub(super) struct SurfaceInner {
     /// older snapshot.
     draft_in_flight: AtomicBool,
     draft: Mutex<Draft>,
+    /// The messages this surface may clean up later (`/cleanup`, or any
+    /// successful turn): bot-sent error cards and notices, newest last.
+    pub(super) tracked: Mutex<VecDeque<TrackedMsg>>,
+    /// Wall clock of the current turn's start — the auto-clean boundary
+    /// (tracked messages older than it go when the turn succeeds).
+    turn_started_ms: AtomicI64,
+    /// The daemon's store for outbox requeue of undeliverable final
+    /// chunks; `None` in tests.
+    pub(super) store: Option<Arc<ka_agent_store::Store>>,
 }
+
+/// Why a sent message is tracked for later cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrackedKind {
+    Error,
+    Notice,
+}
+
+/// One bot-sent message worth deleting later. In-memory only: a restart
+/// loses the ids (acceptable — Telegram's delete window is 48 h, and
+/// `/cleanup` simply finds nothing).
+pub(super) struct TrackedMsg {
+    pub message_id: i64,
+    pub at_ms: i64,
+    pub kind: TrackedKind,
+}
+
+/// The tracked-message ring cap: old entries drop off the front.
+const TRACKED_MAX: usize = 200;
 
 /// The reply being streamed in the current turn.
 #[derive(Default)]
@@ -116,6 +144,9 @@ impl SurfaceInner {
             draft_blocked_until_ms: AtomicI64::new(0),
             draft_in_flight: AtomicBool::new(false),
             draft: Mutex::new(Draft::default()),
+            tracked: Mutex::new(VecDeque::new()),
+            turn_started_ms: AtomicI64::new(0),
+            store: None,
         }
     }
 
@@ -141,23 +172,87 @@ impl SurfaceInner {
         }
     }
 
-    /// Send one message as rendered HTML, keeping ≥1 s between sends.
-    /// Falls back to plain text when the HTML is too long or Telegram
-    /// refuses it (`can't parse entities`).
-    async fn send_rich(&self, text: &str) {
+    /// A notice the surface tracks for later cleanup: sent like
+    /// [`Self::spawn_send`] renders, and the returned message id is
+    /// recorded. The ring entry is stamped at EVENT time, not send
+    /// completion — a card whose send is delayed (flood-control sleep)
+    /// must still count as older than a turn that started after the
+    /// event, or the auto-clean boundary would keep it forever.
+    fn spawn_send_tracked(self: &Arc<Self>, kind: TrackedKind, text: String) {
+        let inner = Arc::clone(self);
+        let at_ms = now_ms();
+        tokio::spawn(async move {
+            if let Some(message_id) = inner.send_rich(&text).await {
+                inner.track_at(kind, message_id, at_ms);
+            }
+        });
+    }
+
+    /// Record one bot-sent message for later cleanup (bounded ring),
+    /// stamped at event time (see [`Self::spawn_send_tracked`]).
+    pub(super) fn track_at(&self, kind: TrackedKind, message_id: i64, at_ms: i64) {
+        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        tracked.push_back(TrackedMsg {
+            message_id,
+            at_ms,
+            kind,
+        });
+        while tracked.len() > TRACKED_MAX {
+            tracked.pop_front();
+        }
+    }
+
+    /// Delete every tracked message recorded before `boundary_ms`
+    /// (the start of a turn that then succeeded), sequentially and
+    /// best-effort: a refusal past Telegram's 48 h window is skipped.
+    pub(super) fn delete_tracked_before(&self, boundary_ms: i64) {
+        let Some(chat) = self.chat() else { return };
+        let due: Vec<i64> = {
+            let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+            let split = tracked
+                .iter()
+                .position(|m| m.at_ms >= boundary_ms)
+                .unwrap_or(tracked.len());
+            tracked.drain(..split).map(|m| m.message_id).collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            for message_id in due {
+                let _ = client.delete_message(chat, message_id).await;
+            }
+        });
+    }
+
+    /// Send one message as rendered HTML, keeping ≥1 s between sends,
+    /// and return its message id (for later cleanup tracking).
+    async fn send_rich(&self, text: &str) -> Option<i64> {
+        let plain = balance_fences(text);
+        let html = ka_agent_core::markdown::render(&plain, ka_agent_core::markdown::Target::Telegram);
+        self.send_card(&html, &plain, None).await
+    }
+
+    /// One HTML-or-plain send with ≥1 s spacing: HTML first, plain-text
+    /// fallback when the HTML is over-length or Telegram refuses it
+    /// (`can't parse entities`). The card form of [`Self::send_rich`] —
+    /// error cards pass their own markup.
+    async fn send_card(&self, html: &str, plain: &str, markup: Option<Value>) -> Option<i64> {
         let mut last = self.last_send_ms.lock().await;
         let wait = SEND_SPACING_MS - (now_ms() - *last);
         if wait > 0 {
             tokio::time::sleep(Duration::from_millis(wait as u64)).await;
         }
-        let Some(chat) = self.chat() else { return };
-        let plain = balance_fences(text);
-        let html =
-            ka_agent_core::markdown::render(&plain, ka_agent_core::markdown::Target::Telegram);
+        let Some(chat) = self.chat() else { return None };
+        let mut sent = None;
         let mut fallback = true;
         if html.chars().count() <= MAX_MESSAGE_CHARS {
-            match self.client.send_message_html(chat, &html, None).await {
-                Ok(_) => fallback = false,
+            match self.client.send_message_html(chat, html, markup.clone()).await {
+                Ok(id) => {
+                    fallback = false;
+                    sent = Some(id);
+                }
                 Err(ChannelError::Api { description, .. }) => {
                     eprintln!("telegram: HTML refused ({description}); sending plain text");
                 }
@@ -167,10 +262,30 @@ impl SurfaceInner {
                 }
             }
         }
-        if fallback && let Err(e) = self.client.send_message(chat, &plain, None).await {
-            eprintln!("telegram: send: {e}");
+        if fallback {
+            // Over-length plain text is split at paragraph boundaries
+            // and sent piece by piece with the usual spacing; the card's
+            // keyboard rides on the first piece.
+            for (i, piece) in split_plain(plain).into_iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                match self
+                    .client
+                    .send_message(chat, &piece, if i == 0 { markup.clone() } else { None })
+                    .await
+                {
+                    Ok(id) => {
+                        if sent.is_none() {
+                            sent = Some(id);
+                        }
+                    }
+                    Err(e) => eprintln!("telegram: send: {e}"),
+                }
+            }
         }
         *last = now_ms();
+        sent
     }
 
     /// Add streamed text to the draft and push it when the throttle allows.
@@ -347,9 +462,17 @@ impl TelegramSurface {
     /// `initial_chat` is the persisted `telegram.chat_id` meta value, so
     /// proactive notices reach the operator right after a restart. Without
     /// it the surface no-ops until the poller learns the chat id from an
-    /// allowed inbound message (`set_chat`).
-    pub fn new(api_base: String, token: String, initial_chat: Option<i64>) -> Self {
-        let inner = Arc::new(SurfaceInner::new(TelegramClient::new(&api_base, &token)));
+    /// allowed inbound message (`set_chat`). `store` enables the outbox
+    /// requeue of final chunks a send could not deliver (tests pass `None`).
+    pub fn new(
+        api_base: String,
+        token: String,
+        initial_chat: Option<i64>,
+        store: Option<Arc<ka_agent_store::Store>>,
+    ) -> Self {
+        let mut inner = SurfaceInner::new(TelegramClient::new(&api_base, &token));
+        inner.store = store;
+        let inner = Arc::new(inner);
         if let Some(chat) = initial_chat {
             inner.set_chat(chat);
         }
@@ -377,6 +500,9 @@ impl Surface for TelegramSurface {
             // Typing indicator only; a progress message appears with the
             // first note.
             AgentEvent::TurnStarted { source, .. } => {
+                self.inner
+                    .turn_started_ms
+                    .store(env.at_ms, Ordering::Release);
                 self.inner.turn_active.store(true, Ordering::Release);
                 // A fresh draft per turn: a non-zero id the API keys the
                 // bubble by. Scheduled turns (cron, the briefing) get no
@@ -500,24 +626,42 @@ impl Surface for TelegramSurface {
             // Operator-must-receive messages (reminders, cron output,
             // pauses): always their own message.
             AgentEvent::Notice { text } => {
-                let inner = Arc::clone(&self.inner);
-                let text = text.clone();
-                tokio::spawn(async move { inner.send_rich(&text).await });
+                // Tracked: `/cleanup` or the next successful turn may
+                // delete it (stale status noise).
+                self.inner
+                    .spawn_send_tracked(TrackedKind::Notice, text.clone());
             }
             // Streamed as a Bot API draft (throttled, plain text); the
             // final chunks still carry the rendered answer.
             AgentEvent::Delta { text } => self.inner.push_draft(text),
-            AgentEvent::FinalChunk { text, .. } => {
+            AgentEvent::FinalChunk { index, turn, text } => {
                 if self.inner.chat().is_none() {
                     return;
                 }
                 let inner = Arc::clone(&self.inner);
                 let text = text.clone();
-                tokio::spawn(async move { inner.send_rich(&text).await });
+                let turn = turn.clone();
+                let chunk_index = index.saturating_sub(1);
+                tokio::spawn(async move {
+                    if inner.send_rich(&text).await.is_none()
+                        && let Some(store) = inner.store.as_ref()
+                    {
+                        // The send still failed after the flood-control
+                        // retry: requeue the outbox row so the startup
+                        // drain redelivers it (private sessions write no
+                        // rows — the requeue is a no-op then).
+                        if let Err(e) = store.requeue_chunk(
+                            &ka_agent_core::TurnId(turn.clone()),
+                            chunk_index,
+                        ) {
+                            eprintln!("telegram: requeue chunk {turn}/{}: {e}", chunk_index + 1);
+                        }
+                    }
+                });
             }
             // Stops typing and deletes the progress message; cost lives
             // in /status.
-            AgentEvent::TurnFinished { .. } => {
+            AgentEvent::TurnFinished { stop, .. } => {
                 *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft::default();
                 self.inner.stop_typing();
                 self.inner.turn_active.store(false, Ordering::Release);
@@ -539,6 +683,15 @@ impl Surface for TelegramSurface {
                     tokio::spawn(async move {
                         let _ = client.delete_message(chat, message_id).await;
                     });
+                }
+                // Any successful turn clears stale error/notice cards
+                // recorded before it started (a retried turn succeeding
+                // is the common case).
+                if matches!(stop.as_str(), "done" | "length") {
+                    let boundary = self.inner.turn_started_ms.load(Ordering::Acquire);
+                    if boundary > 0 {
+                        self.inner.delete_tracked_before(boundary);
+                    }
                 }
             }
             AgentEvent::MemoryProposal { id, text } => {
@@ -673,26 +826,35 @@ impl Surface for TelegramSurface {
                 };
                 self.inner.settle_card(&short_id(id, 12), parsed);
             }
-            AgentEvent::Error { class, message } => {
-                let text = format!("! [{class}] {message}");
-                // ka-port.md §7: rate_limit/network errors offer a Retry
-                // affordance (never automatic). One tap re-sends the
-                // interrupted question via the shared /retry path.
-                if matches!(class.as_str(), "rate_limit" | "network") {
-                    let markup = json!({
+            AgentEvent::Error {
+                class,
+                message,
+                retryable,
+            } => {
+                // A structured card, not a raw provider dump: headline,
+                // what it means, the remedy, and ≤300 chars of detail.
+                let card = crate::errfmt::friendly_error(class, message);
+                let html = card.html();
+                let plain = card.plain();
+                // ka-port.md §7: a retryable failure offers ↻ (never
+                // automatic). One tap re-sends the interrupted question
+                // via the shared /retry path.
+                let markup = if *retryable {
+                    Some(json!({
                         "inline_keyboard": [[
                             { "text": "↻ Retry", "callback_data": "retry:last" }
                         ]]
-                    });
-                    let inner = Arc::clone(&self.inner);
-                    tokio::spawn(async move {
-                        if let Some(chat) = inner.chat() {
-                            let _ = inner.client.send_message(chat, &text, Some(markup)).await;
-                        }
-                    });
+                    }))
                 } else {
-                    self.inner.spawn_send(text);
-                }
+                    None
+                };
+                let inner = Arc::clone(&self.inner);
+                let at_ms = now_ms();
+                tokio::spawn(async move {
+                    if let Some(message_id) = inner.send_card(&html, &plain, markup).await {
+                        inner.track_at(TrackedKind::Error, message_id, at_ms);
+                    }
+                });
             }
             // While tools run and no answer text has streamed, the draft
             // shows the newest tool call; the text replaces it later.

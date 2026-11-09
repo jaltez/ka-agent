@@ -196,6 +196,7 @@ async fn outbound_is_sent_while_sync_is_pending() {
         1,
         AgentEvent::FinalChunk {
             index: 0,
+            turn: "turn_test".into(),
             text: "answer while polling".into(),
         },
     ));
@@ -343,6 +344,7 @@ async fn replies_carry_formatted_html() {
         1,
         AgentEvent::FinalChunk {
             index: 0,
+            turn: "turn_test".into(),
             text: "**done** with `x < y`".into(),
         },
     ));
@@ -519,6 +521,7 @@ async fn operator_turn_streams_with_edits() {
         4,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: full.clone(),
         },
     ));
@@ -593,6 +596,7 @@ async fn scheduled_turn_is_not_streamed() {
         3,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: "briefing".into(),
         },
     ));
@@ -808,6 +812,7 @@ async fn final_chunk_during_the_first_send_edits_the_draft() {
         3,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: full.clone(),
         },
     ));
@@ -878,6 +883,7 @@ async fn a_failed_final_edit_posts_the_answer_as_a_message() {
         3,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: full.clone(),
         },
     ));
@@ -943,6 +949,7 @@ async fn edits_and_typing_stay_in_the_room_the_turn_started_in() {
         4,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: full.clone(),
         },
     ));
@@ -1011,6 +1018,7 @@ async fn a_stale_send_does_not_seed_the_next_turn() {
         5,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: answer.into(),
         },
     ));
@@ -1074,6 +1082,7 @@ async fn a_failed_draft_send_backs_off() {
         3,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: full.clone(),
         },
     ));

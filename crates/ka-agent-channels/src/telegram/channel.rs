@@ -1,7 +1,7 @@
 // TelegramChannel: the long-poll loop, gate, dispatch and callbacks. Split from telegram.rs (moves only).
 
 use super::client::TelegramClient;
-use super::surface::{SurfaceInner, take_surface_state};
+use super::surface::{SurfaceInner, TrackedKind, TrackedMsg, take_surface_state};
 use super::*;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ka_agent_core::audit::AuditRecord;
+use ka_agent_core::ids::id_matches;
 use ka_agent_core::{ApprovalDecision, ApprovalStatus, DaemonConfig, OutboxChunk};
 use ka_agent_runtime::registry::{ModelsListing, ProviderModels};
 use ka_agent_runtime::{Error as RtError, Runtime};
@@ -557,11 +558,13 @@ impl TelegramChannel {
             return;
         };
 
-        // A bare `/model` / `/mode` / `/effort` renders as a native
-        // Telegram picker (an inline keyboard) instead of the router's
-        // text listing; every argument form still routes below.
+        // A bare picker command (`/model` `/mode` `/effort` `/approvals`
+        // `/queue` `/forget` `/skills` `/history` `/cleanup`) renders as
+        // a native Telegram picker (an inline keyboard or, for
+        // `/cleanup`, a direct action) instead of the router's text
+        // listing; every argument form still routes below.
         if let Some(cmd) = bare_picker_command(text) {
-            self.send_picker(&client, chat_id, cmd).await;
+            self.send_picker(&client, chat_id, cmd, surface).await;
             return;
         }
         // Commands route through the shared router; replies go to the same
@@ -865,6 +868,141 @@ impl TelegramChannel {
         if let Some(rest) = data.strip_prefix("sk:") {
             return self.skill_callback(cb, rest).await;
         }
+        // `x` — the ✕ on any picker card: collapse it to its first line.
+        if data == "x" {
+            let line = cb["message"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            return CallbackReply::settle("", trunc_chars(&line, 60));
+        }
+        // `ap:<short12>:y|n` — a row of the `/approvals` card; the same
+        // resolution and decision the `a:` handler uses.
+        if let Some(rest) = data.strip_prefix("ap:") {
+            let Some((short, verdict)) = rest.rsplit_once(':') else {
+                return CallbackReply::none();
+            };
+            if !matches!(verdict, "y" | "n") {
+                return CallbackReply::none();
+            }
+            let full = self
+                .store
+                .pending_approvals(&self.runtime.session_id())
+                .ok()
+                .and_then(|pending| {
+                    pending
+                        .into_iter()
+                        .map(|a| a.id)
+                        .find(|id| id.as_str().ends_with(short))
+                });
+            let Some(full) = full else {
+                return CallbackReply::toast("expired");
+            };
+            let decision = if verdict == "y" {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+            let word = if verdict == "y" { "approved" } else { "denied" };
+            return match self.runtime.decide(full.as_str(), decision).await {
+                Ok(()) => CallbackReply::settle(
+                    if verdict == "y" { "✔ approved" } else { "✖ denied" },
+                    format!("approval [{}] → {word}", short_id(&full.0, 8)),
+                ),
+                Err(RtError::UnknownApproval(_)) => CallbackReply::toast("expired"),
+                Err(e) => {
+                    eprintln!("telegram: decide {full}: {e}");
+                    CallbackReply::toast("error")
+                }
+            };
+        }
+        // `qx:<short12>` — remove one queued message (the `/queue` ✕).
+        if let Some(rest) = data.strip_prefix("qx:") {
+            return match self.runtime.remove_queued(rest) {
+                Ok(true) => CallbackReply::toast("removed"),
+                Ok(false) => CallbackReply::toast("not queued (already turned)"),
+                Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
+            };
+        }
+        // `qclr` — the `/queue` card's Clear all row.
+        if data == "qclr" {
+            return match self.runtime.clear_queue() {
+                Ok(0) => CallbackReply::settle("", "the queue is empty".into()),
+                Ok(n) => CallbackReply::settle("cleared", format!("cleared {n} queued message(s)")),
+                Err(e) => CallbackReply::settle("error", format!("! [queue] {e}")),
+            };
+        }
+        // `fx:<short>` — forget one memory entry (the `/forget` ✖),
+        // resolved by prefix exactly like `/forget <id>`.
+        if let Some(rest) = data.strip_prefix("fx:") {
+            let entries = match self.runtime.memory_entries() {
+                Ok(e) => e,
+                Err(e) => return CallbackReply::toast(&toast_cap(&e.to_string())),
+            };
+            let hits: Vec<_> = entries
+                .iter()
+                .filter(|e| id_matches(&e.id, rest))
+                .collect();
+            return match hits.as_slice() {
+                [one] => match self.runtime.forget(&one.id) {
+                    Ok(true) => {
+                        CallbackReply::toast(&format!("forgot {}", short_id(&one.id, 8)))
+                    }
+                    Ok(false) => CallbackReply::toast("already gone"),
+                    Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
+                },
+                [] => CallbackReply::toast("not found"),
+                _ => CallbackReply::toast("ambiguous id"),
+            };
+        }
+        // `fp:<off>` — page the `/forget` card.
+        if let Some(rest) = data.strip_prefix("fp:") {
+            let Ok(off) = rest.parse::<usize>() else {
+                return CallbackReply::none();
+            };
+            return match self.forget_card(off) {
+                Some((text, markup)) => CallbackReply::page(text, markup),
+                None => CallbackReply::none(),
+            };
+        }
+        // `hp:<off>` — page the `/history` card.
+        if let Some(rest) = data.strip_prefix("hp:") {
+            let Ok(off) = rest.parse::<usize>() else {
+                return CallbackReply::none();
+            };
+            return match self.history_card(off) {
+                Some((text, markup)) => CallbackReply::page(text, markup),
+                None => CallbackReply::none(),
+            };
+        }
+        // `hv:<off>:<short>` — one history row's detail: inbound + answer,
+        // with a back row to the page it came from.
+        if let Some(rest) = data.strip_prefix("hv:") {
+            let Some((off_s, short)) = rest.split_once(':') else {
+                return CallbackReply::none();
+            };
+            let Ok(off) = off_s.parse::<usize>() else {
+                return CallbackReply::none();
+            };
+            return match self.runtime.history_show(short) {
+                Ok(Some((inbound, answer))) => {
+                    let detail = trunc_chars(&format!("> {inbound}\n{answer}"), 4000);
+                    let text = cap_lines(&detail, 12);
+                    let markup = json!({
+                        "inline_keyboard": [[
+                            kb_button("‹ back", &format!("hp:{off}")),
+                            kb_button("✕", "x"),
+                        ]]
+                    });
+                    CallbackReply::page(text, markup)
+                }
+                Ok(None) => CallbackReply::toast("no such turn"),
+                Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
+            };
+        }
         // `a:<short>:y|n`
         let Some(rest) = data.strip_prefix("a:") else {
             return CallbackReply::none();
@@ -919,11 +1057,17 @@ impl TelegramChannel {
         }
     }
 
-    /// Send the native picker card for a bare `/model` / `/mode` /
-    /// `/effort` from the operator: the current value plus an inline
-    /// keyboard instead of the router's text listing. Best-effort — a
-    /// refused send logs and drops the card, the command stays answered.
-    async fn send_picker(&self, client: &TelegramClient, chat_id: i64, cmd: &str) {
+    /// Send the native picker card for a bare picker command from the
+    /// operator: the current value plus an inline keyboard instead of
+    /// the router's text listing. Best-effort — a refused send logs and
+    /// drops the card, the command stays answered.
+    async fn send_picker(
+        &self,
+        client: &TelegramClient,
+        chat_id: i64,
+        cmd: &str,
+        surface: &Arc<SurfaceInner>,
+    ) {
         let (text, markup) = match cmd {
             "/mode" => {
                 let current = self.runtime.config().mode.clone();
@@ -935,6 +1079,47 @@ impl TelegramChannel {
                     .effort()
                     .unwrap_or_else(|| "model default".into());
                 (format!("effort: {current}"), effort_keyboard(&current))
+            }
+            "/approvals" => match self.approvals_card() {
+                Some(card) => card,
+                None => {
+                    let _ = client
+                        .send_message(chat_id, "no pending approvals", None)
+                        .await;
+                    return;
+                }
+            },
+            "/queue" => match self.queue_card() {
+                Some(card) => card,
+                None => {
+                    let _ = client
+                        .send_message(chat_id, "the queue is empty", None)
+                        .await;
+                    return;
+                }
+            },
+            "/forget" => match self.forget_card(0) {
+                Some(card) => card,
+                None => {
+                    let _ = client
+                        .send_message(chat_id, "nothing is remembered yet", None)
+                        .await;
+                    return;
+                }
+            },
+            "/skills" => self.skills_card().await,
+            "/history" => match self.history_card(0) {
+                Some(card) => card,
+                None => {
+                    let _ = client
+                        .send_message(chat_id, "no history yet — say something first", None)
+                        .await;
+                    return;
+                }
+            },
+            "/cleanup" => {
+                self.run_cleanup(client, chat_id, surface).await;
+                return;
             }
             _ => {
                 let listing = self.runtime.models_listing();
@@ -953,6 +1138,240 @@ impl TelegramChannel {
         if let Err(e) = client.send_message(chat_id, &text, Some(markup)).await {
             eprintln!("telegram: {cmd} picker: {e}");
         }
+    }
+
+    /// `/cleanup`: delete every tracked error/notice message (sequential,
+    /// best-effort — a refusal past Telegram's 48 h window is skipped)
+    /// and report what went.
+    async fn run_cleanup(
+        &self,
+        client: &TelegramClient,
+        chat_id: i64,
+        surface: &Arc<SurfaceInner>,
+    ) {
+        let drained: Vec<TrackedMsg> = surface
+            .tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        if drained.is_empty() {
+            let _ = client.send_message(chat_id, "nothing to clean up", None).await;
+            return;
+        }
+        let errors = drained
+            .iter()
+            .filter(|m| matches!(m.kind, TrackedKind::Error))
+            .count();
+        let notices = drained.len() - errors;
+        for m in &drained {
+            let _ = client.delete_message(chat_id, m.message_id).await;
+        }
+        let breakdown = match (errors, notices) {
+            (0, _) => String::new(),
+            (_, 0) => format!(" ({errors} error card(s))"),
+            _ => format!(" ({errors} error, {notices} notice)"),
+        };
+        let _ = client
+            .send_message(
+                chat_id,
+                &format!("removed {} message(s){breakdown}", drained.len()),
+                None,
+            )
+            .await;
+    }
+
+    /// The `/approvals` card: one line per pending approval, one
+    /// Allow/Deny row per item (`ap:<short12>:y|n`), ✕ close.
+    fn approvals_card(&self) -> Option<(String, Value)> {
+        let cards = self.runtime.pending_approval_cards().ok()?;
+        if cards.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        let mut rows = Vec::new();
+        for c in cards.iter().take(10) {
+            let short = short_id(&c.approval_id, 12);
+            let question = c.question.lines().next().unwrap_or("").to_string();
+            lines.push(format!(
+                "[{}] {} — expires in {}",
+                short_id(&c.approval_id, 8),
+                trunc_chars(&question, 60),
+                crate::commands::fmt_interval(c.expires_at_ms - now_ms())
+            ));
+            rows.push(vec![
+                kb_button("✅ Allow", &format!("ap:{short}:y")),
+                kb_button("⛔ Deny", &format!("ap:{short}:n")),
+            ]);
+        }
+        if cards.len() > 10 {
+            lines.push(format!("{} more — /approvals lists them", cards.len() - 10));
+        }
+        rows.push(vec![kb_button("✕", "x")]);
+        Some((
+            format!("pending approvals:\n{}", lines.join("\n")),
+            json!({ "inline_keyboard": rows }),
+        ))
+    }
+
+    /// The `/queue` card: one line per queued message, a ✕ per row
+    /// (`qx:<short12>`) and a Clear all row.
+    fn queue_card(&self) -> Option<(String, Value)> {
+        let items = self.runtime.queued().ok()?;
+        if items.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        let mut rows = Vec::new();
+        for (i, (id, source, text)) in items.iter().take(10).enumerate() {
+            lines.push(format!(
+                "#{} [{}] {}",
+                i + 1,
+                source,
+                trunc_chars(text, 80)
+            ));
+            rows.push(vec![kb_button("✕", &format!("qx:{}", short_id(id, 12)))]);
+        }
+        if items.len() > 10 {
+            lines.push(format!("{} more — /queue clear empties the rest", items.len() - 10));
+        }
+        rows.push(vec![kb_button("Clear all", "qclr"), kb_button("✕", "x")]);
+        Some((
+            format!("{} queued:\n{}", items.len(), lines.join("\n")),
+            json!({ "inline_keyboard": rows }),
+        ))
+    }
+
+    /// One page of the `/forget` card: eight remembered facts per page
+    /// (`[short] first-80`), a ✖ per row (`fx:<short>`), `fp:<off>`
+    /// paging.
+    fn forget_card(&self, off: usize) -> Option<(String, Value)> {
+        let entries = self.runtime.memory_entries().ok()?;
+        if entries.is_empty() {
+            return None;
+        }
+        if off >= entries.len() {
+            return None;
+        }
+        const PER: usize = 8;
+        let page: Vec<_> = entries.iter().skip(off).take(PER).collect();
+        let mut lines = Vec::new();
+        let mut rows = Vec::new();
+        for e in &page {
+            lines.push(format!(
+                "[{}] {}",
+                short_id(&e.id, 8),
+                trunc_chars(&e.text, 80)
+            ));
+            rows.push(vec![kb_button("✖", &format!("fx:{}", short_id(&e.id, 8)))]);
+        }
+        let mut nav = Vec::new();
+        if off > 0 {
+            nav.push(kb_button("‹ prev", &format!("fp:{}", off.saturating_sub(PER))));
+        }
+        if off + PER < entries.len() {
+            nav.push(kb_button("more ›", &format!("fp:{}", off + PER)));
+        }
+        nav.push(kb_button("✕", "x"));
+        rows.push(nav);
+        Some((
+            format!("remembered ({}):\n{}", entries.len(), lines.join("\n")),
+            json!({ "inline_keyboard": rows }),
+        ))
+    }
+
+    /// The `/skills` card: pending proposals get the existing
+    /// `sk:a:<id>` / `sk:r:<id>` rows (the same handler the proposal
+    /// cards use); with none pending it lists the installed skills over
+    /// a lone ✕ close row.
+    async fn skills_card(&self) -> (String, Value) {
+        let pending = self.store.pending_skill_candidates().unwrap_or_default();
+        if !pending.is_empty() {
+            let mut lines = Vec::new();
+            let mut rows = Vec::new();
+            for c in pending.iter().take(10) {
+                lines.push(format!(
+                    "[{}] {} — {}",
+                    short_id(&c.id, 8),
+                    c.name,
+                    trunc_chars(&c.description, 60)
+                ));
+                // The same data shape and handler as proposal cards,
+                // including the 64-byte guard: a long id falls back to
+                // its short suffix, which `id_matches` resolves.
+                let target = if c.id.len() <= 59 {
+                    c.id.clone()
+                } else {
+                    ka_agent_core::ids::short_id(&c.id).to_string()
+                };
+                rows.push(vec![
+                    kb_button("✅ Install", &format!("sk:a:{target}")),
+                    kb_button("✖ Reject", &format!("sk:r:{target}")),
+                ]);
+            }
+            if pending.len() > 10 {
+                lines.push(format!("{} more — /skills review lists them", pending.len() - 10));
+            }
+            return (
+                format!("proposed skills:\n{}", lines.join("\n")),
+                json!({ "inline_keyboard": rows }),
+            );
+        }
+        let reply = match crate::commands::route(&self.runtime, "telegram:picker", "/skills").await
+        {
+            crate::commands::Outcome::Reply(reply) => cap_lines(&reply, PICKER_TEXT_LINES),
+            _ => "no skills enabled".into(),
+        };
+        (reply, json!({ "inline_keyboard": [[kb_button("✕", "x")]] }))
+    }
+
+    /// One page of the `/history` card: the `run_history` line format,
+    /// `hp:<off>` paging and a ▸ detail row per turn
+    /// (`hv:<off>:<short>`).
+    fn history_card(&self, off: usize) -> Option<(String, Value)> {
+        let turns = self.runtime.recent_turns(6, off).ok()?;
+        if turns.is_empty() {
+            return None;
+        }
+        let now = self.runtime.now_zoned();
+        let mut lines = Vec::new();
+        let mut rows = Vec::new();
+        for (t, answer) in &turns {
+            let at = jiff::Timestamp::from_millisecond(t.created_ms)
+                .map(|ts| ts.to_zoned(now.time_zone().clone()))
+                .unwrap_or_else(|_| now.clone());
+            let take = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
+            lines.push(format!(
+                "[{}] {:02}:{:02} you: {} → {}",
+                short_id(t.id.as_str(), 8),
+                at.hour(),
+                at.minute(),
+                take(&t.inbound_text, 60),
+                take(answer, 60)
+            ));
+            rows.push(vec![kb_button(
+                "▸",
+                &format!("hv:{}:{}", off, short_id(t.id.as_str(), 8)),
+            )]);
+        }
+        let mut nav = Vec::new();
+        if off > 0 {
+            nav.push(kb_button("‹ prev", &format!("hp:{}", off.saturating_sub(6))));
+        }
+        if turns.len() == 6
+            && self
+                .runtime
+                .recent_turns(1, off + 6)
+                .is_ok_and(|more| !more.is_empty())
+        {
+            nav.push(kb_button("more ›", &format!("hp:{}", off + 6)));
+        }
+        nav.push(kb_button("✕", "x"));
+        rows.push(nav);
+        Some((
+            format!("history:\n{}", lines.join("\n")),
+            json!({ "inline_keyboard": rows }),
+        ))
     }
 
     /// `mp:<off>` — the provider grid page `off` of the `/model` card.
@@ -1107,8 +1526,10 @@ async fn submit_caption_turn(
 }
 
 /// The lone words that open a native picker instead of the router's
-/// text listing: `/model`, `/mode` or `/effort`, optionally
-/// `@botname`-suffixed (Telegram appends it), with nothing after.
+/// text listing: `/model`, `/mode`, `/effort`, `/approvals`, `/queue`,
+/// `/forget`, `/skills`, `/history` or `/cleanup`, optionally
+/// `@botname`-suffixed (Telegram appends it), with nothing after. Every
+/// argument form still routes through the shared router.
 fn bare_picker_command(text: &str) -> Option<&'static str> {
     let mut words = text.split_whitespace();
     let first = words.next()?;
@@ -1119,6 +1540,12 @@ fn bare_picker_command(text: &str) -> Option<&'static str> {
         "/model" => Some("/model"),
         "/mode" => Some("/mode"),
         "/effort" => Some("/effort"),
+        "/approvals" => Some("/approvals"),
+        "/queue" => Some("/queue"),
+        "/forget" => Some("/forget"),
+        "/skills" => Some("/skills"),
+        "/history" => Some("/history"),
+        "/cleanup" => Some("/cleanup"),
         _ => None,
     }
 }

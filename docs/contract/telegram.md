@@ -22,10 +22,10 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
 - Commands route through the shared router (`commands::route`) and never
   reach the engine. The bot-command menu registers `/help /status /new
   /stop /resume /model /mode /remember /forget /memory /history /remind
-  /reminders /cron /calendar /skills /skill /approvals /y /n /steer`
-  (the shared table's `telegram` flag); `/persona /effort /undo /queue
-  /tools` also work from the phone but stay out of the menu, and `/quit`
-  refuses from any remote channel.
+  /reminders /cron /calendar /skills /skill /approvals /y /n /steer
+  /cleanup /update` (the shared table's `telegram` flag); `/persona
+  /effort /undo /queue /tools` also work from the phone but stay out of
+  the menu, and `/quit` refuses from any remote channel.
 - `/new private` starts an incognito conversation from the phone: the
   reply confirms it (`🕶 private session …`), inbound media lands under
   `attachments/.private-<short-id>/` instead of the shared inbox, and the
@@ -44,15 +44,19 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   `unknown command /word — /help lists them`. Free text expands
   `@references` and goes to `runtime.handle_message`.
 
-- Native pickers: a **bare** `/model`, `/mode` or `/effort` (a lone
-  word, `@botname` stripped like the router does) from a linked private
-  chat answers with ONE card message carrying an inline keyboard instead
-  of the router's text listing — every argument form (`/model
-  <selector>`, `/mode <n>`, …) still routes through the shared router
-  unchanged. Sends/edits are best-effort: a refusal logs to stderr and
-  drops the card. Callback data shapes (all ≤ 64 bytes; unknown data
-  under these prefixes — `mm:nope:1`, an out-of-range index — gets the
-  empty answer and no state change, like any other unknown prefix):
+- Native pickers: a **bare** `/model`, `/mode`, `/effort`, `/approvals`,
+  `/queue`, `/forget`, `/skills` or `/history` (a lone word, `@botname`
+  stripped like the router does) from a linked private chat answers
+  with ONE card message carrying an inline keyboard instead of the
+  router's text listing; a bare `/cleanup` is intercepted the same way
+  but acts directly — it deletes the tracked messages and replies in
+  plain text, no card. Every argument form (`/model <selector>`, `/mode
+  <n>`, `/skills review`, `/history <query>`, …) still routes through
+  the shared router unchanged. Sends/edits are best-effort: a refusal
+  logs to stderr and drops the card. Callback data shapes (all ≤ 64
+  bytes; unknown data under these prefixes — `mm:nope:1`, an
+  out-of-range index — gets the empty answer and no state change, like
+  any other unknown prefix):
   - `/model`: the shared `model_header` (current model + key state) plus
     `pick a provider:`, one button per provider of
     `Runtime::models_listing` — text `name (N)`, the current vendor
@@ -81,7 +85,34 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
     row of the five levels, `callback_data = ef:<level>`. The press runs
     `Runtime::set_effort` and settles the card to its reply with the
     keyboard removed.
-
+  - `/approvals` (empty list → plain `no pending approvals`, no card):
+    one line per pending approval (`[id8] question — expires in …`),
+    one `✅ Allow` / `⛔ Deny` row each (`ap:<last-12-of-id>:y|n`, at
+    most 10 rows, excess noted as `N more — /approvals lists them`),
+    `✕` close. The press resolves the id exactly like the `a:` card and
+    runs the same decision; the card settles to the outcome, and a
+    dead-worker decision toasts `expired`.
+  - `/queue` (empty → plain `the queue is empty`): one line per queued
+    message (`#n [source] first-80-chars`), a `✕` row per item
+    (`qx:<last-12-of-id>` → `Runtime::remove_queued`, toast `removed`)
+    and a final `Clear all` row (`qclr` → `clear_queue`, the card
+    settles to its reply).
+  - `/forget` (empty → plain `nothing is remembered yet`): eight
+    remembered facts per page (`[id8] first-80-chars`), a `✖` row per
+    entry (`fx:<id8>` — prefix-resolved exactly like `/forget <id>`,
+    ambiguous → toast `ambiguous id`, then `Runtime::forget`, toast
+    `forgot <id8>`), `fp:<off>` paging, `✕` close.
+  - `/skills` with pending proposals: one line per proposal and the
+    **same** `sk:a:<id>` / `sk:r:<id>` rows the proposal cards use (the
+    identical handler and data shape), at most 10 rows. With none
+    pending the card lists the installed skills (the router's bare
+    `/skills` text, capped 12 lines) over a lone `✕`.
+  - `/history` (empty → plain `no history yet`): the `/history` line
+    format (`[id8] HH:MM you: … → …`, 6 per page), a `▸` detail row per
+    turn (`hv:<off>:<id8>` — the card edits to `> <inbound>` plus the
+    answer, capped 12 lines, with a `‹ back → hp:<off>` row), `hp:<off>`
+    paging, `✕` close. The generic `✕` (`x`) on any picker card
+    collapses it to its first line.
 - Callback queries are answered exactly once. Data this build does not
   understand (unknown prefix, malformed payload, unknown verdict) gets an
   empty `answerCallbackQuery` and no state change; an unauthorized
@@ -116,13 +147,42 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   `video note`) — no turn, no 👀, never a silent drop.
 - Accepted free text gets a `👀` reaction (`setMessageReaction`) at once —
   a receipt, kept after the answer (clearing costs a call per message).
-- Errors with class `rate_limit` or `network` carry a `↻ Retry` inline
-  button (`callback_data = retry:last`); pressing it answers the callback
-  with a toast and re-submits the newest `error`/`interrupted` turn's
-  stored text through `Runtime::retry_last` — never automatically. A press
+- Engine errors render as structured cards, not raw dumps: bold
+  `<emoji> <title>`, one explanation line, one remedy hint, and the
+  first 300 characters of the raw message escaped in a `<code>` block
+  (`errfmt::friendly_error`; card ≤ 500 chars by construction). When
+  the error is **retryable** (the engine's `retryable` flag, surfaced on
+  the `error` envelope) the card carries a `↻ Retry` inline button
+  (`callback_data = retry:last`); pressing it answers the callback with
+  a toast and re-submits the newest `error`/`interrupted` turn's stored
+  text through `Runtime::retry_last` — never automatically. A press
   with nothing to retry answers `nothing to retry` and changes nothing.
+  The sent card is tracked for cleanup: bare `/cleanup` deletes every
+  tracked error card and notice (sequential, best-effort — Telegram
+  refuses deletions past 48 h, which is skipped) and replies
+  `removed N message(s)`; any **successful** turn
+  (`turn_finished{stop:"done"|"length"}`) first deletes every card
+  tracked before its start, so a failed attempt is cleaned up by its
+  own successful retry. Tracking is in-memory (a restart forgets the
+  ids; `/cleanup` then finds nothing).
   In-turn notes have the engine's local `(esc cancels)` hint stripped:
   Esc does nothing on the phone; `/stop` is the remote interrupt.
+- `/update [check]`: release check and permission-gated self-update,
+  through the same machinery `ka-agent update` uses (release metadata,
+  checksum, atomic image swap, the release pinned to the one the daemon
+  validated). Refused before anything downloads when a turn is in
+  flight (`/stop` it first — an update restarts the daemon; a paused or
+  degraded session has no live turn and may update) or when the daemon
+  cannot write its own binary's directory (a system-wide install owned
+  by root): the reply says so and names the manual path (`ka-agent
+  update` on the machine). One install runs at a time. The install
+  child never restarts services itself; afterwards this daemon stops
+  itself — only when a supervisor owns it (so it comes back on the new
+  binary) and no turn started meanwhile — otherwise it keeps running
+  the old binary and the reply says exactly which case happened. The
+  self-restart fires ~10 s after the reply, so the answer lands first.
+  `check` only reports (`0.13.0 → 0.14.0 available — /update installs
+  it`); the periodic discovery Notice and `/status` name `/update`.
 - Voice notes / audio (`voice`, `audio`): with `[voice]` configured the file
   is downloaded (20 MB / 10 min caps), sent to the OpenAI-compatible
   `/audio/transcriptions` endpoint, echoed back as `🎙 “…”`, and handled
@@ -153,9 +213,19 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   messages.
   While a turn runs: typing action every 4 s plus one editable progress
   message (edits throttled to 1 per 3 s, last 3 notes buffered).
-- Final answer: the `final_chunk` envelope sends one message per chunk (runtime chunks
-  ≤3800 chars at paragraph boundaries); the surface closes unbalanced ```
-  fences per chunk and spaces sends ≥1 s (official per-chat guidance ~1/s).
+- Final answer: the `final_chunk` envelope (carrying its `turn` id)
+  sends one message per chunk (runtime chunks ≤3800 chars at paragraph
+  boundaries); the surface closes unbalanced ``` fences per chunk and
+  spaces sends ≥1 s (official per-chat guidance ~1/s). Every
+  `sendMessage`/`sendMessageHTML` tolerates 429 flood control: sleep
+  `retry_after` (clamped 1..=60 s) and retry exactly once — a second
+  refusal returns the error. A final chunk that still cannot be sent
+  after the retry is requeued in the outbox (`status = 'queued'`), so
+  the startup drain redelivers it after the next restart (private
+  sessions write no outbox rows — nothing to requeue). The plain-text
+  fallback for an over-long render splits at paragraph boundaries
+  (hard-break at 4000 chars) and sends the pieces sequentially; notices
+  and error cards are bounded by construction and never split.
 - Approval cards (SEED.md §5.5): question + detail (first 20 lines) +
   expiry as a relative time (`expires in 14m` — wall-clock timezones are
   never guessed), inline keyboard `✅ Allow` / `⛔ Deny`,
@@ -207,3 +277,17 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
 `$KA_AGENT_SECRET_<NAME>` first, then `<data>/secrets/<name>` (0600 file,
 single line). The OS-keyring tier is a later addition; the lookup order is
 fixed.
+
+## Turn watchdog notices
+
+The runtime's staged watchdog (`turn_watchdog.silent_secs`, default 180,
+and `turn_watchdog.abort_secs`, default 900; 0 disables either stage,
+`abort_secs` must exceed `silent_secs` when both are armed, hot-reload
+`Apply::Live`) watches a turn that is open but silent — the engine is
+alive and emitting nothing. At `silent_secs` of silence the phone gets
+one `⏳ still working — no engine output for N min; /stop cancels` notice
+(once per silent stretch; any engine event resets it), and at
+`abort_secs` the turn is aborted exactly like `/stop`
+(`⏱ no engine activity for N min — aborting; /retry re-sends it`). A
+pending approval gate is legitimate blocking and never triggers either
+stage.

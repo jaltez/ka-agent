@@ -167,16 +167,27 @@ by `turn_finished{stop:"error"}` and reacts by class (SEED §3.8
 | `ErrorClass` | Ka Agent reaction |
 |---|---|
 | `auth` | Pause the instance; alert the operator via Telegram and the CLI. |
-| `rate_limit` | Report it; offer a **Retry** affordance (no auto-retry): `/retry` on every surface, the ↻ inline button on Telegram, and `ka-agent ask --wait` for scripts. `Runtime::retry_last` re-submits the stored `inbound_text` of the newest `error`/`interrupted` turn only — never automatically. |
+| `rate_limit` | Report it; offer a **Retry** affordance (no auto-retry): `/retry` on every surface, the ↻ inline button on Telegram for any error whose `retryable` flag is set, and `ka-agent ask --wait` for scripts. `Runtime::retry_last` re-submits the stored `inbound_text` of the newest `error`/`interrupted` turn only — never automatically. |
 | `network` | Report it; offer the same **Retry** affordance (no auto-retry). |
 | `overflow` | Offer `/compact` (Ka's `compact`) or `/new`. |
 | `protocol`, `unsupported`, `internal` | Report a short summary; log details. |
+
+The `error` envelope carries Ka's own `retryable` flag, and the phone's
+↻ button is driven by that flag (not a hard-coded class list); the
+engine remains the sole judge of what a retry can fix.
 
 Nothing that may have had side effects is ever retried automatically. Worker
 crash (event channel closed without `idle`, gap G13): mark the cycle
 `interrupted`, notify the user, respawn on the next message with backoff
 (1 s → 60 s), crash-loop breaker at `crash_max` crashes in `crash_window_secs`
 (see `[worker_restart]` in `ka-agent.toml`).
+
+The staged turn watchdog (`turn_watchdog.silent_secs` / `abort_secs`,
+defaults 180 s / 900 s, either 0 = off) covers the wedge this table
+cannot: a worker that is alive but emits nothing. Silence past the first
+threshold notifies the operator once (`⏳ still working … /stop cancels`);
+silence past the second aborts the turn exactly like `/stop` (the manual
+`/retry` is the way back). A pending approval gate never triggers it.
 
 ## 8. Kill semantics and `EngineClosed` detection
 

@@ -273,7 +273,7 @@ fn settings_form(runtime: &Runtime) -> String {
 pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
     let now = runtime.now_zoned();
     let mut turns_html = String::new();
-    if let Ok(turns) = runtime.recent_turns(20) {
+    if let Ok(turns) = runtime.recent_turns(20, 0) {
         if turns.is_empty() {
             // A blank first visit says nothing: one hint bubble, the same
             // shape every other empty state in the panel uses.

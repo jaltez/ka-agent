@@ -114,15 +114,24 @@ impl Store {
     }
 
     /// Newest turns for one session (returned oldest-first within the
-    /// window).
-    pub fn latest_turns_for_session(&self, session: &SessionId, limit: usize) -> Result<Vec<Turn>> {
+    /// window), skipping the `offset` newest rows first — paging for the
+    /// history picker.
+    pub fn latest_turns_for_session(
+        &self,
+        session: &SessionId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Turn>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session, inbound_text, status, stop, error_class, error_message,
                     cost_usd, tokens, model, created_ms, updated_ms
-             FROM turns WHERE session = ?1 ORDER BY created_ms DESC LIMIT ?2",
+             FROM turns WHERE session = ?1 ORDER BY created_ms DESC LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![session.as_str(), limit as i64], row_to_turn)?;
+        let rows = stmt.query_map(
+            params![session.as_str(), limit as i64, offset as i64],
+            row_to_turn,
+        )?;
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         out.reverse();
         Ok(out)
@@ -326,7 +335,7 @@ mod tests {
 
         let ids = store.reconcile_running_turns(1234).unwrap();
         assert_eq!(ids.len(), 2);
-        let after = store.latest_turns_for_session(&s.id, 10).unwrap();
+        let after = store.latest_turns_for_session(&s.id, 10, 0).unwrap();
         let q = after.iter().find(|t| t.inbound_text == "q").unwrap();
         let sub = after.iter().find(|t| t.inbound_text == "s").unwrap();
         let run = after.iter().find(|t| t.inbound_text == "r").unwrap();

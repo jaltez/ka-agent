@@ -6,6 +6,7 @@ pub mod calendar;
 pub mod channel;
 pub mod commands;
 pub mod fake;
+pub(crate) mod errfmt;
 pub mod grants;
 pub mod matrix;
 pub mod multi;

@@ -12,6 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub method: String,
+    /// The full request path (`/bot<token>/<method>`): assertions can
+    /// scope to one bot's traffic, ignoring strays a port-reuse race
+    /// delivered from some other test's client.
+    pub path: String,
     pub body: Value,
     /// Verbatim body when it was not JSON (multipart uploads such as
     /// `sendPhoto`/`sendDocument`); `None` for JSON calls.
@@ -373,6 +377,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<Strin
     if st.reject_html && body.get("parse_mode").is_some() {
         st.captured.push(CapturedRequest {
             method,
+            path: path.to_string(),
             body: body.clone(),
             raw,
         });
@@ -382,6 +387,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<Strin
     if st.reject_drafts && method == "sendMessageDraft" {
         st.captured.push(CapturedRequest {
             method,
+            path: path.to_string(),
             body: body.clone(),
             raw,
         });
@@ -406,6 +412,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<Strin
     if let Some((error_code, retry_after)) = failure {
         st.captured.push(CapturedRequest {
             method,
+            path: path.to_string(),
             body: body.clone(),
             raw,
         });
@@ -447,6 +454,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<Strin
         }
         "editMessageText" => Value::Bool(true),
         "answerCallbackQuery" => Value::Bool(true),
+        "deleteMessage" => Value::Bool(true),
         "sendChatAction" => Value::Bool(true),
         "getMe" => json!({ "id": 1, "is_bot": true, "first_name": "fake", "username": "fake_bot" }),
         "getFile" => {
@@ -461,6 +469,7 @@ fn handle(state: &Arc<Mutex<State>>, path: &str, body: &Value, raw: Option<Strin
     };
     st.captured.push(CapturedRequest {
         method,
+        path: path.to_string(),
         body: body.clone(),
         raw,
     });
@@ -1002,6 +1011,7 @@ fn matrix_handle(
             }
             st.sent.push(CapturedRequest {
                 method: event_type.clone(),
+                path: path.to_string(),
                 body: body.clone(),
                 raw: None,
             });

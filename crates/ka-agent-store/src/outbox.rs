@@ -121,6 +121,20 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Put a delivered-but-undeliverable chunk back to `queued`, so the
+    /// startup drain redelivers it after a restart. No row changed (a
+    /// private session writes no outbox rows) is still success — there
+    /// was nothing to requeue.
+    pub fn requeue_chunk(&self, turn: &TurnId, chunk_index: u32) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE outbox SET status = 'queued', channel_message_id = NULL
+             WHERE turn = ?1 AND chunk_index = ?2",
+            params![turn.as_str(), chunk_index as i64],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

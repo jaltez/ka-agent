@@ -211,6 +211,22 @@ pub static KEYS: &[KeySpec] = &[
         doc: "crashes inside the window before the crash-loop breaker trips",
     },
     KeySpec {
+        path: "turn_watchdog.silent_secs",
+        kind: Kind::Int { min: 0, max: 86_400 },
+        default: "180",
+        apply: Apply::Live,
+        web: true,
+        doc: "seconds of engine silence before the once-per-turn \"still working\" notice (0 = off)",
+    },
+    KeySpec {
+        path: "turn_watchdog.abort_secs",
+        kind: Kind::Int { min: 0, max: 86_400 },
+        default: "900",
+        apply: Apply::Live,
+        web: true,
+        doc: "seconds of engine silence before the turn is aborted (0 = never abort)",
+    },
+    KeySpec {
         path: "budgets.daily_usd",
         kind: Kind::Float { min: 0.0 },
         default: "unset",

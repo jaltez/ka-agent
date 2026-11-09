@@ -119,6 +119,161 @@ pub fn latest_release() -> Result<(String, bool), String> {
     Ok((latest, newer))
 }
 
+/// Whether this process can replace the installed binary — the
+/// permission gate for `/update`. The update writes a staging directory
+/// next to the running image and renames over it, so the install
+/// directory must be writable. The probe is one create+delete of a
+/// hidden file in that directory (nothing is left behind); a refusal —
+/// a system-wide install owned by root, a locked-down directory — is
+/// reported with the remedy instead of failing halfway through a
+/// download. Returns the running binary's path on success.
+pub fn can_write_install_dir() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot locate the running binary: {e}"))?;
+    let Some(dir) = exe.parent() else {
+        return Err(format!(
+            "the running binary has no directory: {}",
+            exe.display()
+        ));
+    };
+    if let Some(err) = gate_error(dir) {
+        return Err(err);
+    }
+    Ok(exe)
+}
+
+/// The probe's core: `Some(error)` when a file cannot be created (and
+/// removed) in `dir` — exactly the write the update's staging directory
+/// and final rename need.
+fn dir_probe_error(dir: &std::path::Path) -> Option<String> {
+    let probe = dir.join(format!(".ka-agent-update-probe-{}", std::process::id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            None
+        }
+        Err(e) => Some(format!("cannot write {} — {e}", dir.display())),
+    }
+}
+
+/// The gate's refusal text for a directory the probe cannot write —
+/// one formatter shared by the gate and its tests so the wording
+/// cannot drift.
+fn gate_error(dir: &std::path::Path) -> Option<String> {
+    dir_probe_error(dir).map(|e| {
+        format!(
+            "not enough permissions to update: {e}. The daemon must be able \
+             to replace its own binary; update on the machine instead: \
+             ka-agent update"
+        )
+    })
+}
+
+/// `/update` from a channel — the daemon-side flow over the same
+/// machinery `ka-agent update` uses. `check_only` reports; the install
+/// path checks the permission gate FIRST (nothing downloads when the
+/// daemon cannot replace its binary), then runs the CLI updater as a
+/// child (pinned to the release this daemon validated) and waits for
+/// it. The restart choreography is deliberately conservative: the
+/// daemon only stops itself when a supervisor will bring it back AND
+/// no turn is in flight — the reply must land and a live turn must not
+/// be killed. Blocking: callers keep it off the async workers.
+pub fn update_from_daemon(
+    check_only: bool,
+    paths: &ka_agent_runtime::Paths,
+    runtime: &ka_agent_runtime::Runtime,
+) -> Result<String, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let (latest, newer) = latest_release()?;
+    if !newer {
+        return Ok(format!("ka-agent {current} (up to date)"));
+    }
+    if check_only {
+        return Ok(format!("{current} → {latest} available — /update installs it"));
+    }
+    // The permission gate: refuse before any download.
+    let exe = can_write_install_dir()?;
+    let out = std::process::Command::new(&exe)
+        .args(["update", "run", "--version", latest.as_str()])
+        // The child must not run its service-restart loop: a manual
+        // daemon has no KA_AGENT_DATA_DIR for the inherited check below
+        // to bite on, and the loop's shutdown request would kill THIS
+        // daemon before the reply is sent. This daemon arranges its own
+        // restart instead.
+        .env("KA_AGENT_UPDATE_SKIP_RESTARTS", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("cannot spawn the updater: {e}"))?;
+    if !out.status.success() {
+        let text = {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let pick = if stderr.trim().is_empty() { &stdout } else { &stderr };
+            pick.trim().lines().last().unwrap_or("").to_string()
+        };
+        return Err(if text.is_empty() {
+            format!("update failed (exit {:?})", out.status.code())
+        } else {
+            format!("update failed: {text}")
+        });
+    }
+    // A turn that started while the child downloaded must not be killed
+    // by our own restart: skip the self-shutdown and say so.
+    let turn_active = matches!(
+        runtime.session_status(),
+        ka_agent_core::SessionStatus::Running
+            | ka_agent_core::SessionStatus::AwaitingApproval
+            | ka_agent_core::SessionStatus::Stopping
+    );
+    if turn_active {
+        return Ok(format!(
+            "{current} → {latest} installed — a turn is running, so the \
+             daemon keeps the old binary until its next restart"
+        ));
+    }
+    // Only stop ourselves when a supervisor will actually bring us back.
+    // KA_AGENT_DATA_DIR alone is not proof: service units set it, but so
+    // does a hand-started pinned instance (layout docs) — that daemon
+    // must not exit into nothing. systemd marks unit processes with
+    // INVOCATION_ID; launchd/Windows answer is_active().
+    let supervised = std::env::var_os("KA_AGENT_DATA_DIR").is_some_and(|v| !v.is_empty())
+        && (std::env::var_os("INVOCATION_ID").is_some() || crate::service::is_active());
+    if !supervised {
+        return Ok(format!(
+            "{current} → {latest} installed — restart the daemon to run it \
+             (it keeps the old binary until then)"
+        ));
+    }
+    let p = paths.clone();
+    let rt = runtime.clone();
+    std::thread::spawn(move || {
+        // Covers the reply crossing the router and the Telegram send,
+        // including the send path's flood-control retry (clamped
+        // 1..=60 s).
+        std::thread::sleep(std::time::Duration::from_secs(70));
+        // A turn that started after the check above must not be killed
+        // by our own restart: skip it; the next restart picks the new
+        // binary up.
+        if matches!(
+            rt.session_status(),
+            ka_agent_core::SessionStatus::Running
+                | ka_agent_core::SessionStatus::AwaitingApproval
+                | ka_agent_core::SessionStatus::Stopping
+        ) {
+            eprintln!("update: a turn is in flight — skipping the self-restart");
+            return;
+        }
+        if let Err(e) = crate::admin::request(&p, &serde_json::json!({ "op": "shutdown" })) {
+            eprintln!("update: self-restart request failed: {e}");
+        }
+    });
+    Ok(format!(
+        "{current} → {latest} installed — the service restarts into it shortly"
+    ))
+}
+
 /// Record a check result in the runtime's own store: the daemon-side
 /// counterpart of the CLI's `record_check` (same `update.checked` meta
 /// `doctor` reads).
@@ -270,8 +425,14 @@ pub fn update(action: UpdateAction) -> ExitCode {
     // Unix: ask the running daemon to stop; its supervisor restarts it.
     // Windows: the logon task does not respawn on exit, so start it here
     // (the old process exits on its own once its image is gone).
+    // `KA_AGENT_UPDATE_SKIP_RESTARTS` marks a child spawned by the
+    // daemon's `/update`: it arranges its own restart, so the loop's
+    // shutdown request must not race (or kill) it. KA_AGENT_DATA_DIR is
+    // the CLI test seam with the same effect.
     let mut restarted = 0;
-    if std::env::var_os("KA_AGENT_DATA_DIR").is_none() {
+    if std::env::var_os("KA_AGENT_DATA_DIR").is_none()
+        && std::env::var_os("KA_AGENT_UPDATE_SKIP_RESTARTS").is_none()
+    {
         for p in ka_agent_core::layout::list_profiles() {
             if !crate::service::is_installed_for(&p) {
                 continue;
@@ -379,6 +540,54 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::path::{Path, PathBuf};
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ka-agent-update-probe-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn probe_passes_on_a_writable_dir_and_leaves_nothing_behind() {
+        let dir = scratch_dir("ok");
+        assert!(dir_probe_error(&dir).is_none());
+        assert!(
+            !dir
+                .join(format!(".ka-agent-update-probe-{}", std::process::id()))
+                .exists(),
+            "the probe cleans up after itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate `/update` hinges on: a directory the process cannot write
+    /// must be reported, never attempted. Root bypasses mode bits, so the
+    /// negative expectation self-skips when the restriction does not
+    /// actually apply (a sentinel write succeeds).
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_a_dir_the_process_cannot_write() {
+        let dir = scratch_dir("ro");
+        let ro = dir.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let sentinel = ro.join("sentinel");
+        if std::fs::write(&sentinel, b"x").is_ok() {
+            eprintln!("skipping: this user bypasses mode bits (root)");
+            return;
+        }
+        let err = gate_error(&ro).unwrap();
+        assert!(err.contains("not enough permissions"), "{err}");
+        assert!(err.contains("ka-agent update"), "{err}");
+        assert!(err.contains(&ro.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn swap_puts_the_old_image_back_when_the_new_one_cannot_land() {

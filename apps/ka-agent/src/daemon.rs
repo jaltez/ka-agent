@@ -38,7 +38,7 @@ impl Surface for LogSurface {
                 ..
             } => eprintln!("· turn {stop} · ${cost_usd:.4} · {tokens} tokens"),
             AgentEvent::Notice { text } => eprintln!("» {text}"),
-            AgentEvent::Error { class, message } => eprintln!("! [{class}] {message}"),
+            AgentEvent::Error { class, message, .. } => eprintln!("! [{class}] {message}"),
             AgentEvent::Approval { id, question, .. } => eprintln!("» approval {id}: {question}"),
             _ => {}
         }

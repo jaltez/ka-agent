@@ -167,7 +167,7 @@ async fn one_turn_started_per_live_turn() {
 
     let events = rec.events();
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10)
+        .latest_turns_for_session(&rt.session_id(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 2, "two runtime turns were recorded");
     assert_eq!(
@@ -220,7 +220,7 @@ async fn engine_turns_inside_one_runtime_turn_are_announced_once() {
 
     let events = rec.events();
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10)
+        .latest_turns_for_session(&rt.session_id(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 1, "one runtime turn was recorded");
     assert_eq!(

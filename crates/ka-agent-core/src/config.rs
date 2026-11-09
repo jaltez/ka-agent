@@ -47,6 +47,28 @@ impl Default for WorkerRestart {
     }
 }
 
+/// The turn watchdog: a staged deadline for a wedged-but-alive engine.
+/// `silent_secs` after the last engine event a "still working" notice
+/// goes out (once per turn); `abort_secs` after the last event the turn
+/// is aborted like `/stop`. `0` disables either stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TurnWatchdog {
+    /// Seconds of engine silence before the "still working" notice.
+    pub silent_secs: u32,
+    /// Seconds of engine silence before the turn is aborted; `0` = never.
+    pub abort_secs: u32,
+}
+
+impl Default for TurnWatchdog {
+    fn default() -> Self {
+        Self {
+            silent_secs: 180,
+            abort_secs: 900,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Budgets {
@@ -461,6 +483,8 @@ pub struct DaemonConfig {
     pub worker_idle_timeout_secs: u64,
     #[serde(rename = "worker_restart")]
     pub worker_restart: WorkerRestart,
+    #[serde(rename = "turn_watchdog")]
+    pub turn_watchdog: TurnWatchdog,
     pub budgets: Budgets,
     pub ka: Ka,
     pub telegram: Telegram,
@@ -505,6 +529,7 @@ impl Default for DaemonConfig {
             turn_grace_secs: 10,
             worker_idle_timeout_secs: 900,
             worker_restart: WorkerRestart::default(),
+            turn_watchdog: TurnWatchdog::default(),
             budgets: Budgets::default(),
             ka: Ka::default(),
             telegram: Telegram::default(),
@@ -643,6 +668,28 @@ impl DaemonConfig {
         }
         if self.turn_grace_secs == 0 || self.turn_grace_secs > 600 {
             return Err(Error::Validate("turn_grace_secs must be in 1..=600".into()));
+        }
+        // The watchdog stages are independent (either may be 0 = off);
+        // when both are armed the abort must outlive the notice.
+        for (name, v) in [
+            ("silent_secs", self.turn_watchdog.silent_secs),
+            ("abort_secs", self.turn_watchdog.abort_secs),
+        ] {
+            if v > 86_400 {
+                return Err(Error::Validate(format!(
+                    "turn_watchdog.{name} must be in 0..=86400"
+                )));
+            }
+        }
+        if self.turn_watchdog.silent_secs > 0
+            && self.turn_watchdog.abort_secs > 0
+            && self.turn_watchdog.abort_secs <= self.turn_watchdog.silent_secs
+        {
+            return Err(Error::Validate(
+                "turn_watchdog.abort_secs must be greater than turn_watchdog.silent_secs \
+                 (or 0 to disable the abort)"
+                    .into(),
+            ));
         }
         // 0 disables the idle reap; anything set is capped at a week so a
         // typo cannot silently disable it forever.
@@ -1192,5 +1239,37 @@ digest_time = "07:30"
         cfg.language = "fr".into();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("language must be"), "{err}");
+    }
+
+    #[test]
+    fn turn_watchdog_defaults_bounds_and_stage_order() {
+        let cfg = DaemonConfig::default();
+        assert_eq!(cfg.turn_watchdog.silent_secs, 180);
+        assert_eq!(cfg.turn_watchdog.abort_secs, 900);
+        assert!(cfg.validate().is_ok());
+
+        // Either stage may be off; both off is fine.
+        let mut cfg = DaemonConfig::default();
+        cfg.turn_watchdog.abort_secs = 0;
+        assert!(cfg.validate().is_ok());
+        cfg.turn_watchdog.silent_secs = 0;
+        assert!(cfg.validate().is_ok());
+
+        // Bounds: 0..=86400.
+        let mut cfg = DaemonConfig::default();
+        cfg.turn_watchdog.silent_secs = 86_401;
+        assert!(cfg.validate().is_err());
+        let mut cfg = DaemonConfig::default();
+        cfg.turn_watchdog.abort_secs = 86_401;
+        assert!(cfg.validate().is_err());
+
+        // When both are armed the abort must outlive the notice.
+        let mut cfg = DaemonConfig::default();
+        cfg.turn_watchdog.silent_secs = 600;
+        cfg.turn_watchdog.abort_secs = 600;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("abort_secs"), "{err}");
+        cfg.turn_watchdog.abort_secs = 601;
+        assert!(cfg.validate().is_ok());
     }
 }

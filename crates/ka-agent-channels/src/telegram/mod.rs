@@ -118,6 +118,52 @@ pub(crate) fn balance_fences(text: &str) -> String {
     }
 }
 
+/// Split an over-long plain-text fallback into sendable pieces at
+/// paragraph boundaries, hard-splitting when no paragraph fits (the
+/// same shape the runtime's `split_final_text` uses for final answers).
+pub(crate) fn split_plain(text: &str) -> Vec<String> {
+    const PLAIN_CHUNK: usize = 4000;
+    if text.chars().count() <= PLAIN_CHUNK {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for para in text.split("\n\n") {
+        if !cur.is_empty() && cur.chars().count() + 2 + para.chars().count() > PLAIN_CHUNK {
+            out.push(std::mem::take(&mut cur));
+        }
+        if para.chars().count() > PLAIN_CHUNK {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            let bounds: Vec<usize> = para
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(para.len()))
+                .collect();
+            let n = bounds.len() - 1;
+            let mut lo = 0;
+            while lo + PLAIN_CHUNK < n {
+                out.push(para[bounds[lo]..bounds[lo + PLAIN_CHUNK]].to_string());
+                lo += PLAIN_CHUNK;
+            }
+            cur.push_str(&para[bounds[lo]..]);
+        } else {
+            if !cur.is_empty() {
+                cur.push_str("\n\n");
+            }
+            cur.push_str(para);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Last `n` characters of an id, for compact rendering and callback data.
 pub(crate) fn short_id(id: &str, n: usize) -> String {
     id.chars()

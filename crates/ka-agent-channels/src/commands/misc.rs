@@ -17,6 +17,15 @@ pub(super) fn run_help<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     })
 }
 
+/// `/cleanup`: Telegram intercepts the bare command before the router
+/// (it drains the tracked error/notice messages); every other surface
+/// gets the pointer instead of a no-op.
+pub(super) fn run_cleanup<'a>(_ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        Outcome::Reply("/cleanup tidies Telegram — run it from the phone".into())
+    })
+}
+
 /// `2026-10-30 18:30` in `now`'s zone.
 pub fn local_compact(ms: i64, now: &jiff::Zoned) -> String {
     let z = jiff::Timestamp::from_millisecond(ms)

@@ -26,6 +26,33 @@ pub enum CancelOutcome {
     Ambiguous(Vec<String>),
 }
 
+/// What the turn watchdog decided for one maintenance pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogAction {
+    None,
+    Notify { silent_for_secs: u64 },
+    Abort { silent_for_secs: u64 },
+}
+
+/// The staged watchdog decision: abort takes precedence over notify, a
+/// notice fires at most once per silent stretch, and either stage may
+/// be disabled with `0`.
+pub(crate) fn watchdog_action(
+    silent_ms: i64,
+    silent_secs: u32,
+    abort_secs: u32,
+    already_notified: bool,
+) -> WatchdogAction {
+    let silent_for_secs = (silent_ms.max(0) as u64) / 1000;
+    if abort_secs > 0 && silent_for_secs >= u64::from(abort_secs) {
+        WatchdogAction::Abort { silent_for_secs }
+    } else if silent_secs > 0 && silent_for_secs >= u64::from(silent_secs) && !already_notified {
+        WatchdogAction::Notify { silent_for_secs }
+    } else {
+        WatchdogAction::None
+    }
+}
+
 impl Runtime {
     /// Schedule a reminder at an absolute time (parsing is the router's
     /// job: every surface shares one grammar).
@@ -353,6 +380,7 @@ impl Runtime {
                             GateOutcome::Fail(why) => {
                                 self.sh.emit(AgentEvent::Error {
                                     class: "cron".into(),
+                                    retryable: retryable_class("cron"),
                                     message: format!("{}: gate `{gate}`: {why}", task.id.as_str()),
                                 });
                                 record(&task, "failed", Some("gate"));
@@ -396,6 +424,7 @@ impl Runtime {
                                 Err(e) => {
                                     self.sh.emit(AgentEvent::Error {
                                         class: "cron".into(),
+                                        retryable: retryable_class("cron"),
                                         message: format!("{}: {e}", task.id.as_str()),
                                     });
                                     false
@@ -411,6 +440,7 @@ impl Runtime {
                                 Err(e) => {
                                     self.sh.emit(AgentEvent::Error {
                                         class: "cron".into(),
+                                        retryable: retryable_class("cron"),
                                         message: format!("{}: {e}", task.id.as_str()),
                                     });
                                     false
@@ -437,6 +467,7 @@ impl Runtime {
                                 None => {
                                     self.sh.emit(AgentEvent::Error {
                                         class: "cron".into(),
+                                        retryable: retryable_class("cron"),
                                         message: format!(
                                             "{}: recurrence overflow",
                                             task.id.as_str()
@@ -460,6 +491,7 @@ impl Runtime {
                 other => {
                     self.sh.emit(AgentEvent::Error {
                         class: "cron".into(),
+                        retryable: retryable_class("cron"),
                         message: format!("unknown scheduled kind {other:?}"),
                     });
                     let _ = self.sh.store.settle_task(&task.id, "failed");
@@ -467,6 +499,104 @@ impl Runtime {
             }
         }
         Ok(fired)
+    }
+
+    /// The staged turn watchdog: a turn that is open but silent is a
+    /// wedge (the engine is alive and emitting nothing). Notify once at
+    /// `turn_watchdog.silent_secs`, abort at `turn_watchdog.abort_secs`.
+    /// A pending approval gate is legitimate blocking, never a wedge, so
+    /// an ask in flight disarms both stages.
+    async fn check_watchdog(&self) {
+        let cfg = cfg_of(&self.sh);
+        let (silent_secs, abort_secs) =
+            (cfg.turn_watchdog.silent_secs, cfg.turn_watchdog.abort_secs);
+        if silent_secs == 0 && abort_secs == 0 {
+            return;
+        }
+        let now = ka_agent_core::now_ms();
+        let decided = {
+            let g = self.sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(live) = g.live.as_ref() else {
+                return;
+            };
+            if !live.pending_asks.is_empty() {
+                return;
+            }
+            // An abort is already in flight (`/stop` or an earlier
+            // watchdog pass): its grace/kill choreography owns the turn,
+            // and re-deciding every pass would spam the phone.
+            if g.session.status == SessionStatus::Stopping {
+                return;
+            }
+            // A turn is in flight until its own record says otherwise (or
+            // its prompt is still being handed over: `running` with no
+            // turn recorded yet — the same rule the `idle` handler uses).
+            let turn_open = match &live.current_turn {
+                Some(tid) => self
+                    .sh
+                    .store
+                    .get_turn(tid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|t| !t.status.is_terminal()),
+                None => g.session.status == SessionStatus::Running,
+            };
+            if !turn_open {
+                return;
+            }
+            watchdog_action(
+                now - live.last_activity_ms,
+                silent_secs,
+                abort_secs,
+                live.watchdog_notified,
+            )
+        };
+        match decided {
+            WatchdogAction::None => {}
+            WatchdogAction::Notify { silent_for_secs } => {
+                if let Some(live) = self
+                    .sh
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .live
+                    .as_mut()
+                {
+                    live.watchdog_notified = true;
+                }
+                self.sh.emit(AgentEvent::Notice {
+                    text: format!(
+                        "⏳ still working — no engine output for {} min; /stop cancels",
+                        silent_for_secs.div_ceil(60)
+                    ),
+                });
+            }
+            WatchdogAction::Abort { silent_for_secs } => {
+                if let Some(live) = self
+                    .sh
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .live
+                    .as_mut()
+                {
+                    live.watchdog_notified = false;
+                }
+                self.sh.emit(AgentEvent::Notice {
+                    text: format!(
+                        "⏱ no engine activity for {} min — aborting; /retry re-sends it",
+                        silent_for_secs.div_ceil(60)
+                    ),
+                });
+                if let Err(e) = self.stop_turn().await {
+                    self.sh.emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        message: format!("watchdog abort: {e}"),
+                        retryable: false,
+                    });
+                }
+            }
+        }
     }
 
     /// The maintenance loop: one wake for the approval-expiry sweep and
@@ -481,23 +611,27 @@ impl Runtime {
             if let Err(e) = self.expire_approvals().await {
                 self.sh.emit(AgentEvent::Error {
                     class: "internal".into(),
+                    retryable: retryable_class("internal"),
                     message: format!("expiry sweep: {e}"),
                 });
             }
             if let Err(e) = self.fire_due_tasks().await {
                 self.sh.emit(AgentEvent::Error {
                     class: "internal".into(),
+                    retryable: retryable_class("internal"),
                     message: format!("scheduler: {e}"),
                 });
             }
             self.reap_idle_worker().await;
             self.watch_config_file().await;
+            self.check_watchdog().await;
             self.watch_persona().await;
             // Bounded launchd/redirect logs (journal systems rotate alone).
             let _ = self.sh.paths.rotate_log(5 * 1024 * 1024);
             if let Err(e) = self.announce_memory_proposals() {
                 self.sh.emit(AgentEvent::Error {
                     class: "internal".into(),
+                    retryable: retryable_class("internal"),
                     message: format!("memory proposals: {e}"),
                 });
             }
@@ -560,6 +694,7 @@ impl Runtime {
             Err(e) => {
                 self.sh.emit(AgentEvent::Error {
                     class: "internal".into(),
+                    retryable: retryable_class("internal"),
                     message: format!("prune: {e}"),
                 });
             }
@@ -718,5 +853,64 @@ fn run_gate(gate: &str, workspace: &std::path::Path) -> GateOutcome {
             }
             Err(e) => return GateOutcome::Fail(format!("wait: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_at_the_boundary_once_then_none() {
+        assert_eq!(
+            watchdog_action(179_999, 180, 900, false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            watchdog_action(180_000, 180, 900, false),
+            WatchdogAction::Notify { silent_for_secs: 180 }
+        );
+        // Once per silent stretch: the flag suppresses re-notification.
+        assert_eq!(
+            watchdog_action(300_000, 180, 900, true),
+            WatchdogAction::None
+        );
+    }
+
+    #[test]
+    fn abort_takes_precedence_over_notify() {
+        assert_eq!(
+            watchdog_action(900_000, 180, 900, false),
+            WatchdogAction::Abort { silent_for_secs: 900 }
+        );
+        // Abort even when the notice never went out (notify disabled).
+        assert_eq!(
+            watchdog_action(900_000, 0, 900, false),
+            WatchdogAction::Abort { silent_for_secs: 900 }
+        );
+        // Abort even if already notified.
+        assert_eq!(
+            watchdog_action(900_000, 180, 900, true),
+            WatchdogAction::Abort { silent_for_secs: 900 }
+        );
+    }
+
+    #[test]
+    fn either_stage_may_be_disabled() {
+        // Notify-only: abort disabled.
+        assert_eq!(
+            watchdog_action(9_000_000, 180, 0, false),
+            WatchdogAction::Notify { silent_for_secs: 9000 }
+        );
+        // Both off.
+        assert_eq!(
+            watchdog_action(9_000_000, 0, 0, false),
+            WatchdogAction::None
+        );
+        // Negative silence (clock skew) is clamped to zero.
+        assert_eq!(
+            watchdog_action(-5_000, 180, 900, false),
+            WatchdogAction::None
+        );
     }
 }

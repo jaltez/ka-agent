@@ -159,6 +159,7 @@ impl Host {
                     cfg.telegram.api_base().to_string(),
                     t.clone(),
                     initial_chat,
+                    Some(Arc::clone(&store)),
                 ));
             s.set_streaming(cfg.telegram.stream);
             surfaces.push(s.clone());
@@ -229,6 +230,18 @@ impl Host {
                 "calendar",
                 Arc::new(move |src| ka_agent_channels::calendar::digest_in(src, &st, &tz)),
             );
+        }
+
+        // Self-update (`/update` from any channel): the release machinery
+        // lives in this binary (update_cli), so the runtime dispatches to
+        // a hook. The flow is permission-gated inside — the daemon only
+        // updates when it can replace its own binary.
+        {
+            let p = paths.clone();
+            let rt = runtime.clone();
+            runtime.set_updater(Arc::new(move |check_only| {
+                crate::update_cli::update_from_daemon(check_only, &p, &rt)
+            }));
         }
         let name = runtime.persona_name();
         if opts.channels {

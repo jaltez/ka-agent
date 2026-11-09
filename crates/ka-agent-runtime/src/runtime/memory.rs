@@ -261,10 +261,17 @@ impl Runtime {
     }
 
     /// The `id8` history line listing: the session's last `limit` prompt
-    /// cycles with their answers.
-    pub fn recent_turns(&self, limit: usize) -> Result<Vec<(ka_agent_core::Turn, String)>, Error> {
+    /// cycles with their answers, skipping the `offset` newest first
+    /// (paging for the history picker).
+    pub fn recent_turns(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(ka_agent_core::Turn, String)>, Error> {
         let sid = self.session_id();
-        let turns = self.sh.store.latest_turns_for_session(&sid, limit)?;
+        let turns = self.sh
+            .store
+            .latest_turns_for_session(&sid, limit, offset)?;
         let mut out = Vec::new();
         for t in turns {
             let answer: String = self

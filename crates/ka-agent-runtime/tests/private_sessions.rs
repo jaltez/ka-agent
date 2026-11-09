@@ -134,7 +134,7 @@ async fn private_turn_records_usage_without_text_or_episodes() {
     wait_idle("private turn", &rt, &rec).await;
 
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10)
+        .latest_turns_for_session(&rt.session_id(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 1, "one usage row for the private turn");
     assert_eq!(
@@ -178,7 +178,7 @@ async fn normal_turn_still_records_text_and_episodes() {
     wait_idle("normal turn", &rt, &rec).await;
 
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10)
+        .latest_turns_for_session(&rt.session_id(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].inbound_text, "ordinary question");
@@ -252,7 +252,7 @@ async fn steered_text_never_reaches_the_private_turn_row() {
     wait_idle("steered turn", &rt, &rec).await;
 
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10)
+        .latest_turns_for_session(&rt.session_id(), 10, 0)
         .unwrap();
     assert!(!turns.is_empty(), "the steered turn was recorded");
     for t in &turns {

@@ -67,6 +67,13 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Remove one queued item by exact id (`/queue` per-item removal):
+    /// `true` when a row went away, `false` when nothing matched.
+    pub fn queue_remove(&self, id: &QueueId) -> Result<bool> {
+        let conn = self.lock();
+        Ok(conn.execute("DELETE FROM queue WHERE id = ?1", params![id.as_str()])? > 0)
+    }
+
     /// Record that a queue item became a turn.
     pub fn mark_turned(&self, id: &QueueId, turn: &TurnId) -> Result<()> {
         let conn = self.lock();

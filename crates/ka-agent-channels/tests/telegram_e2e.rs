@@ -54,6 +54,9 @@ struct Stack {
     db_path: std::path::PathBuf,
     store: Arc<Store>,
     runtime: Runtime,
+    /// The surface the runtime holds — emitting here reaches the same
+    /// tracked-message state the channel's `/cleanup` drains.
+    surface: Arc<TelegramSurface>,
     shutdown: watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -86,7 +89,12 @@ fn spawn_on(
     initial_chat: Option<i64>,
 ) -> Stack {
     let dir = db_path.parent().unwrap().to_path_buf();
-    let surface = TelegramSurface::new(base.clone(), token.to_string(), initial_chat);
+    let surface = Arc::new(TelegramSurface::new(
+        base.clone(),
+        token.to_string(),
+        initial_chat,
+        None,
+    ));
     let cfg = DaemonConfig {
         workspace: dir.clone(),
         telegram: TelegramSettings {
@@ -103,7 +111,7 @@ fn spawn_on(
         Paths::new(dir),
         Arc::clone(&store),
         WorkerPort::default(),
-        Arc::new(surface) as Arc<dyn Surface>,
+        Arc::clone(&surface) as Arc<dyn Surface>,
     )
     .unwrap();
     let channel = TelegramChannel::new(
@@ -118,6 +126,7 @@ fn spawn_on(
         db_path,
         store,
         runtime,
+        surface,
         shutdown,
         handle,
     }
@@ -209,7 +218,7 @@ async fn commands_route_locally() {
     assert!(
         stack
             .store
-            .latest_turns_for_session(&session, 1)
+            .latest_turns_for_session(&session, 1, 0)
             .unwrap()
             .is_empty()
     );
@@ -408,7 +417,7 @@ async fn offset_persists_and_dedupes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_card_and_callback_settle() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base.clone(), "tok-appr".to_string(), None);
+    let surface = TelegramSurface::new(base.clone(), "tok-appr".to_string(), None, None);
     let full_id = "appr_0123456789abcdef";
     let card = AgentEvent::Approval {
         id: full_id.to_string(),
@@ -421,7 +430,10 @@ async fn approval_card_and_callback_settle() {
     // no chat yet: must no-op
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        server.captured().is_empty(),
+        server
+            .captured()
+            .iter()
+            .all(|c| !c.path.contains("/bottok-appr/")),
         "surface must no-op before set_chat, got {:?}",
         server.captured()
     );
@@ -471,6 +483,7 @@ async fn approval_card_and_callback_settle() {
         Arc::new(TelegramSurface::new(
             String::new(),
             "unused-token".to_string(),
+            None,
             None,
         )) as Arc<dyn Surface>,
     )
@@ -563,11 +576,12 @@ async fn unknown_callback_prefix_is_answered_once_and_changes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn surface_noops_until_chat_is_known() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-nochat".to_string(), None);
+    let surface = TelegramSurface::new(base, "tok-nochat".to_string(), None, None);
     surface.emit(&env(
         1,
         AgentEvent::FinalChunk {
             index: 0,
+            turn: "turn_test".into(),
             text: "chunk".into(),
         },
     ));
@@ -576,13 +590,17 @@ async fn surface_noops_until_chat_is_known() {
         AgentEvent::Error {
             class: "test".into(),
             message: "boom".into(),
+            retryable: true
         },
     ));
     surface.emit(&finished(3));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        server.captured().is_empty(),
-        "no outbound traffic before set_chat, got {:?}",
+        server
+            .captured()
+            .iter()
+            .all(|c| !c.path.contains("/bottok-nochat/")),
+        "no outbound traffic from this bot before set_chat, got {:?}",
         server.captured()
     );
 }
@@ -592,7 +610,7 @@ async fn surface_noops_until_chat_is_known() {
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-draft".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-draft".to_string(), Some(7), None);
     surface.emit(&env(
         1,
         AgentEvent::TurnStarted {
@@ -617,6 +635,7 @@ async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
         5,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: chunk.repeat(3),
         },
     ));
@@ -655,7 +674,7 @@ async fn streamed_reply_uses_drafts_then_sends_the_final_message() {
 async fn refused_drafts_fall_back_to_the_finished_message() {
     let (server, base) = FakeBotServer::spawn();
     server.set_reject_drafts(true);
-    let surface = TelegramSurface::new(base, "tok-nodraft".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-nodraft".to_string(), Some(7), None);
     surface.emit(&env(
         1,
         AgentEvent::TurnStarted {
@@ -677,6 +696,7 @@ async fn refused_drafts_fall_back_to_the_finished_message() {
         5,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: "the whole answer".into(),
         },
     ));
@@ -701,7 +721,7 @@ async fn refused_drafts_fall_back_to_the_finished_message() {
 async fn flood_control_keeps_drafts_streaming() {
     let (server, base) = FakeBotServer::spawn();
     server.fail_method("sendMessageDraft", 429, Some(1), 1);
-    let surface = TelegramSurface::new(base, "tok-429".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-429".to_string(), Some(7), None);
     surface.emit(&env(
         1,
         AgentEvent::TurnStarted {
@@ -747,6 +767,7 @@ async fn flood_control_keeps_drafts_streaming() {
         4,
         AgentEvent::FinalChunk {
             index: 1,
+            turn: "turn_test".into(),
             text: "done".into(),
         },
     ));
@@ -764,7 +785,7 @@ async fn flood_control_keeps_drafts_streaming() {
 #[tokio::test(flavor = "multi_thread")]
 async fn draft_throttle_ignores_growth_past_the_cap() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-cap".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-cap".to_string(), Some(7), None);
     surface.emit(&env(
         1,
         AgentEvent::TurnStarted {
@@ -1380,7 +1401,7 @@ async fn unknown_picker_callback_is_answered_once_and_changes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn files_go_out_as_photo_or_document_with_caption() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-files".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-files".to_string(), Some(7), None);
     let dir = temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -1460,7 +1481,7 @@ async fn files_go_out_as_photo_or_document_with_caption() {
 #[tokio::test(flavor = "multi_thread")]
 async fn over_long_caption_is_capped_and_the_file_still_goes_out() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-caption".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-caption".to_string(), Some(7), None);
     let dir = temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let png = dir.join("chart.png");
@@ -1495,7 +1516,7 @@ async fn over_long_caption_is_capped_and_the_file_still_goes_out() {
 #[tokio::test(flavor = "multi_thread")]
 async fn draft_shows_tool_progress_and_skips_scheduled_turns() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-activity".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-activity".to_string(), Some(7), None);
     surface.emit(&env(
         1,
         AgentEvent::TurnStarted {
@@ -1552,7 +1573,7 @@ async fn draft_shows_tool_progress_and_skips_scheduled_turns() {
 
     // Scheduled turns: no draft for tool progress or streamed text.
     let (cron_server, cron_base) = FakeBotServer::spawn();
-    let cron = TelegramSurface::new(cron_base, "tok-cron".to_string(), Some(7));
+    let cron = TelegramSurface::new(cron_base, "tok-cron".to_string(), Some(7), None);
     cron.emit(&env(
         1,
         AgentEvent::TurnStarted {
@@ -2053,7 +2074,7 @@ async fn start_deep_link_wrong_payload_burns_an_attempt() {
 #[tokio::test(flavor = "multi_thread")]
 async fn file_event_fires_the_upload_action_before_the_send() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-upload".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-upload".to_string(), Some(7), None);
     let dir = temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -2123,7 +2144,7 @@ async fn file_event_fires_the_upload_action_before_the_send() {
 #[tokio::test(flavor = "multi_thread")]
 async fn video_and_gif_go_out_inline_with_document_fallback() {
     let (server, base) = FakeBotServer::spawn();
-    let surface = TelegramSurface::new(base, "tok-video".to_string(), Some(7));
+    let surface = TelegramSurface::new(base, "tok-video".to_string(), Some(7), None);
     let dir = temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -2193,4 +2214,467 @@ async fn video_and_gif_go_out_inline_with_document_fallback() {
         raw.contains("name=\"document\"; filename=\"clip2.mp4\""),
         "{raw}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Error cards, cleanup tracking, 429 send retry, new pickers
+// ---------------------------------------------------------------------------
+
+/// A retryable rate-limit error renders as a structured HTML card with
+/// the ↻ Retry keyboard.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_error_renders_card_with_retry_button() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-card".to_string(), Some(7), None);
+    surface.emit(&env(
+        1,
+        AgentEvent::Error {
+            class: "rate_limit".into(),
+            message: "provider says slow down <batch 42>".into(),
+            retryable: true,
+        },
+    ));
+    let card = server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["parse_mode"].as_str() == Some("HTML"),
+            Duration::from_secs(5),
+        )
+        .expect("error card sent as HTML");
+    let text = card.body["text"].as_str().unwrap_or("");
+    assert!(text.contains("<b>⏳ Rate limited</b>"), "{text}");
+    assert!(text.contains("&lt;batch 42&gt;"), "detail is escaped: {text}");
+    assert!(text.contains("<code>"), "detail rides in a code block: {text}");
+    assert_eq!(
+        card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+        json!("retry:last")
+    );
+}
+
+/// A non-retryable error (auth) renders the card without any keyboard.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_error_card_has_no_retry_button() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-auth".to_string(), Some(7), None);
+    surface.emit(&env(
+        1,
+        AgentEvent::Error {
+            class: "auth".into(),
+            message: "401 from provider".into(),
+            retryable: false,
+        },
+    ));
+    let card = server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["text"].as_str().is_some_and(|t| t.contains("Provider rejected")),
+            Duration::from_secs(5),
+        )
+        .expect("auth card sent");
+    assert!(
+        card.body["reply_markup"].is_null(),
+        "no keyboard on a non-retryable card"
+    );
+}
+
+/// A successful turn deletes the error/notice cards recorded before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_turn_auto_deletes_stale_cards() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-auto".to_string(), Some(7), None);
+    surface.emit(&env(
+        1,
+        AgentEvent::Error {
+            class: "network".into(),
+            message: "connection reset".into(),
+            retryable: true,
+        },
+    ));
+    server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["parse_mode"].is_null() == false,
+            Duration::from_secs(5),
+        )
+        .expect("error card sent");
+    // The boundary is the turn's start clock: let it move past the
+    // card's event-time stamp with margin (the ring entry is stamped at
+    // emit time, but the send may still be completing).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    surface.emit(&env(
+        2,
+        AgentEvent::TurnStarted {
+            turn: "turn_x".into(),
+            source: "telegram:7".into(),
+        },
+    ));
+    surface.emit(&finished(3));
+    server
+        .await_capture(|c| c.method == "deleteMessage", Duration::from_secs(5))
+        .expect("the stale error card was deleted after the successful turn");
+}
+
+/// `/cleanup` deletes every tracked card and reports the count.
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_command_deletes_tracked_messages() {
+    let mut stack = spawn_channel(vec![42], "tok-clean").await;
+    // Learn the chat with a harmless command first: a surface with no
+    // chat yet cannot send (or track) anything.
+    stack.server.push_text_message(1, 7, 42, "/status");
+    stack
+        .server
+        .await_capture(
+            |c| c.method == "sendMessage" && c.body["chat_id"].as_i64() == Some(7),
+            Duration::from_secs(10),
+        )
+        .expect("chat learned");
+    // One error card through the runtime's own surface: the channel's
+    // `/cleanup` drains exactly this tracked message.
+    stack.surface.emit(&env(
+        1,
+        AgentEvent::Error {
+            class: "network".into(),
+            message: "connection reset".into(),
+            retryable: true,
+        },
+    ));
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.contains("Can't reach"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("error card sent");
+    stack.server.push_text_message(2, 7, 42, "/cleanup");
+    stack
+        .server
+        .await_capture(|c| c.method == "deleteMessage", Duration::from_secs(10))
+        .expect("cleanup deleted the tracked card");
+    let reply = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.starts_with("removed "))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("cleanup reported what it removed");
+    assert!(
+        reply.body["text"].as_str().unwrap().contains("1 message(s)"),
+        "{:?}",
+        reply.body["text"]
+    );
+    stop(&mut stack).await;
+}
+
+/// A 429 on a send waits what the answer asks and retries exactly once:
+/// the capture holds both the refused request and the successful retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_retries_once_on_flood_control() {
+    let (server, base) = FakeBotServer::spawn();
+    let surface = TelegramSurface::new(base, "tok-429b".to_string(), Some(7), None);
+    server.fail_method("sendMessage", 429, Some(1), 1);
+    surface.emit(&env(
+        1,
+        AgentEvent::Notice {
+            text: "must arrive".into(),
+        },
+    ));
+    // The refused request carries the same body as the retry, so wait
+    // for both to land in the capture rather than matching on text.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let sends = server
+            .captured()
+            .iter()
+            .filter(|c| {
+                c.method == "sendMessage" && c.body["text"].as_str() == Some("must arrive")
+            })
+            .count();
+        if sends >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refused request and retry never both appeared: {:?}",
+            server.captured()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `/queue` renders a card whose ✕ removes exactly that queued message.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_picker_removes_one_item() {
+    let mut stack = spawn_channel(vec![42], "tok-qp").await;
+    let sid = stack.runtime.session_id();
+    let item = ka_agent_core::QueueItem::new(sid.clone(), "queued question".into(), "telegram:42");
+    stack.store.enqueue(&item).unwrap();
+    stack.server.push_text_message(1, 7, 42, "/queue");
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.contains("queued question"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("queue card sent");
+    let data = card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(data.starts_with("qx:"), "{data}");
+    assert!(data.len() <= 64);
+    stack.server.push_callback(2, 7, 42, &data);
+    stack
+        .server
+        .await_capture(
+            |c| c.method == "answerCallbackQuery" && c.body["text"].as_str() == Some("removed"),
+            Duration::from_secs(10),
+        )
+        .expect("removal toasted");
+    assert_eq!(stack.store.queue_len(&sid).unwrap(), 0, "queue is empty now");
+    stop(&mut stack).await;
+}
+
+/// `/forget` renders the remembered facts with a ✖ that forgets one.
+#[tokio::test(flavor = "multi_thread")]
+async fn forget_picker_forgets_one_memory() {
+    let mut stack = spawn_channel(vec![42], "tok-fp").await;
+    stack
+        .runtime
+        .remember("allergic to shellfish", "telegram:42")
+        .unwrap();
+    stack.server.push_text_message(1, 7, 42, "/forget");
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.contains("allergic"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("forget card sent");
+    let data = card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(data.starts_with("fx:"), "{data}");
+    stack.server.push_callback(2, 7, 42, &data);
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "answerCallbackQuery"
+                    && c.body["text"].as_str().is_some_and(|t| t.starts_with("forgot "))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("forget toasted");
+    assert!(
+        stack.runtime.memory_entries().unwrap().is_empty(),
+        "the memory is gone"
+    );
+    stop(&mut stack).await;
+}
+
+/// `/skills` with pending proposals renders the existing sk: buttons.
+#[tokio::test(flavor = "multi_thread")]
+async fn skills_picker_lists_pending_proposals() {
+    let mut stack = spawn_channel(vec![42], "tok-sp").await;
+    stack
+        .store
+        .add_skill_candidate("skill_ab12", "reviewer", "reviews diffs", "body")
+        .unwrap();
+    stack.server.push_text_message(1, 7, 42, "/skills");
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.contains("reviewer"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("skills card sent");
+    let flat: Vec<&str> = card.body["reply_markup"]["inline_keyboard"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r.as_array().unwrap())
+        .filter_map(|b| b["callback_data"].as_str())
+        .collect();
+    assert!(flat.contains(&"sk:a:skill_ab12"), "{flat:?}");
+    assert!(flat.contains(&"sk:r:skill_ab12"), "{flat:?}");
+    stop(&mut stack).await;
+}
+
+/// `/history` renders the recent turns; ▸ opens one turn's detail.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_picker_shows_turn_detail() {
+    let mut stack = spawn_channel(vec![42], "tok-hp").await;
+    let sid = stack.runtime.session_id();
+    let turn = ka_agent_core::Turn::new(sid.clone(), "what about volcanoes".into());
+    stack.store.insert_turn(&turn).unwrap();
+    stack
+        .store
+        .push_chunk(&ka_agent_core::OutboxChunk::new(
+            turn.id.clone(),
+            0,
+            "magma is the answer".into(),
+        ))
+        .unwrap();
+    stack.server.push_text_message(1, 7, 42, "/history");
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.contains("volcanoes"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("history card sent");
+    let detail = card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(detail.starts_with("hv:0:"), "{detail}");
+    assert!(detail.len() <= 64);
+    stack.server.push_callback(2, 7, 42, &detail);
+    let shown = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && c.body["text"].as_str().is_some_and(|t| t.starts_with("> what about"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("the turn detail replaced the card");
+    assert!(
+        shown.body["text"].as_str().unwrap().contains("magma"),
+        "{:?}",
+        shown.body["text"]
+    );
+    stop(&mut stack).await;
+}
+
+/// `/approvals` renders pending approvals; with no live worker behind
+/// them the decision toasts `expired` (the honest dead-worker path).
+#[tokio::test(flavor = "multi_thread")]
+async fn approvals_picker_renders_and_answers() {
+    let mut stack = spawn_channel(vec![42], "tok-ap").await;
+    let sid = stack.runtime.session_id();
+    let approval = ka_agent_core::Approval::new(
+        sid.clone(),
+        ka_agent_core::TurnId::generate(),
+        ka_agent_core::ApprovalKind::KaAsk {
+            ask_id: "ask_1".into(),
+            question: "run `rm -rf /tmp/x`?".into(),
+            detail: None,
+            options: vec!["allow".into(), "deny".into()],
+        },
+        300,
+    );
+    stack.store.insert_approval(&approval).unwrap();
+    stack.server.push_text_message(1, 7, 42, "/approvals");
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str().is_some_and(|t| t.contains("rm -rf"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("approvals card sent");
+    let data = card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(data.starts_with("ap:") && data.ends_with(":y"), "{data}");
+    assert!(data.len() <= 64);
+    stack.server.push_callback(2, 7, 42, &data);
+    stack
+        .server
+        .await_capture(
+            |c| c.method == "answerCallbackQuery" && c.body["text"].as_str() == Some("expired"),
+            Duration::from_secs(10),
+        )
+        .expect("dead-worker decision toasts expired, answered exactly once");
+    stop(&mut stack).await;
+}
+
+/// `/update`: without a host hook it refuses with the manual remedy;
+/// with one, the reply flows verbatim (the hook owns the permission
+/// gate and release machinery).
+#[tokio::test(flavor = "multi_thread")]
+async fn update_command_refuses_without_hook_and_dispatches_with_one() {
+    let mut stack = spawn_channel(vec![42], "tok-upd").await;
+    // No hook registered (this harness builds a bare runtime): /update
+    // must name the manual path, never attempt anything.
+    stack.server.push_text_message(1, 5, 42, "/update");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("! [update] self-update is not available"))
+            },
+            Duration::from_secs(5),
+        )
+        .expect("no-hook refusal names the manual path");
+    stack.server.push_text_message(2, 5, 42, "/update frobnicate");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"].as_str() == Some("usage: /update [check]")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("usage form answered");
+    // Registered hook: check and install replies reach the phone.
+    stack.runtime.set_updater(Arc::new(|check_only| {
+        if check_only {
+            Ok("0.1.0 → 9.9.0 available — /update installs it".into())
+        } else {
+            Ok("0.1.0 → 9.9.0 installed — restarting".into())
+        }
+    }));
+    stack.server.push_text_message(3, 5, 42, "/update check");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("9.9.0 available"))
+            },
+            Duration::from_secs(5),
+        )
+        .expect("check reply flows");
+    stack.server.push_text_message(4, 5, 42, "/update");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("9.9.0 installed"))
+            },
+            Duration::from_secs(5),
+        )
+        .expect("install reply flows");
+    stop(&mut stack).await;
 }
