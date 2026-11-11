@@ -101,12 +101,12 @@ impl FriendlyError {
         let mut out = format!("{} {}", self.emoji, self.title);
         for part in [&self.line, &self.hint] {
             if !part.is_empty() {
-                out.push_str("\n");
+                out.push('\n');
                 out.push_str(part);
             }
         }
         if !self.detail.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
             out.push_str(&self.detail);
         }
         out
@@ -118,7 +118,7 @@ impl FriendlyError {
         let mut out = format!("<b>{} {}</b>", self.emoji, html_escape(&self.title));
         for part in [&self.line, &self.hint] {
             if !part.is_empty() {
-                out.push_str("\n");
+                out.push('\n');
                 // static operator chrome, already HTML-free
                 out.push_str(part);
             }

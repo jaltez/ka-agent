@@ -6,58 +6,164 @@ use ka_agent_core::ApprovalDecision;
 use ka_agent_runtime::Runtime;
 use ka_agent_store::Store;
 
-const STYLE: &str = "<style>\
-:root{--bg:#fafafa;--fg:#1a1a1a;--muted:#6b7280;--border:#e5e7eb;--accent:#4f46e5;--accent-soft:#eef2ff;--ok:#047857;--bad:#b91c1c;--warn:#b45309;--surface:#fff;--radius:10px}\
-@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8ea;--muted:#9aa1ab;--border:#262b33;--accent:#818cf8;--accent-soft:#1c2033;--ok:#34d399;--bad:#f87171;--warn:#fbbf24;--surface:#171a20}}\
-*{box-sizing:border-box}\
-body{margin:0;font:15px/1.55 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--fg)}\
-.layout{display:flex;min-height:100vh;max-width:1100px;margin:0 auto}\
-aside{width:190px;flex:none;padding:1.2rem .8rem;border-right:1px solid var(--border)}\
-aside .brand{font-weight:700;padding:.2rem .6rem 1rem;letter-spacing:.02em}\
-aside a{display:flex;justify-content:space-between;gap:.4rem;padding:.42rem .6rem;border-radius:8px;color:var(--fg);text-decoration:none}\
-aside a:hover{background:var(--accent-soft)}\
-aside a.active{background:var(--accent-soft);font-weight:600}\
-aside .badge{background:var(--accent);color:#fff;font-size:.72rem;border-radius:99px;padding:0 .5rem;line-height:1.4}\
-main{flex:1;padding:1.4rem 1.6rem;min-width:0}\
-h1{font-size:1.35rem;margin:.1rem 0 1.1rem}\
-@media(max-width:760px){.layout{flex-direction:column;height:100vh}aside{width:auto;border-right:none;border-bottom:1px solid var(--border);padding:.5rem .6rem}aside .brand{padding:.3rem .6rem}aside a{display:inline-block;margin:.15rem .2rem}main{padding:1rem;flex:1;display:flex;flex-direction:column;min-height:0}}\
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;margin:.7rem 0}\
-button{font:inherit;border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;padding:.35rem .9rem;cursor:pointer}\
-button:hover{border-color:var(--accent)}\
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff}\
-.muted{color:var(--muted)}\
-pre{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.7rem .9rem;overflow-x:auto}\
-code{background:var(--bg);border-radius:4px;padding:.05rem .3rem}\
-pre code{background:none;padding:0}\
-table{border-collapse:collapse;width:100%;font-size:.92rem}\
-th,td{border-bottom:1px solid var(--border);padding:.45rem .5rem;text-align:left}\
-th{color:var(--muted);font-weight:600}\
-#chat{display:flex;flex-direction:column;height:calc(100vh - 8.4rem)}\
-#log{flex:1;overflow-y:auto;padding:.4rem 0}\
-.bubble{max-width:78%;border-radius:14px;padding:.55rem .9rem;margin:.3rem 0;white-space:pre-wrap;word-wrap:break-word}\
-.bubble.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}\
-.bubble.assistant{align-self:flex-start;background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px}\
-.bubble.system{align-self:center;background:none;color:var(--muted);font-size:.85rem;max-width:100%}\
-.bubble.approval{align-self:flex-start;background:var(--surface);border:1px solid var(--warn);max-width:100%}\
-#log{display:flex;flex-direction:column}\
-.bubble .tool{font-size:.85rem;color:var(--muted);white-space:pre-wrap}\
-.bubble.user code{background:rgba(255,255,255,.2)}\
-form#send{display:flex;gap:.5rem;padding:.6rem 0}\
-#text{flex:1;font:inherit;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);padding:.55rem .8rem}\
-.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.7rem}\
-.statgrid .card{margin:0}\
-.statgrid .k{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}\
-.statgrid .v{font-size:1.15rem;margin-top:.15rem}\
-.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}\
-/* Mobile: the wrapped nav is part of the viewport, so #chat flexes inside it (placed after the base #chat rule, which would otherwise win by order). */\
-@media(max-width:760px){#chat{flex:1;height:auto;min-height:0}}</style>";
+/// One sidebar entry: `(path, label, badge count)`.
+type NavItem = (&'static str, &'static str, usize);
+
+const STYLE: &str = r#"<style>
+:root{
+  --bg:#f6f6f4;--fg:#16181d;--muted:#6b7280;--border:#e3e4e8;--border-strong:#cfd1d8;
+  --accent:#4f46e5;--accent-fg:#fff;--accent-soft:#eef0ff;--surface:#fff;--surface-2:#fafaf9;
+  --ok:#047857;--ok-soft:#ecfdf5;--bad:#b91c1c;--bad-soft:#fef2f2;--warn:#b45309;--warn-soft:#fffbeb;
+  --radius:10px;--radius-lg:14px;--shadow:0 1px 2px rgba(16,18,23,.05),0 8px 24px rgba(16,18,23,.06);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0e1014;--fg:#e7e9ee;--muted:#9aa1ab;--border:#23272f;--border-strong:#333945;
+  --accent:#8b93ff;--accent-fg:#0d0f14;--accent-soft:#1a1e33;--surface:#14171d;--surface-2:#191d24;
+  --ok:#34d399;--ok-soft:#12251f;--bad:#f87171;--bad-soft:#2a1515;--warn:#fbbf24;--warn-soft:#2a2111;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+}}
+:root[data-theme="dark"]{
+  --bg:#0e1014;--fg:#e7e9ee;--muted:#9aa1ab;--border:#23272f;--border-strong:#333945;
+  --accent:#8b93ff;--accent-fg:#0d0f14;--accent-soft:#1a1e33;--surface:#14171d;--surface-2:#191d24;
+  --ok:#34d399;--ok-soft:#12251f;--bad:#f87171;--bad-soft:#2a1515;--warn:#fbbf24;--warn-soft:#2a2111;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+[hidden]{display:none !important}
+html,body{height:100%}
+body{margin:0;font:14.5px/1.55 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.layout{display:flex;min-height:100vh;max-width:1240px;margin:0 auto}
+aside{width:224px;flex:none;padding:1rem .7rem 1.4rem;border-right:1px solid var(--border);background:var(--surface);position:sticky;top:0;height:100vh;overflow-y:auto}
+aside .brand{display:block;padding:.35rem .65rem 1.1rem;font-weight:700;letter-spacing:.01em}
+aside .brand .who{display:block;font-weight:500;color:var(--muted);font-size:.8rem;margin-top:.15rem}
+.navlabel{padding:.9rem .65rem .3rem;font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}\
+.themebtn{width:calc(100% - 1.3rem);justify-content:flex-start;margin:.6rem .65rem 0;font-size:.8rem}
+aside a{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.42rem .65rem;margin:.05rem 0;border-radius:8px;color:var(--fg);text-decoration:none;font-size:.93rem}
+aside a:hover{background:var(--surface-2);text-decoration:none}
+aside a.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+aside a .badge{background:var(--accent);color:var(--accent-fg)}
+.badge{display:inline-flex;align-items:center;justify-content:center;min-width:1.35rem;height:1.35rem;padding:0 .4rem;border-radius:99px;background:var(--accent);color:var(--accent-fg);font-size:.72rem;font-weight:600}
+main{flex:1;padding:1.6rem 2rem 3rem;min-width:0}
+.pagehead{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin:0 0 1.2rem}
+.pagehead h1{font-size:1.4rem;line-height:1.2;margin:0}
+.pagehead .sub{color:var(--muted);margin-top:.25rem;max-width:62ch}
+.pagehead .actions{display:flex;gap:.45rem;flex-wrap:wrap}
+h2{font-size:1.02rem;margin:1.5rem 0 .6rem;letter-spacing:.01em}
+h3{font-size:.92rem;margin:1rem 0 .4rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:1rem 1.1rem;margin:.75rem 0;box-shadow:var(--shadow)}
+.card h2,.card h3{margin-top:0}
+.card .cardhead{display:flex;align-items:center;justify-content:space-between;gap:.6rem;margin:-.1rem 0 .7rem}
+.card .cardhead .k{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.07em}
+button,.btn{font:inherit;font-size:.9rem;display:inline-flex;align-items:center;gap:.35rem;border:1px solid var(--border-strong);background:var(--surface);color:var(--fg);border-radius:8px;padding:.38rem .8rem;cursor:pointer;line-height:1.2;transition:border-color .12s,background .12s}
+button:hover,.btn:hover{border-color:var(--accent);text-decoration:none}
+button.primary,.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+button.primary:hover{filter:brightness(1.06)}
+button.ghost,.btn.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+button.ghost:hover{background:var(--surface-2);color:var(--fg)}
+button.danger{color:var(--bad);border-color:var(--bad)}
+button.sm{padding:.22rem .55rem;font-size:.82rem}
+button:disabled{opacity:.5;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+input,select,textarea{font:inherit;color:var(--fg);background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:.42rem .6rem;min-height:2.1rem}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none;box-shadow:0 0 0 3px var(--accent-soft)}
+textarea{resize:vertical;min-height:4.5rem;width:100%}
+label.field{display:block;margin:.55rem 0}
+label.field>span{display:block;font-size:.8rem;color:var(--muted);margin-bottom:.22rem}
+label.field input,label.field select,label.field textarea{width:100%}
+.formrow{display:flex;gap:.5rem;flex-wrap:wrap;align-items:end}
+.formrow>*{margin:0}
+.muted{color:var(--muted)}
+.small{font-size:.85rem}
+.mono,code,pre{font-family:var(--mono);font-size:.86em}
+code{background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:.06rem .32rem}
+pre{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:.7rem .9rem;overflow:auto}
+pre code{background:none;border:0;padding:0}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{border-bottom:1px solid var(--border);padding:.5rem .55rem;text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--surface-2)}
+.tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}
+.tablewrap table{min-width:100%}
+.tablewrap th,.tablewrap td{padding:.55rem .7rem}
+.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}
+.statgrid .card{margin:0}
+.statgrid .k{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.07em}
+.statgrid .v{font-size:1.15rem;margin-top:.2rem;font-weight:600}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:.75rem;align-items:start}
+.chip{display:inline-flex;align-items:center;gap:.3rem;border:1px solid var(--border);border-radius:99px;padding:.12rem .6rem;font-size:.8rem;color:var(--muted);background:var(--surface)}
+.chip b{color:var(--fg);font-weight:600}
+.chip.warn{border-color:var(--warn);color:var(--warn);background:var(--warn-soft)}
+.tag{display:inline-block;border-radius:6px;padding:.08rem .45rem;font-size:.75rem;background:var(--surface-2);border:1px solid var(--border)}
+.empty{border:1px dashed var(--border-strong);border-radius:var(--radius);padding:1rem;color:var(--muted);text-align:center}
+.flash{border-left:3px solid var(--accent);background:var(--accent-soft);padding:.55rem .8rem;border-radius:8px;margin:.6rem 0}
+.flash.bad{border-left-color:var(--bad);background:var(--bad-soft)}
+.flash.ok{border-left-color:var(--ok);background:var(--ok-soft)}
+.bar{height:.45rem;border-radius:99px;background:var(--border);overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--accent)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+.actions{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center}
+.nowrap{white-space:nowrap}
+/* chat */
+#chat{display:flex;flex-direction:column;height:calc(100vh - 10.5rem)}
+#chatbar{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;padding:.1rem 0 .6rem}
+#chatbar .spacer{flex:1}
+#log{flex:1;overflow-y:auto;padding:.4rem .2rem;display:flex;flex-direction:column;gap:.1rem}
+.bubble{max-width:78%;border-radius:14px;padding:.55rem .9rem;margin:.28rem 0;white-space:pre-wrap;word-wrap:break-word;line-height:1.5}
+.bubble.user{align-self:flex-end;background:var(--accent);color:var(--accent-fg);border-bottom-right-radius:4px}
+.bubble.user code{background:rgba(255,255,255,.18);border-color:transparent;color:inherit}
+.bubble.assistant{align-self:flex-start;background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px}
+.bubble.system{align-self:center;background:none;color:var(--muted);font-size:.85rem;max-width:100%}
+.bubble.approval{align-self:flex-start;background:var(--warn-soft);border:1px solid var(--warn);max-width:100%}
+.bubble .tool{font-size:.85rem;color:var(--muted);white-space:pre-wrap}
+.bubble .tool.ok{color:var(--ok)}
+.bubble .tool.bad{color:var(--bad)}
+.bubble details{margin-top:.25rem}
+.bubble details summary{cursor:pointer;color:var(--muted);font-size:.82rem}
+.bubble img.thumb{max-width:320px;max-height:240px;border-radius:8px;display:block;margin-top:.35rem}
+details.card>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+details.card>summary::-webkit-details-marker{display:none}
+details.card>summary:before{content:'▸';color:var(--muted)}
+details.card[open]>summary:before{content:'▾'}
+.bubble .meta{color:var(--muted);font-size:.75rem;margin-bottom:.15rem}
+#chat.streaming #log:after{content:'▍';color:var(--accent);animation:blink 1s steps(2) infinite;align-self:flex-start;margin-left:.3rem}
+@keyframes blink{50%{opacity:0}}
+form#send{display:flex;gap:.5rem;padding:.65rem 0 0;align-items:flex-end;position:sticky;bottom:0;background:var(--bg);padding-bottom:.4rem}
+#text{flex:1;font:inherit;border:1px solid var(--border-strong);border-radius:12px;background:var(--surface);color:var(--fg);padding:.6rem .85rem;min-height:2.6rem;max-height:12rem}
+#text:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);outline:none}
+.filebtn{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border-strong);border-radius:9px;padding:.42rem .6rem;cursor:pointer;background:var(--surface);min-height:2.6rem}
+.filebtn:hover{border-color:var(--accent)}
+.kbd{font-family:var(--mono);font-size:.75rem;border:1px solid var(--border-strong);border-bottom-width:2px;border-radius:5px;padding:0 .28rem;background:var(--surface)}
+/* mobile */
+@media(max-width:820px){
+  .layout{flex-direction:column}
+  aside{width:auto;height:auto;position:static;border-right:0;border-bottom:1px solid var(--border);padding:.4rem .55rem .6rem;overflow:visible;display:flex;flex-wrap:wrap;align-items:center}
+  aside .brand{flex:1 1 100%;display:block;padding:.25rem .5rem}
+  aside .brand .who{display:none}
+  .navlabel{flex:1 1 100%;padding:.4rem .5rem .1rem}
+  aside a{margin:.12rem .1rem;padding:.3rem .55rem}
+  form#send{flex-wrap:wrap}
+  #text{flex:1 1 100%}
+  form#send button.primary{margin-left:auto}
+  .navlabel{display:inline-block;padding:.35rem .4rem;font-size:.66rem}
+  aside a{display:inline-flex;margin:.1rem .1rem;padding:.32rem .55rem}
+  main{padding:1rem .9rem 2.5rem}
+  .pagehead{margin-bottom:.8rem}
+  #chat{height:auto;min-height:60vh;flex:1}
+  .bubble{max-width:92%}
+}
+</style>"#;
 
 /// The viewport-aware head + sidebar layout (top bar on narrow screens).
 /// Both the page title and the persona name are user-derived and escaped.
 fn html_page(persona: &str, title: &str, body: String) -> String {
     format!(
         "<!DOCTYPE html>\n<html><head><title>{} — {}</title>\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{STYLE}</head><body>\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{STYLE}\
+         <script src=\"/static/ui.js\" defer></script></head><body>\
          {body}</body></html>",
         escape_html(title),
         escape_html(persona)
@@ -71,29 +177,62 @@ fn runtime_page(runtime: &Runtime, title: &str, body: String) -> String {
 }
 
 /// A page with the shared sidebar navigation. Badges: approvals waiting,
-/// memory to review.
+/// memory to review, queued messages.
 fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Response {
-    let count = runtime
+    nav_page_sub(runtime, active, title, "", body)
+}
+
+/// The same with a one-line description under the title (what the page is
+/// for) — every page says why it exists, like the CLI help does.
+fn nav_page_sub(
+    runtime: &Runtime,
+    active: &str,
+    title: &str,
+    subtitle: &str,
+    body: String,
+) -> Response {
+    let approvals = runtime
         .pending_approval_cards()
         .map(|c| c.len())
         .unwrap_or(0);
     let review = runtime.pending_candidates().map(|c| c.len()).unwrap_or(0);
-    let items: [(&str, &str, usize); 11] = [
-        ("/", "Chat", 0),
-        ("/status", "Status", 0),
-        ("/tasks", "Tasks", 0),
-        ("/memory", "Memory", review),
-        ("/skills", "Skills", 0),
-        ("/approvals", "Approvals", count),
-        ("/history", "History", 0),
-        ("/usage", "Usage", 0),
-        ("/contacts", "Contacts", 0),
-        ("/audit", "Audit", 0),
-        ("/intents", "Intents", 0),
+    let queued = runtime.queued().map(|q| q.len()).unwrap_or(0);
+    let groups: [(&str, &[NavItem]); 3] = [
+        ("Chat", &[("/", "Chat", 0), ("/queue", "Queue", queued)]),
+        (
+            "Operator",
+            &[
+                ("/status", "Status", 0),
+                ("/sessions", "Sessions", 0),
+                ("/approvals", "Approvals", approvals),
+                ("/memory", "Memory", review),
+                ("/skills", "Skills", 0),
+                ("/history", "History", 0),
+                ("/usage", "Usage", 0),
+            ],
+        ),
+        (
+            "System",
+            &[
+                ("/tasks", "Tasks & cron", 0),
+                ("/profiles", "Profiles & roles", 0),
+                ("/models", "Models & behavior", 0),
+                ("/config", "Config", 0),
+                ("/grants", "Grants", 0),
+                ("/keys", "Keys & secrets", 0),
+                ("/extensions", "Extensions", 0),
+                ("/doctor", "Doctor", 0),
+                ("/logs", "Logs", 0),
+                ("/audit", "Audit", 0),
+                ("/intents", "Intents", 0),
+                ("/contacts", "Contacts", 0),
+            ],
+        ),
     ];
-    let nav: String = items
-        .iter()
-        .map(|(href, label, n)| {
+    let mut nav = String::new();
+    for (group, items) in groups {
+        nav.push_str(&format!("<div class=\"navlabel\">{group}</div>"));
+        for (href, label, n) in items {
             let badge = if *n > 0 {
                 format!("<span class=\"badge\">{n}</span>")
             } else {
@@ -102,19 +241,1170 @@ fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Respo
             let class = if *href == active { "active" } else { "" };
             // `data-nav` gives chat.js a stable hook for live badge
             // updates (approvals, memory review) without a reload.
-            format!("<a class=\"{class}\" data-nav=\"{href}\" href=\"{href}\">{label}{badge}</a>")
-        })
-        .collect::<Vec<_>>()
-        .join("");
+            nav.push_str(&format!(
+                "<a class=\"{class}\" data-nav=\"{href}\" href=\"{href}\">{label}{badge}</a>"
+            ));
+        }
+    }
+    let who = format!(
+        "{} · {}",
+        escape_html(&runtime.persona_name()),
+        escape_html(&ka_agent_core::layout::profile_name())
+    );
+    let sub = if subtitle.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"sub\">{}</div>", escape_html(subtitle))
+    };
     Response::html(runtime_page(
         runtime,
         title,
         format!(
-            "<div class=\"layout\"><aside><div class=\"brand\">{}</div>{nav}</aside>\
-             <main><h1>{title}</h1>{body}</main></div>",
-            escape_html(&runtime.persona_name())
+            "<div class=\"layout\"><aside><div class=\"brand\">Ka Agent<span class=\"who\">{who}</span></div>\
+             <button class=\"ghost themebtn\" id=\"theme-toggle\" type=\"button\">theme: system</button>{nav}</aside>\
+             <main><div class=\"pagehead\"><div><h1>{title}</h1>{sub}</div></div>{body}</main></div>"
         ),
     ))
+}
+
+/// A small result page for an action that produced a message (success or
+/// refusal): the operator sees the agent's own words, plus a way back.
+fn result_page(
+    runtime: &Runtime,
+    active: &str,
+    title: &str,
+    message: &str,
+    ok: bool,
+) -> crate::Response {
+    let class = if ok { "flash ok" } else { "flash bad" };
+    nav_page_sub(
+        runtime,
+        active,
+        title,
+        "",
+        format!(
+            "<div class=\"{class}\">{}</div><p><a href=\"{active}\">back to {title}</a></p>",
+            escape_html(message)
+        ),
+    )
+}
+
+/// `GET /models`: the current model and its key, the mode/effort pickers,
+/// the persona editor, and the provider catalog with one-click switching —
+/// the TUI's `/model`, `/mode`, `/effort` and `ka-agent persona` in one
+/// page.
+pub fn models(runtime: &Runtime) -> crate::Response {
+    let cfg = runtime.config();
+    let current = cfg.model.clone().unwrap_or_else(|| "unset".into());
+    let key_line = match runtime.model_key_state() {
+        Ok(Some((_, ka_agent_runtime::ModelKeyState::Present))) => {
+            "<span class=\"ok\">key present</span>".to_string()
+        }
+        Ok(Some((_, ka_agent_runtime::ModelKeyState::Missing(env)))) => format!(
+            "<span class=\"bad\">✗ {env} missing — on your computer run <code>ka-agent key set {env}</code></span>",
+            env = escape_html(&env)
+        ),
+        Ok(Some((_, ka_agent_runtime::ModelKeyState::Keyless))) => {
+            "<span class=\"muted\">no key needed</span>".to_string()
+        }
+        Ok(None) => {
+            "<span class=\"muted\">no model configured — run ka-agent setup</span>".to_string()
+        }
+        Err(e) => format!("<span class=\"bad\">{}</span>", escape_html(&e.to_string())),
+    };
+    let mode = runtime.effective_mode();
+    let modes: String = ka_agent_channels::commands::MODES
+        .iter()
+        .map(|(name, desc)| {
+            let class = if *name == mode { "primary" } else { "" };
+            format!(
+                "<form method=post action=/models/mode style=display:inline>\
+                 <input type=hidden name=mode value=\"{name}\">\
+                 <button class=\"{class}\">{name}</button></form> \
+                 <span class=\"muted small\">{desc}</span>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let effort = runtime
+        .effort()
+        .unwrap_or_else(|| "model default".to_string());
+    let efforts: String = ka_agent_channels::commands::EFFORTS
+        .iter()
+        .map(|level| {
+            let class = if *level == effort { "primary" } else { "" };
+            format!(
+                "<form method=post action=/models/effort style=display:inline>\
+                 <input type=hidden name=level value=\"{level}\">\
+                 <button class=\"{class} sm\">{level}</button></form>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let persona = escape_html(&runtime.persona_text());
+    let listing = runtime.models_listing();
+    let mut provider_rows = String::new();
+    for p in &listing.providers {
+        let is_current = listing
+            .current
+            .as_deref()
+            .is_some_and(|c| c.starts_with(&format!("{}/", p.name)));
+        let mut rows = String::new();
+        // A big catalog is collapsed: the current provider opens, and each
+        // list caps at 20 with a pointer to the selector form.
+        for m in p.models.iter().take(20) {
+            let current_mark = if listing.current.as_deref() == Some(m.as_str()) {
+                " <span class=\"tag\">current</span>"
+            } else {
+                ""
+            };
+            rows.push_str(&format!(
+                "<tr><td><code>{}</code>{current_mark}</td>\
+                 <td><form method=post action=/models/set>\
+                 <input type=hidden name=selector value=\"{}\"><button class=\"sm\">use</button></form></td></tr>",
+                escape_html(m),
+                escape_html(m)
+            ));
+        }
+        let more = if p.models.len() > 20 {
+            format!(
+                "<p class=\"muted small\">{} more — set any selector with the form above.</p>",
+                p.models.len() - 20
+            )
+        } else {
+            String::new()
+        };
+        provider_rows.push_str(&format!(
+            "<details class=\"card provider\"{}><summary><b>{}</b> <span class=\"muted small\">{}</span> {}</summary>\
+             <div class=\"tablewrap\"><table>{rows}</table></div>{more}</details>",
+            if is_current { " open" } else { "" },
+            escape_html(&p.name),
+            escape_html(&p.note),
+            if is_current { "<span class=\"tag\">current provider</span>" } else { "" }
+        ));
+    }
+    if provider_rows.is_empty() {
+        provider_rows = "<div class=\"empty\">no model catalog yet — set one by selector below or run <code>ka-agent models refresh</code></div>".into();
+    }
+    let body = format!(
+        "<div class=\"grid2\">\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">current model</span><span class=\"tag\">{current}</span></div>\
+         <p>{key_line}</p>\
+         <form method=post action=/models/set class=formrow>\
+         <input name=selector placeholder=\"provider/model[@effort]\" style=\"flex:1\" required>\
+         <button class=primary>set model</button></form>\
+         <p class=\"muted small\">Applies to the session now and to `model` in the config.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">mode</span><span class=\"tag\">{mode}</span></div>{modes}\
+         <p class=\"muted small\">A role's `/mode` is clamped to its own ceiling.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">reasoning effort</span><span class=\"tag\">{effort}</span></div>{efforts}</div>\
+         </div>\
+         <h2>Persona</h2>\
+         <form method=post action=/persona>\
+         <label class=field><span>Persona text compiled into IDENTITY.md — the first line must be <code># &lt;Name&gt;</code>, then tone and house rules</span>\
+         <textarea name=text rows=7>{persona}</textarea></label>\
+         <button class=primary>save persona</button></form>\
+         <h2>Provider catalog</h2>{provider_rows}",
+        current = escape_html(&current),
+    );
+    nav_page_sub(
+        runtime,
+        "/models",
+        "Models & behavior",
+        "The session's model, mode, effort and persona — the TUI's /model, /mode, /effort and the persona editor.",
+        body,
+    )
+}
+
+pub async fn models_set(runtime: &Runtime, body: &str) -> crate::Response {
+    let selector = form_field(body, "selector");
+    match runtime.set_model(selector.trim()).await {
+        Ok(id) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            &format!("model → {id}"),
+            true,
+        ),
+        Err(e) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+pub async fn models_mode(runtime: &Runtime, body: &str) -> crate::Response {
+    let mode = form_field(body, "mode");
+    match runtime.set_mode(&mode, "web").await {
+        Ok(applied) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            &format!("mode → {applied}"),
+            true,
+        ),
+        Err(e) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+pub async fn models_effort(runtime: &Runtime, body: &str) -> crate::Response {
+    let level = form_field(body, "level");
+    match runtime.set_effort(&level).await {
+        Ok(reply) => result_page(runtime, "/models", "Models & behavior", &reply, true),
+        Err(e) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+pub fn persona_set(runtime: &Runtime, body: &str) -> crate::Response {
+    let text = form_field(body, "text");
+    match runtime.set_persona(&text) {
+        Ok(()) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            "persona saved (IDENTITY.md recompiled for every role's engine home)",
+            true,
+        ),
+        Err(e) => result_page(
+            runtime,
+            "/models",
+            "Models & behavior",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+/// `GET /config`: every registered key (path, kind, apply timing, default,
+/// current value) plus the editable web-safe form and the raw file.
+pub fn config_page(runtime: &Runtime) -> crate::Response {
+    use ka_agent_core::config_keys::KEYS;
+    let Some(path) = runtime.config_path() else {
+        return nav_page_sub(
+            runtime,
+            "/config",
+            "Config",
+            "",
+            "<div class=\"empty\">no config file to edit</div>".into(),
+        );
+    };
+    let mut rows = String::new();
+    for spec in KEYS {
+        let value = ka_agent_core::config_file::get(&path, spec.path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "—".to_string());
+        rows.push_str(&format!(
+            "<tr><td><code>{}</code><div class=\"muted small\">{}</div></td>\
+             <td>{}</td><td>{}</td><td class=\"muted small\">{}</td><td><code>{}</code></td></tr>",
+            escape_html(spec.path),
+            escape_html(spec.doc),
+            escape_html(spec.kind.label()),
+            escape_html(spec.apply.label()),
+            escape_html(spec.default),
+            escape_html(&value)
+        ));
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map(|t| escape_html(&t))
+        .unwrap_or_else(|e| escape_html(&e.to_string()));
+    let body = format!(
+        "<p class=\"muted\">file <code>{}</code> · changes apply now, next turn or after a restart (see each row); the form below edits only keys the panel may touch.</p>\
+         {}<h2>Every key</h2><div class=\"tablewrap\"><table><tr><th>key</th><th>type</th><th>applies</th><th>default</th><th>current</th></tr>{rows}</table></div>\
+         <h2>config.toml</h2><details><summary class=\"muted\">show the raw file</summary><pre><code>{raw}</code></pre></details>",
+        escape_html(&path.display().to_string()),
+        settings_form(runtime)
+    );
+    nav_page_sub(
+        runtime,
+        "/config",
+        "Config",
+        "The profile's configuration: schema, apply timing and the safe editor. The CLI equivalent is `ka-agent config get/set/schema/edit`.",
+        body,
+    )
+}
+
+/// `GET /queue`: messages waiting for the next turn, with remove/clear.
+pub fn queue(runtime: &Runtime) -> crate::Response {
+    let items = runtime.queued().unwrap_or_default();
+    if items.is_empty() {
+        return nav_page_sub(
+            runtime,
+            "/queue",
+            "Queue",
+            "Messages that arrived mid-turn wait here until the next turn.",
+            "<div class=\"empty\">the queue is empty</div>".into(),
+        );
+    }
+    let rows: String = items
+        .iter()
+        .map(|(id, source, text)| {
+            format!(
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td>\
+                 <td><form method=post action=/queue/remove>\
+                 <input type=hidden name=id value=\"{}\"><button class=sm>remove</button></form></td></tr>",
+                escape_html(ka_agent_core::ids::short_id(id)),
+                escape_html(source),
+                escape_html(text),
+                escape_html(id)
+            )
+        })
+        .collect();
+    nav_page_sub(
+        runtime,
+        "/queue",
+        "Queue",
+        "Messages that arrived mid-turn wait here until the next turn.",
+        format!(
+            "<div class=\"tablewrap\"><table><tr><th>id</th><th>source</th><th>text</th><th></th></tr>{rows}</table></div>\
+             <form method=post action=/queue/clear><button class=danger>clear the queue</button></form>"
+        ),
+    )
+}
+
+pub fn queue_remove(runtime: &Runtime, body: &str) -> crate::Response {
+    let id = form_field(body, "id");
+    match runtime.remove_queued(&id) {
+        Ok(true) => Response::see_other("/queue"),
+        Ok(false) => result_page(
+            runtime,
+            "/queue",
+            "Queue",
+            "no queued message matches that id",
+            false,
+        ),
+        Err(e) => result_page(runtime, "/queue", "Queue", &e.to_string(), false),
+    }
+}
+
+pub fn queue_clear(runtime: &Runtime) -> crate::Response {
+    match runtime.clear_queue() {
+        Ok(n) => result_page(
+            runtime,
+            "/queue",
+            "Queue",
+            &format!("cleared {n} queued message(s)"),
+            true,
+        ),
+        Err(e) => result_page(runtime, "/queue", "Queue", &e.to_string(), false),
+    }
+}
+
+/// `GET /grants`: scoped tool grants (`ka-agent grant add|list|rm`).
+pub fn grants(runtime: &Runtime) -> crate::Response {
+    let grants = ka_agent_channels::grants::Grants::load(runtime.store()).unwrap_or_default();
+    let rows: String = grants
+        .scopes
+        .iter()
+        .map(|scope| {
+            format!(
+                "<tr><td><code>{}</code></td><td><form method=post action=/grants/rm>\
+                 <input type=hidden name=scope value=\"{}\"><button class=\"sm danger\">remove</button></form></td></tr>",
+                escape_html(scope),
+                escape_html(scope)
+            )
+        })
+        .collect();
+    let body = format!(
+        "<div class=\"card\"><div class=\"cardhead\"><span class=\"k\">scope grants</span><span class=\"tag\">{} scope(s)</span></div>\
+         <p class=\"muted small\">Scoped tools (http_get, GitHub) need a matching grant. Wildcards: <code>http:get:*</code>.</p>\
+         <form method=post action=/grants/add class=formrow>\
+         <input name=scope placeholder=\"http:get:api.github.com\" style=\"flex:1\" required>\
+         <button class=primary>add grant</button></form></div>\
+         {}",
+        grants.scopes.len(),
+        if rows.is_empty() {
+            "<div class=\"empty\">no grants</div>".to_string()
+        } else {
+            format!(
+                "<div class=\"tablewrap\"><table><tr><th>scope</th><th></th></tr>{rows}</table></div>"
+            )
+        }
+    );
+    nav_page_sub(
+        runtime,
+        "/grants",
+        "Grants",
+        "Authority for scoped tools, stored in the state store — the CLI's `ka-agent grant`.",
+        body,
+    )
+}
+
+pub fn grants_add(runtime: &Runtime, body: &str) -> crate::Response {
+    let scope = form_field(body, "scope");
+    let mut grants = match ka_agent_channels::grants::Grants::load(runtime.store()) {
+        Ok(g) => g,
+        Err(e) => return result_page(runtime, "/grants", "Grants", &e.to_string(), false),
+    };
+    grants.add(&scope);
+    match grants.save(runtime.store()) {
+        Ok(()) => Response::see_other("/grants"),
+        Err(e) => result_page(runtime, "/grants", "Grants", &e.to_string(), false),
+    }
+}
+
+pub fn grants_rm(runtime: &Runtime, body: &str) -> crate::Response {
+    let scope = form_field(body, "scope");
+    let mut grants = match ka_agent_channels::grants::Grants::load(runtime.store()) {
+        Ok(g) => g,
+        Err(e) => return result_page(runtime, "/grants", "Grants", &e.to_string(), false),
+    };
+    grants.remove(&scope);
+    match grants.save(runtime.store()) {
+        Ok(()) => Response::see_other("/grants"),
+        Err(e) => result_page(runtime, "/grants", "Grants", &e.to_string(), false),
+    }
+}
+
+/// `GET /keys`: which provider keys and channel secrets exist — names
+/// only, never values (`ka-agent key list`, `secret list`).
+pub fn keys(runtime: &Runtime) -> crate::Response {
+    let env_path = ka_agent_port::catalog::engine_env_path(&runtime.engine_home());
+    let env = ka_agent_port::catalog::read_env_file(&env_path);
+    let provider_rows: String = if env.is_empty() {
+        "<tr><td colspan=2 class=\"muted\">no provider keys in the engine .env</td></tr>".into()
+    } else {
+        env.keys()
+            .map(|k| {
+                format!(
+                    "<tr><td><code>{}</code></td><td class=\"ok\">set</td></tr>",
+                    escape_html(k)
+                )
+            })
+            .collect()
+    };
+    let secrets_dir = runtime.data_root().join("secrets");
+    let mut secret_names: Vec<String> = std::fs::read_dir(&secrets_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    secret_names.sort();
+    let secret_rows: String = if secret_names.is_empty() {
+        "<tr><td colspan=2 class=\"muted\">no channel/connector secrets</td></tr>".into()
+    } else {
+        secret_names
+            .iter()
+            .map(|n| {
+                format!(
+                    "<tr><td><code>{}</code></td><td class=\"ok\">set</td>\
+                     <td><form method=post action=/keys/secret/rm style=display:inline>\
+                     <input type=hidden name=name value=\"{}\">\
+                     <button class=\"sm danger\">remove</button></form></td></tr>",
+                    escape_html(n),
+                    escape_html(n)
+                )
+            })
+            .collect()
+    };
+    let model_line = match runtime.model_key_state() {
+        Ok(Some((id, ka_agent_runtime::ModelKeyState::Missing(env)))) => format!(
+            "<div class=\"flash bad\">{} needs <code>{}</code> — on your computer run <code>ka-agent key set {}</code></div>",
+            escape_html(&id),
+            escape_html(&env),
+            escape_html(&env)
+        ),
+        Ok(Some((id, _))) => format!(
+            "<div class=\"flash ok\">{} is ready</div>",
+            escape_html(&id)
+        ),
+        _ => "<div class=\"flash\">no model configured</div>".into(),
+    };
+    let body = format!(
+        "{model_line}\
+         <div class=\"grid2\">\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">provider keys</span><span class=\"tag\">engine .env</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>name</th><th>state</th></tr>{provider_rows}</table></div>\
+         <p class=\"muted small\">set: <code>ka-agent key set NAME</code>. Values are never shown here.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">secrets</span><span class=\"tag\">0600 files</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>name</th><th>state</th><th></th></tr>{secret_rows}</table></div>\
+         <p class=\"muted small\">set: <code>ka-agent secret set NAME</code>. Values are never shown here.</p></div>\
+         </div>"
+    );
+    nav_page_sub(
+        runtime,
+        "/keys",
+        "Keys & secrets",
+        "Which credentials exist (names only) and whether the current model has its key — `ka-agent key` / `ka-agent secret` parity.",
+        body,
+    )
+}
+
+/// `POST /keys/provider`: write one provider key into the engine `.env`
+/// (0600). The value is never rendered or audited.
+pub fn keys_provider(runtime: &Runtime, body: &str) -> crate::Response {
+    let name = form_field(body, "name").trim().to_string();
+    let value = form_field(body, "value");
+    let valid = (2..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !valid {
+        return result_page(
+            runtime,
+            "/keys",
+            "Keys & secrets",
+            "bad key name (A-Z, 0-9, _)",
+            false,
+        );
+    }
+    if value.is_empty() {
+        return result_page(runtime, "/keys", "Keys & secrets", "empty value", false);
+    }
+    let path = ka_agent_port::catalog::engine_env_path(&runtime.engine_home());
+    match ka_agent_port::catalog::upsert_env_file(&path, &name, &value) {
+        Ok(()) => {
+            let mut rec = ka_agent_core::AuditRecord::new("operator", "key.set", &name, None)
+                .with_role(ka_agent_core::ADMIN_ROLE);
+            let _ = runtime.store().append_audit(&mut rec);
+            result_page(
+                runtime,
+                "/keys",
+                "Keys & secrets",
+                &format!("{name} set (0600) — applies the next time a worker starts"),
+                true,
+            )
+        }
+        Err(e) => result_page(runtime, "/keys", "Keys & secrets", &e.to_string(), false),
+    }
+}
+
+/// `POST /keys/secret`: write one secret file (0600). Same "never echo"
+/// rule as the CLI.
+pub fn keys_secret(runtime: &Runtime, body: &str) -> crate::Response {
+    let name = form_field(body, "name").trim().to_string();
+    let value = form_field(body, "value");
+    let valid = (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return result_page(runtime, "/keys", "Keys & secrets", "bad secret name", false);
+    }
+    if value.is_empty() {
+        return result_page(runtime, "/keys", "Keys & secrets", "empty value", false);
+    }
+    let dir = runtime.data_root().join("secrets");
+    match ka_agent_core::secret::store(&name, &value, &dir) {
+        Ok(_path) => {
+            let mut rec = ka_agent_core::AuditRecord::new("operator", "secret.set", &name, None)
+                .with_role(ka_agent_core::ADMIN_ROLE);
+            let _ = runtime.store().append_audit(&mut rec);
+            result_page(
+                runtime,
+                "/keys",
+                "Keys & secrets",
+                &format!("secret {name} set (0600)"),
+                true,
+            )
+        }
+        Err(e) => result_page(runtime, "/keys", "Keys & secrets", &e.to_string(), false),
+    }
+}
+
+/// `POST /mcp/add`: append one MCP server to `[[mcp]]` and hot-reload.
+pub async fn mcp_add(runtime: &Runtime, body: &str) -> crate::Response {
+    let name = form_field(body, "name").trim().to_string();
+    if !ka_agent_core::config::McpServer::valid_name(&name) {
+        return result_page(
+            runtime,
+            "/extensions",
+            "Extensions",
+            "MCP name: [a-z0-9_-], up to 32, not kagent",
+            false,
+        );
+    }
+    let kind = form_field(body, "kind");
+    let command = form_field(body, "command").trim().to_string();
+    let url = form_field(body, "url").trim().to_string();
+    let (command, url) = match kind.as_str() {
+        "http" if !url.is_empty() => (None, Some(url)),
+        "stdio" if !command.is_empty() => {
+            let mut words = command.split_whitespace();
+            let bin = words.next().unwrap_or_default().to_string();
+            (
+                Some((bin, words.map(str::to_string).collect::<Vec<_>>())),
+                None,
+            )
+        }
+        _ => {
+            return result_page(
+                runtime,
+                "/extensions",
+                "Extensions",
+                "give exactly one of a stdio command or an http url",
+                false,
+            );
+        }
+    };
+    let mut server = ka_agent_core::config::McpServer {
+        name: name.clone(),
+        url,
+        ..Default::default()
+    };
+    if let Some((bin, args)) = command {
+        server.command = Some(bin);
+        server.args = args;
+    }
+    for line in form_field(body, "env").lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() {
+                continue;
+            }
+            if kind == "http" {
+                server.headers.insert(k.to_string(), v.to_string());
+            } else {
+                server.env.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    let Some(path) = runtime.config_path() else {
+        return result_page(
+            runtime,
+            "/extensions",
+            "Extensions",
+            "no config file to edit",
+            false,
+        );
+    };
+    let cfg = runtime.config();
+    let mut servers = cfg.mcp.clone();
+    if servers.iter().any(|m| m.name == name) {
+        return result_page(
+            runtime,
+            "/extensions",
+            "Extensions",
+            "an MCP server with that name exists",
+            false,
+        );
+    }
+    servers.push(server);
+    match ka_agent_core::config_file::set_mcp(&path, &servers) {
+        Ok(new_cfg) => {
+            runtime.reload_config(new_cfg, false).await;
+            result_page(
+                runtime,
+                "/extensions",
+                "Extensions",
+                &format!("MCP server {name} added — the next worker starts it"),
+                true,
+            )
+        }
+        Err(e) => result_page(runtime, "/extensions", "Extensions", &e.to_string(), false),
+    }
+}
+
+/// `POST /mcp/rm`: remove one MCP server by name.
+pub async fn mcp_rm(runtime: &Runtime, body: &str) -> crate::Response {
+    let name = form_field(body, "name");
+    let Some(path) = runtime.config_path() else {
+        return result_page(
+            runtime,
+            "/extensions",
+            "Extensions",
+            "no config file to edit",
+            false,
+        );
+    };
+    let cfg = runtime.config();
+    let servers: Vec<_> = cfg.mcp.iter().filter(|m| m.name != name).cloned().collect();
+    if servers.len() == cfg.mcp.len() {
+        return result_page(
+            runtime,
+            "/extensions",
+            "Extensions",
+            "no such MCP server",
+            false,
+        );
+    }
+    match ka_agent_core::config_file::set_mcp(&path, &servers) {
+        Ok(new_cfg) => {
+            runtime.reload_config(new_cfg, false).await;
+            result_page(
+                runtime,
+                "/extensions",
+                "Extensions",
+                &format!("MCP server {name} removed"),
+                true,
+            )
+        }
+        Err(e) => result_page(runtime, "/extensions", "Extensions", &e.to_string(), false),
+    }
+}
+
+/// `GET /extensions`: MCP servers, plugins, hooks and the live tool
+/// inventory — read-only where the CLI mutates (install/enable is the
+/// operator's terminal), visible so the panel covers the surface.
+pub fn extensions(runtime: &Runtime) -> crate::Response {
+    let cfg = runtime.config();
+    let mcp_rows: String = if cfg.mcp.is_empty() {
+        "<tr><td colspan=4 class=\"muted\">none — add one below or with <code>ka-agent mcp add</code></td></tr>".into()
+    } else {
+        cfg.mcp
+            .iter()
+            .map(|m| {
+                let transport = m
+                    .command
+                    .as_ref()
+                    .map(|c| format!("stdio · <code>{}</code>", escape_html(c)))
+                    .or_else(|| {
+                        m.url
+                            .as_ref()
+                            .map(|u| format!("http · <code>{}</code>", escape_html(u)))
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "<tr><td><code>{}</code></td><td>{transport}</td><td>{}</td><td>\
+                     <form method=post action=/mcp/rm style=display:inline>\
+                     <input type=hidden name=name value=\"{}\">\
+                     <button class=\"sm danger\">remove</button></form></td></tr>",
+                    escape_html(&m.name),
+                    escape_html(&m.args.join(" ")),
+                    escape_html(&m.name)
+                )
+            })
+            .collect()
+    };
+    let lock = runtime.data_root().join("plugins/installed.json");
+    let plugins = ka_agent_plugins::Lockfile::load(&lock)
+        .map(|l| {
+            if l.plugins.is_empty() {
+                "<tr><td colspan=3 class=\"muted\">none — <code>ka-agent plugin install</code></td></tr>".to_string()
+            } else {
+                l.plugins
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                            escape_html(&p.id),
+                            escape_html(&p.version),
+                            if p.enabled { "<span class=\"ok\">enabled</span>" } else { "disabled" }
+                        )
+                    })
+                    .collect()
+            }
+        })
+        .unwrap_or_else(|_| "<tr><td colspan=3 class=\"muted\">no plugin lockfile</td></tr>".into());
+    let hooks: String = if cfg.hooks.is_empty() {
+        "<tr><td colspan=3 class=\"muted\">none — <code>[[hooks]]</code></td></tr>".into()
+    } else {
+        cfg.hooks
+            .iter()
+            .map(|h| {
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td><td><code>{}</code></td></tr>",
+                    escape_html(&h.on),
+                    escape_html(h.tool.as_deref().unwrap_or("—")),
+                    escape_html(&h.command)
+                )
+            })
+            .collect()
+    };
+    let tools = runtime.tools();
+    let tools_html = if tools.is_empty() {
+        "<div class=\"empty\">no live inventory — the worker starts with the next message</div>"
+            .to_string()
+    } else {
+        format!(
+            "<div class=\"actions\">{}</div>",
+            tools
+                .iter()
+                .map(|t| format!("<span class=\"tag\"><code>{}</code></span>", escape_html(t)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let body = format!(
+        "<div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">MCP servers</span><span class=\"tag\">{}</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>name</th><th>transport</th><th>args</th></tr>{mcp_rows}</table></div>\
+         <p class=\"muted small\">Tools appear as <code>&lt;server&gt;__&lt;tool&gt;</code>. Secrets resolve at worker start.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">plugins</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>id</th><th>version</th><th>state</th></tr>{plugins}</table></div>\
+         <p class=\"muted small\">Install/enable from the terminal: <code>ka-agent plugin</code>.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">hooks</span><span class=\"tag\">{}</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>event</th><th>tool</th><th>command</th></tr>{hooks}</table></div></div>\
+         </div>\
+         <h2>Live tools</h2>{tools_html}",
+        cfg.mcp.len(),
+        cfg.hooks.len()
+    );
+    nav_page_sub(
+        runtime,
+        "/extensions",
+        "Extensions",
+        "What the engine can reach beyond its hands: MCP servers, plugins, hooks and the live tool inventory.",
+        body,
+    )
+}
+
+/// `GET /logs`: the daemon log's tail (the same file `ka-agent logs` reads).
+pub fn logs(runtime: &Runtime) -> crate::Response {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = runtime.data_root().join("logs/daemon.log");
+    // Read only the last 256 KiB: a rotated log can be large, and the page
+    // only shows the tail.
+    let mut text = String::new();
+    if let Ok(mut f) = std::fs::File::open(&path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = len.saturating_sub(256 * 1024);
+        if f.seek(SeekFrom::Start(start)).is_ok() {
+            let mut buf = Vec::new();
+            let _ = f.read_to_end(&mut buf);
+            text = String::from_utf8_lossy(&buf).into_owned();
+            if start > 0 {
+                // Drop the partial first line of a mid-line seek.
+                if let Some(nl) = text.find('\n') {
+                    text = text[nl + 1..].to_string();
+                }
+            }
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let tail: String = lines
+        .iter()
+        .skip(lines.len().saturating_sub(300))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "<p class=\"muted\">{} · last {} of {} line(s)</p>\
+         {}",
+        escape_html(&path.display().to_string()),
+        lines.len().min(300),
+        lines.len(),
+        if tail.is_empty() {
+            "<div class=\"empty\">the log is empty (ka-agent logs -f follows the journal)</div>"
+                .to_string()
+        } else {
+            format!("<pre>{}</pre>", escape_html(&tail))
+        }
+    );
+    nav_page_sub(
+        runtime,
+        "/logs",
+        "Logs",
+        "The daemon log tail — the same file `ka-agent logs` reads.",
+        body,
+    )
+}
+
+/// `POST /doctor/fix`: the binary's safe repairs (0700 roots, 0600 secret
+/// files), with the child's own output.
+pub fn doctor_fix(runtime: &Runtime) -> crate::Response {
+    let Ok(exe) = std::env::current_exe() else {
+        return result_page(
+            runtime,
+            "/doctor",
+            "Doctor",
+            "cannot locate the binary",
+            false,
+        );
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("doctor").arg("--fix");
+    if let Some(cfg) = runtime.config_path() {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.env("KA_AGENT_DATA_DIR", runtime.data_root());
+    let (ok, text) = match cmd.output() {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !o.status.success() {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                text = if err.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n{err}")
+                };
+            }
+            (o.status.success(), text)
+        }
+        Err(e) => (false, format!("doctor did not start: {e}")),
+    };
+    result_page(
+        runtime,
+        "/doctor",
+        "Doctor",
+        if text.is_empty() {
+            "doctor --fix finished"
+        } else {
+            &text
+        },
+        ok,
+    )
+}
+
+/// `POST /keys/secret/rm`: delete one secret file (the CLI's `secret rm`).
+pub fn keys_secret_rm(runtime: &Runtime, body: &str) -> crate::Response {
+    let name = form_field(body, "name").trim().to_string();
+    let valid = (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid || name == "." || name == ".." {
+        return result_page(runtime, "/keys", "Keys & secrets", "bad secret name", false);
+    }
+    let path = runtime.data_root().join("secrets").join(&name);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            let mut rec = ka_agent_core::AuditRecord::new("operator", "secret.rm", &name, None)
+                .with_role(ka_agent_core::ADMIN_ROLE);
+            let _ = runtime.store().append_audit(&mut rec);
+            result_page(
+                runtime,
+                "/keys",
+                "Keys & secrets",
+                &format!("secret {name} removed"),
+                true,
+            )
+        }
+        Err(e) => result_page(runtime, "/keys", "Keys & secrets", &e.to_string(), false),
+    }
+}
+
+/// `POST /backup`: run the binary's own `backup` (no user path input) and
+/// show its output. Restore is destructive and stays in the CLI.
+pub fn backup_now(runtime: &Runtime) -> crate::Response {
+    let Some(cfg) = runtime.config_path() else {
+        return result_page(
+            runtime,
+            "/status",
+            "Status",
+            "no config file — nothing to back up",
+            false,
+        );
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return result_page(
+            runtime,
+            "/status",
+            "Status",
+            "cannot locate the binary",
+            false,
+        );
+    };
+    let out = std::process::Command::new(exe)
+        .arg("backup")
+        .arg("--config")
+        .arg(&cfg)
+        .env("KA_AGENT_DATA_DIR", runtime.data_root())
+        .output();
+    let (ok, text) = match out {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !o.status.success() {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                text = if err.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n{err}")
+                };
+            }
+            (o.status.success(), text)
+        }
+        Err(e) => (false, format!("backup did not start: {e}")),
+    };
+    if ok {
+        let mut rec = ka_agent_core::AuditRecord::new("operator", "backup.create", "backups", None)
+            .with_role(ka_agent_core::ADMIN_ROLE);
+        let _ = runtime.store().append_audit(&mut rec);
+    }
+    result_page(
+        runtime,
+        "/status",
+        "Status",
+        if text.is_empty() {
+            "backup done"
+        } else {
+            &text
+        },
+        ok,
+    )
+}
+
+/// The full `ka-agent doctor --json` (pin, contract hash, sandbox, live
+/// checks), rendered beside the in-process checks. Args are fixed: the
+/// admin page supplies no input.
+fn full_doctor(runtime: &Runtime) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("doctor").arg("--json");
+    if let Some(cfg) = runtime.config_path() {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.env("KA_AGENT_DATA_DIR", runtime.data_root());
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let checks = v["checks"].as_array()?;
+    let rows: String = checks
+        .iter()
+        .map(|c| {
+            let level = c["level"].as_str().unwrap_or("info");
+            let (mark, class) = match level {
+                "ok" => ("✓", "ok"),
+                "warn" => ("!", "warn"),
+                "fail" => ("✗", "bad"),
+                _ => ("·", "muted"),
+            };
+            format!(
+                "<tr><td class=\"{class}\">{mark}</td><td>{}</td></tr>",
+                escape_html(c["text"].as_str().unwrap_or(""))
+            )
+        })
+        .collect();
+    Some(format!(
+        "<div class=\"card\"><div class=\"cardhead\"><span class=\"k\">full doctor</span><span class=\"tag\">ka-agent doctor --json</span></div>\
+         <div class=\"tablewrap\"><table><tr><th></th><th>check</th></tr>{rows}</table></div></div>"
+    ))
+}
+
+/// `GET /doctor`: the in-process half of `ka-agent doctor` — config,
+/// model key, store, data-root permissions, web publication and channel
+/// tokens, each with the remedy.
+pub fn doctor(runtime: &Runtime) -> crate::Response {
+    let mut rows: Vec<(bool, String, String)> = Vec::new(); // (ok, check, detail)
+    let cfg = runtime.config();
+    rows.push((
+        true,
+        "config".into(),
+        format!(
+            "loaded from {}",
+            runtime
+                .config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no file)".into())
+        ),
+    ));
+    match runtime.model_key_state() {
+        Ok(Some((id, ka_agent_runtime::ModelKeyState::Present))) => {
+            rows.push((true, "model".into(), format!("{id} · key present")))
+        }
+        Ok(Some((id, ka_agent_runtime::ModelKeyState::Keyless))) => {
+            rows.push((true, "model".into(), format!("{id} · no key needed")))
+        }
+        Ok(Some((id, ka_agent_runtime::ModelKeyState::Missing(env)))) => rows.push((
+            false,
+            "model".into(),
+            format!("{id} needs {env} — `ka-agent key set {env}`"),
+        )),
+        Ok(None) => rows.push((false, "model".into(), "no model — `ka-agent setup`".into())),
+        Err(e) => rows.push((false, "model".into(), e.to_string())),
+    }
+    let version = runtime.store().user_version().unwrap_or(0);
+    rows.push((
+        version > 0,
+        "store".into(),
+        format!("state.db schema v{version}, {} sessions", {
+            runtime
+                .store()
+                .list_recent_sessions(1000)
+                .map(|s| s.len())
+                .unwrap_or(0)
+        }),
+    ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let root = runtime.data_root();
+        let mode = std::fs::metadata(&root)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0);
+        let ok = mode & 0o077 == 0;
+        rows.push((
+            ok,
+            "data root".into(),
+            format!(
+                "{} · {:03o}{}",
+                root.display(),
+                mode,
+                if ok {
+                    ""
+                } else {
+                    " — others can enter; `ka-agent doctor --fix` tightens it"
+                }
+            ),
+        ));
+    }
+    let web_url = runtime
+        .store()
+        .meta_get("web.url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty());
+    rows.push((
+        web_url.is_some() || !cfg.web.enabled,
+        "web".into(),
+        web_url.unwrap_or_else(|| "not published (disabled or failed to bind)".into()),
+    ));
+    let secrets = runtime.data_root().join("secrets");
+    let token_state = |enabled: bool, name: Option<&str>| -> (bool, String) {
+        if !enabled {
+            return (true, "off".into());
+        }
+        match name {
+            Some(n) if secrets.join(n).is_file() => (true, format!("secret {n} present")),
+            Some(n) => (
+                false,
+                format!("secret {n} missing — `ka-agent secret set {n}`"),
+            ),
+            None => (false, "enabled without token_secret".into()),
+        }
+    };
+    let (t_ok, t_text) = token_state(cfg.telegram.enabled, cfg.telegram.token_secret.as_deref());
+    rows.push((t_ok, "telegram".into(), t_text));
+    let (m_ok, m_text) = token_state(cfg.matrix.enabled, cfg.matrix.token_secret.as_deref());
+    rows.push((m_ok, "matrix".into(), m_text));
+    let html: String = rows
+        .iter()
+        .map(|(ok, check, detail)| {
+            let mark = if *ok {
+                "<span class=\"ok\">✓</span>"
+            } else {
+                "<span class=\"bad\">✗</span>"
+            };
+            format!(
+                "<tr><td>{mark}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(check),
+                escape_html(detail)
+            )
+        })
+        .collect();
+    nav_page_sub(
+        runtime,
+        "/doctor",
+        "Doctor",
+        "The in-process health checks: config, model key, store, data-root permissions, web publication and channel tokens.",
+        format!(
+            "<div class=\"tablewrap\"><table><tr><th></th><th>check</th><th>detail</th></tr>{html}</table></div>\
+             <form method=post action=/doctor/fix style=\"margin:.6rem 0\">\
+             <button>apply safe fixes (0700 roots, 0600 secrets)</button></form>\
+             <h2>Full doctor</h2>{}",
+            full_doctor(runtime).unwrap_or_else(|| {
+                "<div class=\"empty\">the full doctor could not run here</div>".to_string()
+            })
+        ),
+    )
 }
 
 /// `GET /status`: the operator report plus the settings with the CLI that
@@ -146,59 +1436,123 @@ pub fn status(runtime: &Runtime) -> crate::Response {
     let card = |k: &str, v: String| {
         format!("<div class='card'><div class='k'>{k}</div><div class='v'>{v}</div></div>")
     };
-    let report_line = |i: usize| {
-        report
-            .render(&runtime.now_zoned())
-            .lines()
-            .nth(i)
-            .unwrap_or("")
-            .to_string()
-    };
     let usd = match report.limit_usd {
         Some(cap) => format!("${:.4} / ${cap:.2}", report.spent_usd),
         None => format!("${:.4}", report.spent_usd),
     };
     let settings = settings_form(runtime);
-    let body = format!(
-        "<div class='statgrid'>\
-         {}{}{}{}{}{}\
-         </div>\
-         <h2>settings</h2>\
-         {settings}\
-         <h2>channels</h2><ul>{channels}</ul>",
-        card("state", escape_html(&report_line(0))),
-        card(
-            "model",
-            escape_html(cfg.model.as_deref().unwrap_or("(none)"))
-        ),
-        card("today", escape_html(&usd)),
-        card(
-            "queue / approvals",
-            format!("{} / {}", report.queue, report.pending_approvals)
-        ),
-        card(
-            "memory",
-            report
-                .memory
-                .as_ref()
-                .map(|m| escape_html(&m.line()))
-                .unwrap_or_else(|| "—".into())
-        ),
-        card(
-            "worker",
-            if report.worker_running {
-                "running".into()
-            } else {
-                "stopped (starts with your next message)".into()
-            }
+    let usd_bar = report.limit_usd.map(|cap| {
+        let pct = (report.spent_usd / cap * 100.0).clamp(0.0, 100.0);
+        format!(
+            "<div class=\"bar\"><i style=\"width:{pct:.1}%\"></i></div>\
+             <div class=\"muted small\">${:.4} of ${cap:.2} today</div>",
+            report.spent_usd
+        )
+    });
+    let token_bar = report.limit_tokens.map(|cap| {
+        let pct = (report.spent_tokens as f64 / cap as f64 * 100.0).clamp(0.0, 100.0);
+        format!(
+            "<div class=\"bar\"><i style=\"width:{pct:.1}%\"></i></div>\
+             <div class=\"muted small\">{} of {cap} tokens today</div>",
+            report.spent_tokens
+        )
+    });
+    let stderr = runtime.worker_stderr_tail();
+    let stderr_html = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h2>Worker stderr</h2><details><summary class=\"muted\">last {} line(s)</summary><pre>{}</pre></details>",
+            stderr.len(),
+            escape_html(&stderr.join("\n"))
+        )
+    };
+    let state = card(
+        "state",
+        format!(
+            "● {}{}",
+            escape_html(&report.status.to_lowercase()),
+            if report.private { " · private" } else { "" }
         ),
     );
-    nav_page(runtime, "/status", "Status", body)
+    let model = card(
+        "model",
+        escape_html(cfg.model.as_deref().unwrap_or("(none)")),
+    );
+    let mode = card(
+        "mode / effort",
+        format!(
+            "{} / {}",
+            escape_html(&report.mode),
+            escape_html(runtime.effort().as_deref().unwrap_or("default"))
+        ),
+    );
+    let today = card("today", escape_html(&usd));
+    let queue = card(
+        "queue / approvals",
+        format!("{} / {}", report.queue, report.pending_approvals),
+    );
+    let memory = card(
+        "memory",
+        report
+            .memory
+            .as_ref()
+            .map(|m| escape_html(&m.line()))
+            .unwrap_or_else(|| "—".into()),
+    );
+    let worker = card(
+        "worker",
+        if report.worker_running {
+            "running".into()
+        } else {
+            "stopped (starts with your next message)".into()
+        },
+    );
+    let role = card(
+        "role / tools",
+        format!(
+            "{} · {} tools",
+            escape_html(&runtime.active_role()),
+            runtime.tools().len()
+        ),
+    );
+    let budget = format!(
+        "{}{}",
+        usd_bar
+            .map(|b| format!(
+                "<div class=\"card\"><div class=\"cardhead\"><span class=\"k\">budget (USD)</span></div>{b}</div>"
+            ))
+            .unwrap_or_default(),
+        token_bar
+            .map(|b| format!(
+                "<div class=\"card\"><div class=\"cardhead\"><span class=\"k\">budget (tokens)</span></div>{b}</div>"
+            ))
+            .unwrap_or_default()
+    );
+    let body = format!(
+        "<div class='statgrid'>\
+         {state}{model}{mode}{today}{queue}{memory}{worker}{role}\
+         </div>\
+         {budget}\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">backup</span><span class=\"tag\">state.db + memory + notes + config</span></div>\
+         <form method=post action=/backup><button class=\"primary\">backup now</button></form>\
+         <p class=\"muted small\">Writes <code>&lt;data&gt;/backups/&lt;timestamp&gt;</code> and prunes to the newest 7 — the same snapshot <code>ka-agent backup</code> takes. Restore stays in the CLI.</p></div>\
+         <h2>settings</h2>\
+         {settings}\
+         <h2>channels</h2><ul>{channels}</ul>{stderr_html}"
+    );
+    nav_page_sub(
+        runtime,
+        "/status",
+        "Status",
+        "Session, model, spend, queue, worker and channels at a glance.",
+        body,
+    )
 }
 
 /// The settings form: every `KEYS` entry marked `web`, its control chosen
 /// by kind, the current value read from the config file, and the key's
-/// apply timing beside it (plan 3.2: one registry, one form).
+/// apply timing beside it (one registry, one form).
 fn settings_form(runtime: &Runtime) -> String {
     use ka_agent_core::config_keys::{KEYS, Kind};
     let Some(path) = runtime.config_path() else {
@@ -217,9 +1571,8 @@ fn settings_form(runtime: &Runtime) -> String {
                 ["true", "false"]
                     .iter()
                     .map(|v| format!(
-                        "<option value='{v}'{}{}>{v}</option>",
-                        if current == *v { " selected" } else { "" },
-                        ""
+                        "<option value='{v}'{}>{v}</option>",
+                        if current == *v { " selected" } else { "" }
                     ))
                     .collect::<String>()
             ),
@@ -255,22 +1608,860 @@ fn settings_form(runtime: &Runtime) -> String {
             ),
         };
         rows.push_str(&format!(
-            "<tr><td><code>{}</code><div class='muted'>{}</div></td>\
-             <td>{control}</td><td class='muted'>{}</td></tr>",
+            "<tr><td><code>{}</code><div class='muted small'>{}</div></td>\
+             <td>{control}</td><td class='muted small nowrap'>{}</td></tr>",
             escape_html(spec.path),
             escape_html(spec.doc),
             spec.apply.label()
         ));
     }
     format!(
-        "<form method='post' action='/settings'><table>{rows}</table>\
-         <button class='primary'>save</button>\
-         <span class='muted'>empty fields are left alone; each key shows when it applies</span></form>"
+        "<div class=\"card\"><div class=\"cardhead\"><span class=\"k\">editable here</span><span class=\"tag\">web-safe keys</span></div>\
+         <form method='post' action='/settings'><div class=\"tablewrap\"><table>{rows}</table></div>\
+         <p><button class='primary'>save</button> \
+         <span class='muted small'>empty fields are left alone; each key shows when it applies</span></p></form></div>"
     )
+}
+
+/// `GET /profiles`: profiles on disk, the configured roles, and the linked
+/// identities with their role (ADR-0002).
+pub fn profiles(runtime: &Runtime, store: &Store) -> crate::Response {
+    let cfg = runtime.config();
+    let active = ka_agent_core::layout::profile_name();
+    let profiles = ka_agent_core::layout::list_profiles();
+    let mut profile_rows = String::new();
+    for name in &profiles {
+        let mark = if *name == active {
+            " <span class=\"tag\">active</span>"
+        } else {
+            ""
+        };
+        let mut actions = format!(
+            "<form method=post action=/profiles/use style=display:inline>\
+             <input type=hidden name=name value=\"{}\"><button class=sm>use</button></form>",
+            escape_html(name)
+        );
+        if *name != active {
+            actions.push_str(&format!(
+                "<form method=post action=/profiles/remove style=display:inline>\
+                 <input type=hidden name=name value=\"{}\">\
+                 <input name=confirm placeholder=\"type name\" size=8>\
+                 <button class=\"sm danger\">remove</button></form>",
+                escape_html(name)
+            ));
+        }
+        profile_rows.push_str(&format!(
+            "<tr><td><code>{}</code>{mark}</td><td class=\"actions\">{actions}</td></tr>",
+            escape_html(name)
+        ));
+    }
+    if profile_rows.is_empty() {
+        profile_rows.push_str("<tr><td class='muted' colspan='2'>no profiles on disk</td></tr>");
+    }
+    let roles: String = cfg
+        .roles
+        .iter()
+        .map(|r| {
+            format!(
+                "<tr><td><a href=\"/roles/edit/{}\"><code>{}</code></a></td><td>{}</td><td>{}</td><td class=\"nowrap\">{}</td></tr>",
+                escape_html(&r.name),
+                escape_html(&r.name),
+                escape_html(&r.mode),
+                if r.allow.is_empty() {
+                    "—".to_string()
+                } else {
+                    escape_html(&r.allow.join(", "))
+                },
+                r.budget_daily_usd
+                    .map(|u| format!("${u:.2}"))
+                    .unwrap_or_else(|| "profile".into())
+            )
+        })
+        .collect();
+    let mut role_options = String::new();
+    for name in std::iter::once(ka_agent_core::ADMIN_ROLE.to_string())
+        .chain(cfg.roles.iter().map(|r| r.name.clone()))
+    {
+        role_options.push_str(&format!("<option value='{name}'>{name}</option>"));
+    }
+    let identities = store.list_identities().unwrap_or_default();
+    let mut identity_rows = String::new();
+    for id in &identities {
+        let options: String = std::iter::once(ka_agent_core::ADMIN_ROLE.to_string())
+            .chain(cfg.roles.iter().map(|r| r.name.clone()))
+            .map(|name| {
+                format!(
+                    "<option value='{name}'{}>{name}</option>",
+                    if id.role == name { " selected" } else { "" }
+                )
+            })
+            .collect();
+        identity_rows.push_str(&format!(
+            "<tr><td><code>{}:{}</code></td><td><form method='post' action='/identities/role'>\
+             <input type='hidden' name='channel' value='{}'>\
+             <input type='hidden' name='address' value='{}'>\
+             <select name='role'>{options}</select> <button class=sm>set</button></form>\
+             <form method=post action=/identities/unlink style=display:inline>\
+             <input type=hidden name=channel value='{}'>\
+             <input type=hidden name=address value='{}'>\
+             <button class=\"sm danger\">unlink</button></form></td></tr>",
+            escape_html(&id.channel),
+            escape_html(&id.address),
+            escape_html(&id.channel),
+            escape_html(&id.address),
+            escape_html(&id.channel),
+            escape_html(&id.address)
+        ));
+    }
+    if identity_rows.is_empty() {
+        identity_rows.push_str("<tr><td class='muted' colspan='2'>no identities linked</td></tr>");
+    }
+    let body = format!(
+        "<div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">profiles</span><span class=\"tag\">{count}</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>name</th><th>actions</th></tr>{profile_rows}</table></div>\
+         <form method=post action=/profiles/create>\
+         <label class=field><span>new profile</span><input name=name placeholder=\"work\" required pattern=\"[a-z0-9-]{{1,32}}\"></label>\
+         <label class=field><span>copy the config from</span><input name=from placeholder=\"default\"></label>\
+         <button class=primary>create profile</button></form>\
+         <p class=\"muted small\">A one-time config copy (minus channels) that keeps roles and <code>[tools]</code> and claims a free web port.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">roles (config)</span><span class=\"tag\">{role_count}</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>name</th><th>mode</th><th>allow</th><th>budget/day</th></tr>{roles}</table></div>\
+         <p class=\"muted small\">Roles are defined in <code>ka-agent.toml</code> (<code>[[role]]</code>); the editor writes that file and the daemon hot-reloads it.</p>\
+         <p><a class=\"btn\" href=/roles/new>new role</a></p>\
+         <form method=post action=/tools/disable>\
+         <label class=field><span>[tools] disable — profile-wide engine baseline (also admin's)</span>\
+         <input name=specs value=\"{tools}\" placeholder=\"tool:bash, mcp:github\"></label>\
+         <button>save tools baseline</button></form></div>\
+         </div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">linked identities</span><span class=\"tag\">{identity_count}</span></div>\
+         <div class=\"tablewrap\"><table><tr><th>identity</th><th>role</th></tr>{identity_rows}</table></div>\
+         <p class=\"muted small\">Link from the terminal with <code>ka-agent identity link &lt;channel&gt; &lt;address&gt; --role &lt;role&gt;</code>, or here:</p>\
+         <form method=post action=/identities/link class=formrow>\
+         <input name=channel placeholder=telegram size=9 required pattern=\"[a-z0-9-]+\">\
+         <input name=address placeholder=\"12345 / @user:domain\" style=\"flex:1\" required>\
+         <select name=role>{role_options}</select> <button class=primary>link identity</button></form></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">new web user</span></div>\
+         <form method=post action=/pair/issue class=formrow>\
+         <select name=role>{role_options}</select> <button class=primary>issue pairing code</button></form>\
+         <p class=\"muted small\">Open <code>/pair</code> in that browser and enter the code; it gets that role's chat only (10 minutes, one use).</p></div>",
+        count = profiles.len(),
+        role_count = cfg.roles.len(),
+        identity_count = identities.len(),
+        tools = escape_html(&cfg.tools.disable.join(", "))
+    );
+    nav_page_sub(
+        runtime,
+        "/profiles",
+        "Profiles & roles",
+        "Profiles on disk, the configured roles, and who is linked as which role.",
+        body,
+    )
+}
+
+/// A comma-separated form field into a list (empty entries dropped).
+fn csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `GET /roles/new` and `GET /roles/edit/<name>`: the role editor. Roles
+/// are config (`[[role]]`), so the form writes the same file the CLI edits
+/// and the daemon's hot reload applies it.
+pub fn role_edit(runtime: &Runtime, name: Option<&str>) -> crate::Response {
+    let cfg = runtime.config();
+    let existing = name.and_then(|n| cfg.roles.iter().find(|r| r.name == n).cloned());
+    if name.is_some() && existing.is_none() {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "no such role in the config",
+            false,
+        );
+    }
+    let editing = existing.is_some();
+    let role = existing
+        .clone()
+        .unwrap_or_else(|| ka_agent_core::config::RoleSpec {
+            name: String::new(),
+            mode: "ask".into(),
+            ..Default::default()
+        });
+    let mode_options: String = ka_agent_channels::commands::MODES
+        .iter()
+        .map(|(m, desc)| {
+            format!(
+                "<option value=\"{m}\"{}>{m} — {desc}</option>",
+                if role.mode == *m { " selected" } else { "" }
+            )
+        })
+        .collect();
+    let name_field = if editing {
+        format!(
+            "<input name=name value=\"{}\" readonly><input type=hidden name=original value=\"{}\">",
+            escape_html(&role.name),
+            escape_html(&role.name)
+        )
+    } else {
+        "<input name=name placeholder=\"guest\" required pattern=\"[a-z0-9-]{1,32}\"><input type=hidden name=original value=\"\">".to_string()
+    };
+    let delete = if editing {
+        format!(
+            "<form method=post action=/roles/delete style=\"margin-top:.6rem\">\
+             <input type=hidden name=name value=\"{}\">\
+             <label class=field><span>force (a role still bound to identities is refused without it)</span>\
+             <input name=force value=\"\" placeholder=\"1\"></label>\
+             <button class=\"danger\">delete role</button></form>",
+            escape_html(&role.name)
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<div class=\"card\" style=\"max-width:42rem\">\
+         <form method=post action=/roles/save>\
+         <label class=field><span>name</span>{name_field}</label>\
+         <label class=field><span>mode (ceiling and default)</span><select name=mode>{mode_options}</select></label>\
+         <label class=field><span>allow — exact hand names, comma-separated (or use disable)</span>\
+         <input name=allow value=\"{}\" placeholder=\"read, grep, kagent__notes_search\"></label>\
+         <label class=field><span>disable — engine feature specs (subtractive; not with allow)</span>\
+         <input name=disable value=\"{}\" placeholder=\"tool:bash, mcp:github\"></label>\
+         <label class=field><span>workspace (empty = <code>&lt;data&gt;/roles/&lt;name&gt;/workspace</code>)</span>\
+         <input name=workspace value=\"{}\" placeholder=\"~/projects/shared\"></label>\
+         <label class=field><span>budget per day (USD, empty = the profile budget)</span>\
+         <input name=budget type=number step=any min=0 value=\"{}\"></label>\
+         <label class=field><span>commands (empty = all the role may reach; help/status always)</span>\
+         <input name=commands value=\"{}\" placeholder=\"status, help, mode, skills, history, memory, cron\"></label>\
+         <p><button class=primary>save role</button> <a href=\"/profiles\">cancel</a></p></form>\
+         {delete}</div>",
+        escape_html(&role.allow.join(", ")),
+        escape_html(&role.disable.join(", ")),
+        escape_html(
+            &role
+                .workspace
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ),
+        role.budget_daily_usd
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
+        escape_html(&role.commands.join(", ")),
+    );
+    nav_page_sub(
+        runtime,
+        "/profiles",
+        if editing { "Edit role" } else { "New role" },
+        "A role is config policy: session, memory, tools, grants, budget and commands. Identities bind to it.",
+        body,
+    )
+}
+
+/// `POST /roles/save`: validate and write `[[role]]` through the core
+/// config editor (the whole file is re-validated before it is written).
+pub async fn role_save(runtime: &Runtime, body: &str) -> crate::Response {
+    let original = form_field(body, "original");
+    let name = form_field(body, "name").trim().to_string();
+    if !ka_agent_core::valid_role_name(&name) {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "role name must be [a-z0-9-], 1..=32",
+            false,
+        );
+    }
+    if !original.is_empty() && original != name {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "renaming a role is not supported (identities and crons reference it)",
+            false,
+        );
+    }
+    let Some(path) = runtime.config_path() else {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "no config file to edit",
+            false,
+        );
+    };
+    let cfg = runtime.config();
+    let mut roles = cfg.roles.clone();
+    let mut role = if original.is_empty() {
+        ka_agent_core::config::RoleSpec {
+            name: name.clone(),
+            grants: Default::default(),
+            ..Default::default()
+        }
+    } else {
+        match roles.iter().find(|r| r.name == original) {
+            Some(r) => r.clone(),
+            None => {
+                return result_page(
+                    runtime,
+                    "/profiles",
+                    "Profiles & roles",
+                    "no such role any more",
+                    false,
+                );
+            }
+        }
+    };
+    let mode = form_field(body, "mode");
+    role.mode = if mode.is_empty() { "ask".into() } else { mode };
+    role.allow = csv_list(&form_field(body, "allow"));
+    role.disable = csv_list(&form_field(body, "disable"));
+    let workspace = form_field(body, "workspace").trim().to_string();
+    role.workspace = (!workspace.is_empty()).then(|| std::path::PathBuf::from(workspace));
+    let budget = form_field(body, "budget").trim().to_string();
+    role.budget_daily_usd = if budget.is_empty() {
+        None
+    } else {
+        match budget.parse::<f64>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return result_page(
+                    runtime,
+                    "/profiles",
+                    "Profiles & roles",
+                    "budget is not a number",
+                    false,
+                );
+            }
+        }
+    };
+    role.commands = csv_list(&form_field(body, "commands"));
+    if original.is_empty() {
+        roles.push(role);
+    } else if let Some(slot) = roles.iter_mut().find(|r| r.name == original) {
+        *slot = role;
+    }
+    match ka_agent_core::config_file::set_roles(&path, &roles) {
+        Ok(new_cfg) => {
+            runtime.reload_config(new_cfg, false).await;
+            result_page(
+                runtime,
+                "/profiles",
+                "Profiles & roles",
+                &format!("role {name} saved — workers pick it up with the next message"),
+                true,
+            )
+        }
+        Err(e) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+/// `POST /roles/delete`: refuse while identities or crons still reference
+/// the role unless `force=1`.
+pub async fn role_delete(runtime: &Runtime, body: &str) -> crate::Response {
+    let name = form_field(body, "name");
+    let force = form_field(body, "force") == "1";
+    let Some(path) = runtime.config_path() else {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "no config file to edit",
+            false,
+        );
+    };
+    let cfg = runtime.config();
+    let mut roles = cfg.roles.clone();
+    let Some(index) = roles.iter().position(|r| r.name == name) else {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "no such role",
+            false,
+        );
+    };
+    let identities = runtime
+        .store()
+        .list_identities()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| i.role == name)
+        .count();
+    let crons = runtime
+        .list_crons()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| {
+            t.payload
+                .as_deref()
+                .and_then(ka_agent_core::CronSpec::from_payload)
+                .and_then(|s| s.role)
+                .as_deref()
+                == Some(name.as_str())
+        })
+        .count();
+    if (identities > 0 || crons > 0) && !force {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &format!(
+                "role {name} is still bound to {identities} identity(ies) and {crons} cron(s) — reassign/remove them or submit force=1"
+            ),
+            false,
+        );
+    }
+    roles.remove(index);
+    match ka_agent_core::config_file::set_roles(&path, &roles) {
+        Ok(new_cfg) => {
+            runtime.reload_config(new_cfg, false).await;
+            result_page(
+                runtime,
+                "/profiles",
+                "Profiles & roles",
+                &format!("role {name} deleted"),
+                true,
+            )
+        }
+        Err(e) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+/// `POST /tools/disable`: the profile-wide engine baseline (also admin's).
+pub async fn tools_disable(runtime: &Runtime, body: &str) -> crate::Response {
+    let Some(path) = runtime.config_path() else {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "no config file to edit",
+            false,
+        );
+    };
+    let specs = csv_list(&form_field(body, "specs"));
+    match ka_agent_core::config_file::set_tools_disable(&path, &specs) {
+        Ok(new_cfg) => {
+            runtime.reload_config(new_cfg, false).await;
+            result_page(
+                runtime,
+                "/profiles",
+                "Profiles & roles",
+                &format!("tools.disable has {} spec(s)", specs.len()),
+                true,
+            )
+        }
+        Err(e) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+/// `POST /identities/link`: bind a channel identity to a role (the CLI
+/// `ka-agent identity link … --role …`).
+pub fn identity_link(runtime: &Runtime, body: &str) -> crate::Response {
+    let channel = form_field(body, "channel").trim().to_string();
+    let address = form_field(body, "address").trim().to_string();
+    let role = form_field(body, "role").trim().to_string();
+    let channel_ok = !channel.is_empty()
+        && channel
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !channel_ok || address.is_empty() || address.chars().any(char::is_control) {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "channel/address are not valid",
+            false,
+        );
+    }
+    let cfg = runtime.config();
+    if role != ka_agent_core::ADMIN_ROLE && !cfg.roles.iter().any(|r| r.name == role) {
+        return result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "role is not defined in the config",
+            false,
+        );
+    }
+    match runtime
+        .store()
+        .link_identity_as(&channel, &address, "web", &role)
+    {
+        Ok(true) => {
+            let mut rec = ka_agent_core::AuditRecord::new(
+                "operator",
+                ka_agent_core::audit::actions::IDENTITY_LINK,
+                &format!("{channel}:{address}"),
+                Some(format!("role {role}")),
+            )
+            .with_role(ka_agent_core::ADMIN_ROLE);
+            let _ = runtime.store().append_audit(&mut rec);
+            result_page(
+                runtime,
+                "/profiles",
+                "Profiles & roles",
+                &format!("linked {channel}:{address} as role {role}"),
+                true,
+            )
+        }
+        Ok(false) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &format!("{channel}:{address} was already linked (use set role to change it)"),
+            false,
+        ),
+        Err(e) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+/// `POST /identities/unlink`: remove one binding (audited).
+pub fn identity_unlink(runtime: &Runtime, body: &str) -> crate::Response {
+    let channel = form_field(body, "channel");
+    let address = form_field(body, "address");
+    match runtime.store().unlink_identity(&channel, &address) {
+        Ok(true) => {
+            let mut rec = ka_agent_core::AuditRecord::new(
+                "operator",
+                ka_agent_core::audit::actions::IDENTITY_UNLINK,
+                &format!("{channel}:{address}"),
+                None,
+            )
+            .with_role(ka_agent_core::ADMIN_ROLE);
+            let _ = runtime.store().append_audit(&mut rec);
+            result_page(
+                runtime,
+                "/profiles",
+                "Profiles & roles",
+                &format!("unlinked {channel}:{address}"),
+                true,
+            )
+        }
+        Ok(false) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            "no such identity",
+            false,
+        ),
+        Err(e) => result_page(
+            runtime,
+            "/profiles",
+            "Profiles & roles",
+            &e.to_string(),
+            false,
+        ),
+    }
+}
+
+/// `POST /identities/role`: reassign one identity's role (audited with the
+/// admin role, like the CLI).
+pub fn identity_role(store: &Store, body: &str) -> crate::Response {
+    let channel = form_field(body, "channel");
+    let address = form_field(body, "address");
+    let role = form_field(body, "role");
+    if channel.is_empty() || address.is_empty() || role.trim().is_empty() {
+        return Response::bad_request("channel, address and role are required");
+    }
+    match store.set_identity_role(&channel, &address, role.trim()) {
+        Ok(_) => {
+            let mut rec = ka_agent_core::AuditRecord::new(
+                "operator",
+                ka_agent_core::audit::actions::IDENTITY_ROLE,
+                &format!("{channel}:{address}"),
+                Some(format!("role → {}", role.trim())),
+            )
+            .with_role(ka_agent_core::ADMIN_ROLE);
+            let _ = store.append_audit(&mut rec);
+            Response::see_other("/profiles")
+        }
+        Err(e) => Response::json(serde_json::json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// The largest upload accepted from the web chat (bytes). The request
+/// parser allows a little more so the route can answer 413 cleanly.
+const UPLOAD_MAX: usize = 8 * 1024 * 1024;
+
+/// A safe file base name: no separators, `[A-Za-z0-9._-]`, 1..=80 chars,
+/// not a dot-only name.
+fn upload_name(raw: &str) -> Option<String> {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let mut out = String::new();
+    for c in base.chars() {
+        out.push(
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            },
+        );
+    }
+    let out = out.trim_matches('.').to_string();
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.chars().take(80).collect())
+}
+
+/// `POST /upload`: one file from the chat composer, stored under the
+/// caller role's `attachments/`; the reply is the `@attachments/…`
+/// reference to paste into the message.
+pub fn web_upload(runtime: &Runtime, role: &str, raw_name: &str, bytes: &[u8]) -> crate::Response {
+    if bytes.is_empty() {
+        return Response::bad_request("empty upload");
+    }
+    if bytes.len() > UPLOAD_MAX {
+        return Response::base(413, "text/plain", "file too large (max 8 MiB)\n".into());
+    }
+    let Some(name) = upload_name(raw_name) else {
+        return Response::bad_request("bad file name");
+    };
+    let dir = runtime.workspace_for_role(role).join("attachments");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Response::base(500, "text/plain", format!("attachments: {e}\n"));
+    }
+    let stored = format!("web-{}-{name}", &crate::random_hex(4)[..8]);
+    if let Err(e) = std::fs::write(dir.join(&stored), bytes) {
+        return Response::base(500, "text/plain", format!("write: {e}\n"));
+    }
+    Response::json(
+        serde_json::json!({
+            "ok": true,
+            "name": stored,
+            "ref": format!("@attachments/{stored}"),
+            "size": bytes.len(),
+        })
+        .to_string(),
+    )
+}
+
+/// The content type (and whether a browser may render it inline) for a
+/// served attachment.
+fn attachment_type(name: &str) -> (&'static str, bool) {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => ("image/png", true),
+        "jpg" | "jpeg" => ("image/jpeg", true),
+        "webp" => ("image/webp", true),
+        "gif" => ("image/gif", true),
+        "pdf" => ("application/pdf", false),
+        "txt" | "log" => ("text/plain; charset=utf-8", true),
+        "md" => ("text/markdown; charset=utf-8", true),
+        "json" => ("application/json", true),
+        "csv" => ("text/csv; charset=utf-8", false),
+        "zip" => ("application/zip", false),
+        "mp3" | "ogg" | "opus" | "m4a" => ("audio/mpeg", true),
+        "mp4" | "webm" => ("video/mp4", true),
+        _ => ("application/octet-stream", false),
+    }
+}
+
+/// `GET /file/<name>`: one attachment of the caller's role. Only direct
+/// children of that role's `attachments/` are served (traversal and
+/// symlinks are refused).
+pub fn serve_file(runtime: &Runtime, role: &str, raw: &str) -> crate::Response {
+    let Some(name) = upload_name(raw) else {
+        return Response::bad_request("bad file name");
+    };
+    // Reject spellings that only normalize to a name (a traversal attempt).
+    if name != raw {
+        return Response::bad_request("bad file name");
+    }
+    // A direct child of the role's `attachments/` or of its workspace
+    // (where `send_file` may point). Nothing deeper, no symlink escapes.
+    let ws = runtime.workspace_for_role(role);
+    let mut found = None;
+    for dir in [ws.join("attachments"), ws.clone()] {
+        let Ok(canon_dir) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        let Ok(path) = std::fs::canonicalize(canon_dir.join(&name)) else {
+            continue;
+        };
+        if path.starts_with(&canon_dir) && path.is_file() {
+            found = Some(path);
+            break;
+        }
+    }
+    let Some(path) = found else {
+        return Response::not_found();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Response::not_found();
+    };
+    let (content_type, inline) = attachment_type(&name);
+    let mut resp = Response::bytes(content_type, bytes);
+    resp.extra_headers.push((
+        "Content-Disposition",
+        format!(
+            "{}; filename=\"{}\"",
+            if inline { "inline" } else { "attachment" },
+            name
+        ),
+    ));
+    resp
+}
+
+/// `POST /pair/issue`: mint a web pairing code for a role from the admin
+/// UI (the browser redeems it at `/pair`). Audited; the code itself is
+/// never stored in the audit row.
+pub fn pair_issue(runtime: &Runtime, store: &Store, body: &str) -> crate::Response {
+    let cfg = runtime.config();
+    let role = form_field(body, "role").trim().to_string();
+    if role != ka_agent_core::ADMIN_ROLE && !cfg.roles.iter().any(|r| r.name == role) {
+        return Response::bad_request("role is not defined in the config");
+    }
+    let code = match ka_agent_channels::pairing::issue_for_role(store, "web", Some(&role)) {
+        Ok(code) => code,
+        Err(e) => {
+            return Response::base(500, "text/plain", format!("pairing: {e}\n"));
+        }
+    };
+    let mut rec = ka_agent_core::AuditRecord::new(
+        "operator",
+        ka_agent_core::audit::actions::IDENTITY_PAIR,
+        "web (pairing code issued)",
+        Some(format!("role {role}")),
+    )
+    .with_role(ka_agent_core::ADMIN_ROLE);
+    let _ = store.append_audit(&mut rec);
+    let base = store
+        .meta_get("web.url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .map(|u| match u.split_once("://") {
+            Some((scheme, rest)) => {
+                let authority = rest.split('/').next().unwrap_or(rest);
+                format!("{scheme}://{authority}")
+            }
+            None => u,
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8480".to_string());
+    let body = format!(
+        "<div class='card' style='max-width:34rem'>         <div class='k'>role {role}</div>         <p style='font-size:1.6rem;letter-spacing:.08em'><code>{code}</code></p>         <p>Open <code>{base}/pair</code> in the browser and enter it.          The code is valid for 10 minutes and works once.</p>         <p class='muted'>Losing the browser cookie means issuing a new code.</p>         <p><a href='/profiles'>back to profiles</a></p></div>",
+        role = escape_html(&role),
+        code = escape_html(&code),
+        base = escape_html(&base)
+    );
+    nav_page(runtime, "/profiles", "Pairing code", body)
+}
+
+/// `POST /profiles/create|use`: run the operator CLI (no shell) and report
+/// its output. Profiles are a global concept; a pinned data root refuses.
+pub async fn profile_action(action: &str, body: &str) -> crate::Response {
+    if std::env::var_os("KA_AGENT_DATA_DIR").is_some_and(|v| !v.is_empty()) {
+        return Response::forbidden(
+            "profiles are managed outside a pinned KA_AGENT_DATA_DIR — use the CLI",
+        );
+    }
+    let name = form_field(body, "name").trim().to_string();
+    if !ka_agent_core::layout::valid_profile_name(&name) {
+        return Response::bad_request("profile name must be [a-z0-9-], up to 32 chars");
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| "ka-agent".into());
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("profile")
+        .arg(action)
+        .arg(&name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if action == "create" {
+        let from = form_field(body, "from");
+        let from = from.trim();
+        if !from.is_empty() {
+            cmd.arg("--from").arg(from);
+        }
+    }
+    if action == "remove" {
+        // Destructive: the name typed twice (the form asks for it).
+        if form_field(body, "confirm").trim() != name {
+            return Response::bad_request(
+                "removing a profile deletes its data — type the profile name to confirm",
+            );
+        }
+        cmd.arg("--yes");
+    }
+    let Ok(out) = cmd.output().await else {
+        return Response::base(
+            500,
+            "text/plain",
+            "profile command failed to start\n".into(),
+        );
+    };
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Response::base(400, "text/plain", format!("{msg}\n"));
+    }
+    Response::see_other("/profiles")
 }
 
 /// `GET /`: the chat page (last 20 turns, live updates via /events).
 pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
+    let _ = store;
+    nav_page(runtime, "/", "Chat", chat_markup(runtime))
+}
+
+/// `GET /pair`: the browser end of `ka-agent pair web` (public page; the
+/// code is the credential).
+pub fn pair_page() -> crate::Response {
+    let body = "<main><h1>Pair this browser</h1>        <div class='card' style='max-width:30rem'>        <p>On your computer run <code>ka-agent pair web --role &lt;role&gt;</code> and enter the code it prints.</p>        <form method='post' action='/pair'>        <label>Pairing code<br><input name='code' autocomplete='one-time-code' required autofocus style='font:inherit;padding:.5rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--fg);width:100%'></label>        <p><button class='primary'>Pair</button></p></form>        <p class='muted'>The code expires in 10 minutes and can be used once.</p></div></main>";
+    crate::Response::html(html_page("Ka Agent", "Pair", body.to_string()))
+}
+
+/// A role's chat page: no admin navigation, just the conversation and the
+/// role badge. The router only renders it after activating the role.
+pub fn chat_page_role(runtime: &Runtime, _store: &Store, role: &str) -> crate::Response {
+    let body = format!(
+        "<div class='layout'><aside><div class='brand'>{}</div>         <span class='badge'>role {}</span></aside>         <main><h1>Chat</h1>{}</main></div>",
+        escape_html(&runtime.persona_name()),
+        escape_html(role),
+        chat_markup(runtime)
+    );
+    crate::Response::html(html_page(&runtime.persona_name(), "Chat", body))
+}
+
+/// Rendered when another role's turn owns the single-session core: no
+/// history, no cross-role data.
+pub fn chat_page_busy(role: &str) -> crate::Response {
+    let body = format!(
+        "<main><h1>Chat</h1><div class='card'>another conversation is running —          try again when its turn finishes (role {})</div></main>",
+        escape_html(role)
+    );
+    crate::Response::html(html_page("Ka Agent", "Chat", body))
+}
+
+fn chat_markup(runtime: &Runtime) -> String {
     let now = runtime.now_zoned();
     let mut turns_html = String::new();
     if let Ok(turns) = runtime.recent_turns(20, 0) {
@@ -306,23 +2497,67 @@ pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
             ));
         }
     }
-    let _ = store;
-    let body = format!(
-        "<div id='chat'><div id='log'>{turns_html}</div>\
-         <form id='send'><textarea id='text' rows='2' placeholder='talk to ka (Enter sends, Shift+Enter newline)'></textarea><button type='button' id='private' title='start a private conversation (nothing is remembered)'>🕶</button><button class='primary'>send</button></form></div>\
-         <script src=\"/static/chat.js\" defer></script>"
-    );
-    nav_page(runtime, "/", "Chat", body)
+    let mode = runtime.effective_mode();
+    let model = runtime
+        .config()
+        .model
+        .clone()
+        .unwrap_or_else(|| "no model".into());
+    let approvals = if runtime.active_role() == ka_agent_core::ADMIN_ROLE {
+        runtime
+            .pending_approval_cards()
+            .map(|c| c.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let waiting = if approvals > 0 {
+        format!("<a class='chip warn' href='/approvals'>{approvals} approval(s) waiting</a>")
+    } else {
+        String::new()
+    };
+    format!(
+        "<div id='chatbar'><span class='chip'>{persona} · {role}</span>\
+         <span class='chip'>mode <b id='chip-mode'>{mode}</b></span>\
+         <span class='chip' id='chip-model'>{model}</span>\
+         <span class='chip' id='chip-ctx' hidden>ctx</span>{waiting}\
+         <span class='spacer'></span>\
+         <button type='button' data-cmd='/new' title='start a fresh session'>new</button>\
+         <button type='button' data-cmd='/retry' title='re-send the last failed turn'>retry</button>\
+         <button type='button' data-cmd='/stop' title='abort the running reply'>stop</button>\
+         <button type='button' data-cmd='/undo' title='revert the last file change of this session'>undo</button></div>\
+         <div id='chat'><div id='log'>{turns_html}</div>\
+         <form id='send'><textarea id='text' rows='2' placeholder='talk to ka (Enter sends, Shift+Enter newline)'></textarea>\
+         <label class='filebtn' title='attach a file (up to 8 MiB)'>attach<input type='file' id='file' hidden></label>\
+         <button type='button' id='private' title='start a private conversation (nothing is remembered)'>private</button><button class='primary'>send</button></form></div>\
+         <script src=\"/static/chat.js\" defer></script>",
+        persona = escape_html(&runtime.persona_name()),
+        role = escape_html(&runtime.active_role()),
+        mode = escape_html(&mode),
+        model = escape_html(&model),
+        waiting = waiting
+    )
 }
 
 /// `POST /chat/send`: a command or a message from the web chat (fetch).
 pub async fn chat_send(runtime: &Runtime, store: &Store, body: &str) -> crate::Response {
+    chat_send_for(runtime, store, body, "web").await
+}
+
+/// The same for one role's browser session: every command and turn runs as
+/// `source` (the role is derived from it server-side).
+pub async fn chat_send_for(
+    runtime: &Runtime,
+    store: &Store,
+    body: &str,
+    source: &str,
+) -> crate::Response {
     let text = crate::url_decode(&form_field_url(body, "text").replace('+', " "));
     let text = text.trim().to_string();
     if text.is_empty() {
         return Response::bad_request("empty text");
     }
-    match ka_agent_channels::commands::route(runtime, "web", &text).await {
+    match ka_agent_channels::commands::route(runtime, source, &text).await {
         ka_agent_channels::commands::Outcome::Reply(r) => {
             Response::json(serde_json::json!({"reply": r}).to_string())
         }
@@ -332,7 +2567,7 @@ pub async fn chat_send(runtime: &Runtime, store: &Store, body: &str) -> crate::R
         ka_agent_channels::commands::Outcome::NotACommand => {
             let expanded =
                 ka_agent_channels::refs::expand(store, &runtime.workspace(), &text).await;
-            match runtime.handle_message(&expanded, "web").await {
+            match runtime.handle_message(&expanded, source).await {
                 Ok(()) => Response::json(serde_json::json!({"ok": true}).to_string()),
                 Err(e) => {
                     Response::json(serde_json::json!({"reply": format!("! {e}")}).to_string())
@@ -355,72 +2590,195 @@ fn form_field_url(body: &str, name: &str) -> String {
     String::new()
 }
 
-/// `GET /tasks`: reminders and crons with snooze (reminders) and cancel
-/// buttons.
+/// `GET /tasks`: reminders and crons — create them with the same grammar
+/// the chat uses, and pause/resume/trigger/remove each cron.
 pub fn tasks(runtime: &Runtime) -> crate::Response {
     let now = runtime.now_zoned();
     let rows = match runtime.scheduled_tasks() {
         Ok(r) => r,
         Err(e) => {
-            return nav_page(
-                runtime,
-                "/tasks",
-                "Error",
-                format!("<p>{}</p>", escape_html(&e.to_string())),
-            );
+            return result_page(runtime, "/tasks", "Tasks & cron", &e.to_string(), false);
         }
     };
-    if rows.is_empty() {
-        return nav_page(
-            runtime,
-            "/tasks",
-            "Tasks",
-            "<p>no reminders or crons</p>".into(),
-        );
-    }
-    let rows_html: Vec<String> = rows
-        .iter()
-        .map(|t| {
-            let next = t
-                .scheduled_at_ms
-                .map(|at| escape_html(&ka_agent_core::when::describe(at, &now)))
-                .unwrap_or_else(|| "-".into());
-            // Only reminders snooze: a cron's next fire belongs to its
-            // cadence (`ka-agent cron`).
-            let snooze = if t.kind == "reminder" {
-                format!(
-                    "<form method=post action=/tasks/snooze class=inline>\
-                     <input type=hidden name=id value=\"{}\">\
-                     <input name=when placeholder=30m size=7>\
-                     <button>snooze</button></form>",
-                    escape_html(t.id.as_str())
-                )
+    let mut table = String::new();
+    for t in &rows {
+        let spec = t
+            .payload
+            .as_deref()
+            .and_then(ka_agent_core::CronSpec::from_payload);
+        let next = t
+            .scheduled_at_ms
+            .map(|at| escape_html(&ka_agent_core::when::describe(at, &now)))
+            .unwrap_or_else(|| "-".into());
+        let role = spec
+            .as_ref()
+            .and_then(|s| s.role.clone())
+            .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+        let tools = spec
+            .as_ref()
+            .filter(|s| !s.tools.is_empty())
+            .map(|s| format!("<code>{}</code>", escape_html(&s.tools.join(","))))
+            .unwrap_or_else(|| "—".into());
+        let status = format!("{:?}", t.status);
+        let actions = if t.kind == "reminder" {
+            format!(
+                "<form method=post action=/tasks/snooze class=inline>\
+                 <input type=hidden name=id value=\"{id}\">\
+                 <input name=when placeholder=30m size=6><button class=sm>snooze</button></form>\
+                 <form method=post action=/tasks/cancel class=inline>\
+                 <input type=hidden name=id value=\"{id}\"><button class=\"sm danger\">cancel</button></form>",
+                id = escape_html(t.id.as_str())
+            )
+        } else {
+            let paused = matches!(t.status, ka_agent_core::TaskStatus::Interrupted);
+            let toggle = if paused {
+                "<input type=hidden name=action value=resume><button class=sm>resume</button>"
             } else {
-                String::new()
+                "<input type=hidden name=action value=pause><button class=sm>pause</button>"
             };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-                 <td>{snooze}</td>\
-                 <td><form method=post action=/tasks/cancel class=inline>\
-                 <input type=hidden name=id value=\"{}\"><button>cancel</button></form></td></tr>",
-                escape_html(ka_agent_core::ids::short_id(t.id.as_str())),
-                escape_html(&t.kind),
-                next,
-                escape_html(&t.title),
-                escape_html(t.id.as_str())
+                "<form method=post action=/tasks/cron class=inline>\
+                 <input type=hidden name=id value=\"{id}\">{toggle}</form>\
+                 <form method=post action=/tasks/cron class=inline>\
+                 <input type=hidden name=id value=\"{id}\"><input type=hidden name=action value=trigger>\
+                 <button class=sm>run now</button></form>\
+                 <form method=post action=/tasks/cron class=inline>\
+                 <input type=hidden name=id value=\"{id}\"><input type=hidden name=action value=remove>\
+                 <button class=\"sm danger\">remove</button></form>",
+                id = escape_html(t.id.as_str())
             )
-        })
-        .collect();
-    nav_page(
+        };
+        table.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"actions\">{}</td></tr>",
+            escape_html(ka_agent_core::ids::short_id(t.id.as_str())),
+            escape_html(&t.kind),
+            escape_html(&role),
+            next,
+            escape_html(&t.title),
+            tools,
+            escape_html(&status),
+            actions
+        ));
+    }
+    let body = format!(
+        "<div class=\"grid2\">\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">new cron</span></div>\
+         <form method=post action=/tasks/add>\
+         <input type=hidden name=kind value=cron>\
+         <label class=field><span>Schedule + prompt, exactly like <code>/cron add</code></span>\
+         <textarea name=args rows=3 placeholder=\"every day at 08:00 summarize my inbox\"></textarea></label>\
+         <button class=primary>schedule cron</button></form>\
+         <p class=\"muted small\"><code>every 1h …</code>, <code>in 10m …</code>, <code>every weekday at 9 …</code>; add <code>--tools read,grep</code> to narrow the toolset.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">new reminder</span></div>\
+         <form method=post action=/tasks/add>\
+         <input type=hidden name=kind value=reminder>\
+         <label class=field><span>When + text, exactly like <code>/remind</code></span>\
+         <textarea name=args rows=3 placeholder=\"tomorrow 9am call the bank\"></textarea></label>\
+         <button class=primary>set reminder</button></form>\
+         <p class=\"muted small\">Reminders notify; they never spend a model turn.</p></div>\
+         </div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">calendar digest</span></div>\
+         <form method=post action=/tasks/calendar class=formrow>\
+         <input name=args placeholder=\"add https://…/calendar.ics  ·  today\" style=\"flex:1\">\
+         <button>run /calendar</button></form>\
+         <p class=\"muted small\">The same command as the chat: a daily digest at <code>calendar.digest_time</code>, or render today's.</p></div>\
+         <h2>Scheduled</h2>\
+         {}",
+        if table.is_empty() {
+            "<div class=\"empty\">nothing scheduled</div>".to_string()
+        } else {
+            format!(
+                "<div class=\"tablewrap\"><table><tr><th>id</th><th>kind</th><th>role</th><th>next</th><th>title</th><th>tools</th><th>status</th><th></th></tr>{table}</table></div>\
+                 <style>form.inline{{display:inline-flex;gap:.3rem;align-items:center;margin:.1rem}}form.inline input{{width:auto}}form.inline button{{margin:0}}</style>"
+            )
+        }
+    );
+    nav_page_sub(
         runtime,
         "/tasks",
-        "Tasks",
-        format!(
-            "<table><tr><th>id</th><th>kind</th><th>next</th><th>title</th><th></th><th></th></tr>{}</table>\
-             <style>form.inline{{display:inline-flex;gap:.3rem;align-items:center}}form.inline input{{font:inherit;padding:.2rem .4rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg);width:auto}}</style>",
-            rows_html.join("")
-        ),
+        "Tasks & cron",
+        "Scheduled prompts and reminders, with the same grammar as /cron and /remind — plus pause, resume, trigger and remove.",
+        body,
     )
+}
+
+/// `POST /tasks/add`: run the router's own `/cron add` / `/remind` so the
+/// web and the chat share one parser and one reply.
+pub async fn tasks_add(runtime: &Runtime, body: &str) -> crate::Response {
+    let kind = form_field(body, "kind");
+    let args = form_field(body, "args").trim().to_string();
+    if args.is_empty() {
+        return result_page(
+            runtime,
+            "/tasks",
+            "Tasks & cron",
+            "the schedule is empty",
+            false,
+        );
+    }
+    let command = match kind.as_str() {
+        "reminder" => format!("/remind {args}"),
+        _ => format!("/cron add {args}"),
+    };
+    match ka_agent_channels::commands::route(runtime, "web", &command).await {
+        ka_agent_channels::commands::Outcome::Reply(reply) => {
+            let ok = !reply.starts_with('!');
+            result_page(runtime, "/tasks", "Tasks & cron", &reply, ok)
+        }
+        ka_agent_channels::commands::Outcome::Silent => {
+            result_page(runtime, "/tasks", "Tasks & cron", "scheduled", true)
+        }
+        ka_agent_channels::commands::Outcome::NotACommand => {
+            result_page(runtime, "/tasks", "Tasks & cron", "not a schedule", false)
+        }
+    }
+}
+
+/// `POST /tasks/cron`: pause/resume/trigger/remove one cron (same code as
+/// `ka-agent cron`).
+/// `POST /tasks/calendar`: the router's `/calendar` (add/today).
+pub async fn tasks_calendar(runtime: &Runtime, body: &str) -> crate::Response {
+    let args = form_field(body, "args").trim().to_string();
+    match ka_agent_channels::commands::route(runtime, "web", &format!("/calendar {args}")).await {
+        ka_agent_channels::commands::Outcome::Reply(reply) => {
+            let ok = !reply.starts_with('!');
+            result_page(runtime, "/tasks", "Tasks & cron", &reply, ok)
+        }
+        _ => result_page(
+            runtime,
+            "/tasks",
+            "Tasks & cron",
+            "not a calendar command",
+            false,
+        ),
+    }
+}
+
+pub fn tasks_cron(runtime: &Runtime, body: &str) -> crate::Response {
+    use ka_agent_runtime::cron_ops;
+    let id = form_field(body, "id");
+    let action = form_field(body, "action");
+    let task = match cron_ops::resolve(runtime.store(), &id) {
+        Ok(t) => t,
+        Err(e) => return result_page(runtime, "/tasks", "Tasks & cron", &e, false),
+    };
+    let result = match action.as_str() {
+        "pause" => cron_ops::pause(runtime.store(), &task).map(|()| "paused".to_string()),
+        "resume" => cron_ops::resume(runtime.store(), &task, &runtime.now_zoned()).map(|at| {
+            format!(
+                "resumed — next {}",
+                ka_agent_core::when::describe(at, &runtime.now_zoned())
+            )
+        }),
+        "trigger" => cron_ops::trigger(runtime.store(), &task)
+            .map(|()| "armed for the next tick".to_string()),
+        "remove" => cron_ops::remove(runtime.store(), &task).map(|()| "removed".to_string()),
+        other => Err(format!("unknown action {other:?}")),
+    };
+    match result {
+        Ok(msg) => result_page(runtime, "/tasks", "Tasks & cron", &msg, true),
+        Err(e) => result_page(runtime, "/tasks", "Tasks & cron", &e, false),
+    }
 }
 
 pub async fn tasks_cancel(runtime: &Runtime, body: &str) -> crate::Response {
@@ -501,67 +2859,161 @@ pub fn tasks_snooze(runtime: &Runtime, body: &str) -> crate::Response {
     }
 }
 
-/// `GET /skills`: enable/disable (skills are prompt text, not permissions).
+/// `GET /skills`: the library and which engine home has each skill — the
+/// admin's and every configured role's (`ka-agent skills list/enable --role`).
 pub fn skills(runtime: &Runtime) -> crate::Response {
-    let engine = runtime.engine_home();
-    let skills = ka_agent_runtime::skills::Skills::new(&engine);
-    let available = skills.available();
-    if available.is_empty() {
-        return nav_page(
+    let cfg = runtime.config();
+    let admin_home = runtime.engine_home();
+    let library = ka_agent_runtime::skills::Skills::new(&admin_home).available();
+    // One engine home per role (admin first).
+    let mut homes: Vec<(String, std::path::PathBuf)> =
+        vec![(ka_agent_core::ADMIN_ROLE.to_string(), admin_home.clone())];
+    for role in &cfg.roles {
+        homes.push((role.name.clone(), runtime.role_engine_home(&role.name)));
+    }
+    let enabled: Vec<std::collections::HashSet<String>> = homes
+        .iter()
+        .map(|(_, home)| {
+            ka_agent_runtime::skills::Skills::new(home)
+                .enabled()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        })
+        .collect();
+    let mut names: Vec<String> = library.iter().map(|s| s.name.clone()).collect();
+    for set in &enabled {
+        for n in set {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        return nav_page_sub(
             runtime,
             "/skills",
             "Skills",
-            "<p>no skills in the library — put them under ~/.config/ka-agent/skills</p>".into(),
+            "Prompt-text capabilities provisioned into each engine home.",
+            "<div class=\"empty\">no skills in the library — put them under the profile's <code>skills/</code> or <code>~/.ka-agent/skills</code></div>".into(),
         );
     }
-    let enabled: Vec<String> = skills.enabled().into_iter().map(|s| s.name).collect();
-    let rows: Vec<String> = available
-        .iter()
-        .map(|s| {
-            let on = enabled.contains(&s.name);
-            let (label, value) = if on {
-                ("Disable", "0")
+    let mut head = String::from("<th>skill</th>");
+    for (role, _) in &homes {
+        head.push_str(&format!("<th>{}</th>", escape_html(role)));
+    }
+    let mut rows = String::new();
+    for name in &names {
+        let desc = library
+            .iter()
+            .find(|s| &s.name == name)
+            .map(|s| s.description.clone())
+            .unwrap_or_default();
+        let mut cells = String::new();
+        for (i, (role, _)) in homes.iter().enumerate() {
+            let on = enabled[i].contains(name);
+            let (value, class) = if on { ("0", "sm danger") } else { ("1", "sm") };
+            cells.push_str(&format!(
+                "<td><form method=post action=/skills/toggle>\
+                 <input type=hidden name=name value=\"{}\">\
+                 <input type=hidden name=role value=\"{}\">\
+                 <input type=hidden name=enable value=\"{value}\">\
+                 <button class=\"{class}\">{}</button></form></td>",
+                escape_html(name),
+                escape_html(role),
+                if on { "enabled" } else { "—" }
+            ));
+        }
+        rows.push_str(&format!(
+            "<tr><td><b>{}</b>{}</td>{cells}</tr>",
+            escape_html(name),
+            if desc.is_empty() {
+                String::new()
             } else {
-                ("Enable", "1")
-            };
-            format!(
-                "<tr><td>{}</td><td>{}</td><td><form method=post action=/skills/toggle>\
-                 <input type=hidden name=name value=\"{}\"><input type=hidden name=enable value=\"{value}\">\
-                 <button>{label}</button></form></td></tr>",
-                escape_html(&s.name),
-                if on { "enabled" } else { "disabled" },
-                escape_html(&s.name)
-            )
-        })
-        .collect();
-    nav_page(
+                format!("<div class=\"muted small\">{}</div>", escape_html(&desc))
+            }
+        ));
+    }
+    let proposals = runtime
+        .store()
+        .pending_skill_candidates()
+        .unwrap_or_default();
+    let proposals_html = if proposals.is_empty() {
+        String::new()
+    } else {
+        let rows: String = proposals
+            .iter()
+            .map(|p| {
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>",
+                    escape_html(&p.name),
+                    escape_html(&p.description),
+                    escape_html(ka_agent_core::ids::short_id(&p.id)),
+                    escape_html(&p.id)
+                )
+            })
+            .collect();
+        format!(
+            "<h2>Proposed skills</h2><p class=\"muted small\">The model proposed these; review them on the admin chat card.</p>\
+             <div class=\"tablewrap\"><table><tr><th>name</th><th>description</th><th>id</th><th></th></tr>{rows}</table></div>"
+        )
+    };
+    nav_page_sub(
         runtime,
         "/skills",
         "Skills",
+        "Prompt-text capabilities. Each engine home has its own provisioning; a role sees only its own.",
         format!(
-            "<table><tr><th>name</th><th>state</th><th></th></tr>{}</table>",
-            rows.join("")
+            "<div class=\"tablewrap\"><table><tr>{head}</tr>{rows}</table></div>\
+             <p class=\"muted small\">The library is the profile's <code>skills/</code> first, <code>~/.ka-agent/skills</code> as fallback. Invoke with <code>/skill &lt;name&gt; &lt;text&gt;</code>.</p>{proposals_html}"
         ),
     )
 }
 
 pub fn skills_toggle(runtime: &Runtime, body: &str) -> crate::Response {
     let name = form_field(body, "name");
+    let role = form_field(body, "role");
+    let role = if role.is_empty() {
+        ka_agent_core::ADMIN_ROLE.to_string()
+    } else {
+        role
+    };
+    let cfg = runtime.config();
+    if role != ka_agent_core::ADMIN_ROLE && !cfg.roles.iter().any(|r| r.name == role) {
+        return result_page(runtime, "/skills", "Skills", "unknown role", false);
+    }
+    let home = if role == ka_agent_core::ADMIN_ROLE {
+        runtime.engine_home()
+    } else {
+        runtime.role_engine_home(&role)
+    };
     let enable = form_field(body, "enable") == "1";
-    let skills = ka_agent_runtime::skills::Skills::new(&runtime.engine_home());
+    let skills = ka_agent_runtime::skills::Skills::new(&home);
     let result = if enable {
         skills.enable(&name)
     } else {
         skills.disable(&name)
     };
     match result {
-        Ok(_) => Response::see_other("/skills"),
-        Err(e) => nav_page(
+        Ok(true) => result_page(
             runtime,
             "/skills",
-            "Error",
-            format!("<p>{}</p>", escape_html(&e.to_string())),
+            "Skills",
+            &format!(
+                "{} {name} for role {role}",
+                if enable { "enabled" } else { "disabled" }
+            ),
+            true,
         ),
+        Ok(false) => result_page(
+            runtime,
+            "/skills",
+            "Skills",
+            &format!("no skill {name:?} in the library"),
+            false,
+        ),
+        Err(e) => result_page(runtime, "/skills", "Skills", &e.to_string(), false),
     }
 }
 
@@ -572,9 +3024,10 @@ pub fn contacts(runtime: &Runtime, store: &Store) -> crate::Response {
         .iter()
         .map(|r| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape_html(&r.channel),
                 escape_html(&r.address),
+                escape_html(&r.role),
                 escape_html(&r.via)
             )
         })
@@ -601,7 +3054,7 @@ pub fn contacts(runtime: &Runtime, store: &Store) -> crate::Response {
             "<p>none — <code>ka-agent pair telegram</code></p>".into()
         } else {
             format!(
-                "<table><tr><th>channel</th><th>address</th><th>via</th></tr>{}</table>",
+                "<table><tr><th>channel</th><th>address</th><th>role</th><th>via</th></tr>{}</table>",
                 linked_rows.join("")
             )
         },
@@ -614,7 +3067,13 @@ pub fn contacts(runtime: &Runtime, store: &Store) -> crate::Response {
             )
         }
     );
-    nav_page(runtime, "/contacts", "Contacts", body)
+    nav_page_sub(
+        runtime,
+        "/contacts",
+        "Contacts",
+        "Linked channel identities (who may talk to this profile) and strangers who tried.",
+        body,
+    )
 }
 
 /// `POST /memory/forget`: remove one accepted entry.
@@ -651,29 +3110,81 @@ pub async fn approvals_decide_json(runtime: &Runtime, body: &str) -> crate::Resp
         "y" => ApprovalDecision::Allow,
         _ => ApprovalDecision::Deny,
     };
-    match runtime.decide(&id, decision).await {
+    match runtime.decide(&id, decision, "web").await {
         Ok(()) => Response::json(serde_json::json!({"ok": true}).to_string()),
         Err(e) => Response::json(serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
 pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
+    let form = "<form method=get action=/history class=formrow>\
+         <input name=q placeholder='search turns…' style='flex:1'><button class=primary>search</button></form>";
     let Some(q) = query.filter(|q| !q.is_empty()) else {
-        let body = "<form method=get action=/history><input name=q placeholder='search…'><button>search</button></form>".into();
-        return nav_page(runtime, "/history", "History", body);
+        let now = runtime.now_zoned();
+        let turns = runtime.recent_turns(10, 0).unwrap_or_default();
+        let rows: String = turns
+            .iter()
+            .rev()
+            .map(|(t, answer)| {
+                let at = jiff::Timestamp::from_millisecond(t.created_ms)
+                    .map(|ts| ts.to_zoned(now.time_zone().clone()))
+                    .map(|ts| {
+                        format!(
+                            "{:02}-{:02} {:02}:{:02}",
+                            ts.month() as u8,
+                            ts.day(),
+                            ts.hour(),
+                            ts.minute()
+                        )
+                    })
+                    .unwrap_or_default();
+                let user: String = t.inbound_text.chars().take(90).collect();
+                let reply: String = answer.chars().take(90).collect();
+                format!(
+                    "<tr><td><a href=\"/history/show/{}\"><code>{}</code></a></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(t.id.as_str()),
+                    escape_html(ka_agent_core::ids::short_id(t.id.as_str())),
+                    escape_html(&at),
+                    escape_html(&user),
+                    escape_html(&reply)
+                )
+            })
+            .collect();
+        let recent = if rows.is_empty() {
+            "<div class=\"empty\">no turns in this session yet</div>".to_string()
+        } else {
+            format!(
+                "<div class=\"tablewrap\"><table><tr><th>turn</th><th>when</th><th>question</th><th>answer</th></tr>{rows}</table></div>"
+            )
+        };
+        return nav_page_sub(
+            runtime,
+            "/history",
+            "History",
+            "Full-text search over past turns; open a hit for the stored question and answer.",
+            format!("{form}<h2>Recent turns</h2>{recent}"),
+        );
     };
-    // FTS search is available on the runtime
     match runtime.history_search(q, 20) {
         Ok(hits) if hits.is_empty() => {
-            let body = format!("<p>no results for {}</p>", escape_html(q));
-            nav_page(runtime, "/history", "History", body)
+            let body = format!(
+                "{form}<p class=\"muted\">no results for {}</p>",
+                escape_html(q)
+            );
+            nav_page_sub(
+                runtime,
+                "/history",
+                "History",
+                "Full-text search over past turns; open a hit for the stored question and answer.",
+                body,
+            )
         }
         Ok(hits) => {
             let rows: Vec<String> = hits
                 .iter()
                 .map(|h| {
                     format!(
-                        "<tr><td><a href=\"/history/show/{}\">{}</a></td><td>{}</td><td>{}</td></tr>",
+                        "<tr><td><a href=\"/history/show/{}\"><code>{}</code></a></td><td>{}</td><td>{}</td></tr>",
                         escape_html(&h.turn),
                         escape_html(ka_agent_core::ids::short_id(&h.turn)),
                         escape_html(&h.role),
@@ -681,20 +3192,23 @@ pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
                     )
                 })
                 .collect();
-            let body = format!(
-                "<table><tr><th>turn</th><th>role</th><th>snippet</th></tr>{}</table>",
-                rows.join(
-                    "
-"
-                )
-            );
-            nav_page(runtime, "/history", "History", body)
+            nav_page_sub(
+                runtime,
+                "/history",
+                "History",
+                "Full-text search over past turns; open a hit for the stored question and answer.",
+                format!(
+                    "{form}<div class=\"tablewrap\"><table><tr><th>turn</th><th>role</th><th>snippet</th></tr>{}</table></div>",
+                    rows.join("")
+                ),
+            )
         }
-        Err(e) => nav_page(
+        Err(e) => nav_page_sub(
             runtime,
             "/history",
-            "Error",
-            format!("<p>{}</p>", escape_html(&e.to_string())),
+            "History",
+            "",
+            format!("<p class=\"bad\">{}</p>", escape_html(&e.to_string())),
         ),
     }
 }
@@ -737,8 +3251,8 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
                 .take(50)
                 .map(|e| {
                     format!(
-                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\\
-                         <td><form method=post action=/memory/forget>\\
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                         <td><form method=post action=/memory/forget>\
                          <input type=hidden name=id value=\"{}\"><button>forget</button></form></td></tr>",
                         escape_html(ka_agent_core::ids::short_id(&e.id)),
                         escape_html(&e.file),
@@ -759,21 +3273,96 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
         .map(|text| format!("<pre>{}</pre>", escape_html(&text)))
         .unwrap_or_else(|e| format!("<p>compile error: {}</p>", escape_html(&e.to_string())));
     let candidates = render_candidates(runtime);
+    let log = runtime
+        .memory_log(10)
+        .map(|rows| {
+            if rows.is_empty() {
+                "<p class=\"muted\">no commits yet</p>".to_string()
+            } else {
+                let lines: String = rows
+                    .iter()
+                    .map(|(hash, subject, at)| {
+                        format!(
+                            "<li><code>{}</code> {} <span class=\"muted small\">{}</span></li>",
+                            escape_html(ka_agent_core::ids::short_id(hash)),
+                            escape_html(subject),
+                            escape_html(at)
+                        )
+                    })
+                    .collect();
+                format!("<ul>{lines}</ul>")
+            }
+        })
+        .unwrap_or_else(|e| format!("<p class=\"muted\">{}</p>", escape_html(&e.to_string())));
     let body = format!(
         "<p>memory: {}B / {}B{}</p><ul>{}</ul>\
-         <h2>propose an entry</h2>\
+         <div class=\"grid2\">\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">remember now</span></div>\
+         <form method=post action=/memory/remember>\
+         <textarea name=text rows=4 placeholder=\"one durable fact — accepted immediately\"></textarea>\
+         <p><button class=primary>remember</button></p></form>\
+         <p class=\"muted small\">Writes facts.md, recompiles MEMORY.md for the active role and commits.</p></div>\
+         <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">propose for review</span></div>\
          <form method=post action=/memory/edit>\
-         <textarea name=text rows=4 cols=60 placeholder=\"one durable fact\"></textarea><br>\
-         <button>propose</button></form>\
+         <textarea name=text rows=4 placeholder=\"one durable fact — queued for review\"></textarea>\
+         <p><button>propose</button></p></form></div>\
+         </div>\
          {candidates}\
          <h2>accepted entries</h2>{entries}\
+         <h2>history</h2>{log}\
+         <form method=post action=/memory/undo>\
+         <button class=sm>undo the last commit</button></form>\
          <h2>compiled (injected)</h2>{compiled}",
         report.total_bytes,
         report.budget_bytes,
         if report.truncated { " (truncated)" } else { "" },
         files.join("")
     );
-    nav_page(runtime, "/memory", "Memory", body)
+    nav_page_sub(
+        runtime,
+        "/memory",
+        "Memory",
+        "Durable facts per role: remember, review proposals, inspect the compiled MEMORY.md and undo a commit.",
+        body,
+    )
+}
+
+/// `POST /memory/remember`: accept one fact now (facts.md + commit).
+pub fn memory_remember(runtime: &Runtime, body: &str) -> crate::Response {
+    let text = form_field(body, "text");
+    if text.trim().is_empty() {
+        return result_page(
+            runtime,
+            "/memory",
+            "Memory",
+            "nothing to remember (empty text)",
+            false,
+        );
+    }
+    match runtime.remember(&text, "web") {
+        Ok(id) => result_page(
+            runtime,
+            "/memory",
+            "Memory",
+            &format!("remembered {id}"),
+            true,
+        ),
+        Err(e) => result_page(runtime, "/memory", "Memory", &e.to_string(), false),
+    }
+}
+
+/// `POST /memory/undo`: revert the last memory commit.
+pub fn memory_undo(runtime: &Runtime) -> crate::Response {
+    match runtime.memory_undo() {
+        Ok(subject) => result_page(
+            runtime,
+            "/memory",
+            "Memory",
+            &format!("reverted: {subject}"),
+            true,
+        ),
+        Err(e) => result_page(runtime, "/memory", "Memory", &e.to_string(), false),
+    }
 }
 
 pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
@@ -836,12 +3425,13 @@ fn render_candidates(runtime: &Runtime) -> String {
                 escape_html(&c.source)
             );
             format!(
-                "<div class='card'><p><b>{}</b> proposes:</p><pre>{diff}</pre>\
+                "<div class='card'><p><b>{} (role {})</b> proposes:</p><pre>{diff}</pre>\
                  <form method=post action=/memory/candidate>\
                  <input type=hidden name=id value=\"{}\">\
                  <button name=decision value=y>Accept</button>\
                  <button name=decision value=n>Reject</button></form></div>",
                 escape_html(&c.source),
+                escape_html(&c.role),
                 escape_html(c.id.as_str())
             )
         })
@@ -897,15 +3487,97 @@ fn form_field(body: &str, name: &str) -> String {
     String::new()
 }
 
+/// `GET /sessions`: recent sessions across roles, with "open" (adopt that
+/// role's latest conversation — the TUI's `/resume` across roles).
+pub fn sessions(runtime: &Runtime, store: &Store) -> crate::Response {
+    let rows = store.list_recent_sessions(50).unwrap_or_default();
+    let active_role = runtime.active_role();
+    let now = runtime.now_zoned();
+    let mut html = String::new();
+    for s in &rows {
+        let at = jiff::Timestamp::from_millisecond(s.updated_ms)
+            .map(|t| t.to_zoned(now.time_zone().clone()))
+            .map(|t| {
+                format!(
+                    "{:02}-{:02} {:02}:{:02}",
+                    t.month() as u8,
+                    t.day(),
+                    t.hour(),
+                    t.minute()
+                )
+            })
+            .unwrap_or_default();
+        let open = if s.role == active_role {
+            "<span class=\"tag\">active role</span>".to_string()
+        } else {
+            format!(
+                "<form method=post action=/sessions/open>\
+                 <input type=hidden name=role value=\"{}\"><button class=\"sm\">open</button></form>",
+                escape_html(&s.role)
+            )
+        };
+        html.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{open}</td></tr>",
+            escape_html(ka_agent_core::ids::short_id(s.id.as_str())),
+            escape_html(&s.role),
+            escape_html(&format!("{:?}", s.status)),
+            if s.private { "yes" } else { "—" },
+            escape_html(&at),
+        ));
+    }
+    let body = if rows.is_empty() {
+        "<div class=\"empty\">no sessions yet</div>".to_string()
+    } else {
+        format!(
+            "<div class=\"tablewrap\"><table><tr><th>id</th><th>role</th><th>status</th><th>private</th><th>updated</th><th></th></tr>{html}</table></div>\
+             <p class=\"muted small\">Opening a role adopts its most recent session; a running turn of another role is never disturbed.</p>"
+        )
+    };
+    nav_page_sub(
+        runtime,
+        "/sessions",
+        "Sessions",
+        "Recent conversations by role. Opening one hands the agent to that role's latest session.",
+        body,
+    )
+}
+
+pub async fn sessions_open(runtime: &Runtime, body: &str) -> crate::Response {
+    let role = form_field(body, "role");
+    let cfg = runtime.config();
+    if role != ka_agent_core::ADMIN_ROLE && !cfg.roles.iter().any(|r| r.name == role) {
+        return result_page(runtime, "/sessions", "Sessions", "unknown role", false);
+    }
+    if runtime.use_role(&role).await {
+        result_page(
+            runtime,
+            "/sessions",
+            "Sessions",
+            &format!("now acting as role {role}"),
+            true,
+        )
+    } else {
+        result_page(
+            runtime,
+            "/sessions",
+            "Sessions",
+            "another conversation is running — try again when its turn finishes",
+            false,
+        )
+    }
+}
+
 pub fn approvals(runtime: &Runtime, store: &Store) -> crate::Response {
     let sid = runtime.session_id();
     let pending = store.pending_approvals(&sid).unwrap_or_default();
     if pending.is_empty() {
-        return nav_page(
+        return nav_page_sub(
             runtime,
             "/approvals",
             "Approvals",
-            "<p>no pending approvals</p>".into(),
+            "Pending cards the engine is blocked on. Only the operator decides; a role never can.",
+            "<div class=\"empty\">nothing waiting — the engine is not blocked on an ask</div>"
+                .into(),
         );
     }
     let cards: Vec<String> = pending
@@ -926,27 +3598,40 @@ pub fn approvals(runtime: &Runtime, store: &Store) -> crate::Response {
                 })
                 .unwrap_or_default();
             // Same expiry rendering as the chat card (operator zone).
-            let expires =
-                ka_agent_core::fmt_interval(a.expires_at_ms - ka_agent_core::now_ms());
+            let expires = ka_agent_core::fmt_interval(a.expires_at_ms - ka_agent_core::now_ms());
             Some(format!(
                 "<div class='card'><p>{q}</p>{d}<p>expires in {expires}</p>\
                  <form method=post action=/approvals/decide>\
-                 <input type=hidden name=id value=\"{}\"><button name=decision value=y>Allow</button>\
-                 <button name=decision value=n>Deny</button></form></div>",
+                 <input type=hidden name=id value=\"{}\">\
+                 <button class=primary name=decision value=y>Allow</button>\
+                 <button name=decision value=n>Deny</button>\
+                 <button name=decision value=session>Allow for this session</button></form></div>",
                 escape_html(a.id.as_str())
             ))
         })
         .collect();
-    nav_page(runtime, "/approvals", "Approvals", cards.join(""))
+    nav_page_sub(
+        runtime,
+        "/approvals",
+        "Approvals",
+        "Pending cards the engine is blocked on. Only the operator decides; a role never can.",
+        cards.join(""),
+    )
 }
 
 pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response {
     let id = form_field(body, "id");
+    if form_field(body, "decision") == "session" {
+        return match runtime.decide_for_session(&id, "web").await {
+            Ok(()) => Response::see_other("/approvals"),
+            Err(e) => result_page(runtime, "/approvals", "Approvals", &e.to_string(), false),
+        };
+    }
     let decision = match form_field(body, "decision").as_str() {
         "y" => ApprovalDecision::Allow,
         _ => ApprovalDecision::Deny,
     };
-    match runtime.decide(&id, decision).await {
+    match runtime.decide(&id, decision, "web").await {
         Ok(()) => Response::redirect("/approvals"),
         Err(e) => Response::html(runtime_page(
             runtime,
@@ -962,13 +3647,19 @@ pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response 
 pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
     let records = store.recent_audit(50).unwrap_or_default();
     if records.is_empty() {
-        return nav_page(runtime, "/audit", "Audit", "<p>no audit records</p>".into());
+        return nav_page_sub(
+            runtime,
+            "/audit",
+            "Audit",
+            "Append-only, hash-chained record of every operator and subject action.",
+            "<p>no audit records</p>".into(),
+        );
     }
     let rows: Vec<String> = records
         .iter()
         .map(|r| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 r.seq,
                 {
                     let now = runtime.now_zoned();
@@ -985,16 +3676,23 @@ pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
                     )
                 },
                 escape_html(&r.actor),
+                escape_html(&r.role),
                 escape_html(&r.action),
                 escape_html(&r.subject)
             )
         })
         .collect();
     let body = format!(
-        "<table><tr><th>seq</th><th>at</th><th>actor</th><th>action</th><th>subject</th></tr>{}</table>",
+        "<div class=\"tablewrap\"><table><tr><th>seq</th><th>at</th><th>actor</th><th>role</th><th>action</th><th>subject</th></tr>{}</table></div>",
         rows.join("")
     );
-    nav_page(runtime, "/audit", "Audit", body)
+    nav_page_sub(
+        runtime,
+        "/audit",
+        "Audit",
+        "Append-only, hash-chained record of every operator and subject action.",
+        body,
+    )
 }
 
 pub fn intents(runtime: &Runtime, store: &Store) -> crate::Response {
@@ -1015,7 +3713,13 @@ pub fn intents(runtime: &Runtime, store: &Store) -> crate::Response {
         "<table><tr><th>id</th><th>tool</th><th>status</th><th>summary</th></tr>{}</table>",
         rows.join("")
     );
-    nav_page(runtime, "/intents", "Intents", body)
+    nav_page_sub(
+        runtime,
+        "/intents",
+        "Intents",
+        "External-write intents: what was attempted, and what may have happened.",
+        body,
+    )
 }
 
 /// `GET /usage`: spend per day and model, CSS bars, today against the
@@ -1072,12 +3776,22 @@ pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
         Some(c) => format!("${today:.4} of ${c:.2} today"),
         None => format!("${today:.4} today (no cap set)"),
     };
-    let body = format!(
-        "<p class='muted'>{budget_note}</p>\
-         <table><tr><th>day</th><th>model</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table>\
-         <style>.bar{{display:inline-block;height:0.8em;background:var(--accent);border-radius:3px;vertical-align:middle}}.bar.over{{background:var(--bad)}}</style>"
-    );
-    nav_page(runtime, "/usage", "Usage", body)
+    let table = if buckets.is_empty() {
+        "<div class=\"empty\">no usage in the last 30 days</div>".to_string()
+    } else {
+        format!(
+            "<div class=\"tablewrap\"><table><tr><th>day</th><th>model</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table></div>\
+             <style>.bar{{display:inline-block;height:0.8em;background:var(--accent);border-radius:3px;vertical-align:middle}}.bar.over{{background:var(--bad)}}</style>"
+        )
+    };
+    let body = format!("<p class='muted'>{budget_note}</p>{table}");
+    nav_page_sub(
+        runtime,
+        "/usage",
+        "Usage",
+        "Spend and tokens by day and model for the last 30 days.",
+        body,
+    )
 }
 
 /// A list field's items: a comma-separated list, optionally wrapped in

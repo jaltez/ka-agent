@@ -85,7 +85,7 @@ fn doctor_reports_pin_contract_state_and_backup() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("ka 193ad5d"), "pin line: {text}");
     assert!(
-        text.contains("contracts ") && text.contains("(13 documents)"),
+        text.contains("contracts ") && text.contains("(14 documents)"),
         "contract hash: {text}"
     );
     // A valid config without a model is the one hard failure.

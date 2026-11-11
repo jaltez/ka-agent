@@ -37,10 +37,10 @@ daemon).
 
 | tool | effect | description |
 |---|---|---|
-| `kagent__memory_propose` | pending candidate | Model proposes a memory for operator review (SEED.md §4.4). Nothing is stored until the operator accepts via `/memory accept`. Text: 1–300 chars, third person, no secrets. |
-| `kagent__notes_search` | read | Case-insensitive substring search across `<data>/notes/*.md`. Max 20 hits. |
-| `kagent__notes_append` | local write | Append a line to `<data>/notes/<name>.md`. Name: `[a-z0-9-]{1,64}`. |
-| `kagent__notes_read` | read | Read a note file (truncated at 8 KB). |
+| `kagent__memory_propose` | pending candidate | Model proposes a memory for operator review (SEED.md §4.4). The candidate records the turn's role (`candidates.role`); acceptance lands it in that role's memory root. Nothing is stored until the operator accepts via `/memory accept`. Text: 1–300 chars, third person, no secrets. |
+| `kagent__notes_search` | read | Case-insensitive substring search across the turn role's notes (`<data>/notes/*.md` for admin, `<data>/roles/<r>/notes/*.md` for a role). Max 20 hits. |
+| `kagent__notes_append` | local write | Append a line to the turn role's `<name>.md` note. Name: `[a-z0-9-]{1,64}`. |
+| `kagent__notes_read` | read | Read a note file of the turn role (truncated at 8 KB). |
 
 ## Protocol (ka-side)
 

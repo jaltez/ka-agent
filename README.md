@@ -179,10 +179,12 @@ Ka Agent keeps everything under `~/.ka-agent` (override with
 ```
 ~/.ka-agent/
   config.toml                  # the default profile's config ($KA_AGENT_CONFIG overrides)
-  skills/                      # your SKILL.md library (shared by all profiles)
+  skills/                      # the global SKILL.md library (fallback for every profile)
   active_profile               # written by `ka-agent profile use`
   profiles/default/            # data for the default profile
     workspace/  state.db  memory/  secrets/  backups/  logs/  …
+    skills/                    # this profile's own SKILL.md library (wins over the global one)
+    roles/<name>/              # one role's disjoint tree (memory, workspace, notes, …)
   profiles/work/               # another profile: same tree + its own config.toml
 ```
 
@@ -195,6 +197,7 @@ config, web port, channels and service units:
 ```sh
 ka-agent profile create work          # one-time copy of default's config — it never tracks later changes there; minus channels, next free web port
 ka-agent profile create work --copy-keys   # also copy the provider keys
+ka-agent profile create work --mode readonly --workspace ~/work-space
 ka-agent -p work setup                # any command takes -p/--profile
 ka-agent profile use work             # make it the default for commands without -p
 ka-agent profile list | show [name] | remove <name> --yes
@@ -219,6 +222,45 @@ Secrets never go in the file:
   `.env` — exactly what ka's own key prompt would write).
 - Channel tokens: `ka-agent secret set <name>` (0600 under `<data>/secrets/`,
   referenced by name from the config).
+
+### Roles (several people, one bot)
+
+One daemon can answer several linked identities without giving them the
+operator's session, memory or tools. Each identity carries a role;
+terminal, web panel, CLI and local API are the implicit `admin` role.
+
+```toml
+[tools]
+disable = ["tool:bash"]              # profile-wide engine baseline
+
+[[role]]
+name = "guest"
+mode = "readonly"                    # ceiling and default
+allow = ["read", "grep"]             # per-turn toolset allowlist
+budget_daily_usd = 2.0
+commands = ["status", "help", "skills", "history", "memory"]
+# workspace = "~/projects/shared"    # default <data>/roles/guest/workspace
+
+[[role.grants.path]]
+dir = "/srv/reports"
+access = "allow"
+```
+
+```sh
+ka-agent identity link telegram 12345 --role guest
+ka-agent identity role telegram 12345 ops     # reassign (audited)
+ka-agent identity list                        # shows the role column
+ka-agent skills enable review --role guest    # provision into that role's engine
+ka-agent pair web --role guest                # one-time code for the browser chat
+```
+
+A role partitions its session, memory root, notes, workspace, grants,
+toolset, budget, audit rows and command surface; approvals stay the
+admin's, and a subject's `/mode` can only get stricter than its ceiling.
+A cron scheduled from a role fires as that role, and its `--tools` list
+can only narrow. Unknown or removed roles fail closed (read-only). The
+full contract is [`docs/contract/rbac.md`](docs/contract/rbac.md) and the
+design is [ADR-0002](docs/adr/0002-in-process-rbac.md).
 
 A pre-0.3 install (`~/.local/share/ka-agent` + `~/.config/ka-agent`) moves
 itself to the new layout on the next run.
@@ -285,10 +327,26 @@ config):
 ka-agent dashboard            # prints + opens a one-shot login URL (10 min TTL)
 ```
 
-Chat with the agent live (streaming over SSE), browse status, tasks, memory,
-skills, approvals, history and contacts. The URL sets an
-`HttpOnly; SameSite=Strict` session cookie; mutations are POST-only.
-Details: `docs/contract/web-ui.md`.
+Chat with the agent live (streaming over SSE, tool/plan cards, file
+attachments), and manage the whole agent: status, models/mode/effort/
+persona, profiles and roles (created, edited and deleted from the panel),
+identities with link/unlink and web pairing codes, config (schema + safe
+editor), queue, tasks and cron (create/pause/resume/run), memory (review,
+remember, undo), skills per role, approvals, grants, keys and secrets,
+extensions (MCP add/remove, plugins/hooks/tools), doctor (with safe fixes),
+logs, history, usage, audit and contacts. The theme follows the OS or can
+be pinned light/dark from the sidebar. The URL sets
+an `HttpOnly; SameSite=Strict` session cookie; mutations are POST-only.
+
+Several people, one panel: `ka-agent pair web --role guest` (or
+**Profiles → new web user** in the admin panel) mints a one-time code for
+`/pair`; that browser gets the role's chat only — its own session, memory
+and toolset, never the admin pages (ADR-0002).
+
+A custom domain/relay: `ka-agent setup web` writes `web.bind` and
+`web.public_url`; keep the daemon behind a TLS reverse proxy (Caddy,
+nginx, Tailscale) and links use the public URL. Design and deployment:
+`docs/design/web-relay.md`. Details: `docs/contract/web-ui.md`.
 
 ## Platforms
 

@@ -110,6 +110,10 @@ pub enum WorkerCommand {
         /// Skill names to inject for this turn.
         #[serde(default)]
         skills: Vec<String>,
+        /// Per-turn allowlist of exact tool names (a role's toolset);
+        /// `None` = every tool the engine exposes.
+        #[serde(default)]
+        allowed_tools: Option<Vec<String>>,
     },
     /// Resolve a pending ask; `choice` indexes the ask's options.
     Answer {
@@ -273,8 +277,9 @@ mod tests {
                 media_type: "image/png".into(),
             }],
             skills: vec!["review".into()],
+            allowed_tools: Some(vec!["read".into(), "grep".into()]),
         });
-        // images/skills default when absent
+        // images/skills/allowed_tools default when absent
         let bare: WorkerCommand = from_line(r#"{"op":"submit","text":"hi"}"#).unwrap();
         assert_eq!(
             bare,
@@ -283,6 +288,7 @@ mod tests {
                 text: "hi".into(),
                 images: Vec::new(),
                 skills: Vec::new(),
+                allowed_tools: None,
             }
         );
         round_trip(&WorkerCommand::Answer {

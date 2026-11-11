@@ -2,8 +2,9 @@
 
 ## Identities (SEED.md §8.1)
 
-Exactly one operator per instance (ADR-0001). The `identities` table
-(schema v3) links channel identities to that operator:
+One daemon; every linked identity acts as a **role** (ADR-0002: `admin` is
+the operator, other roles are subjects with their own session, memory and
+toolset). The `identities` table links channel identities and their role:
 
 ```
 $ ka-agent identity link telegram 12345
@@ -56,7 +57,9 @@ token_secret = "matrix.access_token"   # KA_AGENT_SECRET_MATRIX_ACCESS_TOKEN
   token dedupe, mirroring the Telegram offset. A crash between the two
   replays the event.
 - **Outbound**: `PUT …/rooms/<id>/send/m.room.message/<txn>`; replies go to
-  the room the operator last wrote from; bodies over 3500 bytes split on
+  the room **the sender** last wrote from (one room per linked identity);
+  admin-only events (approval cards, memory proposals) go to the admin's
+  room. Bodies over 3500 bytes split on
   newline boundaries.
 - **Streaming**: on an operator turn the reply streams as one message
   edited in place. All thresholds count **bytes** (`String::len`), not

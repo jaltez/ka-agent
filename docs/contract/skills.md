@@ -6,8 +6,12 @@ the model knows how to do, never what it is allowed to do.
 
 ## Shape and discovery
 
-- One directory per skill under the operator's library:
-  `~/.ka-agent/skills/<name>/SKILL.md` (`$KA_AGENT_HOME`-aware; a pre-0.3 `$XDG_CONFIG_HOME/ka-agent/skills` still wins while it exists).
+- One directory per skill under a skill library. Precedence: the active
+  profile's own library `<data root>/skills/<name>/SKILL.md` first, the
+  global `~/.ka-agent/skills/<name>/SKILL.md` as the fallback
+  (`$KA_AGENT_HOME`-aware; a pre-0.3 `$XDG_CONFIG_HOME/ka-agent/skills`
+  still wins while it exists). A name present in both keeps the profile's
+  copy.
 - `SKILL.md` is the ecosystem format ka already reads: TOML frontmatter
   (`name`, `description`) + Markdown body. A sample lives at
   `examples/skills/review/` in this repository.
@@ -23,11 +27,14 @@ the model knows how to do, never what it is allowed to do.
 
 ## CLI
 
-- `ka-agent skills list` — the operator's library with `[enabled]` markers,
-  plus `[enabled, no source copy]` for provisioned-without-source entries
-  (e.g. after a restore).
-- `ka-agent skills enable <name>` — provision. `disable <name>` — remove
-  the provisioning only.
+- `ka-agent skills list` — both libraries with `[enabled]` (admin) and
+  `[enabled@<role>]` markers, plus `[enabled, no source copy]` for
+  provisioned-without-source entries (e.g. after a restore).
+- `ka-agent skills enable <name> [--role <r>]` — provision into the admin's
+  engine home (default) or the role's. `disable <name> [--role <r>]` —
+  remove the provisioning only; the source copy is never touched.
+- Each role's engine home is `<data>/roles/<r>/engine-home`, so a skill
+  enabled for one role is invisible to the others and to admin.
 
 ## Surfaces (shared router)
 

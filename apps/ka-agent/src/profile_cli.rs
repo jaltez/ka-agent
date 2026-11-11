@@ -46,7 +46,16 @@ pub fn profile_action(action: ProfileAction) -> ExitCode {
             from,
             copy_keys,
             clone_memory,
-        } => create(&name, &from, copy_keys, clone_memory),
+            mode,
+            workspace,
+        } => create(
+            &name,
+            &from,
+            copy_keys,
+            clone_memory,
+            mode.as_deref(),
+            workspace.as_deref(),
+        ),
         ProfileAction::Use { name } => use_profile(&name),
         ProfileAction::Show { name } => show(&name.unwrap_or_else(layout::profile_name)),
         ProfileAction::Remove { name, yes } => remove(&name, yes),
@@ -193,6 +202,34 @@ fn derive_config(source: &str, port: u16) -> Result<String, String> {
     Ok(doc.to_string())
 }
 
+/// Apply `profile create --mode/--workspace` to the derived config text.
+fn apply_create_flags(
+    text: &str,
+    mode: Option<&str>,
+    workspace: Option<&std::path::Path>,
+) -> Result<String, String> {
+    if mode.is_none() && workspace.is_none() {
+        return Ok(text.to_string());
+    }
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    if let Some(mode) = mode {
+        let canonical = ka_agent_core::config::normalize_mode(mode).ok_or_else(|| {
+            format!(
+                "unknown mode {mode:?} (ask | accept_edits | allow | readonly; \
+                 the old names guarded/free/plan still work)"
+            )
+        })?;
+        doc["mode"] = toml_edit::value(canonical);
+    }
+    if let Some(ws) = workspace {
+        if ws.as_os_str().is_empty() {
+            return Err("--workspace must not be empty".into());
+        }
+        doc["workspace"] = toml_edit::value(ws.to_string_lossy().into_owned());
+    }
+    Ok(doc.to_string())
+}
+
 /// Rename: move data and config, replace the units, follow the active
 /// pointer. The `default` profile is not a name you chose — it stays.
 fn rename(from: &str, to: &str) -> ExitCode {
@@ -246,7 +283,14 @@ fn rename(from: &str, to: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn create(name: &str, from: &str, copy_keys: bool, clone_memory: bool) -> ExitCode {
+fn create(
+    name: &str,
+    from: &str,
+    copy_keys: bool,
+    clone_memory: bool,
+    mode: Option<&str>,
+    workspace: Option<&std::path::Path>,
+) -> ExitCode {
     if !layout::valid_profile_name(name) {
         return fail(format!("profile name {name:?}: [a-z0-9-], up to 32 chars"));
     }
@@ -266,6 +310,12 @@ fn create(name: &str, from: &str, copy_keys: bool, clone_memory: bool) -> ExitCo
     let text = match derive_config(&source, port) {
         Ok(t) => t,
         Err(e) => return fail(format!("{from}'s config: {e}")),
+    };
+    // `--mode` / `--workspace` land as plain keys; the config's own load
+    // validates them (the same vocabulary and overlap rules as any edit).
+    let text = match apply_create_flags(&text, mode, workspace) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
     };
     let config = layout::config_path_for(name);
     if let Err(e) = std::fs::write(&config, text) {
@@ -467,6 +517,32 @@ mod tests {
         // An empty source still yields a loadable config with its own port.
         let v: toml::Value = toml::from_str(&derive_config("", 8481).unwrap()).unwrap();
         assert_eq!(v["web"]["port"].as_integer(), Some(8481));
+    }
+
+    #[test]
+    fn derived_profiles_keep_roles_and_the_toolset_baseline() {
+        let src =
+            "[tools]\ndisable = [\"tool:bash\"]\n[[role]]\nname = \"guest\"\nmode = \"readonly\"\n";
+        let out = derive_config(src, 8482).unwrap();
+        let v: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(v["tools"]["disable"][0].as_str(), Some("tool:bash"));
+        assert_eq!(v["role"][0]["name"].as_str(), Some("guest"));
+        assert_eq!(v["role"][0]["mode"].as_str(), Some("readonly"));
+    }
+
+    #[test]
+    fn create_flags_set_mode_and_workspace() {
+        let text = apply_create_flags(
+            "model = \"m\"\n",
+            Some("plan"),
+            Some(std::path::Path::new("/srv/ws")),
+        )
+        .unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(v["mode"].as_str(), Some("readonly"), "old names normalize");
+        assert_eq!(v["workspace"].as_str(), Some("/srv/ws"));
+        assert!(apply_create_flags("", Some("yolo"), None).is_err());
+        assert!(apply_create_flags("", None, Some(std::path::Path::new(""))).is_err());
     }
 
     #[test]

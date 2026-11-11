@@ -123,7 +123,7 @@ impl MemoryFile {
 }
 
 /// The Markdown memory store rooted at `<root>` (normally `<data>/memory`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryStore {
     root: PathBuf,
 }

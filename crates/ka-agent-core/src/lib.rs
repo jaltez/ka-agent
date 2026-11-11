@@ -30,7 +30,8 @@ pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
 pub use config::{
     Approvals, Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Notify,
-    Search, TurnWatchdog, Voice, Web, WorkerRestart,
+    RoleSpec, Search, Tools, TurnWatchdog, Voice, Web, WorkerRestart, valid_feature_spec,
+    valid_role_name,
 };
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
@@ -40,6 +41,14 @@ pub use task::{CronMode, CronSpec, Task, TaskStatus};
 pub use time::{fmt_interval, parse_duration};
 pub use turn::{Turn, TurnStatus};
 pub use when::When;
+
+/// The implicit role of every local surface (terminal, web panel, CLI) and
+/// of every subject that predates roles.
+pub const ADMIN_ROLE: &str = "admin";
+
+pub(crate) fn admin_role() -> String {
+    ADMIN_ROLE.to_string()
+}
 
 /// True when `source` names a local surface — the terminal (`console`),
 /// CLI, web panel or loopback API — exactly (`"console"`) or with a suffix

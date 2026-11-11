@@ -12,7 +12,28 @@ pub(super) fn session_allow_key(question: &str, detail: Option<&str>) -> String 
 impl Runtime {
     /// Decide a pending approval: answer the engine ask and audit (SEED
     /// §5.5: single-use; "always" is never offered from channels).
-    pub async fn decide(&self, approval_id: &str, decision: ApprovalDecision) -> Result<(), Error> {
+    /// Approvals are the admin role's: a subject's answer is refused (and
+    /// audited) before it can reach the engine.
+    pub async fn decide(
+        &self,
+        approval_id: &str,
+        decision: ApprovalDecision,
+        source: &str,
+    ) -> Result<(), Error> {
+        let role = self.role_for_source(source);
+        if role != ka_agent_core::ADMIN_ROLE {
+            let mut rec = AuditRecord::new(
+                source,
+                audit_actions::APPROVAL_DECIDE,
+                approval_id,
+                Some("refused: approvals are decided by the admin role".to_string()),
+            )
+            .with_role(&role);
+            let _ = self.sh.store.append_audit(&mut rec);
+            return Err(Error::Refused(
+                "approvals are decided by the admin role".into(),
+            ));
+        }
         let id = ApprovalId(approval_id.to_string());
         let (ask_id, port) = {
             let g = self.lock();
@@ -67,7 +88,7 @@ impl Runtime {
     /// "Allow for this session": allow this approval and every identical
     /// one (same question and detail) until `/new`. Terminal and web only —
     /// the caller enforces the surface.
-    pub async fn decide_for_session(&self, approval_id: &str) -> Result<(), Error> {
+    pub async fn decide_for_session(&self, approval_id: &str, source: &str) -> Result<(), Error> {
         let approval = self
             .sh
             .store
@@ -80,12 +101,17 @@ impl Runtime {
             let key = session_allow_key(question, detail.as_deref());
             self.lock().session_allow.insert(key);
         }
-        self.decide(approval_id, ApprovalDecision::Allow).await
+        self.decide(approval_id, ApprovalDecision::Allow, source)
+            .await
     }
 
     /// Decide the most recent pending approval (console `/y` and `/n`).
     /// Returns Ok(false) when nothing is pending.
-    pub async fn decide_latest(&self, decision: ApprovalDecision) -> Result<bool, Error> {
+    pub async fn decide_latest(
+        &self,
+        decision: ApprovalDecision,
+        source: &str,
+    ) -> Result<bool, Error> {
         let sid = self.session_id();
         let latest = self
             .sh
@@ -95,7 +121,7 @@ impl Runtime {
             .max_by_key(|a| a.created_ms);
         match latest {
             Some(a) => {
-                self.decide(a.id.as_str(), decision).await?;
+                self.decide(a.id.as_str(), decision, source).await?;
                 Ok(true)
             }
             None => Ok(false),

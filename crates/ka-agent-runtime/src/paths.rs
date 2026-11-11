@@ -90,6 +90,91 @@ impl Paths {
         Ok(())
     }
 
+    /// One role's root: `admin` is the profile root itself (zero
+    /// migration); every other role owns `<root>/roles/<name>`.
+    pub fn role_root(&self, role: &str) -> PathBuf {
+        if role == ka_agent_core::ADMIN_ROLE {
+            self.root.clone()
+        } else {
+            self.root.join("roles").join(role)
+        }
+    }
+
+    /// The role's memory root (disjoint from every other role's).
+    pub fn role_memory(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("memory")
+    }
+
+    /// The role's notes directory (`kagent__notes_*`).
+    pub fn role_notes(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("notes")
+    }
+
+    /// The role's attachments (engine files, private-session media).
+    pub fn role_attachments(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("attachments")
+    }
+
+    /// The role's synthetic HOME (compiled MEMORY.md/IDENTITY.md, skills).
+    pub fn role_engine_home(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("engine-home")
+    }
+
+    /// The role's XDG_STATE_HOME (spills, trust store, detached jobs).
+    pub fn role_engine_state(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("engine-state")
+    }
+
+    /// The role's `KA_DATA_DIR` (strands, waypoints, index).
+    pub fn role_ka_data(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("ka")
+    }
+
+    /// The role's XDG_CACHE_HOME (feeds the sandbox allowlist).
+    pub fn role_engine_cache(&self, role: &str) -> PathBuf {
+        self.role_engine_home(role).join(".cache")
+    }
+
+    /// The role's default workspace (`<role root>/workspace`); a role may
+    /// pin an explicit `workspace` in its config instead.
+    pub fn role_workspace(&self, role: &str) -> PathBuf {
+        self.role_root(role).join("workspace")
+    }
+
+    /// Create one role's tree (`memory/`, `workspace/`, `notes/`,
+    /// `attachments/`, `engine-home/.config/ka`, `engine-state/`), 0700
+    /// like the rest. Idempotent.
+    pub fn ensure_role_dirs(&self, role: &str) -> std::io::Result<()> {
+        if role == ka_agent_core::ADMIN_ROLE {
+            return self.ensure_dirs();
+        }
+        for dir in [
+            self.role_root(role),
+            self.role_memory(role),
+            self.role_workspace(role),
+            self.role_notes(role),
+            self.role_attachments(role),
+            self.role_ka_data(role),
+            self.role_engine_home(role).join(".config/ka"),
+            self.role_engine_cache(role),
+            self.role_engine_state(role),
+        ] {
+            std::fs::create_dir_all(dir)?;
+        }
+        restrict_dir(&self.role_root(role))?;
+        restrict_dir(&self.root.join("roles"))?;
+        Ok(())
+    }
+
+    /// Every configured role's tree (admin's is the profile root, already
+    /// covered by [`Self::ensure_dirs`]).
+    pub fn ensure_role_dirs_for(&self, roles: &[ka_agent_core::RoleSpec]) -> std::io::Result<()> {
+        for role in roles {
+            self.ensure_role_dirs(&role.name)?;
+        }
+        Ok(())
+    }
+
     /// Whether the data root (or the `~/.ka-agent` base above it) lets
     /// other users in — `None` when private.
     pub fn loose_permissions(&self) -> Option<PathBuf> {
@@ -195,6 +280,53 @@ mod tests {
         assert!(p.ka_data().is_dir());
         assert!(p.engine_home().join(".config/ka").is_dir());
         assert!(p.engine_state().is_dir());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn role_roots_are_disjoint_and_admin_is_the_profile_root() {
+        let root = PathBuf::from("/data/profile");
+        let p = Paths::new(root.clone());
+        assert_eq!(p.role_root("admin"), root);
+        assert_eq!(p.role_memory("admin"), root.join("memory"));
+        assert_eq!(p.role_root("guest"), root.join("roles/guest"));
+        assert_eq!(p.role_memory("guest"), root.join("roles/guest/memory"));
+        assert_eq!(p.role_notes("guest"), root.join("roles/guest/notes"));
+        assert_eq!(
+            p.role_engine_home("guest"),
+            root.join("roles/guest/engine-home")
+        );
+        assert_eq!(
+            p.role_workspace("guest"),
+            root.join("roles/guest/workspace")
+        );
+        assert_ne!(p.role_memory("guest"), p.role_memory("ops"));
+    }
+
+    #[test]
+    fn ensure_role_dirs_creates_the_tree_private() {
+        let root = std::env::temp_dir().join(format!("ka-agent-role-paths-{}", std::process::id()));
+        let p = Paths::new(root.clone());
+        p.ensure_role_dirs("guest").unwrap();
+        for dir in [
+            p.role_memory("guest"),
+            p.role_notes("guest"),
+            p.role_workspace("guest"),
+            p.role_attachments("guest"),
+            p.role_engine_home("guest").join(".config/ka"),
+            p.role_engine_state("guest"),
+        ] {
+            assert!(dir.is_dir(), "{dir:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(p.role_root("guest"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "role root must be 0700");
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

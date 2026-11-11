@@ -71,9 +71,11 @@ impl Store {
         };
         let canonical = serde_json::to_string(&payload).unwrap_or_default();
         let hash = audit_hash(&prev_hash, &canonical);
+        // `role` rides beside the chain, not inside the canonical payload:
+        // rows written before roles existed keep verifying unchanged.
         tx.execute(
-            "INSERT INTO audit(seq, at_ms, actor, action, subject, detail, prev_hash, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO audit(seq, at_ms, actor, action, subject, detail, prev_hash, hash, role)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 seq,
                 record.at_ms,
@@ -82,7 +84,8 @@ impl Store {
                 record.subject,
                 record.detail,
                 prev_hash,
-                hash
+                hash,
+                record.role
             ],
         )?;
         record.hash = hash;
@@ -145,7 +148,7 @@ impl Store {
     pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT seq, at_ms, actor, action, subject, detail, prev_hash, hash
+            "SELECT seq, at_ms, actor, action, subject, detail, prev_hash, hash, role
              FROM audit ORDER BY seq DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |r| {
@@ -158,6 +161,7 @@ impl Store {
                 detail: r.get(5)?,
                 prev_hash: r.get(6)?,
                 hash: r.get(7)?,
+                role: r.get(8)?,
             })
         })?;
         let mut out = Vec::new();

@@ -128,8 +128,8 @@ pub fn latest_release() -> Result<(String, bool), String> {
 /// reported with the remedy instead of failing halfway through a
 /// download. Returns the running binary's path on success.
 pub fn can_write_install_dir() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot locate the running binary: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate the running binary: {e}"))?;
     let Some(dir) = exe.parent() else {
         return Err(format!(
             "the running binary has no directory: {}",
@@ -189,7 +189,9 @@ pub fn update_from_daemon(
         return Ok(format!("ka-agent {current} (up to date)"));
     }
     if check_only {
-        return Ok(format!("{current} → {latest} available — /update installs it"));
+        return Ok(format!(
+            "{current} → {latest} available — /update installs it"
+        ));
     }
     // The permission gate: refuse before any download.
     let exe = can_write_install_dir()?;
@@ -210,7 +212,11 @@ pub fn update_from_daemon(
         let text = {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let pick = if stderr.trim().is_empty() { &stdout } else { &stderr };
+            let pick = if stderr.trim().is_empty() {
+                &stdout
+            } else {
+                &stderr
+            };
             pick.trim().lines().last().unwrap_or("").to_string()
         };
         return Err(if text.is_empty() {
@@ -556,8 +562,7 @@ mod tests {
         let dir = scratch_dir("ok");
         assert!(dir_probe_error(&dir).is_none());
         assert!(
-            !dir
-                .join(format!(".ka-agent-update-probe-{}", std::process::id()))
+            !dir.join(format!(".ka-agent-update-probe-{}", std::process::id()))
                 .exists(),
             "the probe cleans up after itself"
         );
@@ -587,7 +592,6 @@ mod tests {
         assert!(err.contains(&ro.display().to_string()), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     #[test]
     fn swap_puts_the_old_image_back_when_the_new_one_cannot_land() {

@@ -91,6 +91,8 @@ enabled = false
 # [web]
 # enabled = true
 # port = 8480
+# bind = "127.0.0.1"            # 0.0.0.0 only behind TLS or a reverse proxy
+# public_url = "https://agent.example.com"  # links (login/pairing) use it
 
 # Daily calendar digest time, local wall clock — what `/calendar add`
 # schedules, and what a live change moves existing digest crons to.
@@ -114,6 +116,29 @@ enabled = false
 # (BRAVE_API_KEY / BING_API_KEY for the others).
 # [search]
 # provider = "tavily"   # tavily | brave | bing
+
+# Roles for linked identities (ADR-0002): one daemon, one bot token, and
+# each identity acts as a role with its own session, memory root, notes,
+# workspace, grants, toolset, budget and command surface. `admin` is
+# implicit (terminal, web panel, CLI). Bind one with
+# `ka-agent identity link telegram 12345 --role guest`.
+# [[role]]
+# name = "guest"                  # [a-z0-9-], never "admin"
+# mode = "readonly"               # ceiling AND default: ask|accept_edits|allow|readonly
+# allow = ["read", "grep"]        # per-turn toolset allowlist (or `disable`, not both)
+# disable = ["tool:bash"]
+# workspace = "~/projects/shared" # default <data>/roles/guest/workspace
+# budget_daily_usd = 2.0          # unset = the profile [budgets] apply
+# commands = ["status", "help", "skills", "skill", "history", "memory"]
+#
+# [[role.grants.path]]            # a role sees ONLY its own grants
+# dir = "/srv/reports"
+# access = "allow"
+
+# Profile-wide engine feature baseline (subtractive, the admin's toolset
+# too): the engine's own [features] disable grammar. A role may narrow it.
+# [tools]
+# disable = ["tool:bash", "mcp:github"]
 
 # MCP servers whose tools the agent may use (`ka-agent mcp add`). Exactly
 # one of `command` (stdio) or `url` (HTTP). `secret:<name>` values resolve

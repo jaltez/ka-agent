@@ -21,7 +21,7 @@ Direction: D→W (daemon to worker, written to the worker's stdin), W→D
 | op | line |
 |---|---|
 | `Open` — start/attach an engine on a strand | `{"op":"open","workspace":"/home/op/work","strand":"/home/op/.ka-agent/profiles/default/ka/strands/01J….jsonl","model":"anthropic/claude-sonnet-4-5","mode":"ask","engine_layer_toml":"/home/op/.config/ka-agent/engine.toml","scenario":null}` |
-| `Submit` — one prompt (text, optional images, optional skills) | `{"op":"submit","text":"fix the failing test","images":[],"skills":[]}` |
+| `Submit` — one prompt (text, optional images, optional skills, optional tool allowlist) | `{"op":"submit","text":"fix the failing test","images":[],"skills":[],"allowed_tools":["read"]}` |
 | `Answer` — resolve a pending ask | `{"op":"answer","ask_id":"a-17","choice":"allow"}` |
 | `Abort` — cancel the running cycle | `{"op":"abort"}` |
 | `SetModel` — set model selector | `{"op":"set_model","selector":"openai/gpt-5.2"}` |
@@ -56,7 +56,9 @@ degradation. The next message starts a fresh worker that resumes the
 strand by path (the §3.6 resume path, replay noted, nothing re-delivered).
 Verified by `idle_worker_is_stopped_then_restarted_on_demand` (chat e2e).
 - `Submit.images`: image inputs for multimodal prompts; `Submit.skills`:
-  skill names to enable for this turn.
+  skill names to enable for this turn; `Submit.allowed_tools` (optional):
+  exact hand names this turn may use (`null` = every tool the engine
+  exposes). Absent = `null`, so an older daemon stays compatible.
 - `Answer.choice`: a **numeric index into the ask's `options`** in request
   order (`0` = allow, `1` = always, `2` = deny for the standard engine
   ordering). Remote channels never send the always index (gap G12).

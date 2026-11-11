@@ -80,6 +80,8 @@ fn spec(text: &str, recurrence_ms: Option<i64>) -> CronSpec {
         weekdays: Vec::new(),
         month_day: None,
         gate: None,
+        role: None,
+        tools: Vec::new(),
     }
 }
 

@@ -38,10 +38,20 @@ impl MatrixChannel {
         }
     }
 
-    /// Point delivery at `room`, persisting it so proactive notices reach
-    /// the operator after a restart.
-    fn set_room(&self, room: &str) {
-        if self.surface.set_room(room)
+    /// Adopt `sender`'s room for per-identity delivery; the last room is
+    /// persisted for proactive notices, but only an admin's room becomes
+    /// the operator's fallback (a subject's room must never receive the
+    /// admin's cards after a restart).
+    fn set_room(&self, sender: &str, room: &str) {
+        self.surface.set_room_for(&format!("matrix:{sender}"), room);
+        let admin = self
+            .store
+            .identity_role("matrix", sender)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r == ka_agent_core::ADMIN_ROLE);
+        if admin
+            && self.store.meta_get(ROOM_KEY).ok().flatten().as_deref() != Some(room)
             && let Err(e) = self.store.meta_set(ROOM_KEY, room)
         {
             eprintln!("matrix: persist room: {e}");
@@ -82,7 +92,7 @@ impl MatrixChannel {
             return;
         }
         match self.surface.client.join(room).await {
-            Ok(()) => self.set_room(room),
+            Ok(()) => self.set_room(&sender, room),
             Err(e) => eprintln!("matrix: join {room}: {e}"),
         }
     }
@@ -123,7 +133,7 @@ impl MatrixChannel {
                 if crate::pairing::redeem(&self.store, "matrix", sender, body)
                     == crate::pairing::Redeem::Linked
                 {
-                    self.set_room(room);
+                    self.set_room(sender, room);
                     self.surface.client.send_split(room, PAIRED_REPLY).await;
                 }
                 return;
@@ -132,7 +142,7 @@ impl MatrixChannel {
             self.audit_unauthorized(sender, format!("room={room}"));
             return;
         }
-        self.set_room(room);
+        self.set_room(sender, room);
         // A reaction is an approval decision on a card we posted.
         if kind == "m.reaction" {
             self.handle_reaction(room, event).await;
@@ -212,7 +222,12 @@ impl MatrixChannel {
         } else {
             ka_agent_core::ApprovalDecision::Deny
         };
-        let reply = match self.runtime.decide(&id, decision).await {
+        let sender = event["sender"].as_str().unwrap_or("");
+        let reply = match self
+            .runtime
+            .decide(&id, decision, &format!("matrix:{sender}"))
+            .await
+        {
             Ok(()) => "decided".to_string(),
             Err(e) => format!("! [approval] {e}"),
         };

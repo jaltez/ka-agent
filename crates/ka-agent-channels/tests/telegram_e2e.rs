@@ -590,7 +590,7 @@ async fn surface_noops_until_chat_is_known() {
         AgentEvent::Error {
             class: "test".into(),
             message: "boom".into(),
-            retryable: true
+            retryable: true,
         },
     ));
     surface.emit(&finished(3));
@@ -2242,8 +2242,14 @@ async fn rate_limit_error_renders_card_with_retry_button() {
         .expect("error card sent as HTML");
     let text = card.body["text"].as_str().unwrap_or("");
     assert!(text.contains("<b>⏳ Rate limited</b>"), "{text}");
-    assert!(text.contains("&lt;batch 42&gt;"), "detail is escaped: {text}");
-    assert!(text.contains("<code>"), "detail rides in a code block: {text}");
+    assert!(
+        text.contains("&lt;batch 42&gt;"),
+        "detail is escaped: {text}"
+    );
+    assert!(
+        text.contains("<code>"),
+        "detail rides in a code block: {text}"
+    );
     assert_eq!(
         card.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
         json!("retry:last")
@@ -2265,7 +2271,12 @@ async fn auth_error_card_has_no_retry_button() {
     ));
     let card = server
         .await_capture(
-            |c| c.method == "sendMessage" && c.body["text"].as_str().is_some_and(|t| t.contains("Provider rejected")),
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("Provider rejected"))
+            },
             Duration::from_secs(5),
         )
         .expect("auth card sent");
@@ -2290,7 +2301,7 @@ async fn successful_turn_auto_deletes_stale_cards() {
     ));
     server
         .await_capture(
-            |c| c.method == "sendMessage" && c.body["parse_mode"].is_null() == false,
+            |c| c.method == "sendMessage" && !c.body["parse_mode"].is_null(),
             Duration::from_secs(5),
         )
         .expect("error card sent");
@@ -2340,7 +2351,9 @@ async fn cleanup_command_deletes_tracked_messages() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.contains("Can't reach"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("Can't reach"))
             },
             Duration::from_secs(10),
         )
@@ -2355,13 +2368,18 @@ async fn cleanup_command_deletes_tracked_messages() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.starts_with("removed "))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("removed "))
             },
             Duration::from_secs(10),
         )
         .expect("cleanup reported what it removed");
     assert!(
-        reply.body["text"].as_str().unwrap().contains("1 message(s)"),
+        reply.body["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 message(s)"),
         "{:?}",
         reply.body["text"]
     );
@@ -2388,9 +2406,7 @@ async fn send_retries_once_on_flood_control() {
         let sends = server
             .captured()
             .iter()
-            .filter(|c| {
-                c.method == "sendMessage" && c.body["text"].as_str() == Some("must arrive")
-            })
+            .filter(|c| c.method == "sendMessage" && c.body["text"].as_str() == Some("must arrive"))
             .count();
         if sends >= 2 {
             break;
@@ -2417,7 +2433,9 @@ async fn queue_picker_removes_one_item() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.contains("queued question"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("queued question"))
             },
             Duration::from_secs(10),
         )
@@ -2436,7 +2454,11 @@ async fn queue_picker_removes_one_item() {
             Duration::from_secs(10),
         )
         .expect("removal toasted");
-    assert_eq!(stack.store.queue_len(&sid).unwrap(), 0, "queue is empty now");
+    assert_eq!(
+        stack.store.queue_len(&sid).unwrap(),
+        0,
+        "queue is empty now"
+    );
     stop(&mut stack).await;
 }
 
@@ -2454,7 +2476,9 @@ async fn forget_picker_forgets_one_memory() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.contains("allergic"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("allergic"))
             },
             Duration::from_secs(10),
         )
@@ -2470,7 +2494,9 @@ async fn forget_picker_forgets_one_memory() {
         .await_capture(
             |c| {
                 c.method == "answerCallbackQuery"
-                    && c.body["text"].as_str().is_some_and(|t| t.starts_with("forgot "))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("forgot "))
             },
             Duration::from_secs(10),
         )
@@ -2496,7 +2522,9 @@ async fn skills_picker_lists_pending_proposals() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.contains("reviewer"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("reviewer"))
             },
             Duration::from_secs(10),
         )
@@ -2534,7 +2562,9 @@ async fn history_picker_shows_turn_detail() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.contains("volcanoes"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("volcanoes"))
             },
             Duration::from_secs(10),
         )
@@ -2551,7 +2581,9 @@ async fn history_picker_shows_turn_detail() {
         .await_capture(
             |c| {
                 c.method == "editMessageText"
-                    && c.body["text"].as_str().is_some_and(|t| t.starts_with("> what about"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("> what about"))
             },
             Duration::from_secs(10),
         )
@@ -2588,7 +2620,9 @@ async fn approvals_picker_renders_and_answers() {
         .await_capture(
             |c| {
                 c.method == "sendMessage"
-                    && c.body["text"].as_str().is_some_and(|t| t.contains("rm -rf"))
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("rm -rf"))
             },
             Duration::from_secs(10),
         )
@@ -2631,7 +2665,9 @@ async fn update_command_refuses_without_hook_and_dispatches_with_one() {
             Duration::from_secs(5),
         )
         .expect("no-hook refusal names the manual path");
-    stack.server.push_text_message(2, 5, 42, "/update frobnicate");
+    stack
+        .server
+        .push_text_message(2, 5, 42, "/update frobnicate");
     stack
         .server
         .await_capture(

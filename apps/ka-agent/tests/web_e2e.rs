@@ -103,13 +103,18 @@ impl Daemon {
 }
 
 fn spawn_daemon(root: &std::path::Path, port: u16) -> Daemon {
+    spawn_daemon_extra(root, port, "")
+}
+
+/// The same daemon with extra config text (roles, tools) appended.
+fn spawn_daemon_extra(root: &std::path::Path, port: u16, extra: &str) -> Daemon {
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let cfg = root.join("ka-agent.toml");
     std::fs::write(
         &cfg,
         format!(
-            "workspace = {:?}\nmode = \"guarded\"\nturn_grace_secs = 5\n",
+            "workspace = {:?}\nmode = \"guarded\"\nturn_grace_secs = 5\n{extra}",
             ws.display().to_string()
         ),
     )
@@ -140,6 +145,550 @@ fn spawn_daemon(root: &std::path::Path, port: u16) -> Daemon {
         .spawn()
         .unwrap();
     Daemon { child, data, port }
+}
+
+/// `ka-agent pair web --role <role>` against the daemon's data dir.
+fn pair_web(daemon: &Daemon, role: &str) -> String {
+    let config = daemon
+        .data
+        .parent()
+        .expect("data root has a parent")
+        .join("ka-agent.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["pair", "web", "--role", role])
+        .arg("--config")
+        .arg(&config)
+        .envs(daemon.env())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "pair web: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("web pairing code: "))
+        .expect("pairing code on stdout")
+        .split_whitespace()
+        .next()
+        .expect("code word")
+        .to_string()
+}
+
+/// ADR-0002: a paired browser gets a role session — chat only, its own
+/// history, and never an admin page. The operator's own session still sees
+/// everything.
+#[test]
+fn web_role_pairing_is_chat_only() {
+    let root = temp_root("roleweb");
+    let port = free_port();
+    let mut daemon = spawn_daemon_extra(
+        &root,
+        port,
+        "[[role]]\nname = \"guest\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
+    );
+    // Wait for the listener (and consume one admin login URL).
+    let _admin_url = daemon.web_token();
+
+    let code = pair_web(&daemon, "guest");
+    let resp = request(
+        port,
+        "POST",
+        "/pair",
+        None,
+        &format!("code={}", code.replace('-', "%2D")),
+    );
+    assert_eq!(resp.status, 303, "pairing redirects: {}", resp.body);
+    let set = resp.header("set-cookie").expect("Set-Cookie on pairing");
+    assert!(set.contains("HttpOnly"), "cookie not HttpOnly: {set}");
+    assert!(set.contains("SameSite=Strict"), "cookie not Strict: {set}");
+    let cookie = resp.cookie();
+
+    // The role chat page renders, with its badge and no admin nav.
+    let page = request(port, "GET", "/", Some(&cookie), "");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("role guest"), "{}", page.body);
+    assert!(
+        !page.body.contains("href=\"/approvals\""),
+        "no admin navigation on a role page"
+    );
+    // Every admin surface is refused.
+    for path in ["/status", "/approvals", "/audit", "/memory", "/contacts"] {
+        let resp = request(port, "GET", path, Some(&cookie), "");
+        assert_eq!(resp.status, 403, "{path} must be admin-only: {}", resp.body);
+    }
+    let resp = request(port, "POST", "/settings", Some(&cookie), "mode=allow");
+    assert_eq!(resp.status, 403, "a role cannot mutate settings");
+
+    // A chat post routes as `web:<id>`, so the role gates apply server-side.
+    let resp = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&cookie),
+        "text=%2Fmodel",
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.body.contains("not available for role guest"),
+        "{}",
+        resp.body
+    );
+
+    // The operator's session is unaffected and sees the profiles page.
+    let admin = login(&daemon);
+    let status = request(port, "GET", "/status", Some(&admin), "");
+    assert_eq!(status.status, 200);
+    let profiles = request(port, "GET", "/profiles", Some(&admin), "");
+    assert_eq!(profiles.status, 200);
+    assert!(
+        profiles.body.contains("linked identities"),
+        "{}",
+        profiles.body
+    );
+    assert!(
+        profiles.body.contains("guest"),
+        "the configured role is listed: {}",
+        profiles.body
+    );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+}
+
+/// Uploads, downloads and admin-issued pairing codes: the web chat's
+/// Telegram-parity file path, scoped to the caller role.
+#[test]
+fn web_uploads_files_and_pairing_codes() {
+    let root = temp_root("webup");
+    let port = free_port();
+    let mut daemon = spawn_daemon_extra(
+        &root,
+        port,
+        "[[role]]\nname = \"guest\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
+    );
+    let admin = login(&daemon);
+
+    // Issue a guest pairing code from the admin UI (no CLI needed).
+    let issued = request(port, "POST", "/pair/issue", Some(&admin), "role=guest");
+    assert_eq!(issued.status, 200, "{}", issued.body);
+    let start = issued.body.find("<code>").expect("code block") + "<code>".len();
+    let end = issued.body[start..].find("</code>").unwrap() + start;
+    let code = issued.body[start..end].to_string();
+    assert!(code.contains('-'), "pairing code shape: {code}");
+    let paired = request(port, "POST", "/pair", None, &format!("code={code}"));
+    assert_eq!(paired.status, 303);
+    let guest = paired.cookie();
+
+    // Guest uploads one file; it lands under the role's own workspace.
+    let up = request_h(
+        port,
+        "POST",
+        "/upload",
+        Some(&guest),
+        "hello from the web",
+        &[("X-Ka-Agent", "1"), ("X-Ka-Filename", "note.txt")],
+    );
+    assert_eq!(up.status, 200, "{}", up.body);
+    let name = up
+        .body
+        .split("\"name\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .expect("upload name")
+        .to_string();
+    assert!(name.contains("note.txt"), "{name}");
+    let role_attachments = daemon.data.join("roles/guest/workspace/attachments");
+    assert!(
+        role_attachments.join(&name).is_file(),
+        "stored under the role tree: {}",
+        role_attachments.display()
+    );
+
+    // The guest can download its own file, but no traversal, and never a
+    // file the operator uploaded.
+    let file = request(port, "GET", &format!("/file/{name}"), Some(&guest), "");
+    assert_eq!(file.status, 200);
+    assert_eq!(file.body, "hello from the web");
+    let trav = request(port, "GET", "/file/..%2Fconfig.toml", Some(&guest), "");
+    assert_eq!(trav.status, 400, "{}", trav.body);
+    let admin_up = request_h(
+        port,
+        "POST",
+        "/upload",
+        Some(&admin),
+        "operator secret",
+        &[("X-Ka-Agent", "1"), ("X-Ka-Filename", "op.txt")],
+    );
+    assert_eq!(admin_up.status, 200);
+    let admin_name = admin_up
+        .body
+        .split("\"name\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap()
+        .to_string();
+    let denied = request(
+        port,
+        "GET",
+        &format!("/file/{admin_name}"),
+        Some(&guest),
+        "",
+    );
+    assert_eq!(
+        denied.status, 404,
+        "a role never reads the operator's files"
+    );
+
+    // Profile lifecycle is refused under a pinned data root (the e2e's
+    // shape): the page says so instead of spawning the CLI.
+    for (path, body) in [
+        ("/profiles/create", "name=other"),
+        ("/profiles/remove", "name=default&confirm=default"),
+    ] {
+        let resp = request(port, "POST", path, Some(&admin), body);
+        assert_eq!(resp.status, 403, "{path}: {}", resp.body);
+        assert!(resp.body.contains("pinned"), "{}", resp.body);
+    }
+
+    // The uploaded @ref is a normal reference for the chat.
+    let chat = request_h(
+        port,
+        "POST",
+        "/chat/send",
+        Some(&guest),
+        &format!(
+            "text={}",
+            urlencode(&format!("what is in @attachments/{name}?")).as_str()
+        ),
+        &[("X-Ka-Agent", "1")],
+    );
+    assert_eq!(chat.status, 200, "{}", chat.body);
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push_str("%20"),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// The admin surface added for TUI/CLI parity: models/mode/effort/persona,
+/// config, queue, grants, keys, tasks (create + cron actions), per-role
+/// skills, memory remember/undo — every page renders and every action
+/// answers.
+#[test]
+fn admin_pages_cover_the_cli_surface() {
+    let root = temp_root("adminpages");
+    let port = free_port();
+    let mut daemon = spawn_daemon_extra(
+        &root,
+        port,
+        "[[role]]\nname = \"guest\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
+    );
+    // A skill in the profile library (enable/disable targets).
+    let skill = daemon.data.join("skills/demo/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: demo\ndescription: demo skill\n---\nbody\n",
+    )
+    .unwrap();
+    let admin = login(&daemon);
+
+    for (path, marker) in [
+        ("/models", "Provider catalog"),
+        ("/config", "Every key"),
+        ("/sessions", "Recent conversations"),
+        ("/queue", "queue is empty"),
+        ("/grants", "scope grants"),
+        ("/keys", "provider keys"),
+        ("/tasks", "new cron"),
+        ("/skills", "demo"),
+        ("/extensions", "Live tools"),
+        ("/doctor", "data root"),
+        ("/logs", "daemon log tail"),
+    ] {
+        let page = request(port, "GET", path, Some(&admin), "");
+        assert_eq!(page.status, 200, "{path}");
+        assert!(
+            page.body.contains(marker),
+            "{path} misses {marker:?}: {}",
+            page.body
+        );
+    }
+    // Role sessions still cannot see any of it.
+    let guest = {
+        let code = {
+            let issued = request(port, "POST", "/pair/issue", Some(&admin), "role=guest");
+            let start = issued.body.find("<code>").unwrap() + 6;
+            let end = issued.body[start..].find("</code>").unwrap() + start;
+            issued.body[start..end].to_string()
+        };
+        request(port, "POST", "/pair", None, &format!("code={code}")).cookie()
+    };
+    let denied = request(port, "GET", "/models", Some(&guest), "");
+    assert_eq!(denied.status, 403);
+
+    // Mode/effort/model switches answer with the applied value.
+    let mode = request(port, "POST", "/models/mode", Some(&admin), "mode=readonly");
+    assert_eq!(mode.status, 200);
+    assert!(mode.body.contains("mode → readonly"), "{}", mode.body);
+    let effort = request(port, "POST", "/models/effort", Some(&admin), "level=low");
+    assert_eq!(effort.status, 200);
+    assert!(effort.body.contains("effort"), "{}", effort.body);
+
+    // Grants add/remove round-trip.
+    let add = request(
+        port,
+        "POST",
+        "/grants/add",
+        Some(&admin),
+        "scope=http%3Aget%3Aexample.com",
+    );
+    assert_eq!(add.status, 303);
+    let grants = request(port, "GET", "/grants", Some(&admin), "");
+    assert!(grants.body.contains("http:get:example.com"));
+    let rm = request(
+        port,
+        "POST",
+        "/grants/rm",
+        Some(&admin),
+        "scope=http%3Aget%3Aexample.com",
+    );
+    assert_eq!(rm.status, 303);
+
+    // Reminder creation through the shared router, then the list shows it.
+    let add = request(
+        port,
+        "POST",
+        "/tasks/add",
+        Some(&admin),
+        "kind=reminder&args=in%202h%20web%20test%20reminder",
+    );
+    assert_eq!(add.status, 200, "{}", add.body);
+    let tasks = request(port, "GET", "/tasks", Some(&admin), "");
+    assert!(tasks.body.contains("web test reminder"), "{}", tasks.body);
+
+    // Memory: remember now, then the fact is listed.
+    let remember = request(
+        port,
+        "POST",
+        "/memory/remember",
+        Some(&admin),
+        "text=the%20web%20remembers",
+    );
+    assert_eq!(remember.status, 200, "{}", remember.body);
+    let memory = request(port, "GET", "/memory", Some(&admin), "");
+    assert!(memory.body.contains("the web remembers"), "{}", memory.body);
+
+    // Per-role skills: enable demo for guest only.
+    let toggle = request(
+        port,
+        "POST",
+        "/skills/toggle",
+        Some(&admin),
+        "name=demo&role=guest&enable=1",
+    );
+    assert_eq!(toggle.status, 200, "{}", toggle.body);
+    assert!(
+        daemon
+            .data
+            .join("roles/guest/engine-home/.config/ka/skills/demo/SKILL.md")
+            .is_file(),
+        "skill provisioned into the role's engine home"
+    );
+
+    // Provider keys and secrets can be set from the panel; values never echo.
+    let key = request(
+        port,
+        "POST",
+        "/keys/provider",
+        Some(&admin),
+        "name=DEMO_KEY&value=sk-test-value",
+    );
+    assert_eq!(key.status, 200, "{}", key.body);
+    assert!(
+        !key.body.contains("sk-test-value"),
+        "the value is never rendered"
+    );
+    let env = std::fs::read_to_string(daemon.data.join("engine-home/.config/ka/.env"))
+        .unwrap_or_default();
+    assert!(env.contains("DEMO_KEY=sk-test-value"), "{env}");
+    let secret = request(
+        port,
+        "POST",
+        "/keys/secret",
+        Some(&admin),
+        "name=demo.token&value=abc123",
+    );
+    assert_eq!(secret.status, 200, "{}", secret.body);
+    assert!(!secret.body.contains("abc123"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = daemon.data.join("secrets/demo.token");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file is 0600");
+    }
+
+    // Roles: create, edit page, delete (config `[[role]]`).
+    let role = request(
+        port,
+        "POST",
+        "/roles/save",
+        Some(&admin),
+        "original=&name=editor&mode=ask&allow=read%2Cgrep&disable=&workspace=&budget=&commands=status%2Chelp",
+    );
+    assert_eq!(role.status, 200, "{}", role.body);
+    let profiles = request(port, "GET", "/profiles", Some(&admin), "");
+    assert!(profiles.body.contains("editor"), "{}", profiles.body);
+    let edit = request(port, "GET", "/roles/edit/editor", Some(&admin), "");
+    assert_eq!(edit.status, 200);
+    assert!(edit.body.contains("editor"), "{}", edit.body);
+    let deleted = request(
+        port,
+        "POST",
+        "/roles/delete",
+        Some(&admin),
+        "name=editor&force=1",
+    );
+    assert_eq!(deleted.status, 200, "{}", deleted.body);
+    let profiles = request(port, "GET", "/profiles", Some(&admin), "");
+    assert!(!profiles.body.contains(">editor<"), "role removed");
+
+    // Profile-wide tool baseline.
+    let tools = request(
+        port,
+        "POST",
+        "/tools/disable",
+        Some(&admin),
+        "specs=tool%3Abash",
+    );
+    assert_eq!(tools.status, 200, "{}", tools.body);
+    let cfg_text = std::fs::read_to_string(root.join("ka-agent.toml")).unwrap();
+    assert!(cfg_text.contains("tool:bash"), "{cfg_text}");
+    let tools = request(port, "POST", "/tools/disable", Some(&admin), "specs=");
+    assert_eq!(tools.status, 200);
+
+    // Identity link/unlink from the panel.
+    let linked = request(
+        port,
+        "POST",
+        "/identities/link",
+        Some(&admin),
+        "channel=matrix&address=%40web%3Aexample.org&role=guest",
+    );
+    assert_eq!(linked.status, 200, "{}", linked.body);
+    let profiles = request(port, "GET", "/profiles", Some(&admin), "");
+    assert!(
+        profiles.body.contains("@web:example.org"),
+        "{}",
+        profiles.body
+    );
+    let unlinked = request(
+        port,
+        "POST",
+        "/identities/unlink",
+        Some(&admin),
+        "channel=matrix&address=%40web%3Aexample.org",
+    );
+    assert_eq!(unlinked.status, 200, "{}", unlinked.body);
+
+    // MCP add/remove through the config.
+    let mcp = request(
+        port,
+        "POST",
+        "/mcp/add",
+        Some(&admin),
+        "name=demo&kind=http&url=http%3A%2F%2F127.0.0.1%3A9%2Fmcp&command=&env=",
+    );
+    assert_eq!(mcp.status, 200, "{}", mcp.body);
+    let ext = request(port, "GET", "/extensions", Some(&admin), "");
+    assert!(ext.body.contains("demo"), "{}", ext.body);
+    let mcp_rm = request(port, "POST", "/mcp/rm", Some(&admin), "name=demo");
+    assert_eq!(mcp_rm.status, 200, "{}", mcp_rm.body);
+
+    // Theme toggle ships on every page.
+    let chat = request(port, "GET", "/", Some(&admin), "");
+    assert!(chat.body.contains("theme-toggle"), "{}", chat.body);
+    assert!(chat.body.contains("/static/ui.js"), "{}", chat.body);
+    let ui = request(port, "GET", "/static/ui.js", None, "");
+    assert_eq!(ui.status, 200);
+    assert!(ui.body.contains("ka-theme"), "{}", ui.body);
+
+    // Doctor --fix runs (exit code may be non-zero with no model; the page
+    // still answers with the child's report).
+    let fix = request(port, "POST", "/doctor/fix", Some(&admin), "");
+    assert_eq!(fix.status, 200, "{}", fix.body);
+
+    // Secret removal.
+    let rm = request(
+        port,
+        "POST",
+        "/keys/secret/rm",
+        Some(&admin),
+        "name=demo.token",
+    );
+    assert_eq!(rm.status, 200, "{}", rm.body);
+    assert!(!daemon.data.join("secrets/demo.token").exists());
+
+    // The full doctor runs the binary's own checks beside the in-process ones.
+    let doctor_page = request(port, "GET", "/doctor", Some(&admin), "");
+    assert!(
+        doctor_page.body.contains("full doctor"),
+        "{}",
+        doctor_page.body
+    );
+
+    // Backup now writes a restorable snapshot under <data>/backups.
+    let backup = request(port, "POST", "/backup", Some(&admin), "");
+    assert_eq!(backup.status, 200, "{}", backup.body);
+    assert!(
+        backup.body.contains("backups") || backup.body.contains("backup"),
+        "{}",
+        backup.body
+    );
+    let backups = std::fs::read_dir(daemon.data.join("backups"))
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
+    assert!(backups >= 1, "a backup directory exists");
+
+    // Sessions: switch to guest and back through the page action.
+    let open = request(port, "POST", "/sessions/open", Some(&admin), "role=guest");
+    assert_eq!(open.status, 200, "{}", open.body);
+    assert!(
+        open.body.contains("now acting as role guest"),
+        "{}",
+        open.body
+    );
+    let back = request(port, "POST", "/sessions/open", Some(&admin), "role=admin");
+    assert_eq!(back.status, 200, "{}", back.body);
+
+    // Persona edit recompiles IDENTITY.md.
+    let persona = request(
+        port,
+        "POST",
+        "/persona",
+        Some(&admin),
+        "text=%23%20Test%20Bot%0Acalm%20and%20clear",
+    );
+    assert_eq!(persona.status, 200, "{}", persona.body);
+    let models = request(port, "GET", "/models", Some(&admin), "");
+    assert!(models.body.contains("Test Bot"), "{}", models.body);
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +785,7 @@ fn seed_session(store: &ka_agent_store::Store, id: &str, workspace: &std::path::
             strand_id: None,
             strand_path: None,
             status: ka_agent_core::SessionStatus::Idle,
+            role: ka_agent_core::ADMIN_ROLE.to_string(),
             private: false,
             created_ms: ka_agent_core::now_ms(),
             updated_ms: ka_agent_core::now_ms(),

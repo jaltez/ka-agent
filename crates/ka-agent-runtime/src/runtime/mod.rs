@@ -33,6 +33,7 @@ mod events;
 mod identity;
 mod intake;
 mod memory;
+mod roles;
 mod scheduler;
 mod worker;
 
@@ -119,6 +120,11 @@ struct Live {
 
 struct Inner {
     session: Session,
+    /// The role the live session belongs to (`admin` for local surfaces).
+    role: String,
+    /// A `/mode` choice inside the role's ceiling for this session (a
+    /// non-admin role never persists it; a switch parks and restores it).
+    session_mode: Option<String>,
     /// Calls the operator allowed "for this session" (question + detail,
     /// exact): asked again, they are answered without a card. Cleared by
     /// `/new`.
@@ -128,6 +134,18 @@ struct Inner {
     /// Timestamps (ms) of recent worker crashes, for the crash-loop breaker.
     crashes: Vec<i64>,
     restart_attempt: u32,
+}
+
+/// One role's conversation state while another role is active: the
+/// single-session core parks it whole and swaps it back on return.
+struct ParkedRole {
+    session: Session,
+    session_allow: std::collections::HashSet<String>,
+    session_mode: Option<String>,
+    budget: BudgetState,
+    crashes: Vec<i64>,
+    restart_attempt: u32,
+    effort: Option<String>,
 }
 
 /// A no-agent cron handler: input is the spec text, output the digest text.
@@ -140,7 +158,6 @@ pub type NoAgentFn = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 /// handlers.
 pub type UpdateFn = Arc<dyn Fn(bool) -> Result<String, String> + Send + Sync>;
 
-
 struct Shared {
     /// The live configuration; swapped whole by [`Runtime::reload_config`].
     cfg: std::sync::RwLock<Arc<DaemonConfig>>,
@@ -148,13 +165,17 @@ struct Shared {
     config_path: Mutex<Option<std::path::PathBuf>>,
     paths: Paths,
     store: Arc<Store>,
-    memory: ka_agent_memory::MemoryStore,
+    /// One memory store per role, opened lazily at the role's root
+    /// (`admin` keeps `<data>/memory`).
+    memories: Mutex<HashMap<String, ka_agent_memory::MemoryStore>>,
     port: WorkerPort,
     surface: Arc<dyn Surface>,
     /// The envelope sequence (starts at 1): every emitted envelope takes
     /// one, so any stream can name the last event it saw.
     seq: AtomicU64,
     inner: Mutex<Inner>,
+    /// Conversation state of every role that is not the active one.
+    parked: Mutex<HashMap<String, ParkedRole>>,
     /// No-agent cron handlers, registered by kind (e.g. "calendar").
     /// Registered by the app binary; the runtime only dispatches (M11).
     no_agent: Mutex<HashMap<String, NoAgentFn>>,
@@ -214,6 +235,13 @@ impl Shared {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.surface.emit(&Envelope::new(seq, ev));
     }
+
+    /// Sequence and fan out one event stamped with the source it belongs
+    /// to (per-identity delivery).
+    pub(super) fn emit_from(&self, ev: AgentEvent, source: Option<&str>) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.surface.emit(&Envelope::from(seq, ev, source));
+    }
 }
 
 fn cfg_of(sh: &Shared) -> Arc<DaemonConfig> {
@@ -254,6 +282,9 @@ impl Runtime {
         surface: Arc<dyn Surface>,
     ) -> Result<Self, Error> {
         paths.ensure_dirs()?;
+        // Every configured role owns a disjoint tree; create it up front so
+        // a role's first message never races directory creation.
+        paths.ensure_role_dirs_for(&cfg.roles)?;
         // The sequence exists before `Shared` does: the recovery notices
         // below are envelopes too (a subscribed early receiver sees them).
         let seq = AtomicU64::new(1);
@@ -281,10 +312,11 @@ impl Runtime {
                 ),
             });
         }
+        // Boot adopts the admin conversation: the daemon's own surfaces
+        // (terminal, web, CLI) are the admin role; a role's session is
+        // adopted on the first message from one of its identities.
         let mut session = store
-            .list_recent_sessions(1)?
-            .into_iter()
-            .next()
+            .latest_session_for_role(ka_agent_core::ADMIN_ROLE)?
             .unwrap_or_else(|| Session::new(cfg.workspace_path()));
         // A fresh (or dangling) adopted session must exist as a row before
         // turns reference it.
@@ -366,26 +398,39 @@ impl Runtime {
             budget.daily_usd_cap = cfg.budgets.daily_usd;
             budget.daily_token_cap = cfg.budgets.daily_tokens;
         }
-        let memory = ka_agent_memory::MemoryStore::open(&paths.root().join("memory"))?;
-        // Compile stable memory into the engine's user-tier MEMORY.md; ka
+        let memory =
+            ka_agent_memory::MemoryStore::open(&paths.role_memory(ka_agent_core::ADMIN_ROLE))?;
+        // Compile stable memory into each engine's user-tier MEMORY.md; ka
         // re-reads it per prompt (validation §5), so no worker restart is
-        // needed after updates.
+        // needed after updates. Every role gets its own root compiled into
+        // its own engine home.
         memory.install_compiled(
             &paths.engine_home().join(".config/ka"),
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
             &memory_preamble(&cfg),
         )?;
+        for role in &cfg.roles {
+            let role_memory = ka_agent_memory::MemoryStore::open(&paths.role_memory(&role.name))?;
+            role_memory.install_compiled(
+                &paths.role_engine_home(&role.name).join(".config/ka"),
+                ka_agent_memory::DEFAULT_BUDGET_BYTES,
+                &memory_preamble(&cfg),
+            )?;
+        }
+        let mut memories = HashMap::new();
+        memories.insert(ka_agent_core::ADMIN_ROLE.to_string(), memory);
         let runtime = Self {
             sh: Arc::new(Shared {
                 cfg: std::sync::RwLock::new(Arc::new(cfg)),
                 config_path: Mutex::new(None),
                 paths,
                 store,
-                memory,
+                memories: Mutex::new(memories),
                 port,
                 surface,
                 seq,
                 no_agent: Mutex::new(HashMap::new()),
+                parked: Mutex::new(HashMap::new()),
                 selector_cache: Mutex::new(None),
                 env_cache: Mutex::new(None),
                 scheduler_tick: tokio::sync::Notify::new(),
@@ -403,6 +448,8 @@ impl Runtime {
                 model_registry: Mutex::new(None),
                 inner: Mutex::new(Inner {
                     session,
+                    role: ka_agent_core::ADMIN_ROLE.to_string(),
+                    session_mode: None,
                     session_allow: std::collections::HashSet::new(),
                     live: None,
                     budget,
@@ -466,9 +513,20 @@ impl Runtime {
         cfg_of(&self.sh)
     }
 
-    /// The operator's workspace: where `@` file references resolve.
+    /// The active session's workspace: where `@` file references resolve
+    /// and where the engine's files live. It follows the live session (a
+    /// role's own tree), falling back to the configured workspace before
+    /// any session exists.
     pub fn workspace(&self) -> std::path::PathBuf {
-        self.cfg().workspace_path()
+        let session = {
+            let g = self.lock();
+            g.session.workspace.clone()
+        };
+        if session.as_os_str().is_empty() {
+            self.cfg().workspace_path()
+        } else {
+            session
+        }
     }
 
     /// Now, in the operator's zone (configured, else the system zone).
@@ -484,7 +542,7 @@ impl Runtime {
     /// Everything `/status` shows, in one struct.
     pub fn status_report(&self) -> Result<crate::status::StatusReport, Error> {
         let cfg = self.cfg();
-        let (sid, status, strand, worker_running, budget, crashes, private) = {
+        let (sid, status, strand, worker_running, budget, crashes, private, role) = {
             let g = self.lock();
             (
                 g.session.id.clone(),
@@ -494,8 +552,10 @@ impl Runtime {
                 g.budget.clone(),
                 g.crashes.len(),
                 g.session.private,
+                g.role.clone(),
             )
         };
+        let (limit_usd, limit_tokens) = roles::budget_caps_of(&cfg, &role);
         let queue = self.sh.store.queue_len(&sid)?;
         let pending_approvals = self.sh.store.pending_approvals(&sid)?.len();
         let next_task = self
@@ -524,13 +584,13 @@ impl Runtime {
             private,
             strand_id: strand,
             model: cfg.model.clone(),
-            mode: cfg.mode.clone(),
+            mode: self.effective_mode(),
             worker_running,
             idle_timeout_secs: cfg.worker_idle_timeout_secs,
             spent_usd: budget.spent_usd,
             spent_tokens: budget.spent_tokens,
-            limit_usd: cfg.budgets.daily_usd,
-            limit_tokens: cfg.budgets.daily_tokens,
+            limit_usd,
+            limit_tokens,
             queue,
             pending_approvals,
             crashes,
@@ -541,12 +601,7 @@ impl Runtime {
                 used_bytes: r.total_bytes,
                 budget_bytes: r.budget_bytes,
                 truncated: r.truncated,
-                to_review: self
-                    .sh
-                    .store
-                    .pending_candidates_full()
-                    .map(|c| c.len())
-                    .unwrap_or(0),
+                to_review: self.pending_candidates().map(|c| c.len()).unwrap_or(0),
             }),
             live_model: self
                 .sh
@@ -615,11 +670,7 @@ impl Runtime {
     /// Register the host's `/update` implementation (the app binary; the
     /// release machinery lives there, not in the runtime).
     pub fn set_updater(&self, f: UpdateFn) {
-        *self
-            .sh
-            .updater
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(f);
+        *self.sh.updater.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
     /// The registered `/update` implementation, if this host can
@@ -699,12 +750,14 @@ impl Runtime {
                 live.deliberate_close = true;
             }
             g.crashes.clear();
-            // "Allow for this session" and the session effort end with it.
+            // "Allow for this session", the session mode and effort end
+            // with it.
             g.session_allow.clear();
+            g.session_mode = None;
             *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let superseded = g.session.private.then(|| g.session.id.clone());
             let live_port = g.live.take().map(|l| l.port);
-            let mut s = Session::new(self.cfg().workspace_path());
+            let mut s = Session::new_for_role(self.workspace_for_role(&g.role), &g.role);
             s.private = private;
             g.session = s;
             g.restart_attempt = 0;
@@ -819,9 +872,11 @@ impl Runtime {
     }
 
     /// Ka-agent's own files the engine may never write (the `__guard`
-    /// list): the live config, store, secrets, memory, engine homes and
-    /// every other profile root.
-    fn guard_write_paths(&self) -> Vec<std::path::PathBuf> {
+    /// list): the live config, store, secrets, memory, engine homes, every
+    /// other profile root and every other role's root. A role's own root
+    /// (and workspace) stays writable; admin blocks the whole `roles/`
+    /// tree.
+    fn guard_write_paths(&self, role: &str) -> Vec<std::path::PathBuf> {
         let root = self.sh.paths.root();
         let base = ka_agent_core::layout::base_dir();
         let mut out = vec![
@@ -841,17 +896,40 @@ impl Runtime {
             base.join("active_profile"),
             base.join("skills"),
         ];
+        if role == ka_agent_core::ADMIN_ROLE {
+            out.push(root.join("roles"));
+            // A role's workspace is not the operator's: admin may not
+            // write into it either (the admin workspace stays free).
+            out.extend(self.cfg().roles.iter().map(|r| r.workspace_path(root)));
+        } else {
+            // Every role root but this worker's own (its workspace lives
+            // inside it).
+            let own = self.sh.paths.role_root(role);
+            if let Ok(entries) = std::fs::read_dir(root.join("roles")) {
+                for e in entries.flatten() {
+                    if e.path() != own {
+                        out.push(e.path());
+                    }
+                }
+            }
+            // The profile's own tree is the admin's.
+            out.push(self.cfg().workspace_path());
+        }
         if let Ok(entries) = std::fs::read_dir(base.join("profiles")) {
             for e in entries.flatten() {
-                out.push(e.path());
+                // The acting instance's own root holds its workspace.
+                if e.path() != root {
+                    out.push(e.path());
+                }
             }
         }
         out
     }
 
     /// Files the engine may never read: the secret store, the admin token,
-    /// the engine `.env` and every other profile's secrets.
-    fn guard_read_paths(&self) -> Vec<std::path::PathBuf> {
+    /// the engine `.env`, every other profile's secrets and (for a role)
+    /// the profile's own memory, notes, strands and store.
+    fn guard_read_paths(&self, role: &str) -> Vec<std::path::PathBuf> {
         let root = self.sh.paths.root();
         let base = ka_agent_core::layout::base_dir();
         let mut out = vec![
@@ -859,6 +937,28 @@ impl Runtime {
             root.join("admin.token"),
             self.sh.paths.engine_home().join(".config/ka/.env"),
         ];
+        // Every other role's root (and, for admin, every role root).
+        let own = self.sh.paths.role_root(role);
+        if let Ok(entries) = std::fs::read_dir(root.join("roles")) {
+            for e in entries.flatten() {
+                if e.path() != own {
+                    out.push(e.path());
+                }
+            }
+        }
+        if role != ka_agent_core::ADMIN_ROLE {
+            // A subject never reads the operator's conversation, memory or
+            // notes: the profile's own tree is off limits.
+            out.extend([
+                root.join("memory"),
+                root.join("notes"),
+                root.join("ka"),
+                root.join("engine-home"),
+                root.join("engine-state"),
+                root.join("state.db"),
+                root.join("config.toml"),
+            ]);
+        }
         if let Ok(entries) = std::fs::read_dir(base.join("profiles")) {
             for e in entries.flatten() {
                 let secrets = e.path().join("secrets");
@@ -891,9 +991,20 @@ impl Runtime {
 
     // ---- memory & history (SEED.md §4) --------------------------------
 
+    /// The data root this runtime was opened on.
+    pub fn data_root(&self) -> std::path::PathBuf {
+        self.sh.paths.root().to_path_buf()
+    }
+
     /// The engine home (skills, compiled memory).
     pub fn engine_home(&self) -> std::path::PathBuf {
         self.sh.paths.engine_home()
+    }
+
+    /// One role's synthetic engine HOME (skills, compiled memory); admin
+    /// is the profile's own.
+    pub fn role_engine_home(&self, role: &str) -> std::path::PathBuf {
+        self.sh.paths.role_engine_home(role)
     }
 
     /// The instance store (read/write by routers and the web layer).
@@ -905,8 +1016,16 @@ impl Runtime {
         self.lock().live.as_ref().map(|l| Arc::clone(&l.port))
     }
 
+    /// The live worker's bounded stderr tail (diagnostics: doctor, tests).
+    pub fn worker_stderr_tail(&self) -> Vec<String> {
+        self.live_port()
+            .map(|p| p.stderr_tail())
+            .unwrap_or_default()
+    }
+
     fn audit(&self, action: &str, subject: &str, detail: Option<String>) -> Result<(), Error> {
-        let mut rec = AuditRecord::new("operator", action, subject, detail);
+        let role = self.active_role();
+        let mut rec = AuditRecord::new("operator", action, subject, detail).with_role(&role);
         self.sh.store.append_audit(&mut rec)?;
         Ok(())
     }

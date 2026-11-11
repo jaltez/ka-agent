@@ -35,8 +35,17 @@ pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         }
         let file = (file != "facts").then_some(file);
         let id = ka_agent_core::MemoryId::generate();
+        // The proposal belongs to the role whose turn made it: accepted
+        // memory lands in that role's root, never the admin's by accident.
         ctx.store
-            .add_candidate_to(&id, "model", text, None, file)
+            .add_candidate_for_role(
+                &id,
+                "model",
+                text,
+                None,
+                file,
+                &super::turn_role(&ctx.store),
+            )
             .map_err(|e| format!("candidate: {e}"))?;
         Ok(format!(
             "proposed for review: {id} (the operator will see it in /memory review)"

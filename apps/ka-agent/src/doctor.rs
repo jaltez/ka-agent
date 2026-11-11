@@ -62,6 +62,7 @@ static CONTRACT_DOCS: &[(&str, &[u8])] = &[
         "plugins.md",
         include_bytes!("../../../docs/contract/plugins.md"),
     ),
+    ("rbac.md", include_bytes!("../../../docs/contract/rbac.md")),
     (
         "skills.md",
         include_bytes!("../../../docs/contract/skills.md"),
@@ -430,12 +431,19 @@ pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::proc
                     cfg.web.port
                 ));
             }
+            let loopback = matches!(cfg.web.bind.as_str(), "127.0.0.1" | "::1");
+            if !loopback {
+                rep.warn(&format!(
+                    "web UI bound to {} — put TLS or a reverse proxy in front                      (docs/design/web-relay.md); pairing codes travel over it",
+                    cfg.web.bind
+                ));
+            }
             if daemon_up && !url_in_meta {
                 rep.warn("web UI not answering (port busy?) — check `ka-agent logs`");
             } else {
                 rep.info(&format!(
-                    "web UI port {} (ka-agent dashboard)",
-                    cfg.web.port
+                    "web UI {}:{} (ka-agent dashboard)",
+                    cfg.web.bind, cfg.web.port
                 ));
             }
         } else {
@@ -571,8 +579,22 @@ pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::proc
     if paths.state_db().exists()
         && let Ok(store) = ka_agent_store::Store::open(&paths.state_db())
     {
-        let ids = store.list_identities().map(|v| v.len()).unwrap_or(0);
+        let identities = store.list_identities().unwrap_or_default();
+        let ids = identities.len();
         rep.ok(format!("identities {ids} linked"));
+        // A role removed from the config leaves its identities running
+        // fail-closed (read-only); say so instead of letting them wonder.
+        for id in &identities {
+            let known = cfg
+                .as_ref()
+                .is_none_or(|c| c.roles.iter().any(|r| r.name == id.role));
+            if id.role != ka_agent_core::ADMIN_ROLE && !known {
+                rep.warn(&format!(
+                    "{}:{} has role {:?} — not defined in the config (it runs read-only)",
+                    id.channel, id.address, id.role
+                ));
+            }
+        }
         match ka_agent_plugins::Lockfile::load(&paths.root().join("plugins/installed.json")) {
             Ok(l) => {
                 let enabled = l.plugins.iter().filter(|p| p.enabled).count();

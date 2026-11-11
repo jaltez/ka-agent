@@ -166,7 +166,11 @@ async fn decide_after_ttl_is_refused() {
     store.insert_approval(&approval).unwrap();
 
     let err = rt
-        .decide(approval.id.as_str(), ka_agent_core::ApprovalDecision::Allow)
+        .decide(
+            approval.id.as_str(),
+            ka_agent_core::ApprovalDecision::Allow,
+            "console",
+        )
         .await
         .unwrap_err()
         .to_string();

@@ -227,11 +227,25 @@ impl PortSession {
         skills: Vec<String>,
         model: Option<String>,
     ) -> Result<(), super::PortError> {
+        self.submit_full(text, images, skills, model, None).await
+    }
+
+    /// Submit with every per-turn knob: model override and the toolset
+    /// allowlist (`None` = every tool the engine exposes).
+    pub async fn submit_full(
+        &self,
+        text: String,
+        images: Vec<ImagePayload>,
+        skills: Vec<String>,
+        model: Option<String>,
+        allowed_tools: Option<Vec<String>>,
+    ) -> Result<(), super::PortError> {
         self.send(WorkerCommand::Submit {
             text,
             model,
             images,
             skills,
+            allowed_tools,
         })
         .await
     }

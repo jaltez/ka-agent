@@ -17,6 +17,11 @@ pub struct AuditRecord {
     /// Free-form subject (ids, tool names). Never secrets.
     pub subject: String,
     pub detail: Option<String>,
+    /// The role the acting subject belonged to (`admin` for local
+    /// surfaces and every row that predates roles). Stored beside the
+    /// chain, not hashed into it, so pre-RBAC rows keep verifying.
+    #[serde(default = "crate::admin_role")]
+    pub role: String,
     /// Hash chain: `hash = sha256(prev_hash || canonical-json(record))`.
     /// Computed by the store; empty until persisted.
     pub prev_hash: String,
@@ -33,9 +38,16 @@ impl AuditRecord {
             action: action.to_string(),
             subject: subject.to_string(),
             detail,
+            role: crate::ADMIN_ROLE.to_string(),
             prev_hash: String::new(),
             hash: String::new(),
         }
+    }
+
+    /// Stamp the acting role.
+    pub fn with_role(mut self, role: &str) -> Self {
+        self.role = role.to_string();
+        self
     }
 }
 
@@ -53,6 +65,7 @@ pub mod actions {
     pub const IDENTITY_LINK: &str = "identity.link";
     pub const IDENTITY_UNLINK: &str = "identity.unlink";
     pub const IDENTITY_PAIR: &str = "identity.pair";
+    pub const IDENTITY_ROLE: &str = "identity.role";
 }
 
 #[cfg(test)]

@@ -185,8 +185,11 @@ async fn normal_turn_still_records_text_and_episodes() {
     // Episodes are indexed at the engine's idle delivery boundary, after
     // the TurnFinished event — poll the store until they land.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while store.search_episodes("ordinary", 10).unwrap().len() < 1
-        || store.search_episodes("public answer", 10).unwrap().len() < 1
+    while store.search_episodes("ordinary", 10).unwrap().is_empty()
+        || store
+            .search_episodes("public answer", 10)
+            .unwrap()
+            .is_empty()
     {
         assert!(
             Instant::now() < deadline,

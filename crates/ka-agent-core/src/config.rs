@@ -87,6 +87,112 @@ pub struct Ka {
     pub engine_layer: Option<PathBuf>,
 }
 
+/// The profile-wide engine feature baseline (`[tools]`): subtractive specs
+/// in the engine's own `[features] disable` grammar. Every worker spawns
+/// with them (the admin role included); a role may narrow further.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tools {
+    /// Engine feature specs disabled for every worker.
+    #[serde(default)]
+    pub disable: Vec<String>,
+}
+
+/// One role (`[[role]]`): a linked identity's slice of the instance.
+/// `admin` is implicit (terminal, web panel, CLI) and cannot be defined.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RoleSpec {
+    /// `[a-z0-9-]{1,32}`, unique, never `admin`.
+    pub name: String,
+    /// Permission-mode ceiling AND default for the role's sessions
+    /// (`ask|accept_edits|allow|readonly`, old aliases accepted).
+    pub mode: String,
+    /// Per-turn allowlist of exact hand names. Mutually exclusive with
+    /// `disable`.
+    pub allow: Vec<String>,
+    /// Subtractive engine feature specs for this role's workers.
+    pub disable: Vec<String>,
+    /// The role's workspace; default `<data>/roles/<name>/workspace`.
+    pub workspace: Option<PathBuf>,
+    /// Daily USD cap for the role (unset = the profile budget applies).
+    pub budget_daily_usd: Option<f64>,
+    /// Chat-command allowlist (unset = every command the role may reach).
+    pub commands: Vec<String>,
+    /// Role grants; only `path` is honored (`install`/`full`/`advisory`
+    /// stay admin-only and are refused when set non-default).
+    pub grants: Grants,
+}
+
+impl Default for RoleSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mode: "ask".to_string(),
+            allow: Vec::new(),
+            disable: Vec::new(),
+            workspace: None,
+            budget_daily_usd: None,
+            commands: Vec::new(),
+            grants: Grants::default(),
+        }
+    }
+}
+
+impl RoleSpec {
+    /// The canonical mode word (old aliases normalized), or `None` when
+    /// the configured word names no mode.
+    pub fn mode_canonical(&self) -> Option<String> {
+        normalize_mode(&self.mode)
+    }
+
+    /// The role's workspace with `~` expanded; the explicit path, else
+    /// `<data>/roles/<name>/workspace`.
+    pub fn workspace_path(&self, data: &Path) -> PathBuf {
+        match &self.workspace {
+            Some(p) => crate::expand_home(&p.display().to_string()),
+            None => data.join("roles").join(&self.name).join("workspace"),
+        }
+    }
+}
+
+/// The engine feature-spec grammar (`[features] disable`), duplicated here
+/// because core may not depend on the engine crates. The port cross-checks
+/// every spec against the engine's own parser before a worker spawns, so a
+/// drift between the two fails closed with the offending spec named.
+pub fn valid_feature_spec(s: &str) -> bool {
+    fn name(s: &str, min: usize, max: usize, ok: impl Fn(char) -> bool) -> bool {
+        (min..=max).contains(&s.len()) && s.chars().all(ok)
+    }
+    match s {
+        "agents" | "skills" | "mcp" | "hooks" | "web" | "lsp" | "debug" => true,
+        _ => {
+            if let Some(n) = s.strip_prefix("mcp:") {
+                name(n, 1, 32, |c| {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                })
+            } else if let Some(n) = s.strip_prefix("skill:") {
+                name(n, 1, 48, |c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+                })
+            } else if let Some(n) = s.strip_prefix("tool:") {
+                name(n, 1, 64, |c| c.is_ascii_alphanumeric() || c == '_')
+            } else if let Some(n) = s.strip_prefix("agent:") {
+                name(n, 1, 64, |c| {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                })
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// A role name: `[a-z0-9-]`, 1..=32 (the profile alphabet).
+pub fn valid_role_name(s: &str) -> bool {
+    crate::layout::valid_profile_name(s)
+}
+
 /// One operator hook (`[[hooks]]`, plan 2.7).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -189,9 +295,15 @@ impl Telegram {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Web {
-    /// Serve the web UI on `127.0.0.1:{port}`.
+    /// Serve the web UI.
     pub enabled: bool,
     pub port: u16,
+    /// Interface to bind (`127.0.0.1` by default; `0.0.0.0` only with TLS
+    /// or a reverse proxy in front — see `docs/design/web-relay.md`).
+    pub bind: String,
+    /// Public base URL printed in login/pairing links
+    /// (e.g. `https://agent.example.com`). `None` = the local URL.
+    pub public_url: Option<String>,
 }
 
 impl Default for Web {
@@ -199,6 +311,8 @@ impl Default for Web {
         Self {
             enabled: true,
             port: 8480,
+            bind: "127.0.0.1".to_string(),
+            public_url: None,
         }
     }
 }
@@ -509,6 +623,13 @@ pub struct DaemonConfig {
     pub approvals: Approvals,
     /// Operator grants (`[grants]`): paths, installs, full access.
     pub grants: Grants,
+    /// Per-profile engine feature baseline (`[tools]`), subtractive.
+    #[serde(default)]
+    pub tools: Tools,
+    /// Roles for linked identities (`[[role]]`); `admin` is implicit.
+    #[serde(rename = "role")]
+    #[serde(default)]
+    pub roles: Vec<RoleSpec>,
     /// Operator hooks ([[hooks]]).
     #[serde(default)]
     pub hooks: Vec<HookSpec>,
@@ -544,6 +665,8 @@ impl Default for DaemonConfig {
             notify: Notify::default(),
             approvals: Approvals::default(),
             grants: Grants::default(),
+            tools: Tools::default(),
+            roles: Vec::new(),
             hooks: Vec::new(),
         }
     }
@@ -717,6 +840,9 @@ impl DaemonConfig {
                 data.join("ka"),
                 data.join("backups"),
                 data.join("logs"),
+                // Every role's root is ka-agent's own tree: neither the
+                // profile workspace nor a role workspace may nest there.
+                data.join("roles"),
                 base.join("config.toml"),
                 base.join("active_profile"),
                 base.join("skills"),
@@ -774,6 +900,24 @@ impl DaemonConfig {
         }
         if self.web.port == 0 {
             return Err(Error::Validate("web.port must not be 0".into()));
+        }
+        if self.web.bind.parse::<std::net::IpAddr>().is_err() {
+            return Err(Error::Validate(format!(
+                "web.bind {:?} is not an IP address (127.0.0.1, 0.0.0.0, ::1, …)",
+                self.web.bind
+            )));
+        }
+        if let Some(url) = &self.web.public_url {
+            let ok = (url.starts_with("https://") || url.starts_with("http://"))
+                && url
+                    .split_once("://")
+                    .is_some_and(|(_, host)| !host.trim_matches('/').is_empty())
+                && !url.chars().any(char::is_whitespace);
+            if !ok {
+                return Err(Error::Validate(format!(
+                    "web.public_url {url:?} must be an absolute http(s) URL (https://agent.example.com)"
+                )));
+            }
         }
         if crate::when::parse_hhmm(&self.calendar.digest_time).is_none() {
             return Err(Error::Validate(
@@ -845,6 +989,190 @@ impl DaemonConfig {
                     "grants.path dir {} is listed twice",
                     g.dir.display()
                 )));
+            }
+        }
+        let mut specs = std::collections::BTreeSet::new();
+        for spec in &self.tools.disable {
+            if !valid_feature_spec(spec) {
+                return Err(Error::Validate(format!(
+                    "tools.disable spec {spec:?}: agents|skills|mcp|hooks|web|lsp|debug \
+                     or mcp:<server>|skill:<name>|tool:<hand>|agent:<name>"
+                )));
+            }
+            if !specs.insert(spec.as_str()) {
+                return Err(Error::Validate(format!(
+                    "tools.disable spec {spec:?} is listed twice"
+                )));
+            }
+        }
+        self.validate_roles()?;
+        Ok(())
+    }
+
+    /// Role table rules: name alphabet/uniqueness, allow XOR disable, the
+    /// mode vocabulary, workspace disjointness, budget and grant shape.
+    fn validate_roles(&self) -> Result<(), Error> {
+        let data = crate::layout::default_root();
+        let profile_ws = {
+            let ws = self.workspace_path();
+            std::fs::canonicalize(&ws).unwrap_or(ws)
+        };
+        let mut names = std::collections::BTreeSet::new();
+        let mut workspaces: Vec<(String, PathBuf)> = Vec::new();
+        for role in &self.roles {
+            if role.name == "admin" {
+                return Err(Error::Validate(
+                    "reserved role name \"admin\" — it is implicit (terminal, web panel, CLI)"
+                        .into(),
+                ));
+            }
+            if !valid_role_name(&role.name) {
+                return Err(Error::Validate(format!(
+                    "role name {:?}: [a-z0-9-], 1..=32 chars",
+                    role.name
+                )));
+            }
+            if !names.insert(role.name.as_str()) {
+                return Err(Error::Validate(format!(
+                    "role name {:?} is used twice",
+                    role.name
+                )));
+            }
+            if role.mode_canonical().is_none() {
+                return Err(Error::Validate(format!(
+                    "role {:?}: {}",
+                    role.name,
+                    unknown_mode(&role.mode)
+                )));
+            }
+            if !role.allow.is_empty() && !role.disable.is_empty() {
+                return Err(Error::Validate(format!(
+                    "role {:?}: set either allow or disable, not both",
+                    role.name
+                )));
+            }
+            for name in &role.allow {
+                if name.trim().is_empty() || name.chars().any(char::is_whitespace) {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: allow entry {name:?} must be one exact tool name",
+                        role.name
+                    )));
+                }
+            }
+            let mut specs = std::collections::BTreeSet::new();
+            for spec in &role.disable {
+                if !valid_feature_spec(spec) {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: disable spec {spec:?}: agents|skills|mcp|hooks|web|lsp|debug \
+                         or mcp:<server>|skill:<name>|tool:<hand>|agent:<name>",
+                        role.name
+                    )));
+                }
+                if !specs.insert(spec.as_str()) {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: disable spec {spec:?} is listed twice",
+                        role.name
+                    )));
+                }
+            }
+            if let Some(usd) = role.budget_daily_usd
+                && usd <= 0.0
+            {
+                return Err(Error::Validate(format!(
+                    "role {:?}: budget_daily_usd must be positive",
+                    role.name
+                )));
+            }
+            for c in &role.commands {
+                if c.trim().is_empty() {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: commands entries must not be empty",
+                        role.name
+                    )));
+                }
+            }
+            // Role grants: only the path list is a role surface. `full` or
+            // `install` on a role would defeat RBAC; `advisory` is an
+            // admin-only display switch.
+            if role.grants.install || role.grants.full || !role.grants.advisory {
+                return Err(Error::Validate(format!(
+                    "role {:?}: grants supports only [[role.grants.path]] \
+                     (install/full/advisory are admin-only)",
+                    role.name
+                )));
+            }
+            let mut dirs = std::collections::BTreeSet::new();
+            for g in &role.grants.path {
+                if !g.dir.is_absolute() {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: grants.path dir {} must be absolute",
+                        role.name,
+                        g.dir.display()
+                    )));
+                }
+                if !dirs.insert(g.dir.clone()) {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: grants.path dir {} is listed twice",
+                        role.name,
+                        g.dir.display()
+                    )));
+                }
+            }
+            if role.workspace.is_some() {
+                let ws = role.workspace_path(&data);
+                if !ws.is_absolute() {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: workspace {} must be absolute or ~-relative",
+                        role.name,
+                        ws.display()
+                    )));
+                }
+                let ws = std::fs::canonicalize(&ws).unwrap_or(ws);
+                // Role workspaces must not nest with the profile workspace,
+                // ka-agent's own tree (the whole `roles/` root included),
+                // or another role's workspace.
+                for p in [
+                    data.join("config.toml"),
+                    data.join("state.db"),
+                    data.join("secrets"),
+                    data.join("memory"),
+                    data.join("engine-home"),
+                    data.join("engine-state"),
+                    data.join("ka"),
+                    data.join("backups"),
+                    data.join("logs"),
+                    data.join("roles"),
+                ] {
+                    let p = std::fs::canonicalize(&p).unwrap_or(p);
+                    if ws == p || ws.starts_with(&p) || p.starts_with(&ws) {
+                        return Err(Error::Validate(format!(
+                            "role {:?}: workspace {} overlaps ka-agent's own files ({}) — pick a directory outside the data and profile roots",
+                            role.name,
+                            ws.display(),
+                            p.display()
+                        )));
+                    }
+                }
+                if ws == profile_ws || ws.starts_with(&profile_ws) || profile_ws.starts_with(&ws) {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: workspace {} overlaps the profile workspace ({}) — pick a directory outside it",
+                        role.name,
+                        ws.display(),
+                        profile_ws.display()
+                    )));
+                }
+                for (other_name, other) in &workspaces {
+                    if ws == *other || ws.starts_with(other) || other.starts_with(&ws) {
+                        return Err(Error::Validate(format!(
+                            "role {:?}: workspace {} overlaps role {:?}'s workspace ({})",
+                            role.name,
+                            ws.display(),
+                            other_name,
+                            other.display()
+                        )));
+                    }
+                }
+                workspaces.push((role.name.clone(), ws));
             }
         }
         Ok(())
@@ -1271,5 +1599,220 @@ digest_time = "07:30"
         assert!(err.contains("abort_secs"), "{err}");
         cfg.turn_watchdog.abort_secs = 601;
         assert!(cfg.validate().is_ok());
+    }
+
+    fn role(name: &str) -> RoleSpec {
+        RoleSpec {
+            name: name.into(),
+            ..RoleSpec::default()
+        }
+    }
+
+    #[test]
+    fn feature_spec_grammar_matches_the_engine_vocabulary() {
+        for ok in [
+            "agents",
+            "skills",
+            "mcp",
+            "hooks",
+            "web",
+            "lsp",
+            "debug",
+            "mcp:github",
+            "mcp:my_server-2",
+            "skill:release-notes",
+            "tool:bash",
+            "tool:kagent__notes_search",
+            "agent:reviewer",
+        ] {
+            assert!(valid_feature_spec(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "tool:",
+            "mcp:",
+            "Tool:bash",
+            "tool:bash extra",
+            "skill:UPPER",
+            "agents ",
+            "tool:bash:x",
+            "bogus",
+        ] {
+            assert!(!valid_feature_spec(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tools_disable_validates_grammar_and_duplicates() {
+        let mut cfg = DaemonConfig::default();
+        cfg.tools.disable = vec!["tool:bash".into(), "mcp:github".into()];
+        assert!(cfg.validate().is_ok());
+        cfg.tools.disable.push("nope".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tools.disable spec \"nope\""), "{err}");
+        cfg.tools.disable = vec!["tool:bash".into(), "tool:bash".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("listed twice"), "{err}");
+    }
+
+    #[test]
+    fn role_names_are_checked_and_admin_is_reserved() {
+        let mut cfg = DaemonConfig {
+            roles: vec![role("guest")],
+            ..DaemonConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        cfg.roles = vec![role("admin")];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved role name \"admin\""), "{err}");
+
+        cfg.roles = vec![role("Guest")];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("role name"), "{err}");
+
+        cfg.roles = vec![role("guest"), role("guest")];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("used twice"), "{err}");
+    }
+
+    #[test]
+    fn role_allow_and_disable_are_exclusive_and_mode_is_normalized() {
+        let mut cfg = DaemonConfig::default();
+        let mut r = role("guest");
+        r.allow = vec!["read".into()];
+        r.disable = vec!["tool:bash".into()];
+        cfg.roles = vec![r];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("either allow or disable"), "{err}");
+
+        let mut r = role("guest");
+        r.mode = "plan".into();
+        assert_eq!(r.mode_canonical().as_deref(), Some("readonly"));
+        r.allow = vec!["read".into(), "grep".into()];
+        cfg.roles = vec![r];
+        assert!(cfg.validate().is_ok());
+
+        let mut bad = role("guest");
+        bad.mode = "yolo".into();
+        cfg.roles = vec![bad];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("unknown mode \"yolo\""), "{err}");
+    }
+
+    #[test]
+    fn role_workspaces_stay_disjoint() {
+        let mut cfg = DaemonConfig::default();
+        let mut a = role("guest");
+        a.workspace = Some(PathBuf::from("/srv/roles/guest"));
+        let mut b = role("ops");
+        b.workspace = Some(PathBuf::from("/srv/roles/ops"));
+        cfg.roles = vec![a.clone(), b];
+        assert!(cfg.validate().is_ok());
+
+        // One role inside another.
+        let mut nested = role("ops");
+        nested.workspace = Some(PathBuf::from("/srv/roles/guest/nested"));
+        cfg.roles = vec![a.clone(), nested];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("overlaps role \"guest\""), "{err}");
+
+        // A role workspace inside the profile workspace.
+        let mut inside_profile = role("guest");
+        inside_profile.workspace = Some(cfg.workspace.clone());
+        cfg.roles = vec![inside_profile];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("profile workspace"), "{err}");
+
+        // Relative paths are refused.
+        let mut rel = role("guest");
+        rel.workspace = Some(PathBuf::from("relative/dir"));
+        cfg.roles = vec![rel];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn role_budget_commands_and_grants_are_validated() {
+        let mut cfg = DaemonConfig::default();
+        let mut r = role("guest");
+        r.budget_daily_usd = Some(0.0);
+        cfg.roles = vec![r];
+        assert!(cfg.validate().is_err());
+
+        let mut r = role("guest");
+        r.commands = vec!["".into()];
+        cfg.roles = vec![r];
+        assert!(cfg.validate().is_err());
+
+        let mut r = role("guest");
+        r.grants.full = true;
+        cfg.roles = vec![r];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("admin-only"), "{err}");
+
+        let mut r = role("guest");
+        r.grants.path = vec![PathGrant {
+            dir: PathBuf::from("rel"),
+            access: Access::Allow,
+        }];
+        cfg.roles = vec![r];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must be absolute"), "{err}");
+
+        let mut r = role("guest");
+        r.grants.path = vec![PathGrant {
+            dir: PathBuf::from("/srv/reports"),
+            access: Access::Allow,
+        }];
+        cfg.roles = vec![r];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn web_bind_and_public_url_are_validated() {
+        let mut cfg = DaemonConfig::default();
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert!(cfg.validate().is_ok());
+        cfg.web.bind = "0.0.0.0".into();
+        assert!(cfg.validate().is_ok());
+        cfg.web.bind = "::1".into();
+        assert!(cfg.validate().is_ok());
+        cfg.web.bind = "localhost".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("web.bind"), "{err}");
+        cfg.web.bind = "127.0.0.1".into();
+        cfg.web.public_url = Some("https://agent.example.com".into());
+        assert!(cfg.validate().is_ok());
+        cfg.web.public_url = Some("ftp://agent.example.com".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("web.public_url"), "{err}");
+        cfg.web.public_url = Some("https://".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn role_tables_parse_and_roundtrip() {
+        let p = write_tmp(
+            "roles",
+            "workspace = \"/tmp/ws\"\n\
+             [tools]\ndisable = [\"tool:bash\"]\n\
+             [[role]]\nname = \"guest\"\nmode = \"readonly\"\nallow = [\"read\", \"grep\"]\n\
+             commands = [\"status\", \"help\"]\nbudget_daily_usd = 2.0\n\
+             [[role.grants.path]]\ndir = \"/srv/reports\"\naccess = \"allow\"\n\
+             [[role]]\nname = \"ops\"\ndisable = [\"tool:write\"]\n",
+        );
+        let cfg = DaemonConfig::load(&p).unwrap();
+        assert_eq!(cfg.tools.disable, vec!["tool:bash"]);
+        assert_eq!(cfg.roles.len(), 2);
+        assert_eq!(cfg.roles[0].name, "guest");
+        assert_eq!(cfg.roles[0].mode, "readonly");
+        assert_eq!(cfg.roles[0].allow, vec!["read", "grep"]);
+        assert_eq!(cfg.roles[0].budget_daily_usd, Some(2.0));
+        assert_eq!(cfg.roles[0].grants.path.len(), 1);
+        assert_eq!(cfg.roles[1].disable, vec!["tool:write"]);
+        // The default role workspace lives under the data root.
+        let default_ws = cfg.roles[1].workspace_path(std::path::Path::new("/data"));
+        assert_eq!(default_ws, PathBuf::from("/data/roles/ops/workspace"));
     }
 }

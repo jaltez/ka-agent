@@ -74,7 +74,7 @@ pub(super) async fn decide(runtime: &Runtime, source: &str, allow: bool, args: &
                 .collect()
         };
         return match pick.as_slice() {
-            [one] => match runtime.decide_for_session(&one.approval_id).await {
+            [one] => match runtime.decide_for_session(&one.approval_id, source).await {
                 Ok(()) => {
                     Outcome::Reply("allowed — identical requests are allowed until /new".into())
                 }
@@ -85,7 +85,7 @@ pub(super) async fn decide(runtime: &Runtime, source: &str, allow: bool, args: &
         };
     }
     if prefix.is_empty() {
-        match runtime.decide_latest(decision).await {
+        match runtime.decide_latest(decision, source).await {
             Ok(true) => Outcome::Reply("decided".into()),
             Ok(false) => Outcome::Reply("no pending approval".into()),
             Err(e) => Outcome::Reply(format!("! [approval] {e}")),
@@ -100,7 +100,7 @@ pub(super) async fn decide(runtime: &Runtime, source: &str, allow: bool, args: &
             .filter(|c| id_matches(&c.approval_id, prefix))
             .collect();
         match matches.as_slice() {
-            [one] => match runtime.decide(&one.approval_id, decision).await {
+            [one] => match runtime.decide(&one.approval_id, decision, source).await {
                 Ok(()) => Outcome::Reply("decided".into()),
                 Err(e) => Outcome::Reply(format!("! [approval] {e}")),
             },

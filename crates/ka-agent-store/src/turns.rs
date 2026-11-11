@@ -262,6 +262,53 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Episodes of one role's sessions only (`admin` sees everything): a
+    /// subject never reads another role's conversation history.
+    pub fn search_episodes_for_role(
+        &self,
+        query: &str,
+        limit: usize,
+        role: &str,
+    ) -> Result<Vec<EpisodeHit>> {
+        let match_expr = fts_and_query(query);
+        if match_expr.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT f.session, f.turn, f.role,
+                    snippet(episodes_fts, 3, '[', ']', '…', 12), t.created_ms
+             FROM episodes_fts f
+             LEFT JOIN turns t ON t.id = f.turn
+             WHERE episodes_fts MATCH ?1
+               AND f.session IN (SELECT id FROM sessions WHERE role = ?3)
+             ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![match_expr, limit as i64, role], |r| {
+            Ok(EpisodeHit {
+                session: r.get(0)?,
+                turn: r.get(1)?,
+                role: r.get(2)?,
+                snippet: r.get(3)?,
+                at_ms: r.get(4).unwrap_or(0),
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// The role of the session a turn belongs to (`None` for an unknown
+    /// turn).
+    pub fn turn_role(&self, id: &TurnId) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT s.role FROM turns t JOIN sessions s ON s.id = t.session WHERE t.id = ?1",
+            params![id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
+    }
+
     /// Remove a session's episodes (strand reset / purge).
     pub fn delete_session_episodes(&self, session: &SessionId) -> Result<()> {
         let conn = self.lock();

@@ -496,6 +496,7 @@ async fn forward(cmd: WorkerCommand, commands: Option<&Sender<Command>>) -> Hand
             model,
             images,
             skills,
+            allowed_tools,
         } => {
             send_cmd(
                 tx,
@@ -509,7 +510,7 @@ async fn forward(cmd: WorkerCommand, commands: Option<&Sender<Command>>) -> Hand
                             media_type: i.media_type,
                         })
                         .collect(),
-                    allowed_tools: None,
+                    allowed_tools,
                     model,
                     skills,
                 },

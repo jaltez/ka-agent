@@ -251,9 +251,10 @@ fn main() -> std::process::ExitCode {
                 Some("search") => setup::Section::Search,
                 Some("briefing") => setup::Section::Briefing,
                 Some("voice") => setup::Section::Voice,
+                Some("web") => setup::Section::Web,
                 Some(other) => {
                     eprintln!(
-                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search | briefing | voice"
+                        "ka-agent: unknown section {other:?} — all | model | telegram | matrix | service | search | briefing | voice | web"
                     );
                     return std::process::ExitCode::FAILURE;
                 }
@@ -335,7 +336,11 @@ fn main() -> std::process::ExitCode {
             daemon::status_client(json)
         }
         Command::Completions { shell } => completions(shell),
-        Command::Pair { channel, config } => pair::pair(channel, config_path(&config)),
+        Command::Pair {
+            channel,
+            config,
+            role,
+        } => pair::pair(channel, config_path(&config), role),
         Command::Model { selector, config } => {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

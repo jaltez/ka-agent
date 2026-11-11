@@ -186,6 +186,26 @@ pub(super) async fn drive(
     // `TurnAnnouncements`: the engine starts extra turns inside one cycle).
     let mut announcements = TurnAnnouncements::default();
     while let Some(ev) = rx.recv().await {
+        // Port identity: a superseded worker (role switch, `/new`, idle
+        // reap) can still flush events while its kill is in flight. They
+        // belong to a session that is no longer live — drop them instead
+        // of folding them into the current one.
+        let is_current = {
+            let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.live
+                .as_ref()
+                .is_some_and(|live| Arc::ptr_eq(&live.port, &port))
+        };
+        if !is_current {
+            continue;
+        }
+        // Turn-scoped events carry the source they belong to: surfaces
+        // with per-identity delivery route replies to the originating chat.
+        let turn_source = {
+            let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.live.as_ref().and_then(|l| l.current_turn_source.clone())
+        };
+        let emit = |ev: AgentEvent| sh.emit_from(ev, turn_source.as_deref());
         // Any event is activity: the idle reap's clock resets.
         {
             let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -201,7 +221,7 @@ pub(super) async fn drive(
                 // status/doctor and tell surfaces, which show the live
                 // model in their status line (F3).
                 *sh.live_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(selector.clone());
-                sh.emit(AgentEvent::Settings {
+                emit(AgentEvent::Settings {
                     model: Some(selector),
                     mode: None,
                     effort: None,
@@ -227,14 +247,14 @@ pub(super) async fn drive(
                     (&snapshot.strand_id, &snapshot.strand_path)
                     && let Err(e) = sh.store.set_strand(&snapshot.id, sid_ref, path_ref)
                 {
-                    sh.emit(AgentEvent::Error {
+                    emit(AgentEvent::Error {
                         class: "internal".into(),
                         retryable: retryable_class("internal"),
                         message: format!("strand persist: {e}"),
                     });
                 }
                 if replay_messages > 0 {
-                    sh.emit(AgentEvent::Note {
+                    emit(AgentEvent::Note {
                         text: format!(
                             "resumed session: {replay_messages} replayed messages (not re-delivered)"
                         ),
@@ -264,7 +284,7 @@ pub(super) async fn drive(
                 if !announcements.admit(&turn) {
                     continue;
                 }
-                sh.emit(AgentEvent::TurnStarted { turn, source });
+                emit(AgentEvent::TurnStarted { turn, source });
             }
             PortEvent::DeltaText(t) => {
                 let (scheduled, _) = {
@@ -280,7 +300,7 @@ pub(super) async fn drive(
                 // delivered as one chunk at the boundary (or not at all,
                 // when it is `[SILENT]`). Tool events still flow.
                 if !scheduled {
-                    sh.emit(AgentEvent::Delta { text: t });
+                    emit(AgentEvent::Delta { text: t });
                 }
             }
             PortEvent::DeltaThought(t) => {
@@ -292,7 +312,7 @@ pub(super) async fn drive(
                     .as_ref()
                     .is_some_and(|l| is_scheduled(l.current_turn_source.as_deref()));
                 if !scheduled {
-                    sh.emit(AgentEvent::Thought { text: t });
+                    emit(AgentEvent::Thought { text: t });
                 }
             }
             PortEvent::CallStarted { tool, id, detail } => {
@@ -302,7 +322,7 @@ pub(super) async fn drive(
                     live.tool_started.insert(id.clone(), Instant::now());
                 }
                 drop(g);
-                sh.emit(AgentEvent::ToolStarted { id, tool, detail });
+                emit(AgentEvent::ToolStarted { id, tool, detail });
             }
             PortEvent::CallFinished { tool, id, ok } => {
                 let started = {
@@ -331,7 +351,7 @@ pub(super) async fn drive(
                 // surfaces can show what the tool actually printed (on
                 // demand in the TUI; failures carry their first line).
                 let output = excerpt.clone().filter(|_| ok);
-                sh.emit(AgentEvent::ToolFinished {
+                emit(AgentEvent::ToolFinished {
                     id,
                     tool,
                     ok,
@@ -351,7 +371,7 @@ pub(super) async fn drive(
                 }
             }
             PortEvent::Plan(items) => {
-                sh.emit(AgentEvent::Plan {
+                emit(AgentEvent::Plan {
                     items: items
                         .into_iter()
                         .map(|(text, state)| PlanItem { text, state })
@@ -362,7 +382,7 @@ pub(super) async fn drive(
                 let pct = (used * 100).checked_div(window.max(1)).unwrap_or(0);
                 if last_ctx_pct != Some(pct) {
                     last_ctx_pct = Some(pct);
-                    sh.emit(AgentEvent::Context { used, window });
+                    emit(AgentEvent::Context { used, window });
                 }
             }
             PortEvent::Title(title) => {
@@ -373,7 +393,7 @@ pub(super) async fn drive(
                     }
                 }
             }
-            PortEvent::Compacting { done } => sh.emit(AgentEvent::Compacting { done }),
+            PortEvent::Compacting { done } => emit(AgentEvent::Compacting { done }),
             PortEvent::Inventory { tools } => {
                 let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(live) = g.live.as_mut() {
@@ -423,7 +443,7 @@ pub(super) async fn drive(
                         Some("Allow (session)".into()),
                     );
                     let _ = sh.store.append_audit(&mut rec);
-                    sh.emit(AgentEvent::Note {
+                    emit(AgentEvent::Note {
                         text: format!("✓ allowed for this session: {question}"),
                     });
                     continue;
@@ -437,7 +457,7 @@ pub(super) async fn drive(
                 let approval = Approval::new(sid, turn_id, kind, ttl as i64);
                 let card = ApprovalCard::from_approval(&approval);
                 if let Err(e) = sh.store.insert_approval(&approval) {
-                    sh.emit(AgentEvent::Error {
+                    emit(AgentEvent::Error {
                         class: "internal".into(),
                         retryable: retryable_class("internal"),
                         message: format!("approval persist: {e}"),
@@ -469,7 +489,15 @@ pub(super) async fn drive(
                 if awaiting {
                     rt_persist_status(&sh, status);
                     if let Some(card) = card {
-                        sh.emit(card.to_event());
+                        // Approvals are decided by the admin role: the card
+                        // goes to the admin surfaces, and a subject's turn
+                        // is told the operator has it.
+                        sh.emit_from(card.to_event(), None);
+                        if self_role_is_subject(&sh) {
+                            emit(AgentEvent::Notice {
+                                text: "waiting for the operator to approve".into(),
+                            });
+                        }
                     }
                     continue;
                 }
@@ -483,7 +511,7 @@ pub(super) async fn drive(
                     ApprovalStatus::Denied,
                     ka_agent_core::now_ms(),
                 ) {
-                    sh.emit(AgentEvent::Error {
+                    emit(AgentEvent::Error {
                         class: "internal".into(),
                         retryable: retryable_class("internal"),
                         message: format!("ask deny persist: {e}"),
@@ -496,7 +524,7 @@ pub(super) async fn drive(
                     Some("deny: the turn this ask belongs to already finished".into()),
                 );
                 let _ = sh.store.append_audit(&mut rec);
-                sh.emit(AgentEvent::Notice {
+                emit(AgentEvent::Notice {
                     text: "ask auto-denied: its turn already finished (nothing to approve)".into(),
                 });
             }
@@ -534,24 +562,30 @@ pub(super) async fn drive(
                             .ok();
                     }
                     if let Err(e) = sh.store.update_turn(&t) {
-                        sh.emit(AgentEvent::Error {
+                        emit(AgentEvent::Error {
                             class: "internal".into(),
                             retryable: retryable_class("internal"),
                             message: format!("turn persist: {e}"),
                         });
                     }
                 }
-                let (verdict, budget) = {
+                let (verdict, budget, budget_key) = {
                     let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     let now = ka_agent_core::now_ms();
                     g.budget.record(cost_usd, tokens, now);
                     let b = g.budget.clone();
+                    let key = if g.role == ka_agent_core::ADMIN_ROLE {
+                        "budget".to_string()
+                    } else {
+                        format!("budget:{}", g.role)
+                    };
                     (
                         g.budget.verdict(),
                         serde_json::to_string(&b).unwrap_or_default(),
+                        key,
                     )
                 };
-                sh.store.meta_set("budget", &budget).ok();
+                sh.store.meta_set(&budget_key, &budget).ok();
                 let (ms, text) = {
                     let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
                     let live = g.live.as_ref();
@@ -561,7 +595,7 @@ pub(super) async fn drive(
                         turn_text(live.map(|l| l.live_text.as_str()).unwrap_or("")),
                     )
                 };
-                sh.emit(AgentEvent::TurnFinished {
+                emit(AgentEvent::TurnFinished {
                     stop: stop.clone(),
                     cost_usd,
                     tokens,
@@ -578,13 +612,13 @@ pub(super) async fn drive(
                     let status = g.session.status;
                     drop(g);
                     rt_persist_status(&sh, status);
-                    sh.emit(AgentEvent::Notice {
+                    emit(AgentEvent::Notice {
                         text: "daily budget reached — paused until tomorrow (override via CLI)"
                             .into(),
                     });
                 }
                 if stop == "error" {
-                    sh.emit(AgentEvent::Notice {
+                    emit(AgentEvent::Notice {
                         text: "turn ended in error; see /status — nothing was re-submitted".into(),
                     });
                 }
@@ -592,6 +626,13 @@ pub(super) async fn drive(
                 // verify): the first settles the status, the later ones only
                 // refresh the cumulative usage.
                 rt_maybe_idle(&sh);
+                // A message from another role may be waiting: hand the
+                // single-session core over once this turn is fully settled.
+                Runtime {
+                    sh: Arc::clone(&sh),
+                }
+                .yield_to_waiting_role()
+                .await;
             }
             PortEvent::Idle => {
                 // Delivery boundary (SEED.md §3.7): flush the buffered final
@@ -633,7 +674,7 @@ pub(super) async fn drive(
                         if !whole.ends_with('\n') {
                             whole.push('\n');
                         }
-                        sh.emit(AgentEvent::Delta { text: whole });
+                        emit(AgentEvent::Delta { text: whole });
                     }
                     let parts = split_final_text(&text, FINAL_CHUNK_MAX);
                     for (i, chunk) in parts.iter().enumerate() {
@@ -648,7 +689,7 @@ pub(super) async fn drive(
                             sh.store.mark_sent(&oc.turn, oc.chunk_index, i as i64).ok();
                         }
                         let index = if parts.len() > 1 { i as u32 + 1 } else { 1 };
-                        sh.emit(AgentEvent::FinalChunk {
+                        emit(AgentEvent::FinalChunk {
                             index,
                             turn: tid.as_str().to_string(),
                             text: chunk.clone(),
@@ -710,13 +751,13 @@ pub(super) async fn drive(
                 }
                 rt_maybe_idle(&sh);
             }
-            PortEvent::Note(t) => sh.emit(AgentEvent::Note { text: t }),
+            PortEvent::Note(t) => emit(AgentEvent::Note { text: t }),
             PortEvent::EngineError {
                 class,
                 message,
                 retryable,
             } => {
-                sh.emit(AgentEvent::Error {
+                emit(AgentEvent::Error {
                     class: class.clone(),
                     message: message.clone(),
                     retryable,
@@ -746,7 +787,7 @@ pub(super) async fn drive(
                             "auth failure — paused; fix the provider key and /resume".to_string()
                         }
                     };
-                    sh.emit(AgentEvent::Notice { text });
+                    emit(AgentEvent::Notice { text });
                 }
             }
             PortEvent::EngineClosed => {
@@ -767,6 +808,12 @@ pub(super) async fn drive(
             }
         }
     }
+}
+
+/// Whether the live session belongs to a non-admin role (approval cards
+/// then go to the admin surfaces, not the asking chat).
+fn self_role_is_subject(sh: &Arc<Shared>) -> bool {
+    sh.inner.lock().unwrap_or_else(|e| e.into_inner()).role != ka_agent_core::ADMIN_ROLE
 }
 
 #[cfg(test)]

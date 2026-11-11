@@ -145,3 +145,13 @@ order is:
 So a `deny` grant and an operator deny rule both outrank every grant;
 only ask-class decisions are skipped. The guard checks deny/protected
 before printing any allow, which keeps that order true on its side too.
+
+## Role grants (`[[role.grants.path]]`)
+
+A role's sessions never see the operator's `[grants]`: `install`, `full`
+and `advisory` are admin-only (a non-default value on a role is a config
+error), and only the role's own `[[role.grants.path]]` list applies. The
+same rules hold (absolute, unique, `allow | ask | deny`), and the
+`__guard` hook enforces the role's list for that role's worker only.
+Role roots are also write-protected from every other role (and from the
+admin), so a granted dir never widens into another subject's tree.

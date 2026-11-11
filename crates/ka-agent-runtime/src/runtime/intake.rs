@@ -3,9 +3,11 @@
 use super::worker::rt_on_engine_closed;
 use super::*;
 
-/// Who started the turn being submitted, for the bridge's loop guard.
-fn publish_turn_source(store: &Store, source: &str) {
+/// Who started the turn being submitted and which role it acts as: the
+/// bridge's loop guard and its per-role notes/memory targets.
+fn publish_turn_context(store: &Store, source: &str, role: &str) {
     let _ = store.meta_set(ka_agent_core::layout::TURN_SOURCE_META_KEY, source);
+    let _ = store.meta_set(ka_agent_core::layout::TURN_ROLE_META_KEY, role);
 }
 
 /// Submit the next queued message, if any. Returns true when a new cycle is
@@ -77,7 +79,11 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         source: item.source.clone(),
         text: item.text.clone(),
     });
-    publish_turn_source(&sh.store, &item.source);
+    let item_role = {
+        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.role.clone()
+    };
+    publish_turn_context(&sh.store, &item.source, &item_role);
     // Background turns may run on the background model; the selector the
     // runtime submits on is recorded with the turn (per-model spend).
     let background = item.source.starts_with("cron")
@@ -132,8 +138,13 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         }
     }
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
+    let role = {
+        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.role.clone()
+    };
+    let allowed_tools = Runtime { sh: Arc::clone(sh) }.role_toolset(&role);
     match port
-        .submit_with_model(wire, Vec::new(), Vec::new(), model)
+        .submit_full(wire, Vec::new(), Vec::new(), model, allowed_tools)
         .await
     {
         Ok(()) => {
@@ -182,13 +193,88 @@ impl Runtime {
             return Ok(None);
         }
         let text = turn.inbound_text.clone();
-        self.handle_message(&text, "retry").await?;
+        // Retry stays in the conversation it came from (never switches
+        // roles from under the operator).
+        let role = self.active_role();
+        self.handle_message_with_role(&text, "retry", &role).await?;
         Ok(Some(text))
     }
 
-    /// Inbound message: submit now when idle, otherwise enqueue durably
-    /// (gap G4 — ka drops mid-cycle prompts, HTTP 200 notwithstanding).
+    /// Inbound message: resolve the sender's role, make it active (or
+    /// queue onto its own session while another role's turn runs), then
+    /// submit.
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
+        let role = self.role_for_source(source);
+        self.handle_message_with_role(text, source, &role).await
+    }
+
+    /// Inbound message for an explicit role (cron jobs carry their
+    /// creator's role; every surface resolves it from the source).
+    pub async fn handle_message_with_role(
+        &self,
+        text: &str,
+        source: &str,
+        role: &str,
+    ) -> Result<(), Error> {
+        self.handle_message_inner(text, source, role, None).await
+    }
+
+    /// A cron fire: its creator role and its (already clamped) tool
+    /// narrowing. `None` = the job requests no narrowing; `Some(list)` is
+    /// an allowlist even when the clamp emptied it (never a widening).
+    pub async fn handle_cron_message(
+        &self,
+        text: &str,
+        source: &str,
+        role: &str,
+        tools: Option<Vec<String>>,
+    ) -> Result<(), Error> {
+        self.handle_message_inner(text, source, role, tools).await
+    }
+
+    async fn handle_message_inner(
+        &self,
+        text: &str,
+        source: &str,
+        role: &str,
+        tool_override: Option<Vec<String>>,
+    ) -> Result<(), Error> {
+        if self.active_role() != role {
+            // Never abort another role's live turn: its message waits on
+            // its own session's durable queue and the core is handed over
+            // at the next idle boundary.
+            if matches!(
+                self.session_status(),
+                SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping
+            ) {
+                let target = self.session_for_role(role)?;
+                let item = QueueItem::new(target.id.clone(), text.to_string(), source);
+                self.sh.store.enqueue(&item)?;
+                let n = self.sh.store.queue_len(&target.id)?;
+                self.sh.emit(AgentEvent::Inbound {
+                    source: source.to_string(),
+                    text: text.to_string(),
+                });
+                self.sh.emit(AgentEvent::Queue { depth: n as u32 });
+                self.sh.emit(AgentEvent::Notice {
+                    text: format!("queued for role {role} (#{n})"),
+                });
+                return Ok(());
+            }
+            self.switch_role(role).await?;
+        }
+        self.handle_message_active(text, source, tool_override)
+            .await
+    }
+
+    /// Submit now when idle, otherwise enqueue durably (gap G4 — ka drops
+    /// mid-cycle prompts, HTTP 200 notwithstanding).
+    async fn handle_message_active(
+        &self,
+        text: &str,
+        source: &str,
+        tool_override: Option<Vec<String>>,
+    ) -> Result<(), Error> {
         self.sh.emit(AgentEvent::Inbound {
             source: source.to_string(),
             text: text.to_string(),
@@ -339,8 +425,10 @@ impl Runtime {
             drain_queue(&self.sh).await;
             return Ok(());
         }
-        publish_turn_source(&self.sh.store, source);
-        match self.submit_text_with(text, Vec::new(), Some(source)).await {
+        match self
+            .submit_text_with(text, Vec::new(), Some(source), tool_override)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Never strand the session in `running`: the queue would
@@ -361,7 +449,10 @@ impl Runtime {
     /// provisioned in the engine home, and the session must be idle — a
     /// skill turn is never queued (the queue carries plain text only).
     pub async fn handle_skill(&self, name: &str, text: &str, source: &str) -> Result<(), Error> {
-        let skills = crate::skills::Skills::new(&self.sh.paths.engine_home());
+        // Skills are provisioned per role: the active role's engine home is
+        // the only one this turn's engine discovers.
+        let skills =
+            crate::skills::Skills::new(&self.sh.paths.role_engine_home(&self.active_role()));
         if !skills.is_enabled(name)? {
             return Err(Error::Refused(format!(
                 "skill {name:?} is not enabled — `ka-agent skills enable {name}`"
@@ -384,7 +475,7 @@ impl Runtime {
         }
         self.persist_session_status(SessionStatus::Running);
         match self
-            .submit_text_with(text, vec![name.to_string()], Some(source))
+            .submit_text_with(text, vec![name.to_string()], Some(source), None)
             .await
         {
             Ok(()) => Ok(()),
@@ -476,7 +567,12 @@ impl Runtime {
         text: &str,
         skills: Vec<String>,
         source: Option<&str>,
+        tool_override: Option<Vec<String>>,
     ) -> Result<(), Error> {
+        // The bridge reads the turn's source and role from the store while
+        // the turn runs (this is also the `/skill` path's only publisher).
+        let role = self.active_role();
+        publish_turn_context(&self.sh.store, source.unwrap_or("console"), &role);
         if let Err(msg) = self.preflight() {
             self.sh.emit(AgentEvent::Notice { text: msg });
             let mut g = self.lock();
@@ -568,8 +664,18 @@ impl Runtime {
             context_line(&self.sh, source.unwrap_or("console"))
         );
         // The selector was resolved before the turn was recorded above.
+        // The per-turn allowlist: the role's toolset, narrowed by a cron's
+        // own list (never widened).
+        let role_allow = self.role_toolset(&self.active_role());
+        let allowed_tools = match tool_override {
+            Some(tools) => Some(match role_allow {
+                Some(allow) => tools.into_iter().filter(|t| allow.contains(t)).collect(),
+                None => tools,
+            }),
+            None => role_allow,
+        };
         match port
-            .submit_with_model(wire, Vec::new(), skills, model)
+            .submit_full(wire, Vec::new(), skills, model, allowed_tools)
             .await
         {
             Ok(()) => {}
@@ -667,12 +773,14 @@ impl Runtime {
     /// Provision one skill into the engine home (the `/skills accept`
     /// path): true when the operator's library has it.
     pub fn enable_skill(&self, name: &str) -> Result<bool, Error> {
-        let skills = crate::skills::Skills::new(&self.sh.paths.engine_home());
+        let role = self.active_role();
+        let skills = crate::skills::Skills::new(&self.sh.paths.role_engine_home(&role));
         skills.enable(name).map_err(Error::Skills)
     }
 
     pub fn skills_enabled(&self) -> Vec<crate::skills::SkillInfo> {
-        crate::skills::Skills::new(&self.sh.paths.engine_home()).enabled()
+        let role = self.active_role();
+        crate::skills::Skills::new(&self.sh.paths.role_engine_home(&role)).enabled()
     }
 }
 

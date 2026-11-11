@@ -43,6 +43,12 @@ enum Progress {
 pub(super) struct SurfaceInner {
     pub(super) client: TelegramClient,
     chat_id: AtomicI64,
+    /// The chat a linked sender writes from, keyed by source
+    /// (`telegram:<uid>`): with several identities on one bot, replies go
+    /// back to whoever asked, never to whoever wrote last.
+    chats: Mutex<HashMap<String, i64>>,
+    /// The chat of the turn being streamed (0 outside a turn).
+    turn_chat: AtomicI64,
     /// Set between the turn's start and finish envelopes; notes outside
     /// a turn are dropped (the journal surface keeps them).
     turn_active: AtomicBool,
@@ -133,6 +139,8 @@ impl SurfaceInner {
         Self {
             client,
             chat_id: AtomicI64::new(0),
+            chats: Mutex::new(HashMap::new()),
+            turn_chat: AtomicI64::new(0),
             turn_active: AtomicBool::new(false),
             progress: Mutex::new(Progress::None),
             last_progress_edit_ms: AtomicI64::new(0),
@@ -150,7 +158,16 @@ impl SurfaceInner {
         }
     }
 
+    /// The chat of the live turn, else the last adopted chat (today's
+    /// behavior for local sources).
     pub(super) fn chat(&self) -> Option<i64> {
+        match self.turn_chat.load(Ordering::Acquire) {
+            0 => self.last_chat(),
+            id => Some(id),
+        }
+    }
+
+    fn last_chat(&self) -> Option<i64> {
         match self.chat_id.load(Ordering::Acquire) {
             0 => None,
             id => Some(id),
@@ -163,12 +180,68 @@ impl SurfaceInner {
         chat_id != 0 && self.chat_id.swap(chat_id, Ordering::AcqRel) != chat_id
     }
 
-    fn spawn_send(&self, text: String) {
-        if let Some(chat) = self.chat() {
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                let _ = client.send_message(chat, &text, None).await;
-            });
+    /// Adopt one sender's chat: remembered per source, and as the last
+    /// chat for sources that carry no identity (local turns, reminders).
+    pub(super) fn set_chat_for(&self, source: &str, chat_id: i64) -> bool {
+        if chat_id == 0 {
+            return false;
+        }
+        self.chats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(source.to_string(), chat_id);
+        self.set_chat(chat_id)
+    }
+
+    /// The admin's chat: every linked identity with role `admin` whose
+    /// chat is known, else the last adopted chat. Used for admin-only
+    /// events (approval cards, memory proposals) even during a subject's
+    /// turn.
+    fn admin_chat(&self) -> Option<i64> {
+        let chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = &self.store {
+            for identity in store.list_identities().unwrap_or_default() {
+                if identity.role == ka_agent_core::ADMIN_ROLE && identity.channel == "telegram" {
+                    let source = format!("telegram:{}", identity.address);
+                    if let Some(chat) = chats.get(&source) {
+                        return Some(*chat);
+                    }
+                }
+            }
+        }
+        // No admin chat is known. Fail closed: the last chat may belong to
+        // a subject, and an admin-only card must never land there.
+        let last = self.last_chat()?;
+        if let Some(store) = &self.store
+            && let Some((source, _)) = chats.iter().find(|(_, chat)| **chat == last)
+            && let Some((channel, address)) = source.split_once(':')
+            && store
+                .identity_role(channel, address)
+                .ok()
+                .flatten()
+                .is_some_and(|role| role != ka_agent_core::ADMIN_ROLE)
+        {
+            return None;
+        }
+        Some(last)
+    }
+
+    /// Where one event goes: its source's chat when known; `None`/local
+    /// sources (and admin-only events) to the admin chat, else the last.
+    fn dest(&self, env: &Envelope) -> Option<i64> {
+        match env.source.as_deref() {
+            Some(source) => {
+                // Drop the map guard before `admin_chat` re-locks it: the
+                // mutex is not reentrant.
+                let known = self
+                    .chats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(source)
+                    .copied();
+                known.or_else(|| self.admin_chat())
+            }
+            None => self.admin_chat(),
         }
     }
 
@@ -230,7 +303,8 @@ impl SurfaceInner {
     /// and return its message id (for later cleanup tracking).
     async fn send_rich(&self, text: &str) -> Option<i64> {
         let plain = balance_fences(text);
-        let html = ka_agent_core::markdown::render(&plain, ka_agent_core::markdown::Target::Telegram);
+        let html =
+            ka_agent_core::markdown::render(&plain, ka_agent_core::markdown::Target::Telegram);
         self.send_card(&html, &plain, None).await
     }
 
@@ -244,11 +318,15 @@ impl SurfaceInner {
         if wait > 0 {
             tokio::time::sleep(Duration::from_millis(wait as u64)).await;
         }
-        let Some(chat) = self.chat() else { return None };
+        let chat = self.chat()?;
         let mut sent = None;
         let mut fallback = true;
         if html.chars().count() <= MAX_MESSAGE_CHARS {
-            match self.client.send_message_html(chat, html, markup.clone()).await {
+            match self
+                .client
+                .send_message_html(chat, html, markup.clone())
+                .await
+            {
                 Ok(id) => {
                     fallback = false;
                     sent = Some(id);
@@ -488,6 +566,11 @@ impl TelegramSurface {
         self.inner.set_chat(chat_id);
     }
 
+    /// Adopt one sender's chat (per-identity delivery).
+    pub fn set_chat_for(&self, source: &str, chat_id: i64) {
+        self.inner.set_chat_for(source, chat_id);
+    }
+
     /// `telegram.stream`: stream replies as drafts (default on).
     pub fn set_streaming(&self, on: bool) {
         self.inner.drafts.store(on, Ordering::Release);
@@ -504,6 +587,10 @@ impl Surface for TelegramSurface {
                     .turn_started_ms
                     .store(env.at_ms, Ordering::Release);
                 self.inner.turn_active.store(true, Ordering::Release);
+                // Pin the turn's chat: every chunk, note and file of this
+                // turn goes back to the chat that asked.
+                let dest = self.inner.dest(env).unwrap_or(0);
+                self.inner.turn_chat.store(dest, Ordering::Release);
                 // A fresh draft per turn: a non-zero id the API keys the
                 // bubble by. Scheduled turns (cron, the briefing) get no
                 // draft at all — their output arrives as notices, and the
@@ -650,10 +737,9 @@ impl Surface for TelegramSurface {
                         // retry: requeue the outbox row so the startup
                         // drain redelivers it (private sessions write no
                         // rows — the requeue is a no-op then).
-                        if let Err(e) = store.requeue_chunk(
-                            &ka_agent_core::TurnId(turn.clone()),
-                            chunk_index,
-                        ) {
+                        if let Err(e) =
+                            store.requeue_chunk(&ka_agent_core::TurnId(turn.clone()), chunk_index)
+                        {
                             eprintln!("telegram: requeue chunk {turn}/{}: {e}", chunk_index + 1);
                         }
                     }
@@ -665,6 +751,7 @@ impl Surface for TelegramSurface {
                 *self.inner.draft.lock().unwrap_or_else(|e| e.into_inner()) = Draft::default();
                 self.inner.stop_typing();
                 self.inner.turn_active.store(false, Ordering::Release);
+                self.inner.turn_chat.store(0, Ordering::Release);
                 self.inner
                     .pending_notes
                     .lock()
@@ -695,7 +782,7 @@ impl Surface for TelegramSurface {
                 }
             }
             AgentEvent::MemoryProposal { id, text } => {
-                let Some(chat) = self.inner.chat() else {
+                let Some(chat) = self.inner.dest(env) else {
                     return;
                 };
                 let short = ka_agent_core::ids::short_id(id.as_str()).to_string();
@@ -718,7 +805,7 @@ impl Surface for TelegramSurface {
                 name,
                 description,
             } => {
-                let Some(chat) = self.inner.chat() else {
+                let Some(chat) = self.inner.dest(env) else {
                     return;
                 };
                 // `sk:<verdict>:<id>` must fit the 64-byte callback cap;
@@ -778,7 +865,7 @@ impl Surface for TelegramSurface {
                 expires_at_ms,
                 ..
             } => {
-                let Some(chat) = self.inner.chat() else {
+                let Some(chat) = self.inner.dest(env) else {
                     return;
                 };
                 let full = id.clone();
@@ -877,7 +964,15 @@ impl Surface for TelegramSurface {
             | AgentEvent::Inbound { .. }
             | AgentEvent::Session { .. } => {}
             // A fired reminder is its own notification, never a model turn.
-            AgentEvent::Reminder { text, .. } => self.inner.spawn_send(format!("⏰ {text}")),
+            AgentEvent::Reminder { text, .. } => {
+                if let Some(chat) = self.inner.dest(env) {
+                    let client = self.inner.client.clone();
+                    let text = format!("⏰ {text}");
+                    tokio::spawn(async move {
+                        let _ = client.send_message(chat, &text, None).await;
+                    });
+                }
+            }
             // Later steps wire these to real deliveries.
             AgentEvent::CronFinished { .. }
             | AgentEvent::Queue { .. }

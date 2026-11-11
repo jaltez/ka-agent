@@ -45,6 +45,11 @@ pub const TIMEZONE_META_KEY: &str = "operator.timezone";
 /// refuse scheduling from inside a scheduled run (loop guard).
 pub const TURN_SOURCE_META_KEY: &str = "turn.source";
 
+/// Store meta key holding the role of the turn being submitted: the MCP
+/// bridge resolves notes/memory targets from it (a missing key = admin,
+/// the pre-RBAC behavior).
+pub const TURN_ROLE_META_KEY: &str = "turn.role";
+
 /// Process-wide profile chosen on the command line (`-p/--profile`).
 /// Set once by the binary before anything resolves a path.
 static PROFILE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

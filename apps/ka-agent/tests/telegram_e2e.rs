@@ -564,7 +564,7 @@ async fn private_session_leaves_no_trace_on_the_phone_path() {
         .collect();
     assert_eq!(private_dirs.len(), 1, "one ephemeral media directory");
     assert!(
-        std::fs::read_dir(&private_dirs[0].path())
+        std::fs::read_dir(private_dirs[0].path())
             .unwrap()
             .flatten()
             .any(|e| e.file_name().to_string_lossy().starts_with("photo-")),
@@ -696,10 +696,7 @@ async fn update_command_busy_gate_and_error_surface() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     fake.push_text_message(2, 42, 42, "/update");
     fake.await_capture(
-        |c| {
-            send_message_text(c)
-                .is_some_and(|t| t.starts_with("! [update] a turn is running"))
-        },
+        |c| send_message_text(c).is_some_and(|t| t.starts_with("! [update] a turn is running")),
         Duration::from_secs(30),
     )
     .expect("the busy gate refused the update");
@@ -712,9 +709,8 @@ async fn update_command_busy_gate_and_error_surface() {
     fake.push_text_message(4, 42, 42, "/update check");
     fake.await_capture(
         |c| {
-            send_message_text(c).is_some_and(|t| {
-                t.starts_with("! [update]") && !t.contains("a turn is running")
-            })
+            send_message_text(c)
+                .is_some_and(|t| t.starts_with("! [update]") && !t.contains("a turn is running"))
         },
         Duration::from_secs(30),
     )

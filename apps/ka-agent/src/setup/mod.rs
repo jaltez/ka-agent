@@ -38,6 +38,7 @@ pub enum Section {
     Search,
     Briefing,
     Voice,
+    Web,
 }
 
 /// Parsed `ka-agent setup` arguments.
@@ -150,15 +151,16 @@ impl Setup {
         println!(
             "Ka Agent setup — about 3 minutes. Nothing is saved until you confirm at the end."
         );
+        // An explicit section (interactive or `--yes`) runs only it.
+        if self.args.section != Section::All {
+            return self.partial(self.args.section).await;
+        }
         if self.args.yes {
             return self.yes_flow().await;
         }
         // An explicit `ka-agent setup telegram` runs only that section;
         // before, it fell through to the full wizard and buried the
         // channel steps behind provider/model prompts.
-        if self.args.section != Section::All {
-            return self.partial(self.args.section).await;
-        }
         // No SECTION given and a config exists: ask which.
         if !self.fresh {
             let options: Vec<String> = vec![
@@ -169,6 +171,7 @@ impl Setup {
                 "Web search".into(),
                 "Daily briefing".into(),
                 "Voice notes".into(),
+                "Web panel & relay".into(),
                 "Everything".into(),
             ];
             let pick = prompt::choice("What do you want to set up?", &options, 0)?;
@@ -180,6 +183,7 @@ impl Setup {
                 4 => Section::Search,
                 5 => Section::Briefing,
                 6 => Section::Voice,
+                7 => Section::Web,
                 _ => Section::All,
             };
             if self.args.section != Section::All {
@@ -210,6 +214,75 @@ impl Setup {
     }
 
     /// A single SECTION on an existing install: only those steps.
+    /// `ka-agent setup web`: where the panel binds and the public URL its
+    /// links use. Auth and pairing stay CLI-first (codes are minted here or
+    /// from the panel's Profiles page), so the wizard never exposes a
+    /// password over an unauthenticated socket.
+    fn step_web(&mut self) -> Result<std::process::ExitCode, Fail> {
+        let cfg = ka_agent_core::DaemonConfig::load(&self.args.config).unwrap_or_default();
+        let bind = if self.args.yes {
+            cfg.web.bind.clone()
+        } else {
+            prompt::text(
+                &format!("Web UI bind address [{}]", cfg.web.bind),
+                Some(&cfg.web.bind),
+            )?
+        };
+        if bind.parse::<std::net::IpAddr>().is_err() {
+            return Err(Fail::Msg(format!(
+                "web.bind {bind:?} is not an IP address (127.0.0.1, 0.0.0.0, ::1, …)"
+            )));
+        }
+        let current_public = cfg.web.public_url.clone().unwrap_or_default();
+        let public = if self.args.yes {
+            current_public
+        } else {
+            prompt::text(
+                "Public URL for links (https://agent.example.com, empty = local)",
+                Some(&current_public),
+            )?
+        };
+        ka_agent_core::config_file::set(&self.args.config, "web.enabled", "true")
+            .map_err(|e| Fail::Msg(e.to_string()))?;
+        ka_agent_core::config_file::set(&self.args.config, "web.bind", &format!("{bind:?}"))
+            .map_err(|e| Fail::Msg(e.to_string()))?;
+        let public = public.trim();
+        if public.is_empty() {
+            ka_agent_core::config_file::unset(&self.args.config, "web.public_url")
+                .map_err(|e| Fail::Msg(e.to_string()))?;
+        } else {
+            ka_agent_core::config_file::set(
+                &self.args.config,
+                "web.public_url",
+                &format!("{public:?}"),
+            )
+            .map_err(|e| Fail::Msg(e.to_string()))?;
+        }
+        // The same validation the daemon applies at load.
+        ka_agent_core::DaemonConfig::load(&self.args.config)
+            .map_err(|e| Fail::Msg(e.to_string()))?;
+        let host = if bind == "0.0.0.0" || bind == "::" {
+            "127.0.0.1"
+        } else {
+            bind.as_str()
+        };
+        println!();
+        println!("web UI  : http://{host}:{}", cfg.web.port);
+        if !public.is_empty() {
+            println!("public  : {public}");
+        }
+        if bind != "127.0.0.1" && bind != "::1" {
+            println!(
+                "warning : {bind} is not loopback — put TLS or a reverse proxy in front                  (docs/design/web-relay.md)"
+            );
+        }
+        println!(
+            "pair    : ka-agent pair web --role <role>   (or Profiles → new web user in the panel)"
+        );
+        println!("restart the agent, then `ka-agent dashboard`");
+        Ok(std::process::ExitCode::SUCCESS)
+    }
+
     async fn partial(&mut self, section: Section) -> Result<std::process::ExitCode, Fail> {
         match section {
             Section::Model => {
@@ -254,6 +327,7 @@ impl Setup {
                 println!("Daily briefing on — `ka-agent briefing now` sends one right away");
                 Ok(std::process::ExitCode::SUCCESS)
             }
+            Section::Web => self.step_web(),
             Section::Search => {
                 self.step_search()?;
                 if self.search.is_none() || !self.confirm_and_write().await? {

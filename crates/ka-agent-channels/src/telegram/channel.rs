@@ -348,10 +348,11 @@ impl TelegramChannel {
         false
     }
 
-    /// Adopt `chat_id` as the operator's chat: persist it when it changed
-    /// and flush chunks recovered while no chat was known.
-    async fn adopt_chat(&self, surface: &Arc<SurfaceInner>, chat_id: i64) {
-        if surface.set_chat(chat_id)
+    /// Adopt `chat_id` for `uid`: remembered per sender (per-identity
+    /// delivery), and as the last chat. Persists it when it changed and
+    /// flushes chunks recovered while no chat was known.
+    async fn adopt_chat(&self, surface: &Arc<SurfaceInner>, uid: i64, chat_id: i64) {
+        if surface.set_chat_for(&format!("telegram:{uid}"), chat_id)
             && let Err(e) = self
                 .store
                 .meta_set("telegram.chat_id", &chat_id.to_string())
@@ -398,7 +399,7 @@ impl TelegramChannel {
         let chat_id = message["chat"]["id"].as_i64().unwrap_or(uid);
         if pairing::is_pair_command(text) {
             if pairing::redeem(&self.store, "telegram", &uid.to_string(), text) == Redeem::Linked {
-                self.adopt_chat(surface, chat_id).await;
+                self.adopt_chat(surface, uid, chat_id).await;
                 let _ = surface
                     .client
                     .send_message(chat_id, pairing::TELEGRAM_WELCOME, None)
@@ -419,7 +420,7 @@ impl TelegramChannel {
                 return if pairing::redeem_code(&self.store, "telegram", &uid.to_string(), payload)
                     == Redeem::Linked
                 {
-                    self.adopt_chat(surface, chat_id).await;
+                    self.adopt_chat(surface, uid, chat_id).await;
                     let _ = surface
                         .client
                         .send_message(chat_id, pairing::TELEGRAM_WELCOME, None)
@@ -475,7 +476,7 @@ impl TelegramChannel {
             return;
         }
         let chat_id = message["chat"]["id"].as_i64().unwrap_or(0);
-        self.adopt_chat(surface, chat_id).await;
+        self.adopt_chat(surface, uid, chat_id).await;
         let client = surface.client.clone();
 
         let voice = message.get("voice").or_else(|| message.get("audio"));
@@ -564,7 +565,31 @@ impl TelegramChannel {
         // `/cleanup`, a direct action) instead of the router's text
         // listing; every argument form still routes below.
         if let Some(cmd) = bare_picker_command(text) {
-            self.send_picker(&client, chat_id, cmd, surface).await;
+            let source = format!("telegram:{uid}");
+            let role = self.runtime.role_for_source(&source);
+            let name = cmd.trim_start_matches('/');
+            // Pickers bypass the router's dispatch: gate them here too.
+            if !crate::commands::allowed_for(&self.runtime, &role, name) {
+                let _ = client
+                    .send_message(
+                        chat_id,
+                        &format!("command /{name} is not available for role {role}"),
+                        None,
+                    )
+                    .await;
+                return;
+            }
+            if !self.runtime.activate_role(&source).await {
+                let _ = client
+                    .send_message(
+                        chat_id,
+                        "another conversation is running — try again when its turn finishes",
+                        None,
+                    )
+                    .await;
+                return;
+            }
+            self.send_picker(&client, chat_id, cmd, surface, uid).await;
             return;
         }
         // Commands route through the shared router; replies go to the same
@@ -788,6 +813,18 @@ impl TelegramChannel {
         let Some(data) = data else {
             return CallbackReply::none();
         };
+        // Model switching, memory review and skill installation are the
+        // operator's, whatever card a subject happens to hold.
+        let uid = cb["from"]["id"].as_i64().unwrap_or(0);
+        let role = self.runtime.role_for_source(&format!("telegram:{uid}"));
+        let admin_only = data == "mx"
+            || data.starts_with("mp:")
+            || data.starts_with("mm:")
+            || data.starts_with("m:")
+            || data.starts_with("sk:");
+        if admin_only && role != ka_agent_core::ADMIN_ROLE {
+            return CallbackReply::toast("not available for this role");
+        }
         // The native `/model` `/mode` `/effort` pickers (checked first:
         // `mm:`/`mo:` would not collide with `m:`, but the picker owns
         // its prefixes as a block).
@@ -907,9 +944,14 @@ impl TelegramChannel {
                 ApprovalDecision::Deny
             };
             let word = if verdict == "y" { "approved" } else { "denied" };
-            return match self.runtime.decide(full.as_str(), decision).await {
+            let source = format!("telegram:{}", cb["from"]["id"].as_i64().unwrap_or(0));
+            return match self.runtime.decide(full.as_str(), decision, &source).await {
                 Ok(()) => CallbackReply::settle(
-                    if verdict == "y" { "✔ approved" } else { "✖ denied" },
+                    if verdict == "y" {
+                        "✔ approved"
+                    } else {
+                        "✖ denied"
+                    },
                     format!("approval [{}] → {word}", short_id(&full.0, 8)),
                 ),
                 Err(RtError::UnknownApproval(_)) => CallbackReply::toast("expired"),
@@ -942,15 +984,10 @@ impl TelegramChannel {
                 Ok(e) => e,
                 Err(e) => return CallbackReply::toast(&toast_cap(&e.to_string())),
             };
-            let hits: Vec<_> = entries
-                .iter()
-                .filter(|e| id_matches(&e.id, rest))
-                .collect();
+            let hits: Vec<_> = entries.iter().filter(|e| id_matches(&e.id, rest)).collect();
             return match hits.as_slice() {
                 [one] => match self.runtime.forget(&one.id) {
-                    Ok(true) => {
-                        CallbackReply::toast(&format!("forgot {}", short_id(&one.id, 8)))
-                    }
+                    Ok(true) => CallbackReply::toast(&format!("forgot {}", short_id(&one.id, 8))),
                     Ok(false) => CallbackReply::toast("already gone"),
                     Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
                 },
@@ -1040,7 +1077,8 @@ impl TelegramChannel {
         } else {
             ApprovalDecision::Deny
         };
-        match self.runtime.decide(&full, decision).await {
+        let source = format!("telegram:{}", cb["from"]["id"].as_i64().unwrap_or(0));
+        match self.runtime.decide(&full, decision, &source).await {
             Ok(()) => CallbackReply::toast(if verdict == "y" {
                 "✔ approved"
             } else {
@@ -1067,10 +1105,11 @@ impl TelegramChannel {
         chat_id: i64,
         cmd: &str,
         surface: &Arc<SurfaceInner>,
+        uid: i64,
     ) {
         let (text, markup) = match cmd {
             "/mode" => {
-                let current = self.runtime.config().mode.clone();
+                let current = self.runtime.effective_mode();
                 (format!("mode: {current}"), mode_keyboard(&current))
             }
             "/effort" => {
@@ -1107,7 +1146,7 @@ impl TelegramChannel {
                     return;
                 }
             },
-            "/skills" => self.skills_card().await,
+            "/skills" => self.skills_card(uid).await,
             "/history" => match self.history_card(0) {
                 Some(card) => card,
                 None => {
@@ -1156,7 +1195,9 @@ impl TelegramChannel {
             .drain(..)
             .collect();
         if drained.is_empty() {
-            let _ = client.send_message(chat_id, "nothing to clean up", None).await;
+            let _ = client
+                .send_message(chat_id, "nothing to clean up", None)
+                .await;
             return;
         }
         let errors = drained
@@ -1224,16 +1265,14 @@ impl TelegramChannel {
         let mut lines = Vec::new();
         let mut rows = Vec::new();
         for (i, (id, source, text)) in items.iter().take(10).enumerate() {
-            lines.push(format!(
-                "#{} [{}] {}",
-                i + 1,
-                source,
-                trunc_chars(text, 80)
-            ));
+            lines.push(format!("#{} [{}] {}", i + 1, source, trunc_chars(text, 80)));
             rows.push(vec![kb_button("✕", &format!("qx:{}", short_id(id, 12)))]);
         }
         if items.len() > 10 {
-            lines.push(format!("{} more — /queue clear empties the rest", items.len() - 10));
+            lines.push(format!(
+                "{} more — /queue clear empties the rest",
+                items.len() - 10
+            ));
         }
         rows.push(vec![kb_button("Clear all", "qclr"), kb_button("✕", "x")]);
         Some((
@@ -1267,7 +1306,10 @@ impl TelegramChannel {
         }
         let mut nav = Vec::new();
         if off > 0 {
-            nav.push(kb_button("‹ prev", &format!("fp:{}", off.saturating_sub(PER))));
+            nav.push(kb_button(
+                "‹ prev",
+                &format!("fp:{}", off.saturating_sub(PER)),
+            ));
         }
         if off + PER < entries.len() {
             nav.push(kb_button("more ›", &format!("fp:{}", off + PER)));
@@ -1284,7 +1326,7 @@ impl TelegramChannel {
     /// `sk:a:<id>` / `sk:r:<id>` rows (the same handler the proposal
     /// cards use); with none pending it lists the installed skills over
     /// a lone ✕ close row.
-    async fn skills_card(&self) -> (String, Value) {
+    async fn skills_card(&self, uid: i64) -> (String, Value) {
         let pending = self.store.pending_skill_candidates().unwrap_or_default();
         if !pending.is_empty() {
             let mut lines = Vec::new();
@@ -1310,14 +1352,22 @@ impl TelegramChannel {
                 ]);
             }
             if pending.len() > 10 {
-                lines.push(format!("{} more — /skills review lists them", pending.len() - 10));
+                lines.push(format!(
+                    "{} more — /skills review lists them",
+                    pending.len() - 10
+                ));
             }
             return (
                 format!("proposed skills:\n{}", lines.join("\n")),
                 json!({ "inline_keyboard": rows }),
             );
         }
-        let reply = match crate::commands::route(&self.runtime, "telegram:picker", "/skills").await
+        let reply = match crate::commands::route(
+            &self.runtime,
+            &format!("telegram:{uid}"),
+            "/skills",
+        )
+        .await
         {
             crate::commands::Outcome::Reply(reply) => cap_lines(&reply, PICKER_TEXT_LINES),
             _ => "no skills enabled".into(),
@@ -1356,7 +1406,10 @@ impl TelegramChannel {
         }
         let mut nav = Vec::new();
         if off > 0 {
-            nav.push(kb_button("‹ prev", &format!("hp:{}", off.saturating_sub(6))));
+            nav.push(kb_button(
+                "‹ prev",
+                &format!("hp:{}", off.saturating_sub(6)),
+            ));
         }
         if turns.len() == 6
             && self
@@ -1462,7 +1515,7 @@ impl TelegramChannel {
             return;
         }
         let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
-        self.adopt_chat(surface, chat_id).await;
+        self.adopt_chat(surface, uid, chat_id).await;
         let reply = self.callback_action(cb, cb["data"].as_str(), surface).await;
         // Exactly one answer per callback query, on every path.
         if let Some(id) = cb["id"].as_str() {

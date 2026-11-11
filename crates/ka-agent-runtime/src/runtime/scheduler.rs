@@ -100,9 +100,67 @@ impl Runtime {
         Ok(self.sh.store.cron_tasks()?)
     }
 
+    /// One role's cron jobs (`admin` sees every subject's).
+    pub fn list_crons_for(&self, role: &str) -> Result<Vec<ka_agent_core::Task>, Error> {
+        let all = self.list_crons()?;
+        if role == ka_agent_core::ADMIN_ROLE {
+            return Ok(all);
+        }
+        Ok(all
+            .into_iter()
+            .filter(|t| {
+                t.payload
+                    .as_deref()
+                    .and_then(ka_agent_core::CronSpec::from_payload)
+                    .map(|c| c.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE) == role)
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
     /// Live reminders and crons, next fire first (`/reminders`).
     pub fn scheduled_tasks(&self) -> Result<Vec<ka_agent_core::Task>, Error> {
         Ok(self.sh.store.scheduled_tasks()?)
+    }
+
+    /// One role's scheduled work: its own crons; reminders are the
+    /// operator's and never shown to a subject.
+    pub fn scheduled_tasks_for(&self, role: &str) -> Result<Vec<ka_agent_core::Task>, Error> {
+        if role == ka_agent_core::ADMIN_ROLE {
+            return self.scheduled_tasks();
+        }
+        let mut tasks = self.list_crons_for(role)?;
+        tasks.sort_by_key(|t| t.scheduled_at_ms.unwrap_or(i64::MAX));
+        Ok(tasks)
+    }
+
+    /// Cancel one scheduled task by id prefix, scoped to `role` (a subject
+    /// cannot cancel the operator's or another role's job).
+    pub fn cancel_scheduled_for(
+        &self,
+        role: &str,
+        id_prefix: &str,
+    ) -> Result<CancelOutcome, Error> {
+        if role == ka_agent_core::ADMIN_ROLE {
+            return self.cancel_scheduled(id_prefix);
+        }
+        let allowed: Vec<_> = self
+            .list_crons_for(role)?
+            .into_iter()
+            .filter(|t| ka_agent_core::ids::id_matches(t.id.as_str(), id_prefix.trim()))
+            .collect();
+        match allowed.as_slice() {
+            [] => Ok(CancelOutcome::NotFound),
+            [one] => {
+                self.sh.store.set_task_status(&one.id, "cancelled")?;
+                Ok(CancelOutcome::Cancelled(one.title.clone()))
+            }
+            many => Ok(CancelOutcome::Ambiguous(
+                many.iter()
+                    .map(|t| ka_agent_core::ids::short_id(t.id.as_str()).to_string())
+                    .collect(),
+            )),
+        }
     }
 
     /// Cancel any scheduled task (reminder or cron) by id prefix.
@@ -326,8 +384,12 @@ impl Runtime {
                             record(&task, "blocked", Some(&why));
                             continue;
                         }
-                        let exceeded =
-                            self.lock().budget.verdict() == ka_agent_core::BudgetVerdict::Exceeded;
+                        let role = spec
+                            .role
+                            .clone()
+                            .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+                        let exceeded = self.budget_verdict_for(&role)
+                            == ka_agent_core::BudgetVerdict::Exceeded;
                         if exceeded {
                             let next = if recurring {
                                 next_for(&spec, task.scheduled_at_ms.unwrap_or(now))
@@ -419,7 +481,19 @@ impl Runtime {
                             } else {
                                 "cron"
                             };
-                            match self.handle_message(&prompt, turn_source).await {
+                            let role = spec
+                                .role
+                                .clone()
+                                .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+                            // Empty `spec.tools` = the job never asked to
+                            // narrow; otherwise the clamp is the allowlist,
+                            // even when it removed every tool.
+                            let tools = (!spec.tools.is_empty())
+                                .then(|| self.clamp_cron_tools(&role, &spec.tools));
+                            match self
+                                .handle_cron_message(&prompt, turn_source, &role, tools)
+                                .await
+                            {
                                 Ok(()) => true,
                                 Err(e) => {
                                     self.sh.emit(AgentEvent::Error {
@@ -868,7 +942,9 @@ mod tests {
         );
         assert_eq!(
             watchdog_action(180_000, 180, 900, false),
-            WatchdogAction::Notify { silent_for_secs: 180 }
+            WatchdogAction::Notify {
+                silent_for_secs: 180
+            }
         );
         // Once per silent stretch: the flag suppresses re-notification.
         assert_eq!(
@@ -881,17 +957,23 @@ mod tests {
     fn abort_takes_precedence_over_notify() {
         assert_eq!(
             watchdog_action(900_000, 180, 900, false),
-            WatchdogAction::Abort { silent_for_secs: 900 }
+            WatchdogAction::Abort {
+                silent_for_secs: 900
+            }
         );
         // Abort even when the notice never went out (notify disabled).
         assert_eq!(
             watchdog_action(900_000, 0, 900, false),
-            WatchdogAction::Abort { silent_for_secs: 900 }
+            WatchdogAction::Abort {
+                silent_for_secs: 900
+            }
         );
         // Abort even if already notified.
         assert_eq!(
             watchdog_action(900_000, 180, 900, true),
-            WatchdogAction::Abort { silent_for_secs: 900 }
+            WatchdogAction::Abort {
+                silent_for_secs: 900
+            }
         );
     }
 
@@ -900,7 +982,9 @@ mod tests {
         // Notify-only: abort disabled.
         assert_eq!(
             watchdog_action(9_000_000, 180, 0, false),
-            WatchdogAction::Notify { silent_for_secs: 9000 }
+            WatchdogAction::Notify {
+                silent_for_secs: 9000
+            }
         );
         // Both off.
         assert_eq!(

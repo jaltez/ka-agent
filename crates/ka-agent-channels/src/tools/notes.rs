@@ -1,11 +1,13 @@
-//! `notes_*`: the operator's local markdown notes under `<data>/notes`.
+//! `notes_*`: the operator's local markdown notes under `<data>/notes`
+//! (a role's own notes live under `<data>/roles/<name>/notes`).
 
 use serde_json::{Value, json};
 
-use super::{ToolCtx, ToolFuture};
+use super::{ToolCtx, ToolFuture, turn_role};
 
 fn notes_dir(ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
-    let dir = ctx.paths.root().join("notes");
+    let role = turn_role(&ctx.store);
+    let dir = ctx.paths.role_notes(&role);
     std::fs::create_dir_all(&dir).map_err(|e| format!("notes dir: {e}"))?;
     Ok(dir)
 }

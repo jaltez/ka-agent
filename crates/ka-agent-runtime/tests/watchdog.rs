@@ -61,9 +61,7 @@ impl Collect {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|ev| {
-                matches!(ev, AgentEvent::Notice { text } if text.contains(needle))
-            })
+            .filter(|ev| matches!(ev, AgentEvent::Notice { text } if text.contains(needle)))
             .count()
     }
 }

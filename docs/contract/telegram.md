@@ -213,6 +213,13 @@ scripted engine. Limits and semantics follow `docs/ka-interface-validation.md`
   messages.
   While a turn runs: typing action every 4 s plus one editable progress
   message (edits throttled to 1 per 3 s, last 3 notes buffered).
+- Per-identity delivery (ADR-0002): the surface keeps one chat per linked
+  sender (`telegram:<uid>`) and every turn-scoped event carries its
+  source, so a subject's reply goes back to the chat that asked even when
+  several linked identities share the bot. `None`/local sources and
+  admin-only events (approval cards, memory proposals, skill proposals,
+  reminders) go to the admin's chat; unknown sources fall back to the last
+  adopted chat (the pre-RBAC behavior).
 - Final answer: the `final_chunk` envelope (carrying its `turn` id)
   sends one message per chunk (runtime chunks ≤3800 chars at paragraph
   boundaries); the surface closes unbalanced ``` fences per chunk and

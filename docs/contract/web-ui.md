@@ -1,4 +1,33 @@
-# Web UI contract (M7, SEED.md §10 Phase 4; redesigned v0.8)
+# Web UI contract
+
+## Binding and the public URL
+
+`[web] bind` is an IP (default `127.0.0.1`; IPv6 literals work) and
+`[web] public_url` is the absolute http(s) base printed in login/pairing
+links. A wildcard bind is not a URL: the local URL stays `127.0.0.1`.
+`ka-agent setup web` writes both; `doctor` warns when the panel is bound
+beyond loopback (pairing codes travel over it — put TLS/reverse proxy in
+front, `docs/design/web-relay.md`).
+
+## Roles (ADR-0002)
+
+- `ka-agent pair web --role <r>` → a one-time code; `POST /pair` redeems
+  it and sets a server-side `HttpOnly; SameSite=Strict` session cookie for
+  a fresh `web:<id>` identity with that role.
+- A role session is **chat-only**: `/`, `/chat/send`, `/events` and the
+  static chat script. Every other page answers `403 this web session is
+  chat-only`. `/events` is filtered to envelopes stamped with the role's
+  own `web:<id>` source, so approval cards and other roles' turns never
+  reach it.
+- The operator's one-shot login (`/auth?token=…`) keeps the full panel:
+  status, profiles (`/profiles`: profiles on disk, configured roles,
+  linked identities with role reassignment), config form (`/settings`),
+  tasks, memory, skills, approvals, audit.
+- `POST /profiles/create|use` and `POST /identities/role` run the same
+  CLI/store operations as the terminal and are audited with the admin
+  role; they are not offered under a pinned `KA_AGENT_DATA_DIR`.
+
+_M7, SEED.md §10 Phase 4; redesigned v0.8._
 
 A loopback-only HTTP/1.1 server inside the daemon (`ka-agent-web`), serving
 server-rendered HTML plus one embedded stylesheet (no external assets, no
@@ -31,7 +60,8 @@ dashboard` mints a one-shot token in the daemon's store (`meta` key
 1. `GET /auth?token=<token>` — validates and **consumes** the token (a second
    use is `401`), then answers `303` with
    `Set-Cookie: ka_session=<32 random bytes hex>; HttpOnly; SameSite=Strict;
-   Path=/; Max-Age=86400` and `Location: /`.
+   Path=/; Max-Age=86400` (`; Secure` when `[web] public_url` is https) and
+   `Location: /`.
 2. Every other route requires a valid `ka_session` cookie; otherwise `401`.
 3. Sessions live in the daemon process (memory only) and expire after 24 h;
    a daemon restart invalidates them.
@@ -46,35 +76,80 @@ requires a valid session cookie.
 | GET | `/healthz` | `ok` (unauthenticated liveness) |
 | GET | `/auth?token=…` | login, sets the cookie |
 | GET | `/` | chat: bubbles (last 20 turns, a first-visit hint when there are none), SSE live updates, Markdown rendered; the composer carries a `🕶` button that starts a private conversation (`/new private`) |
-| GET | `/static/chat.js` | the one script (same-origin, CSP-gated, `no-store`) |
+| GET | `/static/chat.js` | the chat script (same-origin, CSP-gated, `no-store`) |
+| GET | `/static/ui.js` | the UI script: theme preference (system/light/dark via `localStorage` + `data-theme`), loaded on every page |
 | POST | `/chat/send` | a chat message or command (`text=`; requires the `X-Ka-Agent: 1` header, so only the panel's own JS can post) → JSON `{"reply"}` or `{"ok":true}` |
 | GET | `/events` | the SSE stream (one `data:` frame per sequenced bus envelope; `id:` carries the `seq` so a reconnect with `Last-Event-ID` replays exactly the gap) |
 | POST | `/api/notify` | `{"text"}` → a notice on every surface. **Bearer-only**: `Authorization: Bearer <web.api_token>`; `404` while no token is configured, `401` for a wrong one; 16 KiB bodies, 30 req/min |
 | POST | `/api/ask` | `{"text","background","wait"}` → queues a turn (`api` / `api-bg` source); with `wait:true` the reply is held until the turn settles (300 s cap) and carries `{"ok","queued","reply","stop"}`; same bearer auth as `/api/notify` |
-| GET | `/status` | the operator report (state, model, today vs budget, queue/approvals, memory, worker) plus the settings form |
+| GET | `/pair` | the public pairing form (a code from `ka-agent pair web --role <r>`); `POST /pair` redeems it and sets the role cookie |
+| GET | `/sessions` | recent sessions by role with an "open" action (adopts that role's latest conversation; a running turn is never disturbed) |
+| POST | `/sessions/open` | `role=` switches the active role when settled |
+| POST | `/backup` | run the binary's own `backup` (default directory, pruned to 7) and show its output; restore stays in the CLI |
+| GET | `/status` | the operator report (state, model, mode/effort, budget bars, queue/approvals, memory, worker, role/tools, worker stderr tail) plus the settings form |
+| GET | `/profiles` | profiles on disk, configured `[[role]]` entries (each links to the editor), linked identities with role/link/unlink, the `[tools] disable` baseline, and the “new web user” code form |
+| GET | `/roles/new` · `/roles/edit/<name>` | the role editor (name, mode, allow/disable, workspace, budget, commands) |
+| POST | `/roles/save` · `/roles/delete` | write `[[role]]` through the validated config editor and hot-reload; delete refuses while identities/crons reference the role unless `force=1` |
+| POST | `/tools/disable` | write the profile-wide `[tools] disable` baseline |
+| POST | `/identities/link` · `/identities/unlink` | bind/unbind a channel identity and its role (audited) |
+| POST | `/identities/role` | reassign one identity's role (validated against the config, audited) |
+| POST | `/profiles/create` · `/profiles/use` | run the profile CLI and reload the page (refused under a pinned data root) |
+| POST | `/profiles/remove` | the same with `--yes`; the form requires the profile name typed back |
+| GET | `/models` | current model + key state, mode/effort pickers, the persona editor, and the provider catalog with one-click switching |
+| POST | `/models/set` · `/models/mode` · `/models/effort` · `/persona` | apply the change and show the agent's own reply (errors keep the page with the reason) |
+| GET | `/config` | the config file path, the safe (web-flagged) editor, every registered key with kind/apply/default/current, and the raw TOML |
+| GET | `/queue` | messages waiting for the next turn, with remove/clear |
+| POST | `/queue/remove` · `/queue/clear` | drop one queued message by id, or the whole queue |
+| GET | `/grants` | scoped tool grants (`ka-agent grant list`) with add/remove |
+| POST | `/grants/add` · `/grants/rm` | update the store's grant list → `303 /grants` |
+| POST | `/keys/provider` · `/keys/secret` · `/keys/secret/rm` | write one provider key (engine `.env`) or secret file (0600), or remove a secret; values are never echoed |
+| GET | `/keys` | provider key and secret **names** with presence, the current model's key state, the fix (`ka-agent key set …`), and the set forms (values are written 0600 and never rendered or audited) |
+| GET | `/extensions` | MCP servers (add/remove below), plugins, hooks and the live tool inventory (plugin install stays in the CLI) |
+| POST | `/mcp/add` · `/mcp/rm` | append/remove one `[[mcp]]` server (stdio command+args or http url, `KEY=VALUE` env/headers lines, `secret:name` refs) and hot-reload |
+| GET | `/doctor` | the in-process health checks (config, model key, store, data-root permissions, web publication, channel tokens) plus the full `ka-agent doctor --json` (pin, contract hash, sandbox) |
+| POST | `/doctor/fix` | run the binary's safe repairs (0700 roots, 0600 secret files) and show their output |
+| GET | `/logs` | the tail (300 lines) of `<data>/logs/daemon.log`, the same file `ka-agent logs` reads |
+| POST | `/pair/issue` | mint a web pairing code for a role from the admin UI (audited; shown once) |
+| POST | `/upload` | one attachment (`X-Ka-Filename`, raw body, `X-Ka-Agent: 1`, max 8 MiB) under the caller role's `attachments/`; replies with the `@attachments/…` ref |
+| GET | `/file/<name>` | serve one direct child of the caller role's `attachments/` or workspace; traversal and symlink escapes are refused |
 | POST | `/settings` | the status page form, one control per `config_keys::KEYS` entry marked `web` (see below): format-preserving writes + live reload; each key shows when it applies; unknown keys are ignored; invalid values are refused |
 | GET | `/usage` | spend per day **and model** (30 d), CSS bars, today vs the cap |
-| GET | `/tasks` | reminders and crons, next fire first; each reminder row has a snooze form, every row a cancel button |
+| GET | `/tasks` | reminders and crons, next fire first, with role/tools, the create forms (same grammar as `/cron add` and `/remind`), and pause/resume/run-now/remove per cron |
+| POST | `/tasks/add` | `kind=cron\|reminder` + `args=` runs the router's own command and shows its reply |
+| POST | `/tasks/calendar` | `args=` runs the router's `/calendar` (add/today) and shows its reply |
+| POST | `/tasks/cron` | `id=` + `action=pause\|resume\|trigger\|remove` — the same `cron_ops` the CLI uses |
 | POST | `/tasks/cancel` | `id=` (prefix ok) cancels a reminder or cron → `303 /tasks`; unknown/ambiguous ids render an explaining page |
 | POST | `/tasks/snooze` | `id=` + `when=` (the `/remind` grammar: `30m`, `18:30`, `tomorrow 9am`, …) moves one reminder's next fire → `303 /tasks`; crons keep their cadence |
-| GET | `/skills` | the skill library with enable/disable per skill |
-| POST | `/skills/toggle` | `name=` + `enable=1\|0` → `303 /skills` |
+| GET | `/skills` | the skill library and a matrix of which engine home (admin + each role) has each skill, plus pending proposals |
+| POST | `/skills/toggle` | `name=` + `role=` + `enable=1\|0` — provisioning into one role's engine home |
 | GET | `/contacts` | linked identities + unknown contacts with their `ka-agent identity link` command |
 | GET | `/history` | search form; `?q=` runs FTS over episodes (whitespace-separated terms AND together; a quoted span stays one phrase) |
 | GET | `/history/show/<turn>` | one turn: inbound text + the outbound answer |
-| GET | `/memory` | report (bytes/budget), proposal form, the review inbox (candidates with diffs), accepted entries, compiled text |
+| GET | `/memory` | report (bytes/budget), remember-now and propose forms, the review inbox (candidates with role and diffs), accepted entries, commit history with undo, compiled text |
+| POST | `/memory/remember` | accepts one fact now (facts.md + commit) and shows the result |
+| POST | `/memory/undo` | reverts the last memory commit |
 | POST | `/memory/edit` | stages a candidate (`text=`) → `303` back to `/memory` |
 | POST | `/memory/candidate` | `id=` + `decision=y\|n` applies a review decision → `303` |
 | POST | `/memory/forget` | `id=` removes one accepted entry → `303 /memory`; an unknown id renders an error page instead of a silent redirect |
-| GET | `/approvals` | pending asks with allow/deny forms |
-| POST | `/approvals/decide` | `id=` + `decision=y\|n` → `303 /approvals` (JSON when the `X-Ka-Agent` header is present — the inline chat card's fetch path) |
-| GET | `/audit` | the last 50 audit-chain records (seq, time, actor, action, subject) |
+| GET | `/approvals` | pending asks with allow/deny/allow-for-session forms |
+| POST | `/approvals/decide` | `id=` + `decision=y\|n\|session` → `303 /approvals` (JSON when the `X-Ka-Agent` header is present — the inline chat card's fetch path) |
+| GET | `/audit` | the last 50 audit-chain records (seq, time, actor, **role**, action, subject) |
 | GET | `/intents` | the last 20 MCP intents and their status |
 
-Every page above renders inside the shared sidebar navigation (the chat,
-history, audit and intents pages included), whose Approvals and Memory
-items carry live badges: `chat.js` bumps them from the SSE stream so they
-stay current without a reload.
+Every page above renders inside a grouped sidebar (Chat, Operator, System);
+Approvals, Memory and Queue carry live badges that `chat.js` bumps from the
+SSE stream, so they stay current without a reload. The session cookie gains
+`Secure` when `[web] public_url` is https; HTML responses are `no-store`
+under the strict CSP.
+
+## What stays in the CLI
+
+OS-level and destructive operations are not web routes by design:
+`service install|status|uninstall` (systemd/launchd), `restore`,
+`plugin install|remove` (the panel lists them), `update` (the chat's
+`/update` still works), `profile` under a pinned `KA_AGENT_DATA_DIR`, and
+`models refresh`. Everything else has a page or a chat command — including
+roles/identities/MCP editing, a one-click backup and the full doctor.
 
 Anything else is `404` — including `GET` on a mutation path, so no page
 can be triggered by a link.

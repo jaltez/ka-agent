@@ -76,7 +76,7 @@ pub(crate) enum Command {
     /// Guided setup: model and key, phone, web search, background service.
     #[command(visible_alias = "init")]
     Setup {
-        /// Section: all | model | telegram | matrix | service | search | briefing | voice.
+        /// Section: all | model | telegram | matrix | service | search | briefing | voice | web.
         section: Option<String>,
         /// Config path (default: the active profile's, `ka-agent config path`).
         #[arg(short, long)]
@@ -141,11 +141,14 @@ pub(crate) enum Command {
     /// Issue a one-time pairing code for a channel (`ka-agent pair telegram`).
     #[command(hide = true)]
     Pair {
-        /// telegram | matrix
+        /// telegram | matrix | web
         channel: String,
         /// Config path.
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Role the paired identity gets (`web` only; default admin).
+        #[arg(long)]
+        role: Option<String>,
     },
     /// Show or switch the model (`ka-agent model openai/gpt-5.1`).
     Model {
@@ -472,6 +475,12 @@ pub(crate) enum ProfileAction {
         /// Also copy its memory files (never sessions, crons or identities).
         #[arg(long)]
         clone_memory: bool,
+        /// Permission mode for the new profile (ask|accept_edits|allow|readonly).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Workspace directory for the new profile (default: under its data root).
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
     },
     /// Make a profile the default for commands without `-p`.
     Use { name: String },
@@ -592,6 +601,19 @@ pub(crate) enum IdentityAction {
         channel: String,
         /// The channel's stable address (numeric id, @user:domain, …).
         address: String,
+        /// Role the identity acts as (default `admin`; must be defined in
+        /// the config's `[[role]]` table).
+        #[arg(long, default_value = "admin")]
+        role: String,
+    },
+    /// Reassign a linked identity's role (audited).
+    Role {
+        /// Channel name.
+        channel: String,
+        /// The address to reassign.
+        address: String,
+        /// The new role (`admin`, or a `[[role]]` name from the config).
+        role: String,
     },
     /// Unlink a channel identity.
     Unlink {
@@ -658,13 +680,19 @@ pub(crate) enum SkillsAction {
     List,
     /// Provision a skill into the engine home (ka discovers it there).
     Enable {
-        /// Skill name (directory under ~/.ka-agent/skills).
+        /// Skill name (directory under the profile or global library).
         name: String,
+        /// Provision into this role's engine home (default: the admin's).
+        #[arg(long)]
+        role: Option<String>,
     },
     /// Remove a skill's provisioning (the source copy is never touched).
     Disable {
         /// Skill name.
         name: String,
+        /// Remove from this role's engine home (default: the admin's).
+        #[arg(long)]
+        role: Option<String>,
     },
 }
 

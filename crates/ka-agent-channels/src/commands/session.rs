@@ -267,7 +267,7 @@ pub(super) fn run_mode<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args.trim();
         if rest.is_empty() {
-            let current = runtime.config().mode.clone();
+            let current = runtime.effective_mode();
             let mut lines = vec![format!("mode: {current}")];
             for (i, (name, desc)) in MODES.iter().enumerate() {
                 let mark = if *name == current { " ←" } else { "" };

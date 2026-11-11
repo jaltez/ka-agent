@@ -73,8 +73,18 @@ impl Runtime {
             .any(|k| k.apply == ka_agent_core::config_keys::Apply::Worker);
         {
             let mut g = self.lock();
-            g.budget.daily_usd_cap = new.budgets.daily_usd;
-            g.budget.daily_token_cap = new.budgets.daily_tokens;
+            // The active role's caps follow the reload: a role's own USD
+            // cap wins, else the profile's.
+            let (usd, tokens) = super::roles::budget_caps_of(&new, &g.role);
+            g.budget.daily_usd_cap = usd;
+            g.budget.daily_token_cap = tokens;
+        }
+        // New roles get their tree now; a removed role's files stay (the
+        // operator may want them back).
+        if let Err(e) = self.sh.paths.ensure_role_dirs_for(&new.roles) {
+            self.sh.emit(AgentEvent::Notice {
+                text: format!("role directories not created: {e}"),
+            });
         }
         publish_timezone(&self.sh.store, &new);
         // `calendar.digest_time` is Apply::Live: an existing digest cron
@@ -312,9 +322,7 @@ impl Runtime {
             .store
             .queued_items(&sid)?
             .into_iter()
-            .filter(|i| {
-                ka_agent_core::ids::id_matches(i.id.as_str(), id_prefix.trim())
-            })
+            .filter(|i| ka_agent_core::ids::id_matches(i.id.as_str(), id_prefix.trim()))
             .collect();
         match hits.as_slice() {
             [one] => self.sh.store.queue_remove(&one.id).map_err(Error::Store),
@@ -341,7 +349,7 @@ impl Runtime {
         let cfg = self.cfg();
         self.sh.emit(AgentEvent::Settings {
             model: cfg.model.clone(),
-            mode: Some(cfg.mode.clone()),
+            mode: Some(self.effective_mode()),
             effort: self.effort(),
             private: Some(self.session_private()),
         });
@@ -351,28 +359,44 @@ impl Runtime {
     /// turn by `[prompt] identity_file`). Called at startup, after a
     /// persona edit, and from the maintenance watcher.
     pub fn refresh_identity(&self) -> Result<(), Error> {
-        let persona = self.sh.memory.persona_text();
+        // Persona content is profile-wide policy; only the file location is
+        // per role (each engine reads its own HOME).
+        let persona = self.memory_store(ka_agent_core::ADMIN_ROLE)?.persona_text();
         let text = crate::runtime::compile_identity(&persona);
-        let dir = self.sh.paths.engine_home().join(".config/ka");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("IDENTITY.md"), text)?;
+        let mut homes = vec![self.sh.paths.engine_home()];
+        homes.extend(
+            self.cfg()
+                .roles
+                .iter()
+                .map(|r| self.sh.paths.role_engine_home(&r.name)),
+        );
+        for home in homes {
+            let dir = home.join(".config/ka");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("IDENTITY.md"), &text)?;
+        }
         self.remember_persona_mtime();
         Ok(())
     }
 
     /// The persona's display name (`Ka` by default).
     pub fn persona_name(&self) -> String {
-        self.sh.memory.persona_name()
+        self.memory_store(ka_agent_core::ADMIN_ROLE)
+            .map(|m| m.persona_name())
+            .unwrap_or_else(|_| "Ka".to_string())
     }
 
     /// The current persona text.
     pub fn persona_text(&self) -> String {
-        self.sh.memory.persona_text()
+        self.memory_store(ka_agent_core::ADMIN_ROLE)
+            .map(|m| m.persona_text())
+            .unwrap_or_default()
     }
 
     /// Persist a new persona and recompile IDENTITY.md in-process.
     pub fn set_persona(&self, text: &str) -> Result<(), Error> {
-        self.sh.memory.write_persona(text)?;
+        self.memory_store(ka_agent_core::ADMIN_ROLE)?
+            .write_persona(text)?;
         self.refresh_identity()
     }
 
@@ -479,6 +503,39 @@ impl Runtime {
         // check below must never run on an unranked word.
         let new = strictness(&canonical)
             .ok_or_else(|| Error::Refused(format!("unknown mode {mode:?}")))?;
+        // A role's mode is its ceiling: a request above it is clamped to
+        // the ceiling (never an error), applies to this session only, and
+        // is never written to the profile config.
+        let role = self.active_role();
+        if role != ka_agent_core::ADMIN_ROLE {
+            let ceiling = self
+                .effective_role(&role)
+                .mode_canonical()
+                .unwrap_or_else(|| "readonly".to_string());
+            let ceiling_rank = strictness(&ceiling).unwrap_or(3);
+            // Rank grows with strictness: a request BELOW the ceiling is
+            // looser and gets clamped.
+            let applied = if new < ceiling_rank {
+                ceiling.clone()
+            } else {
+                canonical.clone()
+            };
+            if let Some(port) = self.live_port() {
+                let _ = port.set_mode(applied.clone()).await;
+            }
+            self.lock().session_mode = Some(applied.clone());
+            self.audit(
+                audit_actions::MODE_SET,
+                &applied,
+                Some(format!("by {source} (role {role})")),
+            )?;
+            self.settings_event();
+            return Ok(if applied != canonical {
+                format!("{applied} (role {role}'s ceiling is {ceiling})")
+            } else {
+                applied
+            });
+        }
         let phone = source.starts_with("telegram:") || source.starts_with("matrix:");
         let current = strictness(&self.cfg().mode).unwrap_or(2);
         if phone && new < current {

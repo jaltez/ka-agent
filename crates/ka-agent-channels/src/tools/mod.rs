@@ -51,6 +51,17 @@ pub struct ToolCtx {
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
+/// The role of the turn the tool call belongs to (`admin` when the key is
+/// absent: an in-flight turn from before RBAC, or a daemon-side call).
+pub(crate) fn turn_role(store: &Store) -> String {
+    store
+        .meta_get(ka_agent_core::layout::TURN_ROLE_META_KEY)
+        .ok()
+        .flatten()
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string())
+}
+
 /// One registered tool.
 pub struct ToolSpec {
     pub name: &'static str,

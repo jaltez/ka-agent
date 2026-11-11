@@ -170,16 +170,17 @@ impl Host {
             // The last room the operator wrote from survives restarts, so
             // proactive notices are delivered before anyone writes again.
             let initial_room = store.meta_get("matrix.room_id").ok().flatten();
-            let s: Arc<ka_agent_channels::MatrixSurface> =
-                Arc::new(ka_agent_channels::MatrixSurface::new(
-                    ka_agent_channels::MatrixConfig {
-                        homeserver,
-                        user_id: cfg.matrix.user_id.clone(),
-                        token: t.clone(),
-                        transcriber: None,
-                    },
-                    initial_room,
-                ));
+            let mut surface = ka_agent_channels::MatrixSurface::new(
+                ka_agent_channels::MatrixConfig {
+                    homeserver,
+                    user_id: cfg.matrix.user_id.clone(),
+                    token: t.clone(),
+                    transcriber: None,
+                },
+                initial_room,
+            );
+            surface.set_store(store.clone());
+            let s: Arc<ka_agent_channels::MatrixSurface> = Arc::new(surface);
             surfaces.push(s.clone());
             s
         });
@@ -409,8 +410,12 @@ impl Host {
             None
         };
         if let Some(web_port) = web_port {
+            let bind = cfg.web.bind.clone();
+            let public_url = cfg.web.public_url.clone();
             let web = ka_agent_web::WebServer::new(
                 web_port,
+                bind,
+                public_url,
                 runtime.clone(),
                 Arc::clone(&store),
                 Arc::clone(&bus),
@@ -431,7 +436,12 @@ impl Host {
                 }
             }));
             if opts.channels {
-                println!("web UI http://127.0.0.1:{web_port} (open it with: ka-agent dashboard)");
+                let host = if cfg.web.bind == "0.0.0.0" || cfg.web.bind == "::" {
+                    "127.0.0.1"
+                } else {
+                    cfg.web.bind.as_str()
+                };
+                println!("web UI http://{host}:{web_port} (open it with: ka-agent dashboard)");
             }
         }
 

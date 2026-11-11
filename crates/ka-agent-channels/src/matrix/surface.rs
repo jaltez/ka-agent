@@ -27,8 +27,16 @@ const CARD_CAP: usize = 256;
 /// One queued outbound item. Approval cards must keep their sent event id
 /// so a ✅/❌ reaction can be resolved back to the approval.
 pub(super) enum Outbound {
-    Text(String),
-    Card { id: String, text: String },
+    Text {
+        /// The room this item belongs to; `None` = the last known room.
+        room: Option<String>,
+        text: String,
+    },
+    Card {
+        room: Option<String>,
+        id: String,
+        text: String,
+    },
 }
 
 /// The reply being streamed in the current turn.
@@ -69,6 +77,10 @@ struct Stream {
 pub(super) struct Shared {
     pub(super) client: Arc<Client>,
     pub(super) room: Arc<Mutex<Option<String>>>,
+    /// The room a linked sender writes from, keyed by source
+    /// (`matrix:@user:domain`): replies go back to the sender, not to
+    /// whoever wrote last.
+    rooms: Mutex<std::collections::HashMap<String, String>>,
     user: String,
     tx: mpsc::UnboundedSender<Outbound>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<Outbound>>>,
@@ -78,6 +90,8 @@ pub(super) struct Shared {
     /// an older snapshot.
     gate: Arc<tokio::sync::Mutex<()>>,
     typing: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The daemon's store: admin-room lookup for admin-only events.
+    store: Option<Arc<ka_agent_store::Store>>,
 }
 
 /// The Matrix surface: notices, answers and approval cards go to the room
@@ -101,6 +115,7 @@ impl MatrixSurface {
         let inner = Arc::new(Shared {
             client: Arc::clone(&client),
             room: Arc::clone(&room),
+            rooms: Mutex::new(std::collections::HashMap::new()),
             user: cfg.user_id,
             tx,
             rx: Mutex::new(Some(rx)),
@@ -108,6 +123,7 @@ impl MatrixSurface {
             wake: Arc::new(Notify::new()),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             typing: Mutex::new(None),
+            store: None,
         });
         Self {
             client,
@@ -115,6 +131,13 @@ impl MatrixSurface {
             room_known,
             cards,
             inner,
+        }
+    }
+
+    /// Give the surface the store (admin-room lookup).
+    pub fn set_store(&mut self, store: Arc<ka_agent_store::Store>) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.store = Some(store);
         }
     }
 
@@ -126,6 +149,16 @@ impl MatrixSurface {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Adopt one sender's room (per-identity delivery).
+    pub(super) fn set_room_for(&self, source: &str, room: &str) {
+        self.inner
+            .rooms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(source.to_string(), room.to_string());
+        self.set_room(room);
     }
 
     /// Set the delivery room; returns whether it changed.
@@ -144,11 +177,24 @@ impl MatrixSurface {
     }
 
     pub(super) fn enqueue(&self, text: &str) {
-        let _ = self.inner.tx.send(Outbound::Text(text.to_string()));
+        let _ = self.inner.tx.send(Outbound::Text {
+            room: None,
+            text: text.to_string(),
+        });
     }
 
-    fn enqueue_card(&self, id: &str, text: &str) {
+    /// Enqueue for the event's source: a subject's notice goes to its own
+    /// room, admin-only events to the admin's.
+    fn enqueue_for(&self, env: &Envelope, text: &str) {
+        let _ = self.inner.tx.send(Outbound::Text {
+            room: self.inner.room_for(env),
+            text: text.to_string(),
+        });
+    }
+
+    fn enqueue_card(&self, env: &Envelope, id: &str, text: &str) {
         let _ = self.inner.tx.send(Outbound::Card {
+            room: self.inner.room_for(env),
             id: id.to_string(),
             text: text.to_string(),
         });
@@ -185,11 +231,68 @@ impl Shared {
         self.room.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The admin's room: the first linked admin identity with a known
+    /// room, else the last adopted one.
+    fn admin_room(&self) -> Option<String> {
+        {
+            let rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            for identity in self
+                .store
+                .as_ref()
+                .and_then(|s| s.list_identities().ok())
+                .unwrap_or_default()
+            {
+                if identity.role == ka_agent_core::ADMIN_ROLE && identity.channel == "matrix" {
+                    let source = format!("matrix:{}", identity.address);
+                    if let Some(room) = rooms.get(&source) {
+                        return Some(room.clone());
+                    }
+                }
+            }
+        }
+        // Fail closed: the last room may belong to a subject, and an
+        // admin-only card must never land there.
+        let last = self.room()?;
+        if let Some(store) = &self.store {
+            let rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((source, _)) = rooms.iter().find(|(_, room)| **room == last)
+                && let Some((channel, address)) = source.split_once(':')
+                && store
+                    .identity_role(channel, address)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|role| role != ka_agent_core::ADMIN_ROLE)
+            {
+                return None;
+            }
+        }
+        Some(last)
+    }
+
+    /// Where one event goes: its source's room when known, else (and for
+    /// admin-only events) the admin's room.
+    fn room_for(&self, env: &Envelope) -> Option<String> {
+        match env.source.as_deref() {
+            Some(source) => {
+                // Drop the map guard before `admin_room` re-locks it (the
+                // mutex is not reentrant).
+                let known = self
+                    .rooms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(source)
+                    .cloned();
+                known.or_else(|| self.admin_room())
+            }
+            None => self.admin_room(),
+        }
+    }
+
     /// A turn started: reset the stream and start typing on operator turns.
     /// Reset happens once per turn id: a repeated `TurnStarted` for the same
     /// turn must not wipe the draft (the runtime announces each turn once).
-    fn start(self: &Arc<Self>, turn: &str, scheduled: bool) {
-        let room = self.room();
+    fn start(self: &Arc<Self>, turn: &str, scheduled: bool, room: Option<String>) {
+        let room = room.or_else(|| self.room());
         let pending = {
             let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
             if s.turn.as_deref() == Some(turn) {
@@ -210,7 +313,10 @@ impl Shared {
             pending
         };
         if let Some(text) = pending {
-            let _ = self.tx.send(Outbound::Text(text));
+            let _ = self.tx.send(Outbound::Text {
+                room: room.clone(),
+                text,
+            });
         }
         if scheduled {
             return;
@@ -470,7 +576,10 @@ impl Shared {
             None => false,
         };
         if !edited {
-            let _ = self.tx.send(Outbound::Text(text.to_string()));
+            let _ = self.tx.send(Outbound::Text {
+                room: Some(room.to_string()),
+                text: text.to_string(),
+            });
         }
         self.client.typing(room, &self.user, 0).await;
     }
@@ -556,13 +665,14 @@ impl Surface for MatrixSurface {
     fn emit(&self, env: &Envelope) {
         match &env.ev {
             AgentEvent::TurnStarted { turn, source } => {
-                self.inner.start(turn, is_scheduled(source))
+                self.inner
+                    .start(turn, is_scheduled(source), self.inner.room_for(env))
             }
             // Streamed assistant text: the draft message + throttled edits.
             AgentEvent::Delta { text } => self.inner.push_delta(text),
             // In-turn progress: never sent (the journal keeps them).
             AgentEvent::Note { .. } => {}
-            AgentEvent::Notice { text } => self.enqueue(text),
+            AgentEvent::Notice { text } => self.enqueue_for(env, text),
             AgentEvent::Approval {
                 id,
                 question,
@@ -576,14 +686,14 @@ impl Surface for MatrixSurface {
                     question,
                     commands::fmt_interval(left)
                 );
-                self.enqueue_card(id, &text);
+                self.enqueue_card(env, id, &text);
             }
             AgentEvent::ApprovalSettled { id, status } => {
                 self.forget_approval(id);
-                self.enqueue(&format!(
-                    "approval {} → {status}",
-                    ka_agent_core::ids::short_id(id)
-                ));
+                self.enqueue_for(
+                    env,
+                    &format!("approval {} → {status}", ka_agent_core::ids::short_id(id)),
+                );
             }
             AgentEvent::FinalChunk { text, .. } => {
                 if !self.inner.finish(text) {
@@ -612,7 +722,7 @@ impl Surface for MatrixSurface {
                 if *retryable {
                     text.push_str("\n/retry re-sends it");
                 }
-                self.enqueue(&text);
+                self.enqueue_for(env, &text);
             }
             // A file for the operator: uploaded and posted as media.
             AgentEvent::File {
@@ -631,9 +741,12 @@ impl Surface for MatrixSurface {
             AgentEvent::Session { .. } => {}
             AgentEvent::MemoryProposal { id, text } => {
                 let short = ka_agent_core::ids::short_id(id);
-                self.enqueue(&format!(
-                    "💡 remember this? {text}\n   /memory accept {short} · /memory reject {short}"
-                ));
+                self.enqueue_for(
+                    env,
+                    &format!(
+                        "💡 remember this? {text}\n   /memory accept {short} · /memory reject {short}"
+                    ),
+                );
             }
             // Reasoning, tool structure and plans are not drawn on Matrix.
             AgentEvent::Thought { .. }
@@ -644,7 +757,7 @@ impl Surface for MatrixSurface {
             | AgentEvent::Compacting { .. }
             | AgentEvent::Inbound { .. } => {}
             // A fired reminder is its own notification, never a model turn.
-            AgentEvent::Reminder { text, .. } => self.enqueue(&format!("⏰ {text}")),
+            AgentEvent::Reminder { text, .. } => self.enqueue_for(env, &format!("⏰ {text}")),
             // Later steps wire these to real deliveries.
             AgentEvent::CronFinished { .. }
             | AgentEvent::Queue { .. }
@@ -703,11 +816,17 @@ pub(super) async fn sender_loop(
         if let Some(r) = current {
             while let Some(item) = backlog.pop_front() {
                 match item {
-                    Outbound::Text(text) => client.send_split(&r, &text).await,
-                    Outbound::Card { id, text } => match client.send(&r, &text).await {
-                        Ok(event_id) => record_card(&cards, event_id, id),
-                        Err(e) => eprintln!("matrix: card: {e}"),
-                    },
+                    Outbound::Text { room, text } => {
+                        client
+                            .send_split(room.as_deref().unwrap_or(&r), &text)
+                            .await
+                    }
+                    Outbound::Card { room, id, text } => {
+                        match client.send(room.as_deref().unwrap_or(&r), &text).await {
+                            Ok(event_id) => record_card(&cards, event_id, id),
+                            Err(e) => eprintln!("matrix: card: {e}"),
+                        }
+                    }
                 }
             }
         }

@@ -1134,6 +1134,7 @@ dependencies = [
  "jiff",
  "ka-agent-channels",
  "ka-agent-core",
+ "ka-agent-plugins",
  "ka-agent-port",
  "ka-agent-runtime",
  "ka-agent-store",

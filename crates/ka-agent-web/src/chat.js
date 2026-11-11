@@ -131,6 +131,32 @@
     badge.textContent = String(n);
   }
 
+  // Keep the transcript pinned to the newest message unless the operator
+  // scrolled up to read something.
+  function atBottom() {
+    return log.scrollTop + log.clientHeight >= log.scrollHeight - 48;
+  }
+  function scrollBottom(force) {
+    if (force || atBottom()) log.scrollTop = log.scrollHeight;
+  }
+
+  // Set a sidebar badge to an absolute count (the queue reports depth).
+  function setBadge(href, n) {
+    var link = document.querySelector("a[data-nav='" + href + "']");
+    if (!link) return;
+    var badge = link.querySelector(".badge");
+    if (n <= 0) {
+      if (badge) badge.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "badge";
+      link.appendChild(badge);
+    }
+    badge.textContent = String(n);
+  }
+
   function assistant() {
     if (!current) {
       current = bubble("assistant");
@@ -169,8 +195,10 @@
         break;
       case "turn_started":
         finish();
+        document.getElementById("chat").classList.add("streaming");
         current = bubble("assistant");
-        line(current, "…", "muted").className = "pending muted";
+        line(current, "thinking…", "muted").className = "pending muted";
+        scrollBottom(true);
         break;
 
       case "delta":
@@ -179,6 +207,7 @@
         if (pending) pending.remove();
         currentText += ev.text;
         current.appendChild(document.createTextNode(ev.text));
+        scrollBottom();
         break;
       case "tool_started":
         if (!current) current = bubble("assistant");
@@ -200,11 +229,21 @@
         var done = ev.ok
           ? "\u2713 " + ev.tool + " " + (ev.ms || 0) + "ms"
           : "\u2717 " + ev.tool + " " + (ev.error || "failed");
-        if (row) {
-          row.textContent = done;
-        } else {
-          line(current, done, "tool muted");
+        var status = row || line(current, done, "tool muted");
+        status.textContent = done;
+        status.className = "tool " + (ev.ok ? "ok" : "bad");
+        if (ev.output) {
+          // The engine's tool output on demand (dim, bounded server-side).
+          var det = document.createElement("details");
+          var sum = document.createElement("summary");
+          sum.textContent = "output";
+          var pre = document.createElement("pre");
+          pre.textContent = ev.output;
+          det.appendChild(sum);
+          det.appendChild(pre);
+          status.parentNode.insertBefore(det, status.nextSibling);
         }
+        scrollBottom();
         break;
       case "note":
         notes.push(ev.text);
@@ -259,6 +298,59 @@
         else currentText += ev.text || "";
         var dot = current.querySelector(".pending");
         if (dot) dot.remove();
+        // Render incrementally at the boundary so a long answer is legible
+        // before `turn_finished` arrives.
+        if (currentText) {
+          while (current.firstChild) current.removeChild(current.firstChild);
+          md(current, currentText);
+        }
+        scrollBottom();
+        break;
+      case "file": {
+        var fb = bubble("assistant");
+        var fname = String(ev.name || "file").split(/[\\/]/).pop();
+        var href = "/file/" + encodeURIComponent(fname);
+        var link = document.createElement("a");
+        link.href = href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "📎 " + (ev.name || "file");
+        fb.appendChild(link);
+        if (/\.(png|jpe?g|webp|gif)$/i.test(fname)) {
+          var img = document.createElement("img");
+          img.className = "thumb";
+          img.src = href;
+          img.alt = ev.name || "image";
+          fb.appendChild(img);
+        }
+        if (ev.caption) line(fb, ev.caption, "muted");
+        break;
+      }
+      case "plan": {
+        var pb = bubble("assistant plan");
+        (ev.items || []).forEach(function (item) {
+          var done = /done|complete|checked/i.test(item.state || "");
+          line(pb, (done ? "☑ " : "☐ ") + item.text, done ? "ok" : "muted");
+        });
+        break;
+      }
+      case "settings": {
+        var m = document.getElementById("chip-mode");
+        if (m && ev.mode) m.textContent = ev.mode;
+        var mm = document.getElementById("chip-model");
+        if (mm && ev.model) mm.textContent = ev.model;
+        break;
+      }
+      case "context": {
+        var c = document.getElementById("chip-ctx");
+        if (c && ev.window) {
+          c.hidden = false;
+          c.textContent = "ctx " + Math.round((ev.used / ev.window) * 100) + "%";
+        }
+        break;
+      }
+      case "queue":
+        setBadge("/queue", ev.depth || 0);
         break;
       case "memory_proposal":
         // The review inbox grows; the Memory badge says so live.
@@ -269,20 +361,34 @@
         break;
       case "turn_finished":
         finish();
+        document.getElementById("chat").classList.remove("streaming");
         line(
           bubble("system"),
           "· " + (ev.stop || "") + " · $" + Number(ev.cost_usd || 0).toFixed(4) + " · " + (ev.tokens || 0) + " tokens",
           "muted"
         );
+        scrollBottom();
         break;
       case "error":
         finish();
-        line(bubble("system"), "! [" + ev["class"] + "] " + ev.message, "error-line").style.color = "#b00";
+        document.getElementById("chat").classList.remove("streaming");
+        var err = bubble("system");
+        line(err, "! [" + ev["class"] + "] " + ev.message, "error-line").style.color = "var(--bad)";
+        if (ev.retryable) {
+          var retry = document.createElement("button");
+          retry.className = "sm";
+          retry.textContent = "↻ retry";
+          retry.addEventListener("click", function () {
+            send("/retry");
+          });
+          err.appendChild(retry);
+        }
+        scrollBottom();
         break;
       default:
         break;
     }
-    window.scrollTo(0, document.body.scrollHeight);
+    scrollBottom();
   }
 
   function decide(id, decision, actions) {
@@ -296,12 +402,14 @@
     for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
   }
 
-  function send() {
-    var v = input.value.trim();
+  function send(text) {
+    var v = (typeof text === "string" ? text : input.value).trim();
     if (!v) return;
-    input.value = "";
+    if (typeof text !== "string") input.value = "";
+    finish();
     line(bubble("user"), v);
     current = null;
+    scrollBottom(true);
     var body = "text=" + encodeURIComponent(v);
     fetch("/chat/send", {
       method: "POST",
@@ -327,6 +435,53 @@
     e.preventDefault();
     send();
   });
+  // Header actions: the same commands the router knows, sent as messages.
+  var actions = document.querySelectorAll("[data-cmd]");
+  for (var a = 0; a < actions.length; a++) {
+    actions[a].addEventListener("click", function () {
+      send(this.getAttribute("data-cmd"));
+    });
+  }
+  // Attachments: one file per request lands under the caller role's
+  // attachments/ and the @ref is appended to the draft (the engine expands
+  // it like any other reference).
+  var fileInput = document.getElementById("file");
+  function upload(file) {
+    line(bubble("system"), "uploading " + file.name + "…", "muted");
+    var name = String(file.name || "file").split(/[\\/]/).pop();
+    fetch("/upload", {
+      method: "POST",
+      headers: {
+        "X-Ka-Agent": "1",
+        "X-Ka-Filename": name,
+        "Content-Type": file.type || "application/octet-stream",
+      },
+      body: file,
+    })
+      .then(function (r) {
+        return r.json().catch(function () {
+          return { error: "upload failed (" + r.status + ")" };
+        });
+      })
+      .then(function (data) {
+        if (data && data.ref) {
+          input.value = (input.value ? input.value.replace(/\s*$/, " ") : "") + data.ref + " ";
+          input.focus();
+          line(bubble("system"), "attached " + data.name, "muted");
+        } else {
+          line(bubble("system"), "! " + ((data && data.error) || "upload failed"), "error-line");
+        }
+      })
+      .catch(function () {
+        line(bubble("system"), "! upload failed", "error-line");
+      });
+  }
+  if (fileInput)
+    fileInput.addEventListener("change", function () {
+      var file = fileInput.files && fileInput.files[0];
+      if (file) upload(file);
+      fileInput.value = "";
+    });
   var privateBtn = document.getElementById("private");
   if (privateBtn)
     privateBtn.addEventListener("click", function () {
@@ -340,6 +495,22 @@
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
+    }
+  });
+
+  // Start at the newest message of a server-rendered transcript.
+  log.scrollTop = log.scrollHeight;
+  // `/` focuses the composer unless the operator is already typing.
+  document.addEventListener("keydown", function (e) {
+    if (
+      e.key === "/" &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      e.target !== input &&
+      !(e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))
+    ) {
+      e.preventDefault();
+      input.focus();
     }
   });
 

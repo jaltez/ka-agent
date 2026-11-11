@@ -90,6 +90,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v8.sql"),
     include_str!("schema_v9.sql"),
     include_str!("schema_v10.sql"),
+    include_str!("schema_v11.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -150,15 +151,20 @@ pub struct CandidateRow {
     /// Target memory file (`facts`/`preferences`/`environment`/`profile`);
     /// `None` = facts.
     pub file: Option<String>,
+    /// The role whose turn proposed it; accepted memory lands in that
+    /// role's memory root.
+    pub role: String,
 }
 
-/// One channel identity linked to this instance's operator (SEED.md §8.1).
+/// One channel identity linked to this instance (SEED.md §8.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityRow {
     pub channel: String,
     pub address: String,
     pub linked_ms: i64,
     pub via: String,
+    /// The role the identity acts as (`admin` unless assigned).
+    pub role: String,
 }
 
 /// One external-write intent (SEED.md §7.3). Inserted before the API call,
@@ -339,6 +345,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         strand_id: r.get(2)?,
         strand_path: r.get::<_, Option<String>>(3)?.map(std::path::PathBuf::from),
         status: parse_session_status(&r.get::<_, String>(4)?).unwrap_or(SessionStatus::Degraded),
+        role: r.get(8)?,
         created_ms: r.get(5)?,
         updated_ms: r.get(6)?,
         private: r.get::<_, i64>(7)? != 0,
@@ -470,6 +477,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A pre-RBAC (v10) data root opens, migrates to v11, and every
+    /// existing subject becomes `admin`.
+    #[test]
+    fn schema_v11_migrates_old_rows_to_admin() {
+        let path = temp_path("v11");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS.iter().take(10) {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 10).unwrap();
+            conn.execute(
+                "INSERT INTO sessions(id, workspace, status, created_ms, updated_ms)
+                 VALUES ('sess_old', '/tmp/ws', 'idle', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO identities(channel, address, linked_ms, via)
+                 VALUES ('telegram', '42', 1, 'cli')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_candidates(id, source, text, status, created_ms)
+                 VALUES ('mem_old', 'session', 'fact', 'pending', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO audit(at_ms, actor, action, subject, prev_hash, hash)
+                 VALUES (1, 'operator', 'session.new', 'sess_old', '', 'h')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), MIGRATIONS.len());
+        assert_eq!(
+            store
+                .get_session(&SessionId("sess_old".into()))
+                .unwrap()
+                .role,
+            "admin"
+        );
+        assert_eq!(
+            store.identity_role("telegram", "42").unwrap().as_deref(),
+            Some("admin")
+        );
+        assert_eq!(store.pending_candidates_full().unwrap()[0].role, "admin");
+        assert_eq!(store.recent_audit(1).unwrap()[0].role, "admin");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn backup_opens_as_valid_store() {
         let path = temp_path("backup");
@@ -578,6 +640,8 @@ mod tests {
             weekdays: Vec::new(),
             month_day: None,
             gate: None,
+            role: None,
+            tools: Vec::new(),
         };
         let mut task = ka_agent_core::Task::new("cron".into(), "cron", false);
         task.scheduled_at_ms = Some(ka_agent_core::now_ms() + 60_000);

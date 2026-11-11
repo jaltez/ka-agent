@@ -4,7 +4,7 @@
 use super::*;
 
 impl Store {
-    /// Record a candidate memory extracted from a conversation.
+    /// Record a candidate memory extracted from a conversation (admin).
     pub fn add_candidate(
         &self,
         id: &MemoryId,
@@ -25,17 +25,39 @@ impl Store {
         provenance: Option<&str>,
         file: Option<&str>,
     ) -> Result<()> {
+        self.add_candidate_for_role(
+            id,
+            source,
+            text,
+            provenance,
+            file,
+            ka_agent_core::ADMIN_ROLE,
+        )
+    }
+
+    /// A candidate proposed by one role's turn; accepted memory lands in
+    /// that role's memory root.
+    pub fn add_candidate_for_role(
+        &self,
+        id: &MemoryId,
+        source: &str,
+        text: &str,
+        provenance: Option<&str>,
+        file: Option<&str>,
+        role: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO memory_candidates(id, source, text, provenance, status, created_ms, file)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+            "INSERT INTO memory_candidates(id, source, text, provenance, status, created_ms, file, role)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
             params![
                 id.as_str(),
                 source,
                 text,
                 provenance,
                 ka_agent_core::now_ms(),
-                file
+                file,
+                role
             ],
         )?;
         Ok(())
@@ -55,7 +77,7 @@ impl Store {
     pub fn pending_candidates_full(&self) -> Result<Vec<CandidateRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, source, text, provenance, created_ms, file
+            "SELECT id, source, text, provenance, created_ms, file, role
              FROM memory_candidates WHERE status = 'pending' ORDER BY created_ms",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -66,6 +88,7 @@ impl Store {
                 provenance: r.get(3)?,
                 created_ms: r.get(4)?,
                 file: r.get(5)?,
+                role: r.get(6)?,
             })
         })?;
         collect_rows(rows)

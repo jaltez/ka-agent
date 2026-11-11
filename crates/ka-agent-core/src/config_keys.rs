@@ -212,7 +212,10 @@ pub static KEYS: &[KeySpec] = &[
     },
     KeySpec {
         path: "turn_watchdog.silent_secs",
-        kind: Kind::Int { min: 0, max: 86_400 },
+        kind: Kind::Int {
+            min: 0,
+            max: 86_400,
+        },
         default: "180",
         apply: Apply::Live,
         web: true,
@@ -220,7 +223,10 @@ pub static KEYS: &[KeySpec] = &[
     },
     KeySpec {
         path: "turn_watchdog.abort_secs",
-        kind: Kind::Int { min: 0, max: 86_400 },
+        kind: Kind::Int {
+            min: 0,
+            max: 86_400,
+        },
         default: "900",
         apply: Apply::Live,
         web: true,
@@ -361,6 +367,22 @@ pub static KEYS: &[KeySpec] = &[
         doc: "web panel port",
     },
     KeySpec {
+        path: "web.bind",
+        kind: Kind::Str,
+        default: "127.0.0.1",
+        apply: Apply::Restart,
+        web: false,
+        doc: "interface the web UI binds (127.0.0.1 by default; 0.0.0.0 only behind TLS/reverse proxy)",
+    },
+    KeySpec {
+        path: "web.public_url",
+        kind: Kind::Str,
+        default: "unset (local URL)",
+        apply: Apply::Restart,
+        web: false,
+        doc: "public base URL printed in login/pairing links (https://agent.example.com)",
+    },
+    KeySpec {
         path: "calendar.digest_time",
         kind: Kind::Str,
         default: "08:00",
@@ -473,6 +495,22 @@ pub static KEYS: &[KeySpec] = &[
         apply: Apply::Worker,
         web: false,
         doc: "per-directory grants ([[grants.path]]: dir, access allow|ask|deny)",
+    },
+    KeySpec {
+        path: "tools.disable",
+        kind: Kind::List,
+        default: "[]",
+        apply: Apply::Worker,
+        web: false,
+        doc: "engine feature specs disabled for every worker (subtractive: tool:bash, mcp:github, …)",
+    },
+    KeySpec {
+        path: "role",
+        kind: Kind::Table,
+        default: "[]",
+        apply: Apply::Worker,
+        web: false,
+        doc: "roles for linked identities ([[role]]: name, mode, allow/disable, workspace, budget, commands, grants)",
     },
 ];
 

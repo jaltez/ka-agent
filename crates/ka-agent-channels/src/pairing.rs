@@ -32,6 +32,11 @@ struct Pending {
     channel: String,
     expires_ms: i64,
     attempts: u32,
+    /// Role the paired identity gets (`None` = admin, the pre-RBAC
+    /// behavior). Telegram/Matrix pairing and `ka-agent pair web --role`
+    /// share this field.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 /// Outcome of one `/pair <code>` attempt.
@@ -56,6 +61,11 @@ pub struct Contact {
 /// Issue a fresh code for `channel` (replacing any prior one), valid for
 /// 10 minutes. Returned as shown to the operator: `XXXX-XXXX`.
 pub fn issue(store: &Store, channel: &str) -> Result<String, String> {
+    issue_for_role(store, channel, None)
+}
+
+/// Issue a code that links the identity as `role` (`None` = admin).
+pub fn issue_for_role(store: &Store, channel: &str, role: Option<&str>) -> Result<String, String> {
     let mut code = String::with_capacity(CODE_LEN);
     let mut buf = [0u8; 32];
     while code.len() < CODE_LEN {
@@ -78,6 +88,7 @@ pub fn issue(store: &Store, channel: &str) -> Result<String, String> {
         channel: channel.to_string(),
         expires_ms: ka_agent_core::now_ms() + TTL_MS,
         attempts: 0,
+        role: role.map(str::to_string),
     };
     let json = serde_json::to_string(&pending).map_err(|e| e.to_string())?;
     store
@@ -179,7 +190,8 @@ fn redeem_pending(
     given: &str,
 ) -> Redeem {
     if constant_time_eq(given.as_bytes(), pending.code.as_bytes()) {
-        if let Err(e) = store.link_identity(channel, address, "pairing") {
+        let role = pending.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE);
+        if let Err(e) = store.link_identity_as(channel, address, "pairing", role) {
             eprintln!("pairing: link {channel}:{address}: {e}");
             return Redeem::Wrong;
         }
@@ -187,8 +199,9 @@ fn redeem_pending(
             &format!("{channel}:{address}"),
             actions::IDENTITY_PAIR,
             &format!("{channel}:{address}"),
-            None,
-        );
+            Some(format!("role {role}")),
+        )
+        .with_role(role);
         if let Err(e) = store.append_audit(&mut record) {
             eprintln!("pairing: audit: {e}");
         }

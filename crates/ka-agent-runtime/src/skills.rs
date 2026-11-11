@@ -45,11 +45,12 @@ pub struct SkillInfo {
     pub description: String,
 }
 
-/// The two directories that matter: where the operator keeps skills and
-/// where the engine discovers them.
+/// Where the operator keeps skills and where the engine discovers them.
 #[derive(Debug)]
 pub struct Skills {
-    user_dir: PathBuf,
+    /// Precedence list: the profile library first, the global one as the
+    /// fallback (the first match wins).
+    user_dirs: Vec<PathBuf>,
     engine_dir: PathBuf,
 }
 
@@ -59,10 +60,10 @@ pub fn valid_skill_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The operator's skill source directory: `~/.ka-agent/skills`
+/// The global skill library: `~/.ka-agent/skills`
 /// (`$KA_AGENT_HOME`-aware; `$XDG_CONFIG_HOME/ka-agent/skills` still wins
 /// when it exists, for pre-0.3 installs).
-pub fn user_skills_dir() -> PathBuf {
+pub fn global_skills_dir() -> PathBuf {
     let legacy = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -76,10 +77,27 @@ pub fn user_skills_dir() -> PathBuf {
     ka_agent_core::layout::base_dir().join("skills")
 }
 
+/// The skill libraries in precedence order: the active profile's own
+/// library (`<data root>/skills`) first, the global one as the fallback.
+pub fn user_skills_dirs() -> Vec<PathBuf> {
+    vec![
+        ka_agent_core::layout::default_root().join("skills"),
+        global_skills_dir(),
+    ]
+}
+
+/// The primary (profile) skill library — what messages name.
+pub fn user_skills_dir() -> PathBuf {
+    user_skills_dirs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ka_agent_core::layout::base_dir().join("skills"))
+}
+
 impl Skills {
     pub fn new(engine_home: &Path) -> Self {
         Self {
-            user_dir: user_skills_dir(),
+            user_dirs: user_skills_dirs(),
             engine_dir: engine_home.join(".config/ka/skills"),
         }
     }
@@ -107,9 +125,28 @@ impl Skills {
         out
     }
 
-    /// Skills available to enable (in the operator's config directory).
+    /// Skills available to enable, profile library first; a name present
+    /// in both libraries keeps the profile's description.
     pub fn available(&self) -> Vec<SkillInfo> {
-        Self::scan(&self.user_dir)
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for dir in &self.user_dirs {
+            for skill in Self::scan(dir) {
+                if seen.insert(skill.name.clone()) {
+                    out.push(skill);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// The library a skill comes from (first match), if any.
+    fn source_of(&self, name: &str) -> Option<PathBuf> {
+        self.user_dirs
+            .iter()
+            .map(|dir| dir.join(name))
+            .find(|src| src.join("SKILL.md").is_file())
     }
 
     /// Skills the engine currently discovers (provisioned in engine home).
@@ -131,10 +168,9 @@ impl Skills {
         if !valid_skill_name(name) {
             return Err(Error::BadName(name.to_string()));
         }
-        let src = self.user_dir.join(name);
-        if !src.join("SKILL.md").is_file() {
+        let Some(src) = self.source_of(name) else {
             return Ok(false);
-        }
+        };
         self.check_bounds(name, &src)?;
         std::fs::create_dir_all(&self.engine_dir)?;
         let dst = self.engine_dir.join(name);
@@ -284,7 +320,7 @@ mod tests {
         assert_eq!(available[0].description, "review a diff carefully");
 
         let skills = Skills {
-            user_dir: user.clone(),
+            user_dirs: vec![user.clone()],
             engine_dir: engine_home.join(".config/ka/skills"),
         };
         assert!(!skills.is_enabled("review").unwrap());
@@ -306,7 +342,7 @@ mod tests {
     fn enable_unknown_or_invalid_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let skills = Skills {
-            user_dir: tmp.path().join("user"),
+            user_dirs: vec![tmp.path().join("user")],
             engine_dir: tmp.path().join("engine/.config/ka/skills"),
         };
         assert!(!skills.enable("ghost").unwrap());
@@ -328,7 +364,7 @@ mod tests {
         )
         .unwrap();
         let skills = Skills {
-            user_dir: user,
+            user_dirs: vec![user],
             engine_dir: tmp.path().join("engine/.config/ka/skills"),
         };
         assert!(skills.enable("big").is_err());

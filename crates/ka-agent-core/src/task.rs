@@ -211,6 +211,14 @@ pub struct CronSpec {
     /// output appended as context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// The creator's role: the fired turn runs in that role's session and
+    /// toolset (`None`/absent = admin, so old payloads load unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Exact hand names this job may use; re-clamped to the role's
+    /// effective toolset at every fire (config changes only narrow).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 impl CronSpec {
@@ -276,6 +284,8 @@ impl CronSpec {
             weekdays: Vec::new(),
             month_day: None,
             gate: None,
+            role: None,
+            tools: Vec::new(),
         };
         let now_ms = now.timestamp().as_millisecond();
         let (first_at, used) = match words {
@@ -357,6 +367,8 @@ mod cron_tests {
             weekdays: Vec::new(),
             month_day: None,
             gate: None,
+            role: None,
+            tools: Vec::new(),
         };
         assert_eq!(
             CronSpec::from_payload(&one_shot.to_payload()),
@@ -372,11 +384,41 @@ mod cron_tests {
             weekdays: Vec::new(),
             month_day: None,
             gate: None,
+            role: None,
+            tools: Vec::new(),
         };
         let payload = recurring.to_payload();
         assert!(payload.contains(r#""mode":"no_agent""#), "{payload}");
         assert!(payload.contains(r#""kind":"calendar""#), "{payload}");
         assert_eq!(CronSpec::from_payload(&payload), Some(recurring));
+    }
+
+    #[test]
+    fn cronspec_role_and_tools_roundtrip_and_old_payloads_load() {
+        let mut spec = CronSpec {
+            text: "check the report".into(),
+            source: "operator".into(),
+            recurrence_ms: Some(3_600_000),
+            mode: CronMode::Agent,
+            at_local: None,
+            weekdays: Vec::new(),
+            month_day: None,
+            gate: None,
+            role: Some("guest".into()),
+            tools: vec!["read".into(), "grep".into()],
+        };
+        let back = CronSpec::from_payload(&spec.to_payload()).unwrap();
+        assert_eq!(back.role.as_deref(), Some("guest"));
+        assert_eq!(back.tools, vec!["read", "grep"]);
+        // Absent fields mean admin with no narrowing: pre-RBAC payloads
+        // load unchanged.
+        spec.role = None;
+        spec.tools.clear();
+        let old =
+            r#"{"text":"ping","source":"operator","recurrence_ms":null,"mode":{"mode":"agent"}}"#;
+        let old = CronSpec::from_payload(old).unwrap();
+        assert!(old.role.is_none());
+        assert!(old.tools.is_empty());
     }
 
     #[test]

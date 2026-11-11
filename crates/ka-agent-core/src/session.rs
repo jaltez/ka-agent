@@ -72,6 +72,11 @@ pub struct Session {
     /// materialized yet (ka creates it on first append).
     pub strand_path: Option<PathBuf>,
     pub status: SessionStatus,
+    /// The role this conversation belongs to (`admin` for terminal, web
+    /// and CLI surfaces). A role's session never sees another role's
+    /// turns, memory or strand.
+    #[serde(default = "crate::admin_role")]
+    pub role: String,
     /// A private (incognito) conversation: turn text is never recorded,
     /// memory/skill proposals are suppressed, attachments and the strand
     /// are destroyed when the session ends. Usage rows stay anonymous.
@@ -83,6 +88,11 @@ pub struct Session {
 
 impl Session {
     pub fn new(workspace: PathBuf) -> Self {
+        Self::new_for_role(workspace, crate::ADMIN_ROLE)
+    }
+
+    /// A fresh session for one role.
+    pub fn new_for_role(workspace: PathBuf, role: &str) -> Self {
         let now = crate::now_ms();
         Self {
             id: SessionId::generate(),
@@ -90,6 +100,7 @@ impl Session {
             strand_id: None,
             strand_path: None,
             status: SessionStatus::Idle,
+            role: role.to_string(),
             private: false,
             created_ms: now,
             updated_ms: now,

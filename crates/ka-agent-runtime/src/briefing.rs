@@ -46,6 +46,8 @@ pub fn enable(store: &Store, at_local: &str, now: &jiff::Zoned) -> Result<(TaskI
         weekdays: Vec::new(),
         month_day: None,
         gate: None,
+        role: None,
+        tools: Vec::new(),
     };
     let first_at =
         ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, now);

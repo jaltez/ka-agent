@@ -18,6 +18,51 @@ pub fn compose(
     user_layer: Option<&str>,
     resolve_secret: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
+    compose_for_role(cfg, None, user_layer, resolve_secret)
+}
+
+/// The role's effective disable specs: the profile baseline plus the
+/// role's own, deduplicated in order. `None` = the admin role (baseline
+/// only).
+fn disable_specs(
+    cfg: &DaemonConfig,
+    role: Option<&ka_agent_core::RoleSpec>,
+) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for spec in cfg
+        .tools
+        .disable
+        .iter()
+        .chain(role.into_iter().flat_map(|r| r.disable.iter()))
+    {
+        if !ka_agent_core::valid_feature_spec(spec) {
+            return Err(format!(
+                "engine layer: feature spec {spec:?} is not valid \
+                 (agents|skills|mcp|hooks|web|lsp|debug|mcp:<server>|skill:<name>|tool:<hand>|agent:<name>)"
+            ));
+        }
+        if !out.iter().any(|s| s == spec) {
+            out.push(spec.clone());
+        }
+    }
+    // Cross-check with the engine's own parser before any spawn: grammar
+    // drift fails closed here, naming the offending spec.
+    if !out.is_empty() {
+        ka_engine::features::parse_specs(&out).map_err(|e| format!("engine layer: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Compose for one role (`None` = the implicit admin role): the profile
+/// baseline plus the role's subtractive specs, merged into the layer's
+/// `[features] disable` (operator entries kept, duplicates dropped).
+pub fn compose_for_role(
+    cfg: &DaemonConfig,
+    role: Option<&ka_agent_core::RoleSpec>,
+    user_layer: Option<&str>,
+    resolve_secret: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let disable = disable_specs(cfg, role)?;
     let detected = match cfg.sandbox.as_str() {
         "fs" => true,
         "auto" => ka_sandbox::detect_tool().is_some(),
@@ -43,6 +88,8 @@ pub fn compose(
         || cfg.effort.is_some()
         || sandbox_on
         || cfg.budgets.daily_usd.is_some()
+        || role.is_some_and(|r| r.budget_daily_usd.is_some())
+        || !disable.is_empty()
         || cfg
             .hooks
             .iter()
@@ -54,6 +101,29 @@ pub fn compose(
         Some(text) => text.parse().map_err(|e| format!("engine layer: {e}"))?,
         None => toml::Table::new(),
     };
+
+    // Feature toggles: subtractive and fail-closed in the engine. The
+    // operator layer's entries survive; ours append (deduplicated).
+    if !disable.is_empty() {
+        let features = doc
+            .entry("features")
+            .or_insert_with(|| toml::Table::new().into());
+        let features = features
+            .as_table_mut()
+            .ok_or_else(|| "engine layer: `features` must be a table".to_string())?;
+        let list = features
+            .entry("disable")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let list = list
+            .as_array_mut()
+            .ok_or_else(|| "engine layer: `features.disable` must be an array".to_string())?;
+        for spec in disable {
+            let value = toml::Value::String(spec);
+            if !list.contains(&value) {
+                list.push(value);
+            }
+        }
+    }
 
     if let Some(search) = &cfg.search {
         let mut row = toml::Table::new();
@@ -151,8 +221,12 @@ pub fn compose(
     }
 
     // The engine's spend guard is the live budget: the continue-ask it
-    // raises becomes an approval card the operator already knows.
-    if let Some(cap) = cfg.budgets.daily_usd {
+    // raises becomes an approval card the operator already knows. A role's
+    // own USD cap replaces the profile's.
+    let spend_cap = role
+        .and_then(|r| r.budget_daily_usd)
+        .or(cfg.budgets.daily_usd);
+    if let Some(cap) = spend_cap {
         let guards = doc
             .entry("guards")
             .or_insert_with(|| toml::Table::new().into());
@@ -345,6 +419,126 @@ headers = { Authorization = "secret:gh.token" }
         .unwrap();
         let err = compose(&cfg, None, &secrets).unwrap_err();
         assert!(err.contains("ka-agent secret set nope"), "{err}");
+    }
+
+    #[test]
+    fn baseline_and_role_disable_specs_merge_into_the_layer() {
+        let mut cfg = DaemonConfig {
+            sandbox: "off".into(),
+            ..DaemonConfig::default()
+        };
+        cfg.tools.disable = vec!["tool:bash".into(), "mcp:github".into()];
+        let mut guest = ka_agent_core::RoleSpec {
+            name: "guest".into(),
+            allow: Vec::new(),
+            ..Default::default()
+        };
+        guest.disable = vec!["mcp:github".into(), "tool:write".into()];
+
+        // Admin: the profile baseline only.
+        let admin = compose_for_role(&cfg, None, None, &secrets)
+            .unwrap()
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&admin).unwrap();
+        let specs: Vec<&str> = parsed["features"]["disable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(specs, vec!["tool:bash", "mcp:github"]);
+
+        // Role: baseline + role, deduplicated in order.
+        let layer = compose_for_role(&cfg, Some(&guest), None, &secrets)
+            .unwrap()
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&layer).unwrap();
+        let specs: Vec<&str> = parsed["features"]["disable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(specs, vec!["tool:bash", "mcp:github", "tool:write"]);
+        // The engine parses the composed layer without complaint.
+        let engine = parse(&layer);
+        assert_eq!(engine.features.disable.len(), 3);
+    }
+
+    #[test]
+    fn operator_feature_entries_survive_and_ours_append() {
+        let cfg = DaemonConfig {
+            sandbox: "off".into(),
+            ..DaemonConfig::default()
+        };
+        let mut cfg = cfg;
+        cfg.tools.disable = vec!["tool:bash".into(), "web".into()];
+        let user = "[features]\ndisable = [\"debug\", \"tool:bash\"]\n";
+        let text = compose_for_role(&cfg, None, Some(user), &secrets)
+            .unwrap()
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let specs: Vec<&str> = parsed["features"]["disable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(specs, vec!["debug", "tool:bash", "web"]);
+    }
+
+    #[test]
+    fn an_invalid_spec_is_refused_before_any_spawn() {
+        let mut cfg = DaemonConfig {
+            sandbox: "off".into(),
+            ..DaemonConfig::default()
+        };
+        cfg.tools.disable = vec!["Tool:Bash".into()];
+        let err = compose_for_role(&cfg, None, None, &secrets).unwrap_err();
+        assert!(err.contains("Tool:Bash"), "{err}");
+        // A hand-built role with a bad spec is refused too (the config
+        // loader would have caught it; compose is the last gate).
+        cfg.tools.disable.clear();
+        let role = ka_agent_core::RoleSpec {
+            name: "guest".into(),
+            disable: vec!["nope".into()],
+            ..Default::default()
+        };
+        let err = compose_for_role(&cfg, Some(&role), None, &secrets).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    /// Core duplicates the engine's feature grammar; every spec core
+    /// accepts MUST parse with the engine's own parser (the reverse is
+    /// not required: core is deliberately stricter about names).
+    #[test]
+    fn core_and_engine_feature_grammars_agree_on_valid_specs() {
+        let fixture = [
+            "agents",
+            "skills",
+            "mcp",
+            "hooks",
+            "web",
+            "lsp",
+            "debug",
+            "mcp:github",
+            "mcp:my_server-2",
+            "skill:release-notes",
+            "tool:bash",
+            "tool:kagent__notes_search",
+            "agent:reviewer",
+        ];
+        for spec in fixture {
+            assert!(ka_agent_core::valid_feature_spec(spec), "core: {spec}");
+            assert!(
+                spec.parse::<ka_protocol::FeatureSpec>().is_ok(),
+                "engine: {spec}"
+            );
+        }
+        // The engine is more permissive (`tool:bash:x` parses); core
+        // rejects it, and compose never lets it reach the engine.
+        assert!(!ka_agent_core::valid_feature_spec("tool:bash:x"));
+        assert!("tool:bash:x".parse::<ka_protocol::FeatureSpec>().is_ok());
     }
 }
 

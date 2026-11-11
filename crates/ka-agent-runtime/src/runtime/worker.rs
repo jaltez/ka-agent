@@ -60,8 +60,25 @@ impl Runtime {
             }
             tokio::time::sleep(wait).await;
         }
-        let (session, env, engine_layer_toml) = {
+        let admin = ka_agent_core::ADMIN_ROLE;
+        let (session, role, mode, env, engine_layer_toml) = {
             let g = self.lock();
+            let role = g.role.clone();
+            let is_admin = role == admin;
+            // Non-admin roles own a disjoint tree: HOME, KA_DATA_DIR,
+            // XDG_STATE_HOME and the cache all resolve under
+            // `<data>/roles/<name>`, so strands, skills and compiled
+            // memory can never mix with the profile's.
+            let spec = (!is_admin).then(|| self.effective_role(&role));
+            let mode = if is_admin {
+                cfg.mode.clone()
+            } else {
+                g.session_mode.clone().unwrap_or_else(|| {
+                    spec.as_ref()
+                        .and_then(|s| s.mode_canonical())
+                        .unwrap_or_else(|| "readonly".to_string())
+                })
+            };
             // A private conversation's engine state (strands, waypoints,
             // and the spill files oversized tool outputs park under
             // XDG_STATE_HOME) lives in a per-session scratch directory
@@ -75,16 +92,75 @@ impl Runtime {
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             });
-            let data_dir = scratch.clone().unwrap_or_else(|| self.sh.paths.ka_data());
-            let state_dir = scratch.unwrap_or_else(|| self.sh.paths.engine_state());
+            let data_dir = scratch.clone().unwrap_or_else(|| {
+                if is_admin {
+                    self.sh.paths.ka_data()
+                } else {
+                    self.sh.paths.role_ka_data(&role)
+                }
+            });
+            let state_dir = scratch.unwrap_or_else(|| {
+                if is_admin {
+                    self.sh.paths.engine_state()
+                } else {
+                    self.sh.paths.role_engine_state(&role)
+                }
+            });
+            let home = if is_admin {
+                self.sh.paths.engine_home()
+            } else {
+                self.sh.paths.role_engine_home(&role)
+            };
+            let cache_dir = if is_admin {
+                self.sh.paths.engine_cache()
+            } else {
+                self.sh.paths.role_engine_cache(&role)
+            };
+            // Grants: the profile's for admin; a role sees ONLY its own
+            // [[role.grants.path]] (the profile's operator grants do not
+            // apply to roles — they are not the operator).
+            let (install, full, deny, allow) = match &spec {
+                None => (
+                    cfg.grants.install || cfg.grants.full,
+                    cfg.grants.full,
+                    cfg.grants
+                        .path
+                        .iter()
+                        .filter(|g| g.access == ka_agent_core::config::Access::Deny)
+                        .map(|g| g.dir.clone())
+                        .collect(),
+                    cfg.grants
+                        .path
+                        .iter()
+                        .filter(|g| g.access == ka_agent_core::config::Access::Allow)
+                        .map(|g| g.dir.clone())
+                        .collect(),
+                ),
+                Some(spec) => (
+                    false,
+                    false,
+                    spec.grants
+                        .path
+                        .iter()
+                        .filter(|g| g.access == ka_agent_core::config::Access::Deny)
+                        .map(|g| g.dir.clone())
+                        .collect(),
+                    spec.grants
+                        .path
+                        .iter()
+                        .filter(|g| g.access == ka_agent_core::config::Access::Allow)
+                        .map(|g| g.dir.clone())
+                        .collect(),
+                ),
+            };
             let env = WorkerEnv {
-                home: self.sh.paths.engine_home(),
+                home,
                 data_dir,
                 state_dir,
-                cache_dir: self.sh.paths.engine_cache(),
+                cache_dir,
                 agent_data_root: self.sh.paths.root().to_path_buf(),
-                guard_write: self.guard_write_paths(),
-                guard_read: self.guard_read_paths(),
+                guard_write: self.guard_write_paths(&role),
+                guard_read: self.guard_read_paths(&role),
                 // Grant decisions ride the same pre_tool_use hook
                 // contract as the protected lists
                 // (KA_AGENT_GUARD_GRANTS). `hard` marks that no
@@ -92,39 +168,34 @@ impl Runtime {
                 // full): then the whole data root is protected, not
                 // just ka-agent's enumerated own files.
                 guard_grants: ka_agent_port::GuardGrants {
-                    install: cfg.grants.install || cfg.grants.full,
-                    full: cfg.grants.full,
-                    deny: cfg
-                        .grants
-                        .path
-                        .iter()
-                        .filter(|g| g.access == ka_agent_core::config::Access::Deny)
-                        .map(|g| g.dir.clone())
-                        .collect(),
-                    allow: cfg
-                        .grants
-                        .path
-                        .iter()
-                        .filter(|g| g.access == ka_agent_core::config::Access::Allow)
-                        .map(|g| g.dir.clone())
-                        .collect(),
-                    hard: cfg.grants.full || cfg.mode == "allow",
+                    install,
+                    full,
+                    deny,
+                    allow,
+                    hard: full || mode == "allow",
                 },
             };
             let user_layer = cfg
                 .engine_layer_path()
                 .and_then(|p| std::fs::read_to_string(p).ok());
-            (g.session.clone(), env, user_layer)
+            (g.session.clone(), role, mode, env, user_layer)
         };
-        // Ka Agent's own engine features (search, fallback, MCP servers)
-        // join the operator's layer; `secret:` values resolve here, in
-        // memory, from the secret store.
+        // Provider keys live in the profile engine home; a role's worker
+        // reads them through a symlink so key rotation stays in sync.
+        provision_role_env(&self.sh.paths, &role);
+        // Ka Agent's own engine features (search, fallback, MCP servers,
+        // the profile's and the role's feature toggles) join the
+        // operator's layer; `secret:` values resolve here, in memory,
+        // from the secret store.
         let secrets_dir = self.sh.paths.root().join("secrets");
-        let engine_layer_toml =
-            ka_agent_port::engine_layer::compose(&cfg, engine_layer_toml.as_deref(), &|name| {
-                ka_agent_core::secret::resolve(name, &secrets_dir).map_err(|e| e.to_string())
-            })
-            .map_err(Error::Refused)?;
+        let role_spec = (role != admin).then(|| self.effective_role(&role));
+        let engine_layer_toml = ka_agent_port::engine_layer::compose_for_role(
+            &cfg,
+            role_spec.as_ref(),
+            engine_layer_toml.as_deref(),
+            &|name| ka_agent_core::secret::resolve(name, &secrets_dir).map_err(|e| e.to_string()),
+        )
+        .map_err(Error::Refused)?;
         let selector = match (&session.strand_path, session.strand_id.as_ref()) {
             (Some(p), Some(_)) if p.exists() => StrandSelector::Path(p.clone()),
             _ => StrandSelector::New,
@@ -133,7 +204,7 @@ impl Runtime {
             workspace: session.workspace.clone(),
             strand: selector,
             model: cfg.model.clone(),
-            mode: Some(cfg.mode.clone()),
+            mode: Some(mode),
             engine_layer_toml,
             env,
             binary: self.sh.port.binary.clone(),
@@ -244,6 +315,50 @@ impl Runtime {
     }
 }
 
+/// Give a role's worker the profile's provider keys: symlink the profile
+/// engine-home `.env` (key rotation follows the link), copying where
+/// symlinks are unavailable.
+fn provision_role_env(paths: &crate::paths::Paths, role: &str) {
+    if role == ka_agent_core::ADMIN_ROLE {
+        return;
+    }
+    let src = paths.engine_home().join(".config").join("ka").join(".env");
+    let dst = paths
+        .role_engine_home(role)
+        .join(".config")
+        .join("ka")
+        .join(".env");
+    if !src.exists() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if dst.exists() {
+        // A copy (non-unix fallback) refreshes when the profile's file
+        // moved; a symlink is always current.
+        #[cfg(not(unix))]
+        {
+            let src_ms = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+            let dst_ms = std::fs::metadata(&dst).and_then(|m| m.modified()).ok();
+            if src_ms > dst_ms {
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
+        return;
+    }
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(&src, &dst).is_err() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::copy(&src, &dst);
+    }
+}
+
 pub(super) async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>) {
     port.kill().await;
     let now = ka_agent_core::now_ms();
@@ -326,4 +441,7 @@ pub(super) async fn rt_on_engine_closed(sh: &Arc<Shared>, port: Arc<PortSession>
     } else {
         sh.emit(AgentEvent::Notice { text: note });
     }
+    // A message from another role may have waited for this engine: the
+    // session is settled now, so hand the core over.
+    Runtime { sh: Arc::clone(sh) }.yield_to_waiting_role().await;
 }

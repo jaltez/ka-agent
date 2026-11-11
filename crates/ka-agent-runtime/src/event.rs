@@ -142,6 +142,12 @@ pub enum AgentEvent {
 pub struct Envelope {
     pub seq: u64,
     pub at_ms: i64,
+    /// Who the event belongs to (`telegram:<uid>`, `console`, `cron`, …).
+    /// Surfaces with per-identity delivery route a turn's replies to its
+    /// originating chat; `None` marks an admin-only event (approval cards,
+    /// memory proposals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(flatten)]
     pub ev: AgentEvent,
 }
@@ -152,6 +158,17 @@ impl Envelope {
         Self {
             seq,
             at_ms: ka_agent_core::now_ms(),
+            source: None,
+            ev,
+        }
+    }
+
+    /// The same envelope stamped with the source it belongs to.
+    pub fn from(seq: u64, ev: AgentEvent, source: Option<&str>) -> Self {
+        Self {
+            seq,
+            at_ms: ka_agent_core::now_ms(),
+            source: source.map(str::to_string),
             ev,
         }
     }

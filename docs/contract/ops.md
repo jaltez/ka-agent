@@ -18,8 +18,10 @@ root.
   `ka-agent restart` drives exactly that), start-rate limited (5 in 10 min
   → the unit stops until the operator intervenes), `ProtectSystem=strict`
   with write access only to the data root and config dir.
-- One instance per operator (ADR-0001): a second operator = a second user
-  or template instance with its own `KA_AGENT_DATA_DIR`.
+- One instance per operator profile: a second operator = a second profile
+  (or template instance) with its own `KA_AGENT_DATA_DIR`. Within one
+  profile, roles partition subjects (ADR-0002): the terminal/web/CLI
+  remain the operator, linked identities act as their role.
 
 ## Backups and restore
 

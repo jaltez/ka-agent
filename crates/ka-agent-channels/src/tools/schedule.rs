@@ -154,6 +154,9 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                         "{live} model-scheduled crons are live (limit {MAX_MODEL_CRONS}) — remove some first"
                     ));
                 }
+                // The job belongs to the turn's role: a subject's scheduled
+                // prompt must fire as that subject, never as the operator.
+                let role = super::turn_role(&ctx.store);
                 let mut spec = ka_agent_core::CronSpec {
                     text: text.to_string(),
                     source: "kagent".into(),
@@ -165,6 +168,8 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                     weekdays: Vec::new(),
                     month_day: None,
                     gate: None,
+                    role: (role != ka_agent_core::ADMIN_ROLE).then_some(role),
+                    tools: Vec::new(),
                 };
                 if let Some((rule, _)) = &anchored {
                     spec.set_day_rule(rule);
@@ -193,6 +198,20 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             "pause" | "resume" | "remove" | "trigger" => {
                 use ka_agent_runtime::cron_ops;
                 let task = cron_ops::resolve(&ctx.store, args["id"].as_str().unwrap_or(""))?;
+                // A subject only manages its own jobs; admin manages all.
+                let role = super::turn_role(&ctx.store);
+                let owner = task
+                    .payload
+                    .as_deref()
+                    .and_then(ka_agent_core::CronSpec::from_payload)
+                    .and_then(|s| s.role)
+                    .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+                if role != ka_agent_core::ADMIN_ROLE && owner != role {
+                    return Err(format!(
+                        "no cron {} for role {role}",
+                        args["id"].as_str().unwrap_or("")
+                    ));
+                }
                 let short = ka_agent_core::ids::short_id(task.id.as_str());
                 match action {
                     "pause" => {

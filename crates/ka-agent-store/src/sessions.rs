@@ -8,8 +8,8 @@ impl Store {
     pub fn insert_session(&self, s: &Session) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO sessions(id, workspace, strand_id, strand_path, status, private, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO sessions(id, workspace, strand_id, strand_path, status, private, created_ms, updated_ms, role)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 s.id.as_str(),
                 s.workspace.to_string_lossy(),
@@ -18,7 +18,8 @@ impl Store {
                 status_str(&s.status),
                 s.private as i64,
                 s.created_ms,
-                s.updated_ms
+                s.updated_ms,
+                s.role
             ],
         )?;
         Ok(())
@@ -70,7 +71,7 @@ impl Store {
     pub fn get_session(&self, id: &SessionId) -> Result<Session> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
              FROM sessions WHERE id = ?1",
             params![id.as_str()],
             row_to_session,
@@ -83,11 +84,23 @@ impl Store {
     pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
              FROM sessions ORDER BY updated_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_session)?;
         collect_rows(rows)
+    }
+
+    /// The most recently updated session of one role (`/resume` after a
+    /// role switch; `admin` included).
+    pub fn latest_session_for_role(&self, role: &str) -> Result<Option<Session>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
+             FROM sessions WHERE role = ?1 ORDER BY updated_ms DESC LIMIT 1",
+        )?;
+        let rows = stmt.query_map(params![role], row_to_session)?;
+        collect_rows(rows).map(|mut v| v.pop())
     }
 
     /// Bind (or rebind) a session to a Ka strand.
@@ -130,7 +143,7 @@ impl Store {
         // Best-effort: a concurrent reader can hold the checkpoint busy.
         let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
         let mut stmt = conn.prepare(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private
+            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
              FROM sessions WHERE private = 1",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -222,5 +235,25 @@ mod tests {
             store.pending_approvals(&private.id).unwrap().is_empty(),
             "the private session's approval cards are purged"
         );
+    }
+
+    #[test]
+    fn sessions_are_found_by_role() {
+        let store = Store::open_in_memory().unwrap();
+        let admin = session();
+        let guest = Session::new_for_role(std::path::PathBuf::from("/tmp/guest"), "guest");
+        store.insert_session(&admin).unwrap();
+        store.insert_session(&guest).unwrap();
+
+        assert_eq!(store.get_session(&guest.id).unwrap().role, "guest");
+        let found = store.latest_session_for_role("guest").unwrap().unwrap();
+        assert_eq!(found.id, guest.id);
+        assert_eq!(
+            store.latest_session_for_role("admin").unwrap().unwrap().id,
+            admin.id
+        );
+        assert!(store.latest_session_for_role("nobody").unwrap().is_none());
+        // The unfiltered listing still sees both.
+        assert_eq!(store.list_recent_sessions(10).unwrap().len(), 2);
     }
 }

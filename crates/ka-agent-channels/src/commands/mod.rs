@@ -443,6 +443,32 @@ pub fn help_for(name: &str) -> Option<String> {
     ))
 }
 
+/// Whether one role may use a command by name (or alias): admin always
+/// can; a subject gets its configured list plus the `help`/`status` floor,
+/// and the hard admin-only set stays unreachable whatever the list says.
+pub fn allowed_for(runtime: &Runtime, role: &str, name: &str) -> bool {
+    if role == ka_agent_core::ADMIN_ROLE {
+        return true;
+    }
+    const ADMIN_ONLY: &[&str] = &["update", "keys", "quit", "persona", "model", "config"];
+    const FLOOR: &[&str] = &["help", "status"];
+    let Some(spec) = COMMANDS
+        .iter()
+        .find(|c| c.name == name || c.aliases.contains(&name))
+    else {
+        return false;
+    };
+    if ADMIN_ONLY.contains(&spec.name) {
+        return false;
+    }
+    let allowed = runtime.effective_role(role).commands;
+    allowed.is_empty()
+        || allowed
+            .iter()
+            .any(|c| c == spec.name || spec.aliases.contains(&c.as_str()))
+        || FLOOR.contains(&spec.name)
+}
+
 /// Route one inbound line. `source` is the channel identity
 /// (`telegram:12345`, `matrix:@a:b`) used for provenance.
 pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
@@ -468,6 +494,24 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
             "/{} works in the terminal, CLI or web panel",
             spec.name
         ));
+    }
+    // Roles: a non-admin role's command surface is its configured list
+    // plus the help/status floor; a hard admin-only set stays unreachable
+    // whatever the list says (config, keys, model and persona are the
+    // operator's, not a subject's).
+    let role = runtime.role_for_source(source);
+    if !allowed_for(runtime, &role, spec.name) {
+        return Outcome::Reply(format!(
+            "command /{} is not available for role {role}",
+            spec.name
+        ));
+    }
+    // Commands act on the requesting role's session: hand the core over
+    // first (a running turn of another role is never disturbed).
+    if !runtime.activate_role(source).await {
+        return Outcome::Reply(
+            "another conversation is running — try again when its turn finishes".into(),
+        );
     }
     let args = text
         .split_once(char::is_whitespace)

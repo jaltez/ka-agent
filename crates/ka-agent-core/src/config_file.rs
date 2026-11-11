@@ -73,6 +73,102 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<DaemonConfig, Error> {
     write_doc(path, &doc)
 }
 
+/// Replace the whole `[[role]]` array (the admin UI's role editor). The
+/// resulting file is validated as a whole config before it is written; an
+/// invalid role leaves the file untouched.
+pub fn set_roles(path: &Path, roles: &[crate::config::RoleSpec]) -> Result<DaemonConfig, Error> {
+    let mut doc = read_doc(path)?;
+    if roles.is_empty() {
+        doc.as_table_mut().remove("role");
+    } else {
+        let mut array = toml_edit::ArrayOfTables::new();
+        for role in roles {
+            array.push(table_of(role)?);
+        }
+        doc.as_table_mut()
+            .insert("role", Item::ArrayOfTables(array));
+    }
+    write_doc(path, &doc)
+}
+
+/// Replace `[tools] disable` (the profile-wide engine baseline).
+pub fn set_tools_disable(path: &Path, specs: &[String]) -> Result<DaemonConfig, Error> {
+    let mut doc = read_doc(path)?;
+    if specs.is_empty() {
+        if let Some(tools) = doc
+            .as_table_mut()
+            .get_mut("tools")
+            .and_then(Item::as_table_mut)
+        {
+            tools.remove("disable");
+        }
+    } else {
+        let tools = doc
+            .as_table_mut()
+            .entry("tools")
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .ok_or_else(|| Error::Edit("tools is not a table".into()))?;
+        let mut array = toml_edit::Array::new();
+        for spec in specs {
+            array.push(spec.as_str());
+        }
+        tools.insert("disable", Item::Value(Value::Array(array)));
+    }
+    write_doc(path, &doc)
+}
+
+/// Replace the whole `[[mcp]]` array (the admin UI's MCP editor).
+pub fn set_mcp(path: &Path, servers: &[crate::config::McpServer]) -> Result<DaemonConfig, Error> {
+    let mut doc = read_doc(path)?;
+    if servers.is_empty() {
+        doc.as_table_mut().remove("mcp");
+    } else {
+        let mut array = toml_edit::ArrayOfTables::new();
+        for server in servers {
+            array.push(table_of(server)?);
+        }
+        doc.as_table_mut().insert("mcp", Item::ArrayOfTables(array));
+    }
+    write_doc(path, &doc)
+}
+
+/// Serialize one config value into a TOML table for insertion.
+fn table_of<T: serde::Serialize>(value: &T) -> Result<toml_edit::Table, Error> {
+    let text =
+        toml::to_string(value).map_err(|e| Error::Edit(format!("serialize config entry: {e}")))?;
+    let doc: DocumentMut = text
+        .parse()
+        .map_err(|e| Error::Edit(format!("serialize config entry: {e}")))?;
+    let mut table = doc.as_table().clone();
+    // `toml` renders an empty map as a `[table]` header; inside an
+    // array-of-tables that header would be emitted before the `[[entry]]`
+    // and collide with it. Empty sub-tables carry no information — drop
+    // them (the config defaults apply).
+    prune_empty_tables(&mut table);
+    Ok(table)
+}
+
+fn prune_empty_tables(table: &mut toml_edit::Table) {
+    let keys: Vec<String> = table
+        .iter()
+        .filter(|(_, item)| matches!(item, Item::Table(_)))
+        .map(|(key, _)| key.to_string())
+        .collect();
+    for key in keys {
+        let empty = match table.get_mut(&key) {
+            Some(Item::Table(sub)) => {
+                prune_empty_tables(sub);
+                sub.is_empty()
+            }
+            _ => false,
+        };
+        if empty {
+            table.remove(&key);
+        }
+    }
+}
+
 /// Remove a dotted `key`. A key that is not set is a no-op (nothing is
 /// written). Returns the validated resulting config.
 pub fn unset(path: &Path, key: &str) -> Result<DaemonConfig, Error> {
@@ -404,6 +500,54 @@ mod tests {
         let dir = tmp_config("unset-missing", None);
         unset(&dir, "model").unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn role_tools_and_mcp_arrays_are_replaced_atomically() {
+        use crate::config::{McpServer, RoleSpec};
+        let p = tmp_config("role-arrays", Some(BASE));
+        let roles = vec![RoleSpec {
+            name: "guest".into(),
+            mode: "readonly".into(),
+            allow: vec!["read".into()],
+            ..Default::default()
+        }];
+        let cfg = set_roles(&p, &roles).unwrap();
+        assert_eq!(cfg.roles[0].name, "guest");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[[role]]"), "{text}");
+        assert!(text.contains("# keep me"), "comments survive: {text}");
+
+        let cfg = set_tools_disable(&p, &["tool:bash".into()]).unwrap();
+        assert_eq!(cfg.tools.disable, vec!["tool:bash"]);
+        let cfg = set_mcp(
+            &p,
+            &[McpServer {
+                name: "home".into(),
+                url: Some("http://127.0.0.1:8123/mcp".into()),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp[0].name, "home");
+
+        // An invalid role is refused and the file is left untouched.
+        let before = std::fs::read_to_string(&p).unwrap();
+        let bad = vec![RoleSpec {
+            name: "not a role".into(),
+            ..Default::default()
+        }];
+        assert!(set_roles(&p, &bad).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+
+        // Empty lists remove the tables.
+        set_roles(&p, &[]).unwrap();
+        set_tools_disable(&p, &[]).unwrap();
+        set_mcp(&p, &[]).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("[[role]]"), "{text}");
+        assert!(!text.contains("[[mcp]]"), "{text}");
+        assert!(!text.contains("disable"), "{text}");
     }
 
     #[test]

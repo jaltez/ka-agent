@@ -44,12 +44,23 @@ pub fn cron_list_text(tasks: &[ka_agent_core::Task], now: &jiff::Zoned) -> Strin
                 ""
             };
             let text: String = t.title.chars().take(40).collect();
+            let role = spec
+                .as_ref()
+                .and_then(|s| s.role.clone())
+                .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+            let tools = spec
+                .as_ref()
+                .filter(|s| !s.tools.is_empty())
+                .map(|s| format!(" tools=[{}]", s.tools.join(",")))
+                .unwrap_or_default();
             format!(
-                "[{}] {} {} {}{}",
+                "[{}] {} {} {} role={}{}{}",
                 short_id(t.id.as_str()),
                 cadence(spec.as_ref()),
                 next,
                 text,
+                role,
+                tools,
                 paused
             )
         })
@@ -59,13 +70,20 @@ pub fn cron_list_text(tasks: &[ka_agent_core::Task], now: &jiff::Zoned) -> Strin
 
 /// `/cron add …` → reply text. Shared by the router and the console.
 pub fn cron_add(runtime: &Runtime, args: &str) -> String {
-    cron_add_for(runtime, args, "operator", true)
+    cron_add_for(runtime, args, "operator", ka_agent_core::ADMIN_ROLE, true)
 }
 
 /// Shared by `/cron add` and `ka-agent cron add`. `allow_gate` false is the
 /// remote-source path (a gate is a shell command only the operator's own
-/// surface may create).
-pub fn cron_add_for(runtime: &Runtime, args: &str, source: &str, allow_gate: bool) -> String {
+/// surface may create). `role` is the creator's role: the job fires in
+/// that role's session and may narrow (never widen) its toolset.
+pub fn cron_add_for(
+    runtime: &Runtime,
+    args: &str,
+    source: &str,
+    role: &str,
+    allow_gate: bool,
+) -> String {
     let now = runtime.now_zoned();
     // `--if '<shell command>'` may appear anywhere; pull it out first so
     // the schedule words parse exactly as before.
@@ -76,6 +94,10 @@ pub fn cron_add_for(runtime: &Runtime, args: &str, source: &str, allow_gate: boo
     if gate.is_some() && !allow_gate {
         return "gates can only be added from the terminal, CLI or web panel".to_string();
     }
+    let (args, tools) = match split_tools(&args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let words: Vec<&str> = args.split_whitespace().collect();
     let (mut spec, first_at) = match ka_agent_core::CronSpec::from_words(&words, source, &now) {
         Ok(v) => v,
@@ -83,6 +105,15 @@ pub fn cron_add_for(runtime: &Runtime, args: &str, source: &str, allow_gate: boo
         Err(e) => return e,
     };
     spec.gate = gate;
+    if !tools.is_empty() {
+        if let Err(e) = runtime.validate_cron_tools(role, &tools) {
+            return format!("! [cron] {e}");
+        }
+        spec.tools = tools;
+    }
+    if role != ka_agent_core::ADMIN_ROLE {
+        spec.role = Some(role.to_string());
+    }
     match runtime.add_cron(spec, first_at) {
         Ok(id) => format!(
             "cron {} scheduled — {}",
@@ -91,6 +122,31 @@ pub fn cron_add_for(runtime: &Runtime, args: &str, source: &str, allow_gate: boo
         ),
         Err(e) => format!("! [cron] {e}"),
     }
+}
+
+/// Split a `--tools a,b` flag out of the cron arguments: exact hand names
+/// the job may use (the role's toolset is the ceiling).
+fn split_tools(args: &str) -> Result<(String, Vec<String>), String> {
+    let Some(pos) = args.find(" --tools ") else {
+        return Ok((args.to_string(), Vec::new()));
+    };
+    let (head, tail) = args.split_at(pos);
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix("--tools").unwrap_or(tail).trim_start();
+    let (list, rest) = match tail.split_once(' ') {
+        Some((list, rest)) => (list, rest),
+        None => (tail, ""),
+    };
+    let tools: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tools.is_empty() {
+        return Err("--tools needs a comma-separated list (e.g. --tools read,grep)".into());
+    }
+    Ok((format!("{head} {}", rest.trim()).trim().to_string(), tools))
 }
 
 /// Split a `--if '<command>'` flag out of the cron arguments.
@@ -127,9 +183,11 @@ fn cron_add_usage() -> String {
     "usage: /cron add in <duration> <text>\n      /cron add every <duration> <text>\n      /cron add every day at 08:00 <text>\n      /cron add every weekday at 9 <text>\n      /cron add every mon,wed,fri at 18:00 <text>\n      /cron add every month on the 1st at 9 <text>".into()
 }
 
-/// Cancel a reminder or cron by prefix; shared by `/remind rm` and `/cron rm`.
-async fn cancel_by_prefix(runtime: &Runtime, prefix: &str) -> Outcome {
-    match runtime.cancel_scheduled(prefix.trim()) {
+/// Cancel a reminder or cron by prefix; shared by `/remind rm` and
+/// `/cron rm`. Scoped to `role`: a subject never cancels the operator's
+/// (or another role's) job.
+async fn cancel_by_prefix(runtime: &Runtime, role: &str, prefix: &str) -> Outcome {
+    match runtime.cancel_scheduled_for(role, prefix.trim()) {
         Ok(ka_agent_runtime::CancelOutcome::Cancelled(title)) => {
             Outcome::Reply(format!("cancelled: {title}"))
         }
@@ -156,7 +214,8 @@ pub(super) fn run_remind<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             if prefix.is_empty() {
                 return Outcome::Reply("usage: /remind rm <id>".into());
             }
-            return cancel_by_prefix(runtime, &prefix).await;
+            let role = runtime.role_for_source(ctx.source);
+            return cancel_by_prefix(runtime, &role, &prefix).await;
         }
         // Leading `in` is grammar ("in 2h30m"), not part of the text.
         let now = runtime.now_zoned();
@@ -183,7 +242,8 @@ pub(super) fn run_remind<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 pub(super) fn run_reminders<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let runtime = ctx.runtime;
-        match runtime.scheduled_tasks() {
+        let role = runtime.role_for_source(ctx.source);
+        match runtime.scheduled_tasks_for(&role) {
             Ok(rows) if rows.is_empty() => {
                 Outcome::Reply("no reminders or crons — /remind <when> <text> schedules one".into())
             }
@@ -222,7 +282,7 @@ pub(super) fn run_cron<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args;
         let reply = match rest {
-            "" | "list" => match runtime.list_crons() {
+            "" | "list" => match runtime.list_crons_for(&runtime.role_for_source(ctx.source)) {
                 Ok(rows) if rows.is_empty() => "no crons (use /cron add)".to_string(),
                 Ok(rows) => cron_list_text(&rows, &runtime.now_zoned()),
                 Err(e) => format!("! [cron] {e}"),
@@ -230,10 +290,17 @@ pub(super) fn run_cron<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             other => match other.split_once(' ') {
                 Some(("add", args)) => {
                     let local = ka_agent_core::is_local_source(ctx.source);
-                    cron_add_for(runtime, args, "operator", local)
+                    cron_add_for(
+                        runtime,
+                        args,
+                        "operator",
+                        &runtime.role_for_source(ctx.source),
+                        local,
+                    )
                 }
                 Some(("rm", id)) => {
-                    return cancel_by_prefix(runtime, id).await;
+                    let role = runtime.role_for_source(ctx.source);
+                    return cancel_by_prefix(runtime, &role, id).await;
                 }
                 _ => cron_add_usage(),
             },
@@ -315,6 +382,8 @@ async fn calendar_command(runtime: &Runtime, rest: &str) -> Outcome {
                 weekdays: Vec::new(),
                 month_day: None,
                 gate: None,
+                role: None,
+                tools: Vec::new(),
             };
             let first_at =
                 ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, &now);
@@ -363,11 +432,15 @@ mod tests {
             weekdays: Vec::new(),
             month_day: None,
             gate: None,
+            role: None,
+            tools: Vec::new(),
         };
         let weekly = ka_agent_core::CronSpec {
             weekdays: vec![0],
             month_day: None,
             gate: None,
+            role: None,
+            tools: Vec::new(),
             at_local: Some("09:00".into()),
             ..anchored.clone()
         };
