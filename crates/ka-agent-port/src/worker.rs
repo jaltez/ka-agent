@@ -430,15 +430,18 @@ async fn open_engine(
         }
     }
 
-    // Pinned-engine bug workaround (ka v0.4.1 193ad5d): with any live MCP
-    // server the engine registers the `mcp` meta hand TWICE (the cache-hit
-    // path's `rebuild_mcp_meta_hands` plus the unconditional bootstrap
-    // push), and the provider rejects the whole request — observed live as
+    // Pinned-engine bug workaround (ka-harness#1; v0.4.1 193ad5d, still
+    // present at v0.6.0 9ac6977): with any live MCP server the engine
+    // registers the `mcp` meta hand TWICE (the cache-hit path's
+    // `rebuild_mcp_meta_hands` plus the unconditional bootstrap push), and
+    // the provider rejects the whole request — observed live as
     // `tools: Tool names must be unique` / "duplicate tool name `mcp`" on
     // every turn. The spec must be `tool:mcp`, NOT `mcp`: the bare spec
     // disables every MCP server (`server_enabled` consults it), while the
     // tool spec hides only the (duplicated) hand named `mcp` — every eager
     // `<server>__<tool>` hand stays visible and callable.
+    // RETIRE this block on the next deliberate re-pin once ka-harness#1
+    // ships a fix (contract suite green).
     if !cfg.mcp.is_empty()
         && !cfg
             .features
