@@ -312,15 +312,15 @@ impl Runtime {
                 // path the v12 bootstrap moved to `users/<r>`: repoint the row,
                 // or the new guard lists would refuse every file tool.
                 let legacy = self.sh.paths.root().join("roles");
-                if session.workspace.starts_with(&legacy) {
-                    if let Ok(rest) = session.workspace.strip_prefix(&legacy) {
-                        let moved = self.sh.paths.users_root().join(rest);
-                        session.workspace = moved.clone();
-                        let _ = self
-                            .sh
-                            .store
-                            .set_session_workspace(&session.id, &moved);
-                    }
+                if session.workspace.starts_with(&legacy)
+                    && let Ok(rest) = session.workspace.strip_prefix(&legacy)
+                {
+                    let moved = self.sh.paths.users_root().join(rest);
+                    session.workspace = moved.clone();
+                    let _ = self
+                        .sh
+                        .store
+                        .set_session_workspace(&session.id, &moved);
                 }
                 session
             }

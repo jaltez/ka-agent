@@ -394,7 +394,7 @@ impl Runtime {
         // A session workspace outside user_root (an explicit role workspace
         // or a private session's temp dir) must still be writable.
         if let Ok(canon_root) = std::fs::canonicalize(&user_root) {
-            for ws in self.session_workspaces_outside(&username, &canon_root) {
+            for ws in self.session_workspaces_outside(username, &canon_root) {
                 full.push("--bind".into());
                 let p = ws.to_string_lossy().into_owned();
                 full.push(p.clone());
