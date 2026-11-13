@@ -1232,8 +1232,8 @@ dependencies = [
 
 [[package]]
 name = "ka-dialect"
-version = "0.4.1"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
+version = "0.7.0"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=247e99e#247e99e50f2c8b535a08e78fee939393a5f7c7b1"
 dependencies = [
  "futures-util",
  "ka-protocol",
@@ -1247,8 +1247,8 @@ dependencies = [
 
 [[package]]
 name = "ka-engine"
-version = "0.4.1"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
+version = "0.7.0"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=247e99e#247e99e50f2c8b535a08e78fee939393a5f7c7b1"
 dependencies = [
  "ignore",
  "ka-dialect",
@@ -1274,8 +1274,8 @@ dependencies = [
 
 [[package]]
 name = "ka-protocol"
-version = "0.4.1"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
+version = "0.7.0"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=247e99e#247e99e50f2c8b535a08e78fee939393a5f7c7b1"
 dependencies = [
  "schemars",
  "serde",
@@ -1284,8 +1284,8 @@ dependencies = [
 
 [[package]]
 name = "ka-sandbox"
-version = "0.4.1"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
+version = "0.7.0"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=247e99e#247e99e50f2c8b535a08e78fee939393a5f7c7b1"
 dependencies = [
  "landlock",
  "serde",
@@ -1294,8 +1294,8 @@ dependencies = [
 
 [[package]]
 name = "ka-strand"
-version = "0.4.1"
-source = "git+https://github.com/jaltez/ka-harness.git?rev=193ad5d#193ad5d77b141f45cc289952b65bf2432113fb2f"
+version = "0.7.0"
+source = "git+https://github.com/jaltez/ka-harness.git?rev=247e99e#247e99e50f2c8b535a08e78fee939393a5f7c7b1"
 dependencies = [
  "ka-protocol",
  "serde",

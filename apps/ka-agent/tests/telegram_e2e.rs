@@ -12,7 +12,12 @@ use std::time::{Duration, Instant};
 
 use ka_agent_channels::fake::FakeBotServer;
 
-const MARKER: &str = "/tmp/ka-agent-m2-marker";
+/// Workspace-relative marker file: bash runs with the workspace as cwd, and
+/// the workspace is writable inside the fs sandbox without any grant
+/// expansion. (The old /tmp marker broke under the v0.7.0 engine: its
+/// sandbox refuses a writable /tmp that contains the protected engine-home
+/// — which the test's temp data root always is.)
+const MARKER: &str = "ka-agent-m2-marker";
 
 struct Daemon {
     child: Child,
@@ -204,7 +209,7 @@ async fn simple_turn_and_offset_persistence_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ask_mode_approval_over_inline_keyboard() {
     let root = temp_root("ask");
-    let _ = std::fs::remove_file(MARKER);
+    let _ = std::fs::remove_file(root.join("ws").join(MARKER));
     let (fake, base) = FakeBotServer::spawn();
     let cfg = write_config(&root, &base);
     let sc = scenario_file(
@@ -212,7 +217,7 @@ async fn ask_mode_approval_over_inline_keyboard() {
         "ask.json",
         r#"{
             "steps": [
-                {"call": {"tool": "bash", "args": {"command": "touch /tmp/ka-agent-m2-marker"}}},
+                {"call": {"tool": "bash", "args": {"command": "touch ka-agent-m2-marker"}}},
                 {"text": "done anyway"}
             ],
             "stop": "done", "cost_usd": 0.0, "tokens": 10
@@ -258,12 +263,12 @@ async fn ask_mode_approval_over_inline_keyboard() {
     // Observed: allowing the card runs the bash call in the workspace,
     // so the marker exists once the turn completes.
     assert!(
-        Path::new(MARKER).exists(),
+        root.join("ws").join(MARKER).exists(),
         "allow did not run the scripted bash call"
     );
 
     daemon.sigterm_wait(Duration::from_secs(10));
-    let _ = std::fs::remove_file(MARKER);
+    let _ = std::fs::remove_file(root.join("ws").join(MARKER));
     std::fs::remove_dir_all(&root).ok();
 }
 

@@ -61,10 +61,10 @@ pub fn run_worker(run: WorkerRun) -> Result<(), String> {
 /// caller (`open` from a test or an older client).
 pub fn parse_mode(s: &str) -> Option<Mode> {
     match s {
-        "ask" | "guarded" => Some(Mode::Guarded),
+        "ask" | "guarded" => Some(Mode::Ask),
         "accept_edits" | "accept-edits" => Some(Mode::AcceptEdits),
-        "allow" | "free" => Some(Mode::Free),
-        "readonly" | "plan" => Some(Mode::Plan),
+        "allow" | "free" => Some(Mode::Allow),
+        "readonly" | "plan" => Some(Mode::Readonly),
         _ => None,
     }
 }
@@ -283,17 +283,15 @@ async fn reassert_policy(engine: &mut Option<EngineMeta>, commands: Option<&Send
     // through the event pump
 }
 
-/// The engine's own wire word for a mode. The pinned engine (ka rev
-/// 193ad5d) only knows the old vocabulary — `guarded | accept_edits |
-/// free | plan` is exactly what its `Mode` wire format accepts — so this
-/// mapping MUST keep emitting those names no matter what the daemon's
-/// config says (`ask`/`allow`/`readonly` would be rejected on the wire).
+/// The engine's own wire word for a mode — the canonical permission
+/// language of v0.7.0 (guarded/free/plan stay serde aliases, so strands
+/// written by older engines replay unchanged).
 fn mode_word(mode: Mode) -> &'static str {
     match mode {
-        Mode::Guarded => "guarded",
+        Mode::Ask => "ask",
         Mode::AcceptEdits => "accept_edits",
-        Mode::Free => "free",
-        Mode::Plan => "plan",
+        Mode::Allow => "allow",
+        Mode::Readonly => "readonly",
     }
 }
 
@@ -342,7 +340,7 @@ async fn open_engine(
     // off (a detached job would escape cancellation, gap G15), and the
     // engine's `remember` hand off — memory proposals go through Ka
     // Agent (§4.4). The overlay always wins over the engine layer.
-    let mode = requested_mode.unwrap_or(Mode::Guarded);
+    let mode = requested_mode.unwrap_or(Mode::Ask);
     cfg.mode = Some(mode);
     cfg.tools.bash.background_after_ms = Some(0);
     if !cfg.features.disable.iter().any(|s| s == "tool:remember") {
@@ -430,28 +428,10 @@ async fn open_engine(
         }
     }
 
-    // Pinned-engine bug workaround (ka-harness#1): with any live MCP
-    // server the engine registers the `mcp` meta hand TWICE (the cache-hit
-    // path's `rebuild_mcp_meta_hands` plus the unconditional bootstrap
-    // push), and the provider rejects the whole request — observed live as
-    // `tools: Tool names must be unique` / "duplicate tool name `mcp`" on
-    // every turn. The spec must be `tool:mcp`, NOT `mcp`: the bare spec
-    // disables every MCP server (`server_enabled` consults it), while the
-    // tool spec hides only the (duplicated) hand named `mcp` — every eager
-    // `<server>__<tool>` hand stays visible and callable.
-    // FIXED upstream in 2d5ec38 (v0.7.0): the bootstrap no longer pushes
-    // the meta hand. RETIRE this block at the next deliberate re-pin
-    // (v0.4.1 -> v0.7.0+, contract suite green).
-    if !cfg.mcp.is_empty()
-        && !cfg
-            .features
-            .disable
-            .iter()
-            .any(|s| s == "tool:mcp" || s == "mcp")
-    {
-        cfg.features.disable.push("tool:mcp".to_string());
-    }
-
+    // ka-harness#1 (the duplicated `mcp` meta hand — "tools: Tool names
+    // must be unique" on every provider turn) is fixed since 2d5ec38;
+    // the `tool:mcp` hide we carried for the v0.4.1 pin was retired at
+    // this re-pin (ka-harness#1, suite green).
     let strand_choice = match strand {
         StrandSel::New => ka_engine::StrandChoice::New,
         StrandSel::Path(p) => ka_engine::StrandChoice::Path(PathBuf::from(p)),

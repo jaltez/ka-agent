@@ -29,9 +29,10 @@ pub use proto::{ImagePayload, StrandSel, WorkerCommand, WorkerEvent};
 pub use scenario::{Scenario, ScenarioSpeaker, Step};
 pub use worker::{WorkerRun, run_worker};
 
-/// The ka-harness content this build is pinned to (`Cargo.toml`): the
-/// `v0.4.1` rev `193ad5d` — identity_file, live steers, anthropic
-/// user-merge, the embedder trampoline, native opencode-go. `doctor`
-/// reports it and backups record it; `scripts/check-ka-deps.sh`
-/// verifies it matches the manifest.
-pub const KA_PIN: &str = "193ad5d";
+/// The ka-harness content this build is pinned to (`Cargo.toml`):
+/// `v0.7.0+` rev `247e99e` — meta/lazy mcp hands registered once
+/// (ka-harness#1), strand power-loss durability, leaf-merged dialect
+/// overlays, landlock /dev surface, permission-language rename.
+/// `doctor` reports it and backups record it;
+/// `scripts/check-ka-deps.sh` verifies it matches the manifest.
+pub const KA_PIN: &str = "247e99e";

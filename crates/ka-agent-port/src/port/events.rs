@@ -434,7 +434,7 @@ mod tests {
         for ev in [
             Event::SessionInfo { id: "s1".into() },
             Event::ModeChanged {
-                mode: ka_protocol::Mode::Plan,
+                mode: ka_protocol::Mode::Readonly,
             },
             Event::EffortChanged {
                 level: ka_protocol::Effort::Medium,

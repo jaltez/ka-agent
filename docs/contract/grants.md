@@ -100,8 +100,8 @@ without changing access. `doctor` also lists
 
 ### Why `mode = "allow"` composes no sandbox
 
-The pinned engine (ka rev 193ad5d, `crates/ka-engine/src/voice.rs`
-~2720-2760) poses a "sandbox grant for `…`" ask even when the
+The pinned engine (ka rev 247e99e, `crates/ka-engine/src/voice.rs`
+~2880-2955) poses a "sandbox grant for `…`" ask even when the
 permission gate already returned `Gate::Allow` — an exec call that
 computes sandbox grants (paths beyond the policy) asks regardless. So
 `mode = "allow"` (and `grants.full`) must keep the sandbox off
@@ -127,7 +127,7 @@ covers both the command and its grants.
 ### Ordering: hook pre-approve vs operator engine rules
 
 The pinned engine runs `pre_tool_use` hooks before the permission gate
-(`crates/ka-engine/src/voice.rs:2594-2625`, rev 193ad5d), and a hook
+(`crates/ka-engine/src/voice.rs:2737-2820`, rev 247e99e), and a hook
 pre-approve may only *downgrade an ask*: with `hook_allowed` set it
 computes the normal gate first and IGNORES the pre-approve when that
 gate is a `Gate::Deny` (`voice.rs:2638-2660`, "hook pre-approve ignored").

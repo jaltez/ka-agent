@@ -514,8 +514,10 @@ async fn policy_reassert_after_replay() {
         stderr.contains("set_model \"scen/m\" re-asserted after replay"),
         "stderr: {stderr}"
     );
+    // v0.7.0's permission language: the wire word is the canonical
+    // `readonly` (the `plan` spelling stays a serde alias).
     assert!(
-        stderr.contains("set_mode plan re-asserted after replay"),
+        stderr.contains("set_mode readonly re-asserted after replay"),
         "stderr: {stderr}"
     );
 
@@ -530,8 +532,10 @@ async fn policy_reassert_after_replay() {
         strand_text.contains("scen/m"),
         "Change record carries the model: {strand_text}"
     );
+    // v0.7.0 permission language: the persisted Change record carries
+    // the canonical `readonly` (`plan` stays an accepted input spelling).
     assert!(
-        strand_text.contains("plan"),
+        strand_text.contains("readonly"),
         "Change record carries the mode: {strand_text}"
     );
     let (second, mut rx2) = open_session(env.open(

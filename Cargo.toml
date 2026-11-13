@@ -25,16 +25,17 @@ repository = "https://github.com/jaltez/ka-agent"
 [workspace.dependencies]
 # Ka engine crates, pinned to the exact released version (SEED.md §3.4:
 # exact pin, upgraded deliberately with the contract suite green).
-# v0.4.1 (193ad5d): [prompt] identity_file, live steers at tool-batch
-# boundaries, anthropic consecutive-user merge, embedder-hosted landlock
-# trampoline (ka-sandbox), native opencode-go provider with
-# x-opencode-session routing. All from one source so the dialect/strand
-# types crossing into ka-engine stay unified.
-ka-protocol = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
-ka-engine = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
-ka-dialect = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
-ka-strand = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
-ka-sandbox = { git = "https://github.com/jaltez/ka-harness.git", rev = "193ad5d" }
+# v0.7.0+ (247e99e): mcp meta/lazy hands registered once at bootstrap
+# (ka-harness#1 - the duplicate-tool-name 400s), strand power-loss
+# durability, leaf-merged dialect overlays, landlock /dev surface,
+# permission-language rename (ask|accept_edits|allow|readonly; the old
+# guarded/plan spellings stay aliases). All from one source so the
+# dialect/strand types crossing into ka-engine stay unified.
+ka-protocol = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
+ka-engine = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
+ka-dialect = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
+ka-strand = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
+ka-sandbox = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
 
 ka-agent-core = { path = "crates/ka-agent-core" }
 ka-agent-port = { path = "crates/ka-agent-port" }

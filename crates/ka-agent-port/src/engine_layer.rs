@@ -68,7 +68,7 @@ pub fn compose_for_role(
         "auto" => ka_sandbox::detect_tool().is_some(),
         _ => false,
     };
-    // The pinned engine (ka rev 193ad5d, `crates/ka-engine/src/voice.rs`
+    // The pinned engine (ka rev 247e99e, `crates/ka-engine/src/voice.rs`
     // ~2720-2760) poses a "sandbox grant for `…`" ask even when the
     // permission gate returned `Gate::Allow` — so `mode = "allow"` and
     // `grants.full` must keep the sandbox off entirely, or bash would
