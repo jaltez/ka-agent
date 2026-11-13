@@ -23,7 +23,7 @@ jobs:
           # One macOS job builds both Darwin targets (x86_64 cross-compiles
           # natively on the arm64 runner): a second macOS job would wait for
           # a second runner from a pool that starves for hours.
-          - os: macos-14
+          - os: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
           # Windows ships a zip: the binary plus the license, the same
           # checksum format as the tarballs.
