@@ -100,10 +100,15 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
     let background = item.source.starts_with("cron")
         || item.source == "briefing"
         || item.source.ends_with("-bg");
-    let configured = background
-        .then(|| cfg_of(sh).background_model.clone())
-        .flatten()
-        .or_else(|| cfg_of(sh).model.clone());
+    // The user's own `/model` choice binds queued messages too — a member's
+    // session pick is not a no-op behind a busy turn.
+    let session_pick = Runtime { sh: Arc::clone(sh) }.session_model_for(&who.username);
+    let configured = session_pick.or_else(|| {
+        background
+            .then(|| cfg_of(sh).background_model.clone())
+            .flatten()
+            .or_else(|| cfg_of(sh).model.clone())
+    });
     let model =
         model_under_policy(&sh.store, &who.username, configured.as_deref()).unwrap_or_else(|e| {
             sh.emit_from(AgentEvent::Notice { text: e }, Some(&item.source));
@@ -718,13 +723,18 @@ impl Runtime {
         // the briefing, `-bg` asks) may run on a cheaper model.
         let src = source.unwrap_or("");
         let background = src.starts_with("cron") || src == "briefing" || src.ends_with("-bg");
+        // Same precedence as the drain path: the user's session pick wins
+        // over background/configured (policy was enforced at `/model` time).
         let model = model_under_policy(
             &self.sh.store,
             &who.username,
-            background
-                .then(|| self.cfg().background_model.clone())
-                .flatten()
-                .or_else(|| self.cfg().model.clone())
+            self.session_model_for(&who.username)
+                .or_else(|| {
+                    background
+                        .then(|| self.cfg().background_model.clone())
+                        .flatten()
+                        .or_else(|| self.cfg().model.clone())
+                })
                 .as_deref(),
         )
         .unwrap_or_else(|e| {

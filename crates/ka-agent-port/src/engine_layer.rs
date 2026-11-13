@@ -255,7 +255,20 @@ pub fn compose_for_role(
             if !allowed {
                 continue;
             }
-            servers.push(mcp_row(m, resolve_secret)?.into());
+            // Same-name dedupe (config wins): the engine persists the
+            // servers it was opened with, so a warm engine home already
+            // carries an injected `kagent` (or an old `[[mcp]]` def) —
+            // appending again sends the provider duplicate tool names
+            // ("tools: Tool names must be unique"). Replace, never stack.
+            let row = mcp_row(m, resolve_secret)?;
+            if let Some(existing) = servers
+                .iter_mut()
+                .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(m.name.as_str()))
+            {
+                *existing = row.into();
+            } else {
+                servers.push(row.into());
+            }
         }
         doc.insert("mcp".into(), toml::Value::Array(servers));
         // Several servers' full tool lists crowd the context: let the model

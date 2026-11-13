@@ -416,14 +416,37 @@ async fn open_engine(
                 user.to_string_lossy().into_owned(),
             );
         }
-        cfg.mcp.push(ka_engine::mcp::McpServerConfig {
-            name: "kagent".to_string(),
-            command: Some(exe.to_string_lossy().into_owned()),
-            args: vec!["__mcp".to_string()],
-            env: mcp_env,
-            url: None,
-            headers: Vec::new(),
-        });
+        // Idempotent: an operator-defined `kagent` server (or one carried
+        // in from the engine layer) is never stacked with a second bridge.
+        if !cfg.mcp.iter().any(|m| m.name == "kagent") {
+            cfg.mcp.push(ka_engine::mcp::McpServerConfig {
+                name: "kagent".to_string(),
+                command: Some(exe.to_string_lossy().into_owned()),
+                args: vec!["__mcp".to_string()],
+                env: mcp_env,
+                url: None,
+                headers: Vec::new(),
+            });
+        }
+    }
+
+    // Pinned-engine bug workaround (ka v0.4.1 193ad5d): with any live MCP
+    // server the engine registers the `mcp` meta hand TWICE (the cache-hit
+    // path's `rebuild_mcp_meta_hands` plus the unconditional bootstrap
+    // push), and the provider rejects the whole request — observed live as
+    // `tools: Tool names must be unique` / "duplicate tool name `mcp`" on
+    // every turn. The spec must be `tool:mcp`, NOT `mcp`: the bare spec
+    // disables every MCP server (`server_enabled` consults it), while the
+    // tool spec hides only the (duplicated) hand named `mcp` — every eager
+    // `<server>__<tool>` hand stays visible and callable.
+    if !cfg.mcp.is_empty()
+        && !cfg
+            .features
+            .disable
+            .iter()
+            .any(|s| s == "tool:mcp" || s == "mcp")
+    {
+        cfg.features.disable.push("tool:mcp".to_string());
     }
 
     let strand_choice = match strand {

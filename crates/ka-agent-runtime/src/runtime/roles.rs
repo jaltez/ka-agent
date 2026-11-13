@@ -388,6 +388,12 @@ impl Runtime {
         Ok(map[&who.username].clone())
     }
 
+    /// The acting user's live `/model` pick for this session, if any
+    /// (policy was already enforced when it was set).
+    pub fn session_model_for(&self, username: &str) -> Option<String> {
+        self.user_handle(username).and_then(|st| st.lock().session_model.clone())
+    }
+
     /// The model a turn of `who` runs on: their session choice, else the
     /// policy default, else the configured model — always inside the user's
     /// allowlist (an empty allowlist allows the whole catalog).
