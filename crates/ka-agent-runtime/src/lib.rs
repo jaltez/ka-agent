@@ -12,6 +12,7 @@ pub mod runtime;
 pub mod skills;
 pub mod status;
 pub mod surface;
+pub mod user_ops;
 
 pub use bus::EventBus;
 pub use event::{AgentEvent, Envelope, PlanItem};

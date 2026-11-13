@@ -6,6 +6,12 @@ use ka_agent_core::ApprovalDecision;
 use ka_agent_runtime::Runtime;
 use ka_agent_store::Store;
 
+/// The actor of the admin-only pages (they are rendered only for the
+/// operator; per-user pages take an explicit principal).
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
+}
+
 /// One sidebar entry: `(path, label, badge count)`.
 type NavItem = (&'static str, &'static str, usize);
 
@@ -176,6 +182,37 @@ fn runtime_page(runtime: &Runtime, title: &str, body: String) -> String {
     html_page(&runtime.persona_name(), title, body)
 }
 
+/// The panel chrome for the account pages (users, groups, knowledge): the
+/// same stylesheet and header, without the live badges (they need a
+/// runtime, and these pages are forms).
+pub fn admin_shell(active: &str, title: &str, subtitle: &str, body: String) -> Response {
+    let nav = [
+        ("/users", "Users"),
+        ("/groups", "Groups"),
+        ("/kb", "Knowledge"),
+        ("/agents", "Agents"),
+        ("/", "Chat"),
+        ("/status", "Status"),
+    ];
+    let links: String = nav
+        .iter()
+        .map(|(href, label)| {
+            let class = if *href == active { " class=active" } else { "" };
+            format!(
+                "<a href=\"{href}\"{class}>{}</a>",
+                escape_html(label)
+            )
+        })
+        .collect();
+    let body = format!(
+        "<div class=\"layout\"><aside><a class=brand href=\"/\">Ka Agent</a>{links}</aside>         <main><div class=\"pagehead\"><div><h1>{}</h1><div class=\"sub\">{}</div></div></div>{}</main></div>",
+        escape_html(title),
+        escape_html(subtitle),
+        body
+    );
+    Response::html(html_page("Ka Agent", title, body))
+}
+
 /// A page with the shared sidebar navigation. Badges: approvals waiting,
 /// memory to review, queued messages.
 fn nav_page(runtime: &Runtime, active: &str, title: &str, body: String) -> Response {
@@ -191,19 +228,26 @@ fn nav_page_sub(
     subtitle: &str,
     body: String,
 ) -> Response {
+    let operator = ka_agent_core::Principal::operator();
     let approvals = runtime
-        .pending_approval_cards()
+        .pending_approval_cards(&operator)
         .map(|c| c.len())
         .unwrap_or(0);
-    let review = runtime.pending_candidates().map(|c| c.len()).unwrap_or(0);
-    let queued = runtime.queued().map(|q| q.len()).unwrap_or(0);
+    let review = runtime
+        .pending_candidates_for(&operator)
+        .map(|c| c.len())
+        .unwrap_or(0);
+    let queued = runtime.queued(&operator).map(|q| q.len()).unwrap_or(0);
     let groups: [(&str, &[NavItem]); 3] = [
         ("Chat", &[("/", "Chat", 0), ("/queue", "Queue", queued)]),
         (
             "Operator",
             &[
                 ("/status", "Status", 0),
-                ("/sessions", "Sessions", 0),
+                ("/users", "Users", 0),
+                ("/groups", "Groups", 0),
+                ("/kb", "Knowledge", 0),
+                ("/agents", "Agents", 0),
                 ("/approvals", "Approvals", approvals),
                 ("/memory", "Memory", review),
                 ("/skills", "Skills", 0),
@@ -312,7 +356,7 @@ pub fn models(runtime: &Runtime) -> crate::Response {
         }
         Err(e) => format!("<span class=\"bad\">{}</span>", escape_html(&e.to_string())),
     };
-    let mode = runtime.effective_mode();
+    let mode = runtime.effective_mode_for(ka_agent_core::OPERATOR_USER);
     let modes: String = ka_agent_channels::commands::MODES
         .iter()
         .map(|(name, desc)| {
@@ -327,7 +371,7 @@ pub fn models(runtime: &Runtime) -> crate::Response {
         .collect::<Vec<_>>()
         .join("<br>");
     let effort = runtime
-        .effort()
+        .effort(&op())
         .unwrap_or_else(|| "model default".to_string());
     let efforts: String = ka_agent_channels::commands::EFFORTS
         .iter()
@@ -386,6 +430,32 @@ pub fn models(runtime: &Runtime) -> crate::Response {
     if provider_rows.is_empty() {
         provider_rows = "<div class=\"empty\">no model catalog yet — set one by selector below or run <code>ka-agent models refresh</code></div>".into();
     }
+    // Every group's model policy, read from the store (the toggles for the
+    // catalog itself live on the Groups page, one editor for one concept).
+    let groups = runtime.store().list_groups().unwrap_or_default();
+    let group_rows = if groups.is_empty() {
+        "<div class=\"empty\">no groups — every user may use every model</div>".to_string()
+    } else {
+        let rows: String = groups
+            .iter()
+            .map(|g| {
+                let allow = if g.models_allow.is_empty() {
+                    "every model".to_string()
+                } else {
+                    g.models_allow.join(", ")
+                };
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&g.name),
+                    escape_html(&allow),
+                    escape_html(g.models_default.as_deref().unwrap_or("profile default"))
+                )
+            })
+            .collect();
+        format!(
+            "<div class=\"tablewrap\"><table><tr><th>group</th><th>allowed models</th><th>default</th></tr>{rows}</table></div>"
+        )
+    };
     let body = format!(
         "<div class=\"grid2\">\
          <div class=\"card\"><div class=\"cardhead\"><span class=\"k\">current model</span><span class=\"tag\">{current}</span></div>\
@@ -403,6 +473,8 @@ pub fn models(runtime: &Runtime) -> crate::Response {
          <label class=field><span>Persona text compiled into IDENTITY.md — the first line must be <code># &lt;Name&gt;</code>, then tone and house rules</span>\
          <textarea name=text rows=7>{persona}</textarea></label>\
          <button class=primary>save persona</button></form>\
+         <h2>Per-group model access</h2>{group_rows}\
+         <p class=\"muted small\">A user's allowlist is the union of their groups' lists; a group with none grants every catalog model. Editing lives on the <a href=\"/groups\">Groups</a> page.</p>\
          <h2>Provider catalog</h2>{provider_rows}",
         current = escape_html(&current),
     );
@@ -417,7 +489,8 @@ pub fn models(runtime: &Runtime) -> crate::Response {
 
 pub async fn models_set(runtime: &Runtime, body: &str) -> crate::Response {
     let selector = form_field(body, "selector");
-    match runtime.set_model(selector.trim()).await {
+    let operator = ka_agent_core::Principal::operator();
+    match runtime.set_model(selector.trim(), &operator).await {
         Ok(id) => result_page(
             runtime,
             "/models",
@@ -437,7 +510,8 @@ pub async fn models_set(runtime: &Runtime, body: &str) -> crate::Response {
 
 pub async fn models_mode(runtime: &Runtime, body: &str) -> crate::Response {
     let mode = form_field(body, "mode");
-    match runtime.set_mode(&mode, "web").await {
+    let operator = ka_agent_core::Principal::operator();
+    match runtime.set_mode(&mode, "web", &operator).await {
         Ok(applied) => result_page(
             runtime,
             "/models",
@@ -457,7 +531,8 @@ pub async fn models_mode(runtime: &Runtime, body: &str) -> crate::Response {
 
 pub async fn models_effort(runtime: &Runtime, body: &str) -> crate::Response {
     let level = form_field(body, "level");
-    match runtime.set_effort(&level).await {
+    let operator = ka_agent_core::Principal::operator();
+    match runtime.set_effort(&level, &operator).await {
         Ok(reply) => result_page(runtime, "/models", "Models & behavior", &reply, true),
         Err(e) => result_page(
             runtime,
@@ -539,8 +614,8 @@ pub fn config_page(runtime: &Runtime) -> crate::Response {
 }
 
 /// `GET /queue`: messages waiting for the next turn, with remove/clear.
-pub fn queue(runtime: &Runtime) -> crate::Response {
-    let items = runtime.queued().unwrap_or_default();
+pub fn queue(runtime: &Runtime, who: &ka_agent_core::Principal) -> crate::Response {
+    let items = runtime.queued(who).unwrap_or_default();
     if items.is_empty() {
         return nav_page_sub(
             runtime,
@@ -576,9 +651,13 @@ pub fn queue(runtime: &Runtime) -> crate::Response {
     )
 }
 
-pub fn queue_remove(runtime: &Runtime, body: &str) -> crate::Response {
+pub fn queue_remove(
+    runtime: &Runtime,
+    body: &str,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
     let id = form_field(body, "id");
-    match runtime.remove_queued(&id) {
+    match runtime.remove_queued(&id, who) {
         Ok(true) => Response::see_other("/queue"),
         Ok(false) => result_page(
             runtime,
@@ -591,8 +670,8 @@ pub fn queue_remove(runtime: &Runtime, body: &str) -> crate::Response {
     }
 }
 
-pub fn queue_clear(runtime: &Runtime) -> crate::Response {
-    match runtime.clear_queue() {
+pub fn queue_clear(runtime: &Runtime, who: &ka_agent_core::Principal) -> crate::Response {
+    match runtime.clear_queue(who) {
         Ok(n) => result_page(
             runtime,
             "/queue",
@@ -1019,7 +1098,7 @@ pub fn extensions(runtime: &Runtime) -> crate::Response {
             })
             .collect()
     };
-    let tools = runtime.tools();
+    let tools = runtime.tools(&op());
     let tools_html = if tools.is_empty() {
         "<div class=\"empty\">no live inventory — the worker starts with the next message</div>"
             .to_string()
@@ -1409,8 +1488,8 @@ pub fn doctor(runtime: &Runtime) -> crate::Response {
 
 /// `GET /status`: the operator report plus the settings with the CLI that
 /// changes each.
-pub fn status(runtime: &Runtime) -> crate::Response {
-    let report = match runtime.status_report() {
+pub fn status(runtime: &Runtime, _who: &ka_agent_core::Principal) -> crate::Response {
+    let report = match runtime.status_report_for(&op()) {
         Ok(r) => r,
         Err(e) => {
             return nav_page(
@@ -1484,7 +1563,7 @@ pub fn status(runtime: &Runtime) -> crate::Response {
         format!(
             "{} / {}",
             escape_html(&report.mode),
-            escape_html(runtime.effort().as_deref().unwrap_or("default"))
+            escape_html(runtime.effort(&op()).as_deref().unwrap_or("default"))
         ),
     );
     let today = card("today", escape_html(&usd));
@@ -1512,8 +1591,8 @@ pub fn status(runtime: &Runtime) -> crate::Response {
         "role / tools",
         format!(
             "{} · {} tools",
-            escape_html(&runtime.active_role()),
-            runtime.tools().len()
+            escape_html(&op().role),
+            runtime.tools(&op()).len()
         ),
     );
     let budget = format!(
@@ -2235,7 +2314,13 @@ fn upload_name(raw: &str) -> Option<String> {
 /// `POST /upload`: one file from the chat composer, stored under the
 /// caller role's `attachments/`; the reply is the `@attachments/…`
 /// reference to paste into the message.
-pub fn web_upload(runtime: &Runtime, role: &str, raw_name: &str, bytes: &[u8]) -> crate::Response {
+pub fn web_upload(
+    runtime: &Runtime,
+    role: &str,
+    username: &str,
+    raw_name: &str,
+    bytes: &[u8],
+) -> crate::Response {
     if bytes.is_empty() {
         return Response::bad_request("empty upload");
     }
@@ -2245,7 +2330,8 @@ pub fn web_upload(runtime: &Runtime, role: &str, raw_name: &str, bytes: &[u8]) -
     let Some(name) = upload_name(raw_name) else {
         return Response::bad_request("bad file name");
     };
-    let dir = runtime.workspace_for_role(role).join("attachments");
+    let who = ka_agent_core::Principal::new(username, role);
+    let dir = runtime.workspace_for(&who).join("attachments");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Response::base(500, "text/plain", format!("attachments: {e}\n"));
     }
@@ -2288,7 +2374,12 @@ fn attachment_type(name: &str) -> (&'static str, bool) {
 /// `GET /file/<name>`: one attachment of the caller's role. Only direct
 /// children of that role's `attachments/` are served (traversal and
 /// symlinks are refused).
-pub fn serve_file(runtime: &Runtime, role: &str, raw: &str) -> crate::Response {
+pub fn serve_file(
+    runtime: &Runtime,
+    role: &str,
+    username: &str,
+    raw: &str,
+) -> crate::Response {
     let Some(name) = upload_name(raw) else {
         return Response::bad_request("bad file name");
     };
@@ -2298,7 +2389,8 @@ pub fn serve_file(runtime: &Runtime, role: &str, raw: &str) -> crate::Response {
     }
     // A direct child of the role's `attachments/` or of its workspace
     // (where `send_file` may point). Nothing deeper, no symlink escapes.
-    let ws = runtime.workspace_for_role(role);
+    let who = ka_agent_core::Principal::new(username, role);
+    let ws = runtime.workspace_for(&who);
     let mut found = None;
     for dir in [ws.join("attachments"), ws.clone()] {
         let Ok(canon_dir) = std::fs::canonicalize(&dir) else {
@@ -2331,9 +2423,6 @@ pub fn serve_file(runtime: &Runtime, role: &str, raw: &str) -> crate::Response {
     resp
 }
 
-/// `POST /pair/issue`: mint a web pairing code for a role from the admin
-/// UI (the browser redeems it at `/pair`). Audited; the code itself is
-/// never stored in the audit row.
 pub fn pair_issue(runtime: &Runtime, store: &Store, body: &str) -> crate::Response {
     let cfg = runtime.config();
     let role = form_field(body, "role").trim().to_string();
@@ -2428,43 +2517,46 @@ pub async fn profile_action(action: &str, body: &str) -> crate::Response {
 
 /// `GET /`: the chat page (last 20 turns, live updates via /events).
 pub fn chat_page(runtime: &Runtime, store: &Store) -> crate::Response {
+    chat_page_user(runtime, store, &ka_agent_core::Principal::operator())
+}
+
+/// The chat page for one user: their own history, their own composer.
+pub fn chat_page_user(
+    runtime: &Runtime,
+    store: &Store,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
     let _ = store;
-    nav_page(runtime, "/", "Chat", chat_markup(runtime))
-}
-
-/// `GET /pair`: the browser end of `ka-agent pair web` (public page; the
-/// code is the credential).
-pub fn pair_page() -> crate::Response {
-    let body = "<main><h1>Pair this browser</h1>        <div class='card' style='max-width:30rem'>        <p>On your computer run <code>ka-agent pair web --role &lt;role&gt;</code> and enter the code it prints.</p>        <form method='post' action='/pair'>        <label>Pairing code<br><input name='code' autocomplete='one-time-code' required autofocus style='font:inherit;padding:.5rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--fg);width:100%'></label>        <p><button class='primary'>Pair</button></p></form>        <p class='muted'>The code expires in 10 minutes and can be used once.</p></div></main>";
-    crate::Response::html(html_page("Ka Agent", "Pair", body.to_string()))
-}
-
-/// A role's chat page: no admin navigation, just the conversation and the
-/// role badge. The router only renders it after activating the role.
-pub fn chat_page_role(runtime: &Runtime, _store: &Store, role: &str) -> crate::Response {
-    let body = format!(
-        "<div class='layout'><aside><div class='brand'>{}</div>         <span class='badge'>role {}</span></aside>         <main><h1>Chat</h1>{}</main></div>",
+    let body = chat_markup(runtime, who);
+    if who.is_admin() {
+        // The operator's panel: full navigation.
+        return nav_page(runtime, "/", "Chat", body);
+    }
+    // A member reaches the conversation only: no operator navigation, just
+    // the brand and the chat itself (same chrome the role realm had).
+    let shell = format!(
+        "<div class=\"layout\"><aside><div class=\"brand\">{}<span class=\"who\">{}</span></div></aside>\
+         <main><div class=\"pagehead\"><div><h1>Chat</h1></div></div>{body}</main></div>",
         escape_html(&runtime.persona_name()),
-        escape_html(role),
-        chat_markup(runtime)
+        escape_html(&who.username)
     );
-    crate::Response::html(html_page(&runtime.persona_name(), "Chat", body))
+    Response::html(html_page(&runtime.persona_name(), "Chat", shell))
 }
 
 /// Rendered when another role's turn owns the single-session core: no
 /// history, no cross-role data.
-pub fn chat_page_busy(role: &str) -> crate::Response {
+pub fn chat_page_busy(user: &str) -> crate::Response {
     let body = format!(
-        "<main><h1>Chat</h1><div class='card'>another conversation is running —          try again when its turn finishes (role {})</div></main>",
-        escape_html(role)
+        "<main><h1>Chat</h1><div class='card'>your previous message is still running — the next one queues behind it ({})</div></main>",
+        escape_html(user)
     );
     crate::Response::html(html_page("Ka Agent", "Chat", body))
 }
 
-fn chat_markup(runtime: &Runtime) -> String {
+fn chat_markup(runtime: &Runtime, who: &ka_agent_core::Principal) -> String {
     let now = runtime.now_zoned();
     let mut turns_html = String::new();
-    if let Ok(turns) = runtime.recent_turns(20, 0) {
+    if let Ok(turns) = runtime.recent_turns(20, 0, who) {
         if turns.is_empty() {
             // A blank first visit says nothing: one hint bubble, the same
             // shape every other empty state in the panel uses.
@@ -2497,20 +2589,14 @@ fn chat_markup(runtime: &Runtime) -> String {
             ));
         }
     }
-    let mode = runtime.effective_mode();
+    let mode = runtime.effective_mode_for(&who.username);
     let model = runtime
-        .config()
-        .model
-        .clone()
+        .model_for(who, false)
         .unwrap_or_else(|| "no model".into());
-    let approvals = if runtime.active_role() == ka_agent_core::ADMIN_ROLE {
-        runtime
-            .pending_approval_cards()
-            .map(|c| c.len())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let approvals = runtime
+        .pending_approval_cards(who)
+        .map(|c| c.len())
+        .unwrap_or(0);
     let waiting = if approvals > 0 {
         format!("<a class='chip warn' href='/approvals'>{approvals} approval(s) waiting</a>")
     } else {
@@ -2532,7 +2618,7 @@ fn chat_markup(runtime: &Runtime) -> String {
          <button type='button' id='private' title='start a private conversation (nothing is remembered)'>private</button><button class='primary'>send</button></form></div>\
          <script src=\"/static/chat.js\" defer></script>",
         persona = escape_html(&runtime.persona_name()),
-        role = escape_html(&runtime.active_role()),
+        role = escape_html(&who.role),
         mode = escape_html(&mode),
         model = escape_html(&model),
         waiting = waiting
@@ -2541,16 +2627,24 @@ fn chat_markup(runtime: &Runtime) -> String {
 
 /// `POST /chat/send`: a command or a message from the web chat (fetch).
 pub async fn chat_send(runtime: &Runtime, store: &Store, body: &str) -> crate::Response {
-    chat_send_for(runtime, store, body, "web").await
+    chat_send_for(
+        runtime,
+        store,
+        body,
+        "web",
+        &ka_agent_core::Principal::operator(),
+    )
+    .await
 }
 
-/// The same for one role's browser session: every command and turn runs as
-/// `source` (the role is derived from it server-side).
+/// The same for one user's browser session: every command and turn runs as
+/// `source` (the user is derived from it server-side).
 pub async fn chat_send_for(
     runtime: &Runtime,
     store: &Store,
     body: &str,
     source: &str,
+    who: &ka_agent_core::Principal,
 ) -> crate::Response {
     let text = crate::url_decode(&form_field_url(body, "text").replace('+', " "));
     let text = text.trim().to_string();
@@ -2565,8 +2659,10 @@ pub async fn chat_send_for(
             Response::json(serde_json::json!({"ok": true}).to_string())
         }
         ka_agent_channels::commands::Outcome::NotACommand => {
-            let expanded =
-                ka_agent_channels::refs::expand(store, &runtime.workspace(), &text).await;
+            let (expanded, refs) =
+                ka_agent_channels::refs::expand(store, &runtime.workspace_for(who), who, &text)
+                    .await;
+            ka_agent_channels::refs::stage_sources(store, source, &refs);
             match runtime.handle_message(&expanded, source).await {
                 Ok(()) => Response::json(serde_json::json!({"ok": true}).to_string()),
                 Err(e) => {
@@ -2592,7 +2688,7 @@ fn form_field_url(body: &str, name: &str) -> String {
 
 /// `GET /tasks`: reminders and crons — create them with the same grammar
 /// the chat uses, and pause/resume/trigger/remove each cron.
-pub fn tasks(runtime: &Runtime) -> crate::Response {
+pub fn tasks(runtime: &Runtime, _who: &ka_agent_core::Principal) -> crate::Response {
     let now = runtime.now_zoned();
     let rows = match runtime.scheduled_tasks() {
         Ok(r) => r,
@@ -3079,7 +3175,8 @@ pub fn contacts(runtime: &Runtime, store: &Store) -> crate::Response {
 /// `POST /memory/forget`: remove one accepted entry.
 pub async fn memory_forget(runtime: &Runtime, body: &str) -> crate::Response {
     let id = form_field(body, "id");
-    match runtime.forget(&id) {
+    let operator = ka_agent_core::Principal::operator();
+    match runtime.forget(&id, &operator) {
         Ok(true) => Response::see_other("/memory"),
         Ok(false) => nav_page(
             runtime,
@@ -3104,24 +3201,32 @@ pub async fn memory_forget(runtime: &Runtime, body: &str) -> crate::Response {
 }
 
 /// The fetch path of the approval card buttons (chat.js).
-pub async fn approvals_decide_json(runtime: &Runtime, body: &str) -> crate::Response {
+pub async fn approvals_decide_json(
+    runtime: &Runtime,
+    body: &str,
+    source: &str,
+) -> crate::Response {
     let id = form_field(body, "id");
     let decision = match form_field(body, "decision").as_str() {
         "y" => ApprovalDecision::Allow,
         _ => ApprovalDecision::Deny,
     };
-    match runtime.decide(&id, decision, "web").await {
+    match runtime.decide(&id, decision, source).await {
         Ok(()) => Response::json(serde_json::json!({"ok": true}).to_string()),
         Err(e) => Response::json(serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
-pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
+pub fn history(
+    runtime: &Runtime,
+    query: Option<&str>,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
     let form = "<form method=get action=/history class=formrow>\
          <input name=q placeholder='search turns…' style='flex:1'><button class=primary>search</button></form>";
     let Some(q) = query.filter(|q| !q.is_empty()) else {
         let now = runtime.now_zoned();
-        let turns = runtime.recent_turns(10, 0).unwrap_or_default();
+        let turns = runtime.recent_turns(10, 0, who).unwrap_or_default();
         let rows: String = turns
             .iter()
             .rev()
@@ -3165,7 +3270,7 @@ pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
             format!("{form}<h2>Recent turns</h2>{recent}"),
         );
     };
-    match runtime.history_search(q, 20) {
+    match runtime.history_search(q, 20, who) {
         Ok(hits) if hits.is_empty() => {
             let body = format!(
                 "{form}<p class=\"muted\">no results for {}</p>",
@@ -3213,7 +3318,12 @@ pub fn history(runtime: &Runtime, query: Option<&str>) -> crate::Response {
     }
 }
 
-pub fn history_show(runtime: &Runtime, store: &Store, turn_id: &str) -> crate::Response {
+pub fn history_show(
+    runtime: &Runtime,
+    store: &Store,
+    turn_id: &str,
+    _who: &ka_agent_core::Principal,
+) -> crate::Response {
     let Some(turn) = store
         .get_turn(&ka_agent_core::TurnId(turn_id.into()))
         .ok()
@@ -3231,8 +3341,8 @@ pub fn history_show(runtime: &Runtime, store: &Store, turn_id: &str) -> crate::R
     nav_page(runtime, "/history", "Turn", body)
 }
 
-pub fn memory(runtime: &Runtime) -> crate::Response {
-    let Ok(report) = runtime.memory_report() else {
+pub fn memory(runtime: &Runtime, who: &ka_agent_core::Principal) -> crate::Response {
+    let Ok(report) = runtime.memory_report_for(&op()) else {
         return nav_page(runtime, "/memory", "Memory", "<p>memory error</p>".into());
     };
     let files: Vec<String> = report
@@ -3241,7 +3351,7 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
         .map(|f| format!("<li>{}: {} bytes</li>", escape_html(&f.name), f.bytes))
         .collect();
     let entries = runtime
-        .memory_entries()
+        .memory_entries(who)
         .map(|entries| {
             if entries.is_empty() {
                 return "<p>no accepted entries</p>".to_string();
@@ -3269,12 +3379,12 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
         })
         .unwrap_or_else(|e| format!("<p>entries error: {}</p>", escape_html(&e.to_string())));
     let compiled = runtime
-        .memory_compiled_text()
+        .memory_compiled_text(who)
         .map(|text| format!("<pre>{}</pre>", escape_html(&text)))
         .unwrap_or_else(|e| format!("<p>compile error: {}</p>", escape_html(&e.to_string())));
-    let candidates = render_candidates(runtime);
+    let candidates = render_candidates(runtime, who);
     let log = runtime
-        .memory_log(10)
+        .memory_log(10, who)
         .map(|rows| {
             if rows.is_empty() {
                 "<p class=\"muted\">no commits yet</p>".to_string()
@@ -3328,7 +3438,11 @@ pub fn memory(runtime: &Runtime) -> crate::Response {
 }
 
 /// `POST /memory/remember`: accept one fact now (facts.md + commit).
-pub fn memory_remember(runtime: &Runtime, body: &str) -> crate::Response {
+pub fn memory_remember(
+    runtime: &Runtime,
+    body: &str,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
     let text = form_field(body, "text");
     if text.trim().is_empty() {
         return result_page(
@@ -3339,7 +3453,7 @@ pub fn memory_remember(runtime: &Runtime, body: &str) -> crate::Response {
             false,
         );
     }
-    match runtime.remember(&text, "web") {
+    match runtime.remember(&text, "web", who) {
         Ok(id) => result_page(
             runtime,
             "/memory",
@@ -3352,8 +3466,8 @@ pub fn memory_remember(runtime: &Runtime, body: &str) -> crate::Response {
 }
 
 /// `POST /memory/undo`: revert the last memory commit.
-pub fn memory_undo(runtime: &Runtime) -> crate::Response {
-    match runtime.memory_undo() {
+pub fn memory_undo(runtime: &Runtime, who: &ka_agent_core::Principal) -> crate::Response {
+    match runtime.memory_undo(who) {
         Ok(subject) => result_page(
             runtime,
             "/memory",
@@ -3365,7 +3479,11 @@ pub fn memory_undo(runtime: &Runtime) -> crate::Response {
     }
 }
 
-pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
+pub fn memory_edit(
+    runtime: &Runtime,
+    body: &str,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
     let text = form_field(body, "text");
     if text.trim().is_empty() {
         return Response::html(runtime_page(
@@ -3374,7 +3492,7 @@ pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
             "<p>nothing to remember (empty text)</p><p><a href=\"/memory\">back</a></p>".into(),
         ));
     }
-    match runtime.propose_memory("web", &text, None) {
+    match runtime.propose_memory("web", &text, None, who) {
         Ok(_id) => {
             // 303 so a refresh does not re-submit the form.
             let mut resp = Response::redirect("/memory");
@@ -3394,13 +3512,13 @@ pub fn memory_edit(runtime: &Runtime, body: &str) -> crate::Response {
 /// appends `- {text}` plus a provenance comment to facts.md
 /// (`MemoryStore::add`); the id/timestamp are generated on accept, so the
 /// preview marks them.
-fn render_candidates(runtime: &Runtime) -> String {
-    let rows = runtime.pending_candidates().unwrap_or_default();
+fn render_candidates(runtime: &Runtime, who: &ka_agent_core::Principal) -> String {
+    let rows = runtime.pending_candidates_for(who).unwrap_or_default();
     if rows.is_empty() {
         return "<h2>candidates</h2><p>none awaiting review</p>".into();
     }
     let facts = runtime
-        .memory_facts_text()
+        .memory_facts_text(who)
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -3440,11 +3558,15 @@ fn render_candidates(runtime: &Runtime) -> String {
 }
 
 /// `POST /memory/candidate`: apply a review decision.
-pub fn memory_candidate(runtime: &Runtime, body: &str) -> crate::Response {
+pub fn memory_candidate(
+    runtime: &Runtime,
+    body: &str,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
     let id = form_field(body, "id");
     let applied = match form_field(body, "decision").as_str() {
-        "y" => runtime.accept_candidate(&id),
-        _ => runtime.reject_candidate(&id),
+        "y" => runtime.accept_candidate(&id, who),
+        _ => runtime.reject_candidate(&id, who),
     };
     match applied {
         // Ok(false): unknown or already-settled candidate — say so instead of
@@ -3487,142 +3609,87 @@ fn form_field(body: &str, name: &str) -> String {
     String::new()
 }
 
-/// `GET /sessions`: recent sessions across roles, with "open" (adopt that
-/// role's latest conversation — the TUI's `/resume` across roles).
-pub fn sessions(runtime: &Runtime, store: &Store) -> crate::Response {
-    let rows = store.list_recent_sessions(50).unwrap_or_default();
-    let active_role = runtime.active_role();
-    let now = runtime.now_zoned();
-    let mut html = String::new();
-    for s in &rows {
-        let at = jiff::Timestamp::from_millisecond(s.updated_ms)
-            .map(|t| t.to_zoned(now.time_zone().clone()))
-            .map(|t| {
-                format!(
-                    "{:02}-{:02} {:02}:{:02}",
-                    t.month() as u8,
-                    t.day(),
-                    t.hour(),
-                    t.minute()
-                )
-            })
-            .unwrap_or_default();
-        let open = if s.role == active_role {
-            "<span class=\"tag\">active role</span>".to_string()
+fn approval_card_html(
+    runtime: &Runtime,
+    card: &ka_agent_runtime::ApprovalCard,
+    escalated: bool,
+) -> String {
+    let q = escape_html(&card.question);
+    let d = card
+        .detail
+        .as_deref()
+        .map(|d| {
+            let escaped = escape_html(&d.lines().take(20).collect::<Vec<_>>().join("\n"));
+            format!("<pre>{escaped}</pre>")
+        })
+        .unwrap_or_default();
+    let expires = ka_agent_core::fmt_interval(card.expires_at_ms - ka_agent_core::now_ms());
+    let _ = runtime;
+    format!(
+        "<div class='card'><p>{q}</p>{d}<p class='small muted'>{tag} · expires in {expires}</p>\
+         <form method=post action=/approvals/decide>\
+         <input type=hidden name=id value=\"{id}\">\
+         <button class=primary name=decision value=y>Allow</button>\
+         <button name=decision value=n>Deny</button>\
+         <button name=decision value=session>Allow for this session</button></form></div>",
+        tag = if escalated {
+            "escalated to the admin"
         } else {
-            format!(
-                "<form method=post action=/sessions/open>\
-                 <input type=hidden name=role value=\"{}\"><button class=\"sm\">open</button></form>",
-                escape_html(&s.role)
-            )
-        };
-        html.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{open}</td></tr>",
-            escape_html(ka_agent_core::ids::short_id(s.id.as_str())),
-            escape_html(&s.role),
-            escape_html(&format!("{:?}", s.status)),
-            if s.private { "yes" } else { "—" },
-            escape_html(&at),
-        ));
-    }
-    let body = if rows.is_empty() {
-        "<div class=\"empty\">no sessions yet</div>".to_string()
-    } else {
-        format!(
-            "<div class=\"tablewrap\"><table><tr><th>id</th><th>role</th><th>status</th><th>private</th><th>updated</th><th></th></tr>{html}</table></div>\
-             <p class=\"muted small\">Opening a role adopts its most recent session; a running turn of another role is never disturbed.</p>"
-        )
-    };
-    nav_page_sub(
-        runtime,
-        "/sessions",
-        "Sessions",
-        "Recent conversations by role. Opening one hands the agent to that role's latest session.",
-        body,
+            "yours to decide"
+        },
+        id = escape_html(&card.approval_id),
     )
 }
 
-pub async fn sessions_open(runtime: &Runtime, body: &str) -> crate::Response {
-    let role = form_field(body, "role");
-    let cfg = runtime.config();
-    if role != ka_agent_core::ADMIN_ROLE && !cfg.roles.iter().any(|r| r.name == role) {
-        return result_page(runtime, "/sessions", "Sessions", "unknown role", false);
-    }
-    if runtime.use_role(&role).await {
-        result_page(
-            runtime,
-            "/sessions",
-            "Sessions",
-            &format!("now acting as role {role}"),
-            true,
-        )
-    } else {
-        result_page(
-            runtime,
-            "/sessions",
-            "Sessions",
-            "another conversation is running — try again when its turn finishes",
-            false,
-        )
-    }
-}
-
-pub fn approvals(runtime: &Runtime, store: &Store) -> crate::Response {
-    let sid = runtime.session_id();
-    let pending = store.pending_approvals(&sid).unwrap_or_default();
-    if pending.is_empty() {
-        return nav_page_sub(
-            runtime,
-            "/approvals",
-            "Approvals",
-            "Pending cards the engine is blocked on. Only the operator decides; a role never can.",
-            "<div class=\"empty\">nothing waiting — the engine is not blocked on an ask</div>"
-                .into(),
-        );
-    }
-    let cards: Vec<String> = pending
+pub fn approvals(
+    runtime: &Runtime,
+    _store: &Store,
+    who: &ka_agent_core::Principal,
+) -> crate::Response {
+    let mut cards: Vec<String> = runtime
+        .pending_approval_cards(who)
+        .unwrap_or_default()
         .iter()
-        .filter_map(|a| {
-            let ka_agent_core::ApprovalKind::KaAsk {
-                question, detail, ..
-            } = &a.kind
-            else {
-                return None;
-            };
-            let q = escape_html(question);
-            let d = detail
-                .as_deref()
-                .map(|d| {
-                    let escaped = escape_html(&d.lines().take(20).collect::<Vec<_>>().join("\n"));
-                    format!("<pre>{escaped}</pre>")
-                })
-                .unwrap_or_default();
-            // Same expiry rendering as the chat card (operator zone).
-            let expires = ka_agent_core::fmt_interval(a.expires_at_ms - ka_agent_core::now_ms());
-            Some(format!(
-                "<div class='card'><p>{q}</p>{d}<p>expires in {expires}</p>\
-                 <form method=post action=/approvals/decide>\
-                 <input type=hidden name=id value=\"{}\">\
-                 <button class=primary name=decision value=y>Allow</button>\
-                 <button name=decision value=n>Deny</button>\
-                 <button name=decision value=session>Allow for this session</button></form></div>",
-                escape_html(a.id.as_str())
-            ))
-        })
+        .map(|c| approval_card_html(runtime, c, false))
         .collect();
+    if who.is_admin() {
+        for card in runtime.escalated_cards(50).unwrap_or_default() {
+            cards.push(approval_card_html(runtime, &card, true));
+        }
+        let own: Vec<String> = runtime
+            .cards_for_user(&who.username)
+            .unwrap_or_default()
+            .iter()
+            .map(|c| approval_card_html(runtime, c, false))
+            .collect();
+        for c in own {
+            if !cards.iter().any(|existing| existing == &c) {
+                cards.push(c);
+            }
+        }
+    }
+    let body = if cards.is_empty() {
+        "<div class=\"empty\">nothing waiting — no engine is blocked on an ask</div>".to_string()
+    } else {
+        cards.join("")
+    };
     nav_page_sub(
         runtime,
         "/approvals",
         "Approvals",
-        "Pending cards the engine is blocked on. Only the operator decides; a role never can.",
-        cards.join(""),
+        "Cards the engine is blocked on. Within your own grants you decide your own actions; anything shared, over quota or on your role's escalate list goes to the admin (D9).",
+        body,
     )
 }
 
-pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response {
+pub async fn approvals_decide(
+    runtime: &Runtime,
+    body: &str,
+    source: &str,
+) -> crate::Response {
     let id = form_field(body, "id");
     if form_field(body, "decision") == "session" {
-        return match runtime.decide_for_session(&id, "web").await {
+        return match runtime.decide_for_session(&id, source).await {
             Ok(()) => Response::see_other("/approvals"),
             Err(e) => result_page(runtime, "/approvals", "Approvals", &e.to_string(), false),
         };
@@ -3631,7 +3698,7 @@ pub async fn approvals_decide(runtime: &Runtime, body: &str) -> crate::Response 
         "y" => ApprovalDecision::Allow,
         _ => ApprovalDecision::Deny,
     };
-    match runtime.decide(&id, decision, "web").await {
+    match runtime.decide(&id, decision, source).await {
         Ok(()) => Response::redirect("/approvals"),
         Err(e) => Response::html(runtime_page(
             runtime,
@@ -3659,7 +3726,7 @@ pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
         .iter()
         .map(|r| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 r.seq,
                 {
                     let now = runtime.now_zoned();
@@ -3676,6 +3743,7 @@ pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
                     )
                 },
                 escape_html(&r.actor),
+                escape_html(&r.username),
                 escape_html(&r.role),
                 escape_html(&r.action),
                 escape_html(&r.subject)
@@ -3683,7 +3751,7 @@ pub fn audit(runtime: &Runtime, store: &Store) -> crate::Response {
         })
         .collect();
     let body = format!(
-        "<div class=\"tablewrap\"><table><tr><th>seq</th><th>at</th><th>actor</th><th>role</th><th>action</th><th>subject</th></tr>{}</table></div>",
+        "<div class=\"tablewrap\"><table><tr><th>seq</th><th>at</th><th>actor</th><th>user</th><th>role</th><th>action</th><th>subject</th></tr>{}</table></div>",
         rows.join("")
     );
     nav_page_sub(
@@ -3722,47 +3790,69 @@ pub fn intents(runtime: &Runtime, store: &Store) -> crate::Response {
     )
 }
 
-/// `GET /usage`: spend per day and model, CSS bars, today against the
-/// budget.
-pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
+/// `GET /usage`: spend per day, model **and user**, CSS bars, today against
+/// the budget. `?format=csv` downloads the same rows.
+pub fn usage(runtime: &Runtime, store: &Store, format: Option<&str>) -> crate::Response {
     let cfg = runtime.config();
     let since = jiff::Timestamp::now()
         .checked_sub(jiff::Span::new().days(30))
         .map(|t| t.as_millisecond())
         .unwrap_or(0);
-    let rows = store.usage_rows_since(since).unwrap_or_default();
-    // Bucket by local day and model (a turn lands on the day it started).
+    let rows = store.usage_rows_with_user(since).unwrap_or_default();
+    // Bucket by local day, user and model (a turn lands on the day it
+    // started).
     let tz = runtime.now_zoned().time_zone().clone();
-    let mut buckets: Vec<(String, String, u64, u64, f64)> = Vec::new();
-    for (at_ms, cost, tokens, model) in rows {
+    let mut buckets: Vec<(String, String, String, u64, u64, f64)> = Vec::new();
+    for (at_ms, cost, tokens, model, user) in rows {
         let day = jiff::Timestamp::from_millisecond(at_ms)
             .map(|t| t.to_zoned(tz.clone()).strftime("%Y-%m-%d").to_string())
             .unwrap_or_default();
         let model = model.unwrap_or_else(|| "(not recorded)".into());
-        match buckets.last_mut() {
-            Some(last) if last.0 == day && last.1 == model => {
-                last.2 += 1;
-                last.3 += tokens;
-                last.4 += cost;
+        match buckets
+            .iter_mut()
+            .find(|b| b.0 == day && b.1 == user && b.2 == model)
+        {
+            Some(b) => {
+                b.3 += 1;
+                b.4 += tokens;
+                b.5 += cost;
             }
-            _ => buckets.push((day, model, 1, tokens, cost)),
+            None => buckets.push((day, user, model, 1, tokens, cost)),
         }
+    }
+    buckets.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+    if format == Some("csv") {
+        let mut out = String::from("day,user,model,turns,tokens,cost_usd\n");
+        for (day, user, model, turns, tokens, cost) in &buckets {
+            out.push_str(&format!(
+                "{day},{},\"{}\" ,{turns},{tokens},{cost:.6}\n",
+                csv_field(user),
+                model.replace('"', "\"\"")
+            ));
+        }
+        let mut r = Response::base(200, "text/csv; charset=utf-8", out);
+        r.extra_headers.push((
+            "Content-Disposition",
+            "attachment; filename=\"ka-agent-usage.csv\"".to_string(),
+        ));
+        return r;
     }
     let max = buckets
         .iter()
-        .map(|b| b.4)
+        .map(|b| b.5)
         .fold(0.0_f64, f64::max)
         .max(0.01);
     let cap = cfg.budgets.daily_usd;
     let rows_html: String = buckets
         .iter()
         .rev()
-        .map(|(day, model, turns, tokens, cost)| {
+        .map(|(day, user, model, turns, tokens, cost)| {
             let pct = (cost / max * 100.0).clamp(1.0, 100.0);
             let over = cap.is_some_and(|c| *cost > c);
             format!(
-                "<tr><td>{day}</td><td><code>{}</code></td><td>{turns}</td><td>{tokens}</td>\
+                "<tr><td>{day}</td><td><code>{}</code></td><td><code>{}</code></td><td>{turns}</td><td>{tokens}</td>\
                  <td><span class='bar{}' style='width:{}em'></span> <span class='{}'>${:.4}</span></td></tr>",
+                escape_html(user),
                 escape_html(model),
                 if over { " over" } else { "" },
                 (pct / 4.0) as u32,
@@ -3771,16 +3861,53 @@ pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
             )
         })
         .collect();
-    let today = buckets.last().map(|b| b.4).unwrap_or(0.0);
+    let mut per_user: Vec<(String, f64, u64)> = Vec::new();
+    for (_, user, _, _, tokens, cost) in &buckets {
+        match per_user.iter_mut().find(|u| &u.0 == user) {
+            Some(u) => {
+                u.1 += cost;
+                u.2 += tokens;
+            }
+            None => per_user.push((user.clone(), *cost, *tokens)),
+        }
+    }
+    per_user.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let user_rows: String = per_user
+        .iter()
+        .map(|(user, cost, tokens)| {
+            let quota = store
+                .get_user(user)
+                .ok()
+                .flatten()
+                .and_then(|u| u.quota_daily_usd)
+                .map(|q| format!("${q:.2}/day"))
+                .unwrap_or_else(|| "role/profile budget".into());
+            format!(
+                "<tr><td><code>{}</code></td><td>{tokens}</td><td>${cost:.4}</td><td>{quota}</td></tr>",
+                escape_html(user)
+            )
+        })
+        .collect();
+    let today_key = jiff::Timestamp::now()
+        .to_zoned(tz.clone())
+        .strftime("%Y-%m-%d")
+        .to_string();
+    let today = buckets
+        .iter()
+        .filter(|b| b.0 == today_key)
+        .map(|b| b.5)
+        .sum::<f64>();
     let budget_note = match cap {
         Some(c) => format!("${today:.4} of ${c:.2} today"),
-        None => format!("${today:.4} today (no cap set)"),
+        None => format!("${today:.4} today (no profile cap set)"),
     };
     let table = if buckets.is_empty() {
         "<div class=\"empty\">no usage in the last 30 days</div>".to_string()
     } else {
         format!(
-            "<div class=\"tablewrap\"><table><tr><th>day</th><th>model</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table></div>\
+            "<h2>By user</h2><div class=\"tablewrap\"><table><tr><th>user</th><th>tokens</th><th>cost</th><th>quota</th></tr>{user_rows}</table></div>\
+             <h2>By day</h2><div class=\"tablewrap\"><table><tr><th>day</th><th>user</th><th>model</th><th>turns</th><th>tokens</th><th>cost</th></tr>{rows_html}</table></div>\
+             <p><a href=\"/usage?format=csv\">download CSV</a></p>\
              <style>.bar{{display:inline-block;height:0.8em;background:var(--accent);border-radius:3px;vertical-align:middle}}.bar.over{{background:var(--bad)}}</style>"
         )
     };
@@ -3789,9 +3916,18 @@ pub fn usage(runtime: &Runtime, store: &Store) -> crate::Response {
         runtime,
         "/usage",
         "Usage",
-        "Spend and tokens by day and model for the last 30 days.",
+        "Spend and tokens by user, day and model for the last 30 days (the org pays; quotas cap each user).",
         body,
     )
+}
+
+/// One CSV field, quoted when it contains a comma or a quote.
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 /// A list field's items: a comma-separated list, optionally wrapped in
@@ -3863,7 +3999,7 @@ fn render_setting(spec: &ka_agent_core::config_keys::KeySpec, v: &str) -> Result
 /// The status page with a flash paragraph under its heading (the POST answer:
 /// a redirect would drop the message).
 fn status_with_flash(runtime: &Runtime, flash: &str) -> crate::Response {
-    let mut page = status(runtime);
+    let mut page = status(runtime, &op());
     if let Some(body_start) = page.body.find("<h1>Status</h1>") {
         let at = body_start + "<h1>Status</h1>".len();
         page.body.insert_str(at, flash);

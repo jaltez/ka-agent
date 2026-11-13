@@ -3,11 +3,12 @@
 
 use serde_json::{Value, json};
 
-use super::{ToolCtx, ToolFuture, turn_role};
+use super::{ToolCtx, ToolFuture, turn_principal};
 
 fn notes_dir(ctx: &ToolCtx) -> Result<std::path::PathBuf, String> {
-    let role = turn_role(&ctx.store);
-    let dir = ctx.paths.role_notes(&role);
+    // The acting user's own notes partition (never a role tree).
+    let who = turn_principal(ctx);
+    let dir = ctx.paths.user_notes(&who.username);
     std::fs::create_dir_all(&dir).map_err(|e| format!("notes dir: {e}"))?;
     Ok(dir)
 }
@@ -87,7 +88,7 @@ pub(crate) fn append<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         // Notes are shared durable state — a private conversation writes
         // nothing to them (the tool is auto-allowed, so no card would
         // otherwise stand between the model and the file).
-        if ctx.runtime.session_private() {
+        if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
             return Err("this is a private conversation — notes are off here; /new first".into());
         }
         let file = args["file"].as_str().ok_or("missing 'file'")?;

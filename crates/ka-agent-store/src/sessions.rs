@@ -7,9 +7,17 @@ impl Store {
     /// Persist a brand-new session.
     pub fn insert_session(&self, s: &Session) -> Result<()> {
         let conn = self.lock();
+        // `sessions.username` references `users`: a session never outlives
+        // its person, so the row exists first (an idempotent upsert — a user
+        // row is never deleted).
         conn.execute(
-            "INSERT INTO sessions(id, workspace, strand_id, strand_path, status, private, created_ms, updated_ms, role)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR IGNORE INTO users(username, display_name, role, created_ms, created_by)
+             VALUES (?1, ?1, ?2, ?3, 'session')",
+            params![s.username, s.role, ka_agent_core::now_ms()],
+        )?;
+        conn.execute(
+            "INSERT INTO sessions(id, workspace, strand_id, strand_path, status, private, created_ms, updated_ms, role, username)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 s.id.as_str(),
                 s.workspace.to_string_lossy(),
@@ -19,7 +27,8 @@ impl Store {
                 s.private as i64,
                 s.created_ms,
                 s.updated_ms,
-                s.role
+                s.role,
+                s.username
             ],
         )?;
         Ok(())
@@ -71,8 +80,7 @@ impl Store {
     pub fn get_session(&self, id: &SessionId) -> Result<Session> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
-             FROM sessions WHERE id = ?1",
+            &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
             params![id.as_str()],
             row_to_session,
         )
@@ -84,23 +92,58 @@ impl Store {
     pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
-             FROM sessions ORDER BY updated_ms DESC LIMIT ?1",
+            &format!(
+                "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC LIMIT ?1"
+            ),
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_session)?;
         collect_rows(rows)
     }
 
-    /// The most recently updated session of one role (`/resume` after a
-    /// role switch; `admin` included).
-    pub fn latest_session_for_role(&self, role: &str) -> Result<Option<Session>> {
+    /// The most recently updated session of one user (their partition).
+    ///
+    /// Every session bound to a username (sandbox mounting needs the full
+    /// set of out-of-tree workspaces the user's sessions use).
+    pub fn sessions_for_user(&self, username: &str) -> Result<Vec<Session>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
-             FROM sessions WHERE role = ?1 ORDER BY updated_ms DESC LIMIT 1",
-        )?;
-        let rows = stmt.query_map(params![role], row_to_session)?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE username = ?1
+             ORDER BY updated_ms DESC"
+        ))?;
+        let rows = stmt.query_map(params![username], row_to_session)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn latest_session_for_user(&self, username: &str) -> Result<Option<Session>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE username = ?1
+             ORDER BY updated_ms DESC LIMIT 1"
+        ))?;
+        let rows = stmt.query_map(params![username], row_to_session)?;
         collect_rows(rows).map(|mut v| v.pop())
+    }
+
+    /// Repoint a session's workspace (the v12 bootstrap migrates legacy
+    /// `roles/<r>/workspace` rows to the user partition).
+    pub fn set_session_workspace(&self, id: &SessionId, workspace: &Path) -> Result<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE sessions SET workspace = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![
+                id.as_str(),
+                workspace.to_string_lossy(),
+                ka_agent_core::now_ms()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id)));
+        }
+        Ok(())
     }
 
     /// Bind (or rebind) a session to a Ka strand.
@@ -143,8 +186,7 @@ impl Store {
         // Best-effort: a concurrent reader can hold the checkpoint busy.
         let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
         let mut stmt = conn.prepare(
-            "SELECT id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role
-             FROM sessions WHERE private = 1",
+            &format!("SELECT {SESSION_COLS} FROM sessions WHERE private = 1"),
         )?;
         let rows = stmt.query_map([], row_to_session)?;
         collect_rows(rows)
@@ -238,21 +280,22 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_found_by_role() {
+    fn sessions_are_found_by_user() {
         let store = Store::open_in_memory().unwrap();
         let admin = session();
-        let guest = Session::new_for_role(std::path::PathBuf::from("/tmp/guest"), "guest");
+        let guest = Session::new_for_user(std::path::PathBuf::from("/tmp/guest"), "guest", "guest");
         store.insert_session(&admin).unwrap();
         store.insert_session(&guest).unwrap();
 
         assert_eq!(store.get_session(&guest.id).unwrap().role, "guest");
-        let found = store.latest_session_for_role("guest").unwrap().unwrap();
+        assert_eq!(store.get_session(&guest.id).unwrap().username, "guest");
+        let found = store.latest_session_for_user("guest").unwrap().unwrap();
         assert_eq!(found.id, guest.id);
         assert_eq!(
-            store.latest_session_for_role("admin").unwrap().unwrap().id,
+            store.latest_session_for_user("operator").unwrap().unwrap().id,
             admin.id
         );
-        assert!(store.latest_session_for_role("nobody").unwrap().is_none());
+        assert!(store.latest_session_for_user("nobody").unwrap().is_none());
         // The unfiltered listing still sees both.
         assert_eq!(store.list_recent_sessions(10).unwrap().len(), 2);
     }

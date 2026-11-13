@@ -214,7 +214,7 @@ async fn commands_route_locally() {
         .expect("unknown command answered locally");
     assert!(unknown.body["text"].as_str().is_some());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let session = stack.runtime.session_id();
+    let session = stack.runtime.session_id_for(&op()).unwrap();
     assert!(
         stack
             .store
@@ -283,7 +283,7 @@ async fn photo_lands_in_attachments_with_ref() {
         .expect("attachment ack with @ref");
     let text = reply.body["text"].as_str().unwrap_or("");
     assert!(text.contains("saved attachments/"), "reply: {text}");
-    let dir = stack.runtime.workspace().join("attachments");
+    let dir = stack.runtime.workspace_for(&op()).join("attachments");
     let saved = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()
@@ -320,7 +320,7 @@ async fn document_name_sanitized_and_missing_file_reported() {
         .expect("document ack");
     let text = reply.body["text"].as_str().unwrap_or("");
     assert!(!text.contains(".."), "sanitized: {text}");
-    let dir = stack.runtime.workspace().join("attachments");
+    let dir = stack.runtime.workspace_for(&op()).join("attachments");
     let names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()
@@ -1348,7 +1348,7 @@ async fn effort_picker_sets_the_level() {
         )
         .expect("level settles the card");
     assert!(keyboard_is_gone(&settled));
-    assert_eq!(stack.runtime.effort(), Some("high".to_string()));
+    assert_eq!(stack.runtime.effort(&op()), Some("high".to_string()));
     stop(&mut stack).await;
 }
 
@@ -1942,7 +1942,7 @@ async fn album_of_three_photos_gets_one_ack_naming_every_ref() {
         })
         .count();
     assert_eq!(acks, 1, "exactly one ack for the album");
-    let dir = stack.runtime.workspace().join("attachments");
+    let dir = stack.runtime.workspace_for(&op()).join("attachments");
     let files = std::fs::read_dir(&dir).unwrap().flatten().count();
     assert_eq!(files, 3, "every album member lands on disk");
     stop(&mut stack).await;
@@ -1987,7 +1987,7 @@ async fn album_with_caption_submits_one_turn_not_per_photo_acks() {
         c.method == "sendMessage" && c.body["text"].as_str().unwrap_or("").contains("saved")
     });
     assert!(!acks, "a captioned album is not answered with acks");
-    let dir = stack.runtime.workspace().join("attachments");
+    let dir = stack.runtime.workspace_for(&op()).join("attachments");
     let files = std::fs::read_dir(&dir).unwrap().flatten().count();
     assert_eq!(files, 3, "every album member lands on disk");
     stop(&mut stack).await;
@@ -2424,7 +2424,7 @@ async fn send_retries_once_on_flood_control() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_picker_removes_one_item() {
     let mut stack = spawn_channel(vec![42], "tok-qp").await;
-    let sid = stack.runtime.session_id();
+    let sid = stack.runtime.session_id_for(&op()).unwrap();
     let item = ka_agent_core::QueueItem::new(sid.clone(), "queued question".into(), "telegram:42");
     stack.store.enqueue(&item).unwrap();
     stack.server.push_text_message(1, 7, 42, "/queue");
@@ -2468,7 +2468,7 @@ async fn forget_picker_forgets_one_memory() {
     let mut stack = spawn_channel(vec![42], "tok-fp").await;
     stack
         .runtime
-        .remember("allergic to shellfish", "telegram:42")
+        .remember("allergic to shellfish", "telegram:42", &op())
         .unwrap();
     stack.server.push_text_message(1, 7, 42, "/forget");
     let card = stack
@@ -2502,7 +2502,7 @@ async fn forget_picker_forgets_one_memory() {
         )
         .expect("forget toasted");
     assert!(
-        stack.runtime.memory_entries().unwrap().is_empty(),
+        stack.runtime.memory_entries(&op()).unwrap().is_empty(),
         "the memory is gone"
     );
     stop(&mut stack).await;
@@ -2545,7 +2545,7 @@ async fn skills_picker_lists_pending_proposals() {
 #[tokio::test(flavor = "multi_thread")]
 async fn history_picker_shows_turn_detail() {
     let mut stack = spawn_channel(vec![42], "tok-hp").await;
-    let sid = stack.runtime.session_id();
+    let sid = stack.runtime.session_id_for(&op()).unwrap();
     let turn = ka_agent_core::Turn::new(sid.clone(), "what about volcanoes".into());
     stack.store.insert_turn(&turn).unwrap();
     stack
@@ -2601,7 +2601,7 @@ async fn history_picker_shows_turn_detail() {
 #[tokio::test(flavor = "multi_thread")]
 async fn approvals_picker_renders_and_answers() {
     let mut stack = spawn_channel(vec![42], "tok-ap").await;
-    let sid = stack.runtime.session_id();
+    let sid = stack.runtime.session_id_for(&op()).unwrap();
     let approval = ka_agent_core::Approval::new(
         sid.clone(),
         ka_agent_core::TurnId::generate(),
@@ -2647,6 +2647,11 @@ async fn approvals_picker_renders_and_answers() {
 /// `/update`: without a host hook it refuses with the manual remedy;
 /// with one, the reply flows verbatim (the hook owns the permission
 /// gate and release machinery).
+/// The operator: the principal every local surface acts as.
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn update_command_refuses_without_hook_and_dispatches_with_one() {
     let mut stack = spawn_channel(vec![42], "tok-upd").await;

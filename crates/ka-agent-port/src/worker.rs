@@ -407,6 +407,15 @@ async fn open_engine(
             "KA_AGENT_DATA_DIR".to_string(),
             data_dir.to_string_lossy().into_owned(),
         );
+        // Per-user tool context: the relay attributes each call so the
+        // daemon resolves notes/memory/history/KB access for THIS user even
+        // while other users' turns run (ADR-0004).
+        if let Some(user) = std::env::var_os("KA_AGENT_TOOLCTX") {
+            mcp_env.insert(
+                "KA_AGENT_TOOLCTX".to_string(),
+                user.to_string_lossy().into_owned(),
+            );
+        }
         cfg.mcp.push(ka_engine::mcp::McpServerConfig {
             name: "kagent".to_string(),
             command: Some(exe.to_string_lossy().into_owned()),

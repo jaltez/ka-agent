@@ -67,6 +67,38 @@ impl Store {
         .map_err(|e| e.into())
     }
 
+    /// Mark every intent stuck in `executing` as `unknown` (a crash between
+    /// the external write and its result recording): the next proposal with
+    /// the same content surfaces a confirmation card instead of executing
+    /// again. Returns the reconciled intents.
+    pub fn reconcile_executing_intents(&self) -> Result<Vec<IntentRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, tool, args_hash, status, external_ref, summary, created_ms, updated_ms
+             FROM intents WHERE status = 'executing'",
+        )?;
+        let stuck = collect_rows(stmt.query_map([], |r| {
+            Ok(IntentRow {
+                id: r.get(0)?,
+                tool: r.get(1)?,
+                args_hash: r.get(2)?,
+                status: r.get(3)?,
+                external_ref: r.get(4)?,
+                summary: r.get(5)?,
+                created_ms: r.get(6)?,
+                updated_ms: r.get(7)?,
+            })
+        })?)?;
+        drop(stmt);
+        if !stuck.is_empty() {
+            conn.execute(
+                "UPDATE intents SET status = 'unknown', updated_ms = ?1 WHERE status = 'executing'",
+                params![ka_agent_core::now_ms()],
+            )?;
+        }
+        Ok(stuck)
+    }
+
     /// Recent intents (for reporting).
     pub fn recent_intents(&self, limit: usize) -> Result<Vec<IntentRow>> {
         let conn = self.lock();
@@ -95,6 +127,35 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn executing_intents_reconcile_to_unknown() {
+        let store = Store::open_in_memory().unwrap();
+        let row = |id: &str, status: &str| IntentRow {
+            id: id.into(),
+            tool: "github.create_issue".into(),
+            args_hash: format!("h-{id}"),
+            status: status.into(),
+            external_ref: None,
+            summary: None,
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        store.insert_intent(&row("i1", "executing")).unwrap();
+        store.insert_intent(&row("i2", "done")).unwrap();
+        let reconciled = store.reconcile_executing_intents().unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].id, "i1");
+        // The row is now `unknown`: a re-proposal with the same content finds
+        // it as the active intent (the confirmation card path).
+        let active = store
+            .active_intent_by_hash("github.create_issue", "h-i1")
+            .unwrap()
+            .expect("the unknown intent stays active");
+        assert_eq!(active.status, "unknown");
+        // A second pass is a no-op.
+        assert!(store.reconcile_executing_intents().unwrap().is_empty());
+    }
 
     #[test]
     fn intent_lifecycle() {

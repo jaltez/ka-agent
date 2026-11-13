@@ -13,7 +13,7 @@ pub(super) fn run_skills<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             "review" | "accept" | "reject" => return skill_review(ctx, verb, arg).await,
             _ => {}
         }
-        let enabled = ctx.runtime.skills_enabled();
+        let enabled = ctx.runtime.skills_enabled(&ctx.principal);
         let reply = if enabled.is_empty() {
             "no skills enabled — `ka-agent skills enable <name>` provisions one".to_string()
         } else {
@@ -38,7 +38,7 @@ pub(super) fn run_skill<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let rest = ctx.args;
         match rest.split_once(' ') {
             Some((name, prompt)) if !name.is_empty() && !prompt.is_empty() => {
-                match ctx.runtime.handle_skill(name, prompt, ctx.source).await {
+                match ctx.runtime.handle_skill(name, prompt, ctx.source, &ctx.principal).await {
                     // The turn itself streams back through the surface.
                     Ok(()) => Outcome::Silent,
                     Err(e) => Outcome::Reply(format!("! [skill] {e}")),
@@ -47,7 +47,7 @@ pub(super) fn run_skill<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             _ => {
                 // No usable arguments: list what a `/skill <name> <text>`
                 // turn can load (the same inventory `/skills` shows).
-                let enabled = ctx.runtime.skills_enabled();
+                let enabled = ctx.runtime.skills_enabled(&ctx.principal);
                 if enabled.is_empty() {
                     return Outcome::Reply(
                         "no skills enabled — `ka-agent skills enable <name>` provisions one".into(),
@@ -127,7 +127,7 @@ async fn skill_review(ctx: Ctx<'_>, verb: &str, arg: &str) -> Outcome {
             if let Err(e) = store.set_skill_candidate_status(&one.id, "accepted") {
                 return Outcome::Reply(format!("! [skills] {e}"));
             }
-            match ctx.runtime.enable_skill(&one.name) {
+            match ctx.runtime.enable_skill(&one.name, &ctx.principal) {
                 Ok(true) => Outcome::Reply(format!(
                     "installed and enabled skill {} — /skill:{} uses it",
                     one.name, one.name

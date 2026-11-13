@@ -90,8 +90,135 @@ impl Paths {
         Ok(())
     }
 
-    /// One role's root: `admin` is the profile root itself (zero
-    /// migration); every other role owns `<root>/roles/<name>`.
+    /// The `users/` tree every non-operator user owns a subdirectory of.
+    pub fn users_root(&self) -> PathBuf {
+        self.root.join("users")
+    }
+
+    /// One user's root: the operator keeps the profile root itself (zero
+    /// migration); everyone else owns `<root>/users/<username>`.
+    pub fn user_root(&self, username: &str) -> PathBuf {
+        if username == ka_agent_core::OPERATOR_USER {
+            self.root.clone()
+        } else {
+            self.users_root().join(username)
+        }
+    }
+
+    /// The user's memory root (disjoint from every other user's).
+    pub fn user_memory(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("memory")
+    }
+
+    /// The user's notes directory (`kagent__notes_*`).
+    pub fn user_notes(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("notes")
+    }
+
+    /// The user's attachments (engine files, private-session media).
+    pub fn user_attachments(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("attachments")
+    }
+
+    /// The user's synthetic HOME (compiled MEMORY.md/IDENTITY.md, skills).
+    pub fn user_engine_home(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("engine-home")
+    }
+
+    /// The user's XDG_STATE_HOME (spills, trust store, detached jobs).
+    pub fn user_engine_state(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("engine-state")
+    }
+
+    /// The user's `KA_DATA_DIR` (strands, waypoints, index).
+    pub fn user_ka_data(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("ka")
+    }
+
+    /// The user's XDG_CACHE_HOME (feeds the sandbox allowlist).
+    pub fn user_engine_cache(&self, username: &str) -> PathBuf {
+        self.user_engine_home(username).join(".cache")
+    }
+
+    /// The user's default workspace (`<user root>/workspace`).
+    pub fn user_workspace(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("workspace")
+    }
+
+    /// Create one user's tree, 0700 like the rest. Idempotent; the operator
+    /// is the profile root already covered by [`Self::ensure_dirs`].
+    pub fn ensure_user_dirs(&self, username: &str) -> std::io::Result<()> {
+        if username == ka_agent_core::OPERATOR_USER {
+            return self.ensure_dirs();
+        }
+        for dir in [
+            self.user_root(username),
+            self.user_memory(username),
+            self.user_workspace(username),
+            self.user_notes(username),
+            self.user_attachments(username),
+            self.user_ka_data(username),
+            self.user_engine_home(username).join(".config/ka"),
+            self.user_engine_cache(username),
+            self.user_engine_state(username),
+        ] {
+            std::fs::create_dir_all(dir)?;
+        }
+        restrict_dir(&self.user_root(username))?;
+        restrict_dir(&self.users_root())?;
+        Ok(())
+    }
+
+    /// Move the pre-users `<root>/roles/<name>` trees to their user
+    /// partitions (`<root>/users/<name>`) once. Idempotent: a tree moves only
+    /// when the source exists and the target does not, and a failed move
+    /// leaves the source in place. Returns what moved.
+    pub fn migrate_role_trees(&self) -> std::io::Result<Vec<(String, PathBuf)>> {
+        let roles = self.root.join("roles");
+        let users = self.users_root();
+        let mut moved = Vec::new();
+        let entries = match std::fs::read_dir(&roles) {
+            Ok(e) => e,
+            Err(_) => return Ok(moved),
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = match entry.file_name().to_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            // `admin` was never a directory (it is the profile root).
+            if name == ka_agent_core::ADMIN_ROLE {
+                continue;
+            }
+            let target = users.join(&name);
+            if target.exists() {
+                continue;
+            }
+            std::fs::create_dir_all(&users)?;
+            match std::fs::rename(entry.path(), &target) {
+                Ok(()) => moved.push((name, target)),
+                Err(_) => {
+                    // Different filesystems: copy then remove the source. A
+                    // failed copy leaves a partial target that would block
+                    // every later retry, so remove it and surface the error.
+                    if let Err(e) = copy_tree(&entry.path(), &target) {
+                        let _ = std::fs::remove_dir_all(&target);
+                        return Err(e);
+                    }
+                    let _ = std::fs::remove_dir_all(entry.path());
+                    moved.push((name, target));
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    /// One role's root: `admin` is the profile root itself; every other role
+    /// owns `<root>/roles/<name>`. Roles are permission sets now, but the
+    /// pre-users trees still exist and are moved to `users/` at bootstrap.
     pub fn role_root(&self, role: &str) -> PathBuf {
         if role == ka_agent_core::ADMIN_ROLE {
             self.root.clone()
@@ -228,6 +355,21 @@ impl InstanceLock {
         }
         matches!(Self::acquire(paths), Err(LockError::Held(_)))
     }
+}
+
+/// Recursive copy (the fallback when a rename crosses filesystems).
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -8,8 +8,8 @@ impl Store {
     pub fn insert_approval(&self, a: &Approval) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO approvals(id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO approvals(id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms, username, escalated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 a.id.as_str(),
                 a.session.as_str(),
@@ -18,7 +18,9 @@ impl Store {
                 status_str(&a.status),
                 a.expires_at_ms,
                 a.decided_at_ms,
-                a.created_ms
+                a.created_ms,
+                a.username,
+                a.escalated as i64
             ],
         )?;
         Ok(())
@@ -28,7 +30,7 @@ impl Store {
     pub fn pending_approvals(&self, session: &SessionId) -> Result<Vec<Approval>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms
+            "SELECT id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms, username, escalated
              FROM approvals WHERE session = ?1 AND status = 'pending'
              ORDER BY created_ms",
         )?;
@@ -36,11 +38,37 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Pending approvals addressed to one user (their self-scope cards).
+    pub fn pending_approvals_for_user(&self, username: &str) -> Result<Vec<Approval>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms, username, escalated
+             FROM approvals
+             WHERE status = 'pending' AND username = ?1 AND escalated = 0
+             ORDER BY created_ms",
+        )?;
+        let rows = stmt.query_map(params![username], row_to_approval)?;
+        collect_rows(rows)
+    }
+
+    /// Pending escalations: cards only the admin may decide (D9).
+    pub fn escalated_approvals(&self, limit: usize) -> Result<Vec<Approval>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms, username, escalated
+             FROM approvals
+             WHERE status = 'pending' AND (escalated = 1 OR username IS NULL)
+             ORDER BY created_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_approval)?;
+        collect_rows(rows)
+    }
+
     /// Fetch one approval by id.
     pub fn get_approval(&self, id: &ApprovalId) -> Result<Approval> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms
+            "SELECT id, session, turn, kind_json, status, expires_at_ms, decided_at_ms, created_ms, username, escalated
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_approval,

@@ -17,6 +17,7 @@ pub mod labels;
 pub mod layout;
 pub mod markdown;
 pub mod outbox;
+pub mod principal;
 pub mod queue;
 pub mod secret;
 pub mod session;
@@ -30,11 +31,12 @@ pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
 pub use config::{
     Approvals, Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Notify,
-    RoleSpec, Search, Tools, TurnWatchdog, Voice, Web, WorkerRestart, valid_feature_spec,
-    valid_role_name,
+    Channels, DiscordSettings, Retention, RoleSpec, RuntimeSettings, Search, SlackSettings, Tools, TurnWatchdog, Voice, Web, WorkerRestart,
+    valid_feature_spec, valid_role_name,
 };
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
+pub use principal::Principal;
 pub use queue::QueueItem;
 pub use session::{Session, SessionStatus};
 pub use task::{CronMode, CronSpec, Task, TaskStatus};
@@ -48,6 +50,14 @@ pub const ADMIN_ROLE: &str = "admin";
 
 pub(crate) fn admin_role() -> String {
     ADMIN_ROLE.to_string()
+}
+
+/// The operator's username: the user every local surface and every
+/// pre-users row belongs to (ADR-0004).
+pub const OPERATOR_USER: &str = "operator";
+
+pub(crate) fn operator_user() -> String {
+    OPERATOR_USER.to_string()
 }
 
 /// True when `source` names a local surface — the terminal (`console`),

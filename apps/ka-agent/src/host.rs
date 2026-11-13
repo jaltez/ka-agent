@@ -135,6 +135,35 @@ impl Host {
         } else {
             None
         };
+        // Slack (workspace app): resolved before the runtime so its surface
+        // joins the fan-out; the connector itself starts after the runtime
+        // exists.
+        let slack_parts = if opts.channels && cfg.slack.enabled {
+            let secrets = paths.root().join("secrets");
+            let Some(scfg) = ka_agent_channels::slack::SlackConfig::from_config(&cfg, &secrets)
+                .map_err(|e| format!("ka-agent: {e}"))?
+            else {
+                return Err("ka-agent: slack.enabled is set but the Slack config could not be resolved".into());
+            };
+            let parts = ka_agent_channels::slack::SlackParts::new(&scfg);
+            Some((scfg, parts))
+        } else {
+            None
+        };
+        // Discord: same shape (surface first, connector after the runtime).
+        let discord_parts = if opts.channels && cfg.discord.enabled {
+            let secrets = paths.root().join("secrets");
+            let Some(dcfg) =
+                ka_agent_channels::discord::DiscordConfig::from_config(&cfg, &secrets)
+                    .map_err(|e| format!("ka-agent: {e}"))?
+            else {
+                return Err("ka-agent: discord.enabled is set but the Discord config could not be resolved".into());
+            };
+            let parts = ka_agent_channels::discord::DiscordParts::new(&dcfg);
+            Some((dcfg, parts))
+        } else {
+            None
+        };
         // Surfaces fan out: the journal (daemon), the event bus (attached
         // terminals, the web chat, and the local chat's own reader), and
         // every enabled channel.
@@ -184,6 +213,12 @@ impl Host {
             surfaces.push(s.clone());
             s
         });
+        if let Some((_, parts)) = &slack_parts {
+            surfaces.push(parts.surface());
+        }
+        if let Some((_, parts)) = &discord_parts {
+            surfaces.push(parts.surface());
+        }
         // Operator hooks ride the fan-out (agent events only; engine
         // events were composed into the engine layer).
         if !cfg.hooks.is_empty() {
@@ -249,7 +284,10 @@ impl Host {
             println!(
                 "ka-agent run · {} is awake · session {} · data {}",
                 name,
-                runtime.session_id(),
+                runtime
+                    .session_id_for(&ka_agent_core::Principal::operator())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
                 paths.root().display()
             );
         }
@@ -384,6 +422,143 @@ impl Host {
                     cfg.matrix.homeserver.clone().unwrap_or_default()
                 );
             }
+        }
+
+        if let Some((_, parts)) = &slack_parts {
+            parts.attach_runtime(&runtime);
+        }
+        if let Some((_, parts)) = &discord_parts {
+            parts.attach_runtime(&runtime);
+        }
+        if let Some((scfg, parts)) = slack_parts {
+            let teams = scfg.teams.clone();
+            let channel = std::sync::Arc::new(ka_agent_channels::slack::SlackChannel::new(
+                scfg,
+                runtime.clone(),
+                Arc::clone(&store),
+                parts,
+            ));
+            if opts.channels {
+                println!("slack channel on workspace(s) {}", teams.join(", "));
+            }
+            tasks.push(tokio::spawn(channel.run(shutdown_rx.clone())));
+        }
+
+        if let Some((dcfg, parts)) = discord_parts {
+            let guilds = dcfg.guilds.clone();
+            let channel = std::sync::Arc::new(ka_agent_channels::discord::DiscordChannel::new(
+                dcfg,
+                runtime.clone(),
+                Arc::clone(&store),
+                parts,
+            ));
+            if opts.channels {
+                println!("discord channel on guild(s) {}", guilds.join(", "));
+            }
+            tasks.push(tokio::spawn(channel.run(shutdown_rx.clone())));
+        }
+
+        // Knowledge-base syncs: the runtime asks on every maintenance tick;
+        // this hook decides which sources are due and runs one connector per
+        // source, pausing a source (with a notice) when it fails.
+        {
+            let store = Arc::clone(&store);
+            let paths = paths.clone();
+            let rt = runtime.clone();
+            // One sync per source at a time: a slow connector must not run
+            // concurrently with its own next tick.
+            let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+            runtime.set_kb_sync(Arc::new(move || {
+                let store = Arc::clone(&store);
+                let secrets = paths.root().join("secrets");
+                let rt = rt.clone();
+                let in_flight = std::sync::Arc::clone(&in_flight);
+                let Ok(sources) = store.list_kb_sources() else {
+                    return;
+                };
+                let now = ka_agent_core::now_ms();
+                for src in sources {
+                    let key = format!(
+                        "kbsync:last:{}:{}:{}",
+                        src.kb_name, src.kind, src.target
+                    );
+                    let error_key = format!("{key}:error");
+                    let last: i64 = store
+                        .meta_get(&key)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if now - last < src.schedule_ms.max(60_000) {
+                        continue;
+                    }
+                    // A failing source stays paused until an operator looks
+                    // (`ka-agent kb source sync` clears it).
+                    if store.meta_get(&error_key).ok().flatten().is_some_and(|e| !e.is_empty()) {
+                        continue;
+                    }
+                    store.meta_set(&key, &now.to_string()).ok();
+                    if !in_flight.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
+                        continue;
+                    }
+                    let store = Arc::clone(&store);
+                    let secrets = secrets.clone();
+                    let rt = rt.clone();
+                    let in_flight = std::sync::Arc::clone(&in_flight);
+                    tokio::spawn(async move {
+                        let result =
+                            ka_agent_channels::kbsync::sync(&store, &src, &secrets).await;
+                        in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&key);
+                        match result {
+                            Ok(report) => {
+                                store.meta_set(&error_key, "").ok();
+                                let mut rec = ka_agent_core::AuditRecord::new(
+                                    "kbsync",
+                                    "kb.sync",
+                                    &format!("{}:{}", report.kb, src.kind),
+                                    Some(format!(
+                                        "{} indexed, {} unchanged, {} removed",
+                                        report.indexed, report.unchanged, report.removed
+                                    )),
+                                );
+                                let _ = store.append_audit(&mut rec);
+                            }
+                            Err(e) => {
+                                store.meta_set(&error_key, &e).ok();
+                                let mut rec = ka_agent_core::AuditRecord::new(
+                                    "kbsync",
+                                    "kb.sync_failed",
+                                    &format!("{}:{}", src.kb_name, src.kind),
+                                    Some(e.clone()),
+                                );
+                                let _ = store.append_audit(&mut rec);
+                                rt.emit(ka_agent_runtime::AgentEvent::Notice {
+                                    text: format!(
+                                        "knowledge sync paused for {} ({}): {e} — fix it and run `ka-agent kb source sync {} {}`{}",
+                                        src.kb_name,
+                                        src.kind,
+                                        src.kb_name,
+                                        src.kind,
+                                        if e.contains("secret") || e.contains("token") || e.contains("401") || e.contains("403")
+                                        {
+                                            format!(
+                                                " (check the token file under {})",
+                                                secrets.display()
+                                            )
+                                        } else {
+                                            String::new()
+                                        }
+                                    ),
+                                });
+                            }
+                        }
+                    });
+                }
+            }));
         }
 
         // Admin socket: newline-delimited JSON. The lock above proves a

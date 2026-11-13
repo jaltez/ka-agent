@@ -34,6 +34,9 @@ pub struct WorkerEnv {
     pub guard_write: Vec<PathBuf>,
     /// Paths the engine's file tools may never read (`__guard` list).
     pub guard_read: Vec<PathBuf>,
+    /// The acting user's name, pinned into the MCP bridge's env so its relay
+    /// attributes every tool call (per-user context under concurrency).
+    pub tool_context: Option<String>,
     /// Grant decisions the `__guard` hook enforces or pre-approves.
     pub guard_grants: GuardGrants,
 }
@@ -110,6 +113,9 @@ impl WorkerEnv {
             && let Ok(joined) = std::env::join_paths(&self.guard_read)
         {
             cmd.env("KA_AGENT_GUARD_READ", joined);
+        }
+        if let Some(user) = &self.tool_context {
+            cmd.env("KA_AGENT_TOOLCTX", user);
         }
         // Always sent (all-false by default): the hook's parser treats
         // absence as all-false, so older daemons stay compatible.
@@ -189,6 +195,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
         let env = WorkerEnv {
+            tool_context: None,
             home: root.join("home"),
             data_dir: root.join("ka"),
             state_dir: root.join("state"),
@@ -242,6 +249,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
         let env = WorkerEnv {
+            tool_context: None,
             home: root.join("home"),
             guard_grants: GuardGrants {
                 install: true,

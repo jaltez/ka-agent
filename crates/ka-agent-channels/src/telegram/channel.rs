@@ -191,7 +191,14 @@ impl TelegramChannel {
         // chat they wait for the operator's first message.
         let recover = self
             .store
-            .pending_chunks_for_session(&self.runtime.session_id())
+            .latest_session_for_user(ka_agent_core::OPERATOR_USER)
+            .ok()
+            .flatten()
+            .map(|s| {
+                self.store
+                    .pending_chunks_for_session(&s.id)
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
         if !recover.is_empty() {
             eprintln!("telegram: recovered {} queued chunk(s)", recover.len());
@@ -320,11 +327,15 @@ impl TelegramChannel {
         chat_type: &str,
         unauthorized_last: &mut HashMap<i64, i64>,
     ) -> bool {
+        // Resolution-based: an enabled linked identity passes; a *disabled*
+        // account is refused silently (no re-pair hint — its identity exists,
+        // the account is just off), and only a truly unlinked sender is
+        // routed to the pairing flow by the caller.
         let linked = chat_type == "private"
             && self
-                .store
-                .is_linked("telegram", &uid.to_string())
-                .unwrap_or(false);
+                .runtime
+                .principal_for_source(&format!("telegram:{uid}"))
+                .is_some();
         if linked {
             return true;
         }
@@ -352,12 +363,19 @@ impl TelegramChannel {
     /// delivery), and as the last chat. Persists it when it changed and
     /// flushes chunks recovered while no chat was known.
     async fn adopt_chat(&self, surface: &Arc<SurfaceInner>, uid: i64, chat_id: i64) {
-        if surface.set_chat_for(&format!("telegram:{uid}"), chat_id)
-            && let Err(e) = self
-                .store
-                .meta_set("telegram.chat_id", &chat_id.to_string())
-        {
-            eprintln!("telegram: persist chat id: {e}");
+        if surface.set_chat_for(&format!("telegram:{uid}"), chat_id) {
+            // The global fallback chat is the operator's alone: a member's
+            // DM must never become the target of recovered operator chunks.
+            if self
+                .runtime
+                .principal_for_source(&format!("telegram:{uid}"))
+                .is_some_and(|p| p.is_admin())
+                && let Err(e) = self
+                    .store
+                    .meta_set("telegram.chat_id", &chat_id.to_string())
+            {
+                eprintln!("telegram: persist chat id: {e}");
+            }
         }
         let pending =
             std::mem::take(&mut *self.undelivered.lock().unwrap_or_else(|e| e.into_inner()));
@@ -462,6 +480,10 @@ impl TelegramChannel {
         let Some(uid) = message["from"]["id"].as_i64() else {
             return;
         };
+        // Resolution, not a bare link check: only a sender with NO identity
+        // row reaches the pairing flow. A disabled account keeps its row
+        // (resolution fails) and falls through to `gate`, which refuses it
+        // silently with the audit row — no re-pair hint for an off account.
         if chat_type == "private"
             && let Some(text) = message["text"].as_str()
             && !self
@@ -502,11 +524,12 @@ impl TelegramChannel {
             // A single photo/document: saved and acknowledged. A caption
             // is the operator's message — it becomes the turn, the file
             // riding along as an `@reference` instead of a bare ack.
+            let who = self.who(uid);
             match crate::attachments::save_attachment(
                 &client,
-                &self.runtime.workspace(),
+                &self.runtime.workspace_for(&who),
                 message,
-                || self.runtime.private_session_token(),
+                || self.runtime.private_session_token_for(&who),
             )
             .await
             {
@@ -565,8 +588,8 @@ impl TelegramChannel {
         // `/cleanup`, a direct action) instead of the router's text
         // listing; every argument form still routes below.
         if let Some(cmd) = bare_picker_command(text) {
-            let source = format!("telegram:{uid}");
-            let role = self.runtime.role_for_source(&source);
+            let who = self.who(uid);
+            let role = who.role.clone();
             let name = cmd.trim_start_matches('/');
             // Pickers bypass the router's dispatch: gate them here too.
             if !crate::commands::allowed_for(&self.runtime, &role, name) {
@@ -579,13 +602,9 @@ impl TelegramChannel {
                     .await;
                 return;
             }
-            if !self.runtime.activate_role(&source).await {
+            if let Err(e) = self.runtime.ensure_user_state(&who) {
                 let _ = client
-                    .send_message(
-                        chat_id,
-                        "another conversation is running — try again when its turn finishes",
-                        None,
-                    )
+                    .send_message(chat_id, &format!("{e}"), None)
                     .await;
                 return;
             }
@@ -612,11 +631,13 @@ impl TelegramChannel {
                         let _ = client.set_message_reaction(chat_id, message_id, "👀").await;
                     });
                 }
-                let text = crate::refs::expand(&self.store, &self.runtime.workspace(), text).await;
-                if let Err(e) = self
-                    .runtime
-                    .handle_message(&text, &format!("telegram:{uid}"))
-                    .await
+                let who = self.who(uid);
+                let source = format!("telegram:{uid}");
+                let (text, refs) =
+                    crate::refs::expand(&self.store, &self.runtime.workspace_for(&who), &who, text)
+                        .await;
+                crate::refs::stage_sources(&self.store, &source, &refs);
+                if let Err(e) = self.runtime.handle_message(&text, &source).await
                 {
                     eprintln!("telegram: handle_message: {e}");
                 }
@@ -640,11 +661,12 @@ impl TelegramChannel {
         let Some(group_id) = message["media_group_id"].as_str() else {
             return;
         };
+        let who = self.who(uid);
         let rel = match crate::attachments::save_attachment(
             client,
-            &self.runtime.workspace(),
+            &self.runtime.workspace_for(&who),
             message,
-            || self.runtime.private_session_token(),
+            || self.runtime.private_session_token_for(&who),
         )
         .await
         {
@@ -718,6 +740,8 @@ impl TelegramChannel {
     /// ✅ / ✖ on a memory proposal: accept or reject, then turn the card
     /// into its outcome (buttons removed) so it cannot be pressed twice.
     async fn memory_callback(&self, cb: &Value, rest: &str) -> CallbackReply {
+        let uid = cb["from"]["id"].as_i64().unwrap_or(0);
+        let who = self.who(uid);
         let Some((short, verdict)) = rest.rsplit_once(':') else {
             return CallbackReply::none();
         };
@@ -728,12 +752,12 @@ impl TelegramChannel {
             .trim()
             .to_string();
         let (outcome, toast) = match verdict {
-            "y" => match self.runtime.accept_candidate(short) {
+            "y" => match self.runtime.accept_candidate(short, &who) {
                 Ok(true) => (format!("✅ Remembered: {text}"), "remembered"),
                 Ok(false) => (format!("(already decided) {text}"), "already decided"),
                 Err(e) => (format!("! [memory] {e}"), "error"),
             },
-            "n" => match self.runtime.reject_candidate(short) {
+            "n" => match self.runtime.reject_candidate(short, &who) {
                 Ok(true) => (format!("✖ Discarded: {text}"), "discarded"),
                 Ok(false) => (format!("(already decided) {text}"), "already decided"),
                 Err(e) => (format!("! [memory] {e}"), "error"),
@@ -816,7 +840,8 @@ impl TelegramChannel {
         // Model switching, memory review and skill installation are the
         // operator's, whatever card a subject happens to hold.
         let uid = cb["from"]["id"].as_i64().unwrap_or(0);
-        let role = self.runtime.role_for_source(&format!("telegram:{uid}"));
+        let who = self.who(uid);
+        let role = who.role.clone();
         let admin_only = data == "mx"
             || data.starts_with("mp:")
             || data.starts_with("mm:")
@@ -831,7 +856,7 @@ impl TelegramChannel {
         // `mx` — the ✕ on a `/model` card: collapse it to the current
         // model line, keyboard gone.
         if data == "mx" {
-            let head = crate::commands::model_header(&self.runtime).await;
+            let head = crate::commands::model_header(&self.runtime, &who).await;
             let line = head.lines().next().unwrap_or("model:").to_string();
             return CallbackReply::settle("", line);
         }
@@ -839,19 +864,19 @@ impl TelegramChannel {
         // `/model` card; `mp:<off>` (digits only) pages the provider grid.
         if let Some(rest) = data.strip_prefix("mp:") {
             if let Ok(off) = rest.parse::<usize>() {
-                return self.provider_page_reply(off).await;
+                return self.provider_page_reply(off, &who).await;
             }
             return match rest.split_once(':') {
-                None => self.vendor_page_reply(rest, 0).await,
+                None => self.vendor_page_reply(rest, 0, &who).await,
                 Some((vendor, off)) => match off.parse::<usize>() {
-                    Ok(off) => self.vendor_page_reply(vendor, off).await,
+                    Ok(off) => self.vendor_page_reply(vendor, off, &who).await,
                     Err(_) => CallbackReply::none(),
                 },
             };
         }
         // `mm:<vendor>:<idx>` — pick `models[idx]` of the provider.
         if let Some(rest) = data.strip_prefix("mm:") {
-            return self.model_pick_callback(rest).await;
+            return self.model_pick_callback(rest, &who).await;
         }
         // `mo:<mode>` — a `/mode` button. The phone may only tighten;
         // the refusal is the outcome (H1, same as `/mode <name>`).
@@ -862,7 +887,7 @@ impl TelegramChannel {
             let uid = cb["from"]["id"].as_i64().unwrap_or(0);
             return match self
                 .runtime
-                .set_mode(mode, &format!("telegram:{uid}"))
+                .set_mode(mode, &format!("telegram:{uid}"), &who)
                 .await
             {
                 Ok(m) => {
@@ -879,7 +904,7 @@ impl TelegramChannel {
             if !crate::commands::EFFORTS.contains(&level) {
                 return CallbackReply::none();
             }
-            return match self.runtime.set_effort(level).await {
+            return match self.runtime.set_effort(level, &who).await {
                 Ok(reply) => CallbackReply::settle(&toast_cap(&reply), reply),
                 Err(e) => {
                     CallbackReply::settle(&toast_cap(&e.to_string()), format!("! [effort] {e}"))
@@ -888,7 +913,7 @@ impl TelegramChannel {
         }
         // `retry:last` — the ↻ button on a rate_limit/network error.
         if data == "retry:last" {
-            return match self.runtime.retry_last().await {
+            return match self.runtime.retry_last(&who).await {
                 Ok(Some(text)) => {
                     let head: String = text.lines().next().unwrap_or("").chars().take(60).collect();
                     CallbackReply::toast(&format!("↻ re-sending \"{head}\""))
@@ -925,10 +950,9 @@ impl TelegramChannel {
             if !matches!(verdict, "y" | "n") {
                 return CallbackReply::none();
             }
-            let full = self
-                .store
-                .pending_approvals(&self.runtime.session_id())
-                .ok()
+            let sid = self.runtime.session_id_for(&who);
+            let full = sid
+                .and_then(|sid| self.store.pending_approvals(&sid).ok())
                 .and_then(|pending| {
                     pending
                         .into_iter()
@@ -963,7 +987,7 @@ impl TelegramChannel {
         }
         // `qx:<short12>` — remove one queued message (the `/queue` ✕).
         if let Some(rest) = data.strip_prefix("qx:") {
-            return match self.runtime.remove_queued(rest) {
+            return match self.runtime.remove_queued(rest, &who) {
                 Ok(true) => CallbackReply::toast("removed"),
                 Ok(false) => CallbackReply::toast("not queued (already turned)"),
                 Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
@@ -971,7 +995,7 @@ impl TelegramChannel {
         }
         // `qclr` — the `/queue` card's Clear all row.
         if data == "qclr" {
-            return match self.runtime.clear_queue() {
+            return match self.runtime.clear_queue(&who) {
                 Ok(0) => CallbackReply::settle("", "the queue is empty".into()),
                 Ok(n) => CallbackReply::settle("cleared", format!("cleared {n} queued message(s)")),
                 Err(e) => CallbackReply::settle("error", format!("! [queue] {e}")),
@@ -980,13 +1004,13 @@ impl TelegramChannel {
         // `fx:<short>` — forget one memory entry (the `/forget` ✖),
         // resolved by prefix exactly like `/forget <id>`.
         if let Some(rest) = data.strip_prefix("fx:") {
-            let entries = match self.runtime.memory_entries() {
+            let entries = match self.runtime.memory_entries(&who) {
                 Ok(e) => e,
                 Err(e) => return CallbackReply::toast(&toast_cap(&e.to_string())),
             };
             let hits: Vec<_> = entries.iter().filter(|e| id_matches(&e.id, rest)).collect();
             return match hits.as_slice() {
-                [one] => match self.runtime.forget(&one.id) {
+                [one] => match self.runtime.forget(&one.id, &who) {
                     Ok(true) => CallbackReply::toast(&format!("forgot {}", short_id(&one.id, 8))),
                     Ok(false) => CallbackReply::toast("already gone"),
                     Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
@@ -1000,7 +1024,8 @@ impl TelegramChannel {
             let Ok(off) = rest.parse::<usize>() else {
                 return CallbackReply::none();
             };
-            return match self.forget_card(off) {
+            let who = self.who(uid);
+            return match self.forget_card(off, &who) {
                 Some((text, markup)) => CallbackReply::page(text, markup),
                 None => CallbackReply::none(),
             };
@@ -1010,7 +1035,8 @@ impl TelegramChannel {
             let Ok(off) = rest.parse::<usize>() else {
                 return CallbackReply::none();
             };
-            return match self.history_card(off) {
+            let who = self.who(uid);
+            return match self.history_card(off, &who) {
                 Some((text, markup)) => CallbackReply::page(text, markup),
                 None => CallbackReply::none(),
             };
@@ -1024,7 +1050,7 @@ impl TelegramChannel {
             let Ok(off) = off_s.parse::<usize>() else {
                 return CallbackReply::none();
             };
-            return match self.runtime.history_show(short) {
+            return match self.runtime.history_show(short, &who) {
                 Ok(Some((inbound, answer))) => {
                     let detail = trunc_chars(&format!("> {inbound}\n{answer}"), 4000);
                     let text = cap_lines(&detail, 12);
@@ -1057,9 +1083,9 @@ impl TelegramChannel {
                 .map(|(full, _, _)| full.clone())
                 .or_else(|| {
                     // fallback: suffix match against pending approvals
-                    self.store
-                        .pending_approvals(&self.runtime.session_id())
-                        .ok()
+                    self.runtime
+                        .session_id_for(&who)
+                        .and_then(|sid| self.store.pending_approvals(&sid).ok())
                         .and_then(|pending| {
                             pending
                                 .into_iter()
@@ -1107,19 +1133,20 @@ impl TelegramChannel {
         surface: &Arc<SurfaceInner>,
         uid: i64,
     ) {
+        let who = self.who(uid);
         let (text, markup) = match cmd {
             "/mode" => {
-                let current = self.runtime.effective_mode();
+                let current = self.runtime.effective_mode_for(&who.username);
                 (format!("mode: {current}"), mode_keyboard(&current))
             }
             "/effort" => {
                 let current = self
                     .runtime
-                    .effort()
+                    .effort(&who)
                     .unwrap_or_else(|| "model default".into());
                 (format!("effort: {current}"), effort_keyboard(&current))
             }
-            "/approvals" => match self.approvals_card() {
+            "/approvals" => match self.approvals_card(&who) {
                 Some(card) => card,
                 None => {
                     let _ = client
@@ -1128,7 +1155,7 @@ impl TelegramChannel {
                     return;
                 }
             },
-            "/queue" => match self.queue_card() {
+            "/queue" => match self.queue_card(&who) {
                 Some(card) => card,
                 None => {
                     let _ = client
@@ -1137,7 +1164,7 @@ impl TelegramChannel {
                     return;
                 }
             },
-            "/forget" => match self.forget_card(0) {
+            "/forget" => match self.forget_card(0, &who) {
                 Some(card) => card,
                 None => {
                     let _ = client
@@ -1147,7 +1174,7 @@ impl TelegramChannel {
                 }
             },
             "/skills" => self.skills_card(uid).await,
-            "/history" => match self.history_card(0) {
+            "/history" => match self.history_card(0, &who) {
                 Some(card) => card,
                 None => {
                     let _ = client
@@ -1169,7 +1196,7 @@ impl TelegramChannel {
                 };
                 let text = format!(
                     "{}\n{line}",
-                    crate::commands::model_header(&self.runtime).await
+                    crate::commands::model_header(&self.runtime, &who).await
                 );
                 (text, provider_grid(&listing, 0))
             }
@@ -1224,8 +1251,16 @@ impl TelegramChannel {
 
     /// The `/approvals` card: one line per pending approval, one
     /// Allow/Deny row per item (`ap:<short12>:y|n`), ✕ close.
-    fn approvals_card(&self) -> Option<(String, Value)> {
-        let cards = self.runtime.pending_approval_cards().ok()?;
+    /// Who a Telegram uid acts as (an unlinked uid never reaches here: both
+    /// the message and callback paths gate on the identity link first).
+    fn who(&self, uid: i64) -> ka_agent_core::Principal {
+        self.runtime
+            .principal_for_source(&format!("telegram:{uid}"))
+            .unwrap_or_else(ka_agent_core::Principal::operator)
+    }
+
+    fn approvals_card(&self, who: &ka_agent_core::Principal) -> Option<(String, Value)> {
+        let cards = self.runtime.pending_approval_cards(who).ok()?;
         if cards.is_empty() {
             return None;
         }
@@ -1257,8 +1292,8 @@ impl TelegramChannel {
 
     /// The `/queue` card: one line per queued message, a ✕ per row
     /// (`qx:<short12>`) and a Clear all row.
-    fn queue_card(&self) -> Option<(String, Value)> {
-        let items = self.runtime.queued().ok()?;
+    fn queue_card(&self, who: &ka_agent_core::Principal) -> Option<(String, Value)> {
+        let items = self.runtime.queued(who).ok()?;
         if items.is_empty() {
             return None;
         }
@@ -1284,8 +1319,12 @@ impl TelegramChannel {
     /// One page of the `/forget` card: eight remembered facts per page
     /// (`[short] first-80`), a ✖ per row (`fx:<short>`), `fp:<off>`
     /// paging.
-    fn forget_card(&self, off: usize) -> Option<(String, Value)> {
-        let entries = self.runtime.memory_entries().ok()?;
+    fn forget_card(
+        &self,
+        off: usize,
+        who: &ka_agent_core::Principal,
+    ) -> Option<(String, Value)> {
+        let entries = self.runtime.memory_entries(who).ok()?;
         if entries.is_empty() {
             return None;
         }
@@ -1378,8 +1417,13 @@ impl TelegramChannel {
     /// One page of the `/history` card: the `run_history` line format,
     /// `hp:<off>` paging and a ▸ detail row per turn
     /// (`hv:<off>:<short>`).
-    fn history_card(&self, off: usize) -> Option<(String, Value)> {
-        let turns = self.runtime.recent_turns(6, off).ok()?;
+    fn history_card(
+        &self,
+        off: usize,
+        who: &ka_agent_core::Principal,
+    ) -> Option<(String, Value)> {
+        let who = who.clone();
+        let turns = self.runtime.recent_turns(6, off, &who).ok()?;
         if turns.is_empty() {
             return None;
         }
@@ -1414,7 +1458,7 @@ impl TelegramChannel {
         if turns.len() == 6
             && self
                 .runtime
-                .recent_turns(1, off + 6)
+                .recent_turns(1, off + 6, &who)
                 .is_ok_and(|more| !more.is_empty())
         {
             nav.push(kb_button("more ›", &format!("hp:{}", off + 6)));
@@ -1428,14 +1472,18 @@ impl TelegramChannel {
     }
 
     /// `mp:<off>` — the provider grid page `off` of the `/model` card.
-    async fn provider_page_reply(&self, off: usize) -> CallbackReply {
+    async fn provider_page_reply(
+        &self,
+        off: usize,
+        who: &ka_agent_core::Principal,
+    ) -> CallbackReply {
         let listing = self.runtime.models_listing();
         if off >= listing.providers.len() {
             return CallbackReply::none();
         }
         let text = format!(
             "{}\npick a provider:",
-            crate::commands::model_header(&self.runtime).await
+            crate::commands::model_header(&self.runtime, who).await
         );
         CallbackReply::page(text, provider_grid(&listing, off))
     }
@@ -1443,7 +1491,12 @@ impl TelegramChannel {
     /// `mp:<vendor>[:<off>]` — one page of a provider's models in the
     /// `/model` card: the shared vendor listing text (capped) over a
     /// keyboard of its models.
-    async fn vendor_page_reply(&self, vendor: &str, off: usize) -> CallbackReply {
+    async fn vendor_page_reply(
+        &self,
+        vendor: &str,
+        off: usize,
+        who: &ka_agent_core::Principal,
+    ) -> CallbackReply {
         let listing = self.runtime.models_listing();
         let Some(p) = listing.providers.iter().find(|p| p.name == vendor) else {
             return CallbackReply::none();
@@ -1452,7 +1505,7 @@ impl TelegramChannel {
             return CallbackReply::none();
         }
         let text = cap_lines(
-            &crate::commands::model_vendor_listing(&self.runtime, vendor).await,
+            &crate::commands::model_vendor_listing(&self.runtime, vendor, who).await,
             PICKER_TEXT_LINES,
         );
         CallbackReply::page(text, model_grid(p, off))
@@ -1460,7 +1513,11 @@ impl TelegramChannel {
 
     /// `mm:<vendor>:<idx>` — switch to `models[idx]` and settle the card
     /// to the same reply the router's `/model <selector>` produces.
-    async fn model_pick_callback(&self, rest: &str) -> CallbackReply {
+    async fn model_pick_callback(
+        &self,
+        rest: &str,
+        who: &ka_agent_core::Principal,
+    ) -> CallbackReply {
         let Some((vendor, idx)) = rest.rsplit_once(':') else {
             return CallbackReply::none();
         };
@@ -1475,7 +1532,7 @@ impl TelegramChannel {
             return CallbackReply::none();
         };
         let sel = sel.clone();
-        match self.runtime.set_model(&sel).await {
+        match self.runtime.set_model(&sel, who).await {
             Ok(id) => {
                 let mut reply = format!("model → {id} (next message uses it)");
                 if let Ok(Some((_, ka_agent_runtime::ModelKeyState::Missing(env)))) =
@@ -1570,7 +1627,12 @@ async fn submit_caption_turn(
                     let _ = client.set_message_reaction(chat_id, message_id, "👀").await;
                 });
             }
-            let text = crate::refs::expand(store, &runtime.workspace(), &text).await;
+            let who = runtime
+                .principal_for_source(&source)
+                .unwrap_or_else(ka_agent_core::Principal::operator);
+            let (text, refs) =
+                crate::refs::expand(store, &runtime.workspace_for(&who), &who, &text).await;
+            crate::refs::stage_sources(store, &source, &refs);
             if let Err(e) = runtime.handle_message(&text, &source).await {
                 eprintln!("telegram: handle_message: {e}");
             }

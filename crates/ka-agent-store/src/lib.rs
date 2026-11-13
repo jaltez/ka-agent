@@ -16,20 +16,35 @@
 //! `tasks`, `intents`), each an `impl Store` block split from this file
 //! (moves only).
 
+mod accounts;
+mod agents;
 mod approvals;
 mod audit;
 mod candidates;
+mod groups;
 mod identities;
 mod intents;
+mod kb_sources;
+mod kbs;
 mod outbox;
 mod queue;
 mod retention;
 mod sessions;
 mod tasks;
+pub use tasks::task_username;
+mod turn_sources;
 mod turns;
+mod users;
 
+pub use accounts::{InviteRow, InviteVerdict, WebSessionRow};
+pub use agents::{AgentAccess, AgentRow, AgentView};
 pub use candidates::SkillCandidateRow;
+pub use groups::{GroupRow, model_allowed, model_matches};
+pub use kb_sources::KbSourceRow;
+pub use kbs::{KbDocInfo, KbHit, KbRow};
 pub use retention::PruneReport;
+pub use turn_sources::{StagedSource, TurnSourceRow};
+pub use users::{UserRow, user_for_role, valid_username};
 
 use std::path::Path;
 
@@ -70,6 +85,10 @@ pub enum StoreError {
     },
     #[error("not found: {0}")]
     NotFound(String),
+    /// A write the store's own invariants refuse (it would leave a shared
+    /// resource without an owner, or name an unknown access level).
+    #[error("refused: {0}")]
+    Refused(String),
     #[error("audit chain broken at seq {seq}: {why}")]
     BrokenAuditChain { seq: i64, why: &'static str },
     #[error("io error: {0}")]
@@ -91,6 +110,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v9.sql"),
     include_str!("schema_v10.sql"),
     include_str!("schema_v11.sql"),
+    include_str!("schema_v12.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -151,9 +171,11 @@ pub struct CandidateRow {
     /// Target memory file (`facts`/`preferences`/`environment`/`profile`);
     /// `None` = facts.
     pub file: Option<String>,
-    /// The role whose turn proposed it; accepted memory lands in that
-    /// role's memory root.
+    /// The role whose turn proposed it.
     pub role: String,
+    /// The user whose turn proposed it; accepted memory lands in that
+    /// user's memory root.
+    pub username: String,
 }
 
 /// One channel identity linked to this instance (SEED.md §8.1).
@@ -165,6 +187,8 @@ pub struct IdentityRow {
     pub via: String,
     /// The role the identity acts as (`admin` unless assigned).
     pub role: String,
+    /// The user this identity resolves to (the runtime's partition key).
+    pub username: Option<String>,
 }
 
 /// One external-write intent (SEED.md §7.3). Inserted before the API call,
@@ -346,11 +370,16 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         strand_path: r.get::<_, Option<String>>(3)?.map(std::path::PathBuf::from),
         status: parse_session_status(&r.get::<_, String>(4)?).unwrap_or(SessionStatus::Degraded),
         role: r.get(8)?,
+        username: r.get(9)?,
         created_ms: r.get(5)?,
         updated_ms: r.get(6)?,
         private: r.get::<_, i64>(7)? != 0,
     })
 }
+
+/// The column list every session read uses (order is `row_to_session`'s).
+const SESSION_COLS: &str =
+    "id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role, username";
 
 fn row_to_turn(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
     Ok(Turn {
@@ -384,6 +413,8 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
         expires_at_ms: r.get(5)?,
         decided_at_ms: r.get(6)?,
         created_ms: r.get(7)?,
+        username: r.get(8)?,
+        escalated: r.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -532,6 +563,137 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A v11 (role-keyed) data root opens, migrates to v12 and every
+    /// subject row is re-keyed by the user mapping: `admin` -> `operator`,
+    /// any other role -> a user named after it.
+    #[test]
+    fn schema_v12_migrates_roles_to_users() {
+        let path = temp_path("v12");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS.iter().take(11) {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+            conn.execute(
+                "INSERT INTO identities(channel, address, linked_ms, via, role)
+                 VALUES ('telegram', '1', 1, 'cli', 'admin'),
+                        ('telegram', '2', 2, 'cli', 'guest')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions(id, workspace, status, created_ms, updated_ms, role)
+                 VALUES ('sess_admin', '/tmp/ws', 'idle', 1, 1, 'admin'),
+                        ('sess_guest', '/tmp/ws', 'idle', 2, 2, 'guest')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_candidates(id, source, text, status, created_ms, role)
+                 VALUES ('mem_a', 'session', 'fact', 'pending', 1, 'admin'),
+                        ('mem_g', 'session', 'fact', 'pending', 2, 'guest')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO audit(at_ms, actor, action, subject, prev_hash, hash, role)
+                 VALUES (1, 'operator', 'session.new', 'sess_admin', '', 'h', 'admin')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id, title, kind, status, scheduled_at_ms, payload, created_ms, updated_ms)
+                 VALUES ('task_g', 'digest', 'cron', 'queued', 1,
+                         '{\"text\":\"digest\",\"source\":\"operator\",\"recurrence_ms\":86400000,\"mode\":{\"mode\":\"agent\"},\"role\":\"guest\"}',
+                         1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), MIGRATIONS.len());
+
+        // One user per role that had identities; admin becomes operator.
+        let operator = store.get_user("operator").unwrap().unwrap();
+        assert_eq!(operator.role, "admin");
+        let guest = store.get_user("guest").unwrap().unwrap();
+        assert_eq!(guest.role, "guest");
+        assert_eq!(store.list_users().unwrap().len(), 2);
+
+        // Identities resolve to users, with the user's role.
+        assert_eq!(
+            store.identity_principal("telegram", "1").unwrap(),
+            Some(("operator".to_string(), "admin".to_string()))
+        );
+        assert_eq!(
+            store.identity_principal("telegram", "2").unwrap(),
+            Some(("guest".to_string(), "guest".to_string()))
+        );
+
+        // Subject rows carry the user.
+        assert_eq!(
+            store
+                .get_session(&SessionId("sess_guest".into()))
+                .unwrap()
+                .username,
+            "guest"
+        );
+        assert_eq!(
+            store
+                .get_session(&SessionId("sess_admin".into()))
+                .unwrap()
+                .username,
+            "operator"
+        );
+        assert_eq!(
+            store.latest_session_for_user("guest").unwrap().unwrap().id,
+            SessionId("sess_guest".into())
+        );
+        let candidates = store.pending_candidates_full().unwrap();
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.id.as_str() == "mem_a" && c.username == "operator")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.id.as_str() == "mem_g" && c.username == "guest")
+        );
+        assert_eq!(store.recent_audit(1).unwrap()[0].username, "operator");
+        // The cron belongs to its creator's user.
+        assert_eq!(store.cron_tasks_for_user("guest").unwrap().len(), 1);
+        assert!(store.cron_tasks_for_user("operator").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The user stamp rides beside the hash chain exactly like `role`: an
+    /// audit row appended with a username verifies, and rewriting the
+    /// username does not break the chain (it was never hashed).
+    #[test]
+    fn audit_username_is_beside_the_chain() {
+        let store = Store::open_in_memory().unwrap();
+        let mut rec = AuditRecord::new("operator", "user.invite", "ana", None)
+            .with_role("member")
+            .with_user("operator");
+        store.append_audit(&mut rec).unwrap();
+        assert_eq!(store.verify_audit_chain().unwrap(), 1);
+        assert_eq!(store.recent_audit(1).unwrap()[0].username, "operator");
+        {
+            let conn = store.lock();
+            conn.execute("UPDATE audit SET username = 'mallory' WHERE seq = 1", [])
+                .unwrap();
+        }
+        assert_eq!(
+            store.verify_audit_chain().unwrap(),
+            1,
+            "the username is beside the chain, not inside it"
+        );
+        assert_eq!(store.recent_audit(1).unwrap()[0].username, "mallory");
+    }
+
     #[test]
     fn backup_opens_as_valid_store() {
         let path = temp_path("backup");
@@ -641,6 +803,7 @@ mod tests {
             month_day: None,
             gate: None,
             role: None,
+            username: None,
             tools: Vec::new(),
         };
         let mut task = ka_agent_core::Task::new("cron".into(), "cron", false);

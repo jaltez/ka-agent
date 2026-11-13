@@ -47,6 +47,7 @@ pub fn enable(store: &Store, at_local: &str, now: &jiff::Zoned) -> Result<(TaskI
         month_day: None,
         gate: None,
         role: None,
+        username: None,
         tools: Vec::new(),
     };
     let first_at =

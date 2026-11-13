@@ -32,6 +32,7 @@ impl Env {
 
     fn worker_env(&self) -> WorkerEnv {
         WorkerEnv {
+            tool_context: None,
             home: self.root.join("home"),
             data_dir: self.root.join("ka"),
             state_dir: self.root.join("state"),

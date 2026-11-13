@@ -33,7 +33,7 @@ pub(crate) struct AdminCtx {
 async fn ask_and_wait(ctx: &AdminCtx, text: &str, source: &str) -> serde_json::Value {
     let queued = ctx
         .runtime
-        .status_report()
+        .status_report_for(&ka_agent_core::Principal::operator())
         .map(|r| r.queue > 0 || r.status != "Idle")
         .unwrap_or(false);
     let mut rx = ctx.bus.subscribe();
@@ -123,7 +123,21 @@ fn tool_ctx(ctx: &AdminCtx) -> ka_agent_channels::tools::ToolCtx {
         runtime: ctx.runtime.clone(),
         store: Arc::clone(&ctx.store),
         paths: ka_agent_runtime::paths::Paths::new(ctx.paths_root.clone()),
+        actor: ka_agent_core::Principal::operator(),
     }
+}
+
+/// The tool context for a relayed call: the bridge pins the acting user
+/// (`KA_AGENT_TOOLCTX` env of the worker that spawned it), and the role is
+/// re-derived from the user row per call.
+fn tool_ctx_for(ctx: &AdminCtx, user: &str) -> ka_agent_channels::tools::ToolCtx {
+    let mut tool_ctx = tool_ctx(ctx);
+    if !user.is_empty()
+        && let Ok(Some(row)) = ctx.store.get_user(user)
+    {
+        tool_ctx.actor = ka_agent_core::Principal::new(&row.username, &row.role);
+    }
+    tool_ctx
 }
 
 /// First request line ceiling: anything bigger is not one of ours, and an
@@ -168,7 +182,7 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
             .and_then(|o| o.as_str())
             .map(str::to_string);
         match (req, op.as_deref()) {
-            (Some(_), Some("status")) => match ctx.runtime.status_report() {
+            (Some(_), Some("status")) => match ctx.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
                 Ok(report) => serde_json::json!({"ok": true, "report": report}),
                 Err(e) => serde_json::json!({"error": e.to_string()}),
             },
@@ -239,7 +253,7 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
                             Ok(()) => {
                                 let queued = ctx
                                     .runtime
-                                    .status_report()
+                                    .status_report_for(&ka_agent_core::Principal::operator())
                                     .map(|r| r.queue > 0)
                                     .unwrap_or(false);
                                 serde_json::json!({"ok": true, "queued": queued})
@@ -250,15 +264,17 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
                 }
             }
             // The `__mcp` relay: list the daemon's tools, or run one.
-            (Some(_), Some("tool_list")) => {
-                let tool_ctx = tool_ctx(&ctx);
+            (Some(req), Some("tool_list")) => {
+                let user = req.get("user").and_then(|v| v.as_str()).unwrap_or("");
+                let tool_ctx = tool_ctx_for(&ctx, user);
                 let tools = ka_agent_channels::tools::list(&tool_ctx).await;
                 serde_json::json!({"ok": true, "tools": tools})
             }
             (Some(req), Some("tool_call")) => {
                 let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = req.get("args").cloned().unwrap_or(serde_json::Value::Null);
-                let tool_ctx = tool_ctx(&ctx);
+                let user = req.get("user").and_then(|v| v.as_str()).unwrap_or("");
+                let tool_ctx = tool_ctx_for(&ctx, user);
                 let (text, is_error) = ka_agent_channels::tools::call(&tool_ctx, name, args).await;
                 serde_json::json!({"ok": true, "text": text, "is_error": is_error})
             }
@@ -308,7 +324,7 @@ async fn serve_attach(
             Err(_) => true,
         }
     };
-    match ctx.runtime.status_report() {
+    match ctx.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
         Ok(report) => {
             send(
                 &tx,
@@ -375,7 +391,7 @@ async fn serve_attach(
         // `status` answers this client with a fresh `hello`, ordered after
         // everything it said before (a piped chat waits for idle with it).
         if req.get("op").and_then(|o| o.as_str()) == Some("status") {
-            if let Ok(report) = ctx.runtime.status_report() {
+            if let Ok(report) = ctx.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
                 send(
                     &tx,
                     &Envelope::new(
@@ -405,7 +421,7 @@ async fn serve_attach(
             ka_agent_channels::commands::Outcome::Silent => {}
             ka_agent_channels::commands::Outcome::NotACommand => {
                 let expanded =
-                    ka_agent_channels::refs::expand(&ctx.store, &ctx.runtime.workspace(), text)
+                    ka_agent_channels::refs::expand_operator(&ctx.store, &ctx.runtime.workspace_for(&ka_agent_core::Principal::operator()), text)
                         .await;
                 if let Err(e) = ctx.runtime.handle_message(&expanded, "console").await {
                     send(

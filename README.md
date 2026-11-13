@@ -184,7 +184,8 @@ Ka Agent keeps everything under `~/.ka-agent` (override with
   profiles/default/            # data for the default profile
     workspace/  state.db  memory/  secrets/  backups/  logs/  …
     skills/                    # this profile's own SKILL.md library (wins over the global one)
-    roles/<name>/              # one role's disjoint tree (memory, workspace, notes, …)
+    roles/<name>/              # a role's config-only partition (legacy trees migrate to users/)
+    users/<name>/              # one account's disjoint tree (memory, workspace, notes, …)
   profiles/work/               # another profile: same tree + its own config.toml
 ```
 
@@ -223,44 +224,68 @@ Secrets never go in the file:
 - Channel tokens: `ka-agent secret set <name>` (0600 under `<data>/secrets/`,
   referenced by name from the config).
 
-### Roles (several people, one bot)
+### Users and roles (a small team, one bot)
 
-One daemon can answer several linked identities without giving them the
-operator's session, memory or tools. Each identity carries a role;
-terminal, web panel, CLI and local API are the implicit `admin` role.
+One daemon serves one organization. A channel identity resolves to a
+**user** (a person); the user's **role** is the permission set they hold,
+and their **groups** govern shared resources (models, knowledge bases,
+agents). Terminal, web panel, CLI and local API act as the operator
+(`operator`, role `admin`).
 
 ```toml
 [tools]
 disable = ["tool:bash"]              # profile-wide engine baseline
 
 [[role]]
-name = "guest"
+name = "member"
 mode = "readonly"                    # ceiling and default
 allow = ["read", "grep"]             # per-turn toolset allowlist
 budget_daily_usd = 2.0
-commands = ["status", "help", "skills", "history", "memory"]
-# workspace = "~/projects/shared"    # default <data>/roles/guest/workspace
+commands = ["status", "help", "history", "memory"]
+# escalate = ["bash"]               # always the admin's call (D9)
 
 [[role.grants.path]]
 dir = "/srv/reports"
 access = "allow"
+
+[runtime]
+max_workers = 8                      # live engines at once (LRU idle eviction)
+# sandbox_engine = true              # bubblewrap per worker (measured, opt-in)
+
+[retention]
+# turns_days = 365                   # 0 = keep forever (default)
 ```
 
 ```sh
-ka-agent identity link telegram 12345 --role guest
-ka-agent identity role telegram 12345 ops     # reassign (audited)
-ka-agent identity list                        # shows the role column
-ka-agent skills enable review --role guest    # provision into that role's engine
-ka-agent pair web --role guest                # one-time code for the browser chat
+ka-agent user invite --role member --group dev   # prints a 24 h code
+ka-agent user list | disable | enable | set | reset | export | purge
+ka-agent identity link telegram 12345 --role member
+ka-agent kb create handbook --group dev
+ka-agent kb add handbook ./plan.md --title "Q3 plan"
+ka-agent agent create reviewer --persona "You review changes" --group dev
 ```
 
-A role partitions its session, memory root, notes, workspace, grants,
-toolset, budget, audit rows and command surface; approvals stay the
-admin's, and a subject's `/mode` can only get stricter than its ceiling.
-A cron scheduled from a role fires as that role, and its `--tools` list
-can only narrow. Unknown or removed roles fail closed (read-only). The
-full contract is [`docs/contract/rbac.md`](docs/contract/rbac.md) and the
-design is [ADR-0002](docs/adr/0002-in-process-rbac.md).
+Each user gets their own session, memory, notes, workspace, engine home and
+daily quota; sessions run in parallel (up to `runtime.max_workers`, idle
+workers evicted first). Approvals route by policy (D9): within their own
+grants and quota a user decides their own actions; shared resources,
+over-quota actions and a role's `escalate` list go to the admin queue. An
+approval is re-authorized at execute time, so a revoked grant voids it with
+an `approval.stale` audit row. Offboarding pauses everything (sessions,
+identities, crons) until the admin decides; `user export` writes a tar and
+`user purge` deletes the data trees. Unknown or removed roles fail closed
+(read-only).
+
+Workplace channels run beside Telegram: **Slack** (Socket Mode, no public
+endpoint) and **Discord** (gateway) — DMs are the person's private session,
+a shared channel answers only on a mention, under a read-only per-channel
+account, with native approval buttons, and answers whose sources the channel
+may not see are blocked (provenance). Knowledge bases index text-like
+uploads (`.md .txt .csv .json`) and sync from Notion, Dropbox or git.
+
+The full contract is [`docs/contract/rbac.md`](docs/contract/rbac.md); the
+design is [ADR-0003](docs/adr/0003-multi-session-runtime.md) and
+[ADR-0004](docs/adr/0004-org-users-and-approvals.md).
 
 A pre-0.3 install (`~/.local/share/ka-agent` + `~/.config/ka-agent`) moves
 itself to the new layout on the next run.
@@ -338,10 +363,10 @@ logs, history, usage, audit and contacts. The theme follows the OS or can
 be pinned light/dark from the sidebar. The URL sets
 an `HttpOnly; SameSite=Strict` session cookie; mutations are POST-only.
 
-Several people, one panel: `ka-agent pair web --role guest` (or
-**Profiles → new web user** in the admin panel) mints a one-time code for
-`/pair`; that browser gets the role's chat only — its own session, memory
-and toolset, never the admin pages (ADR-0002).
+Several people, one panel: `ka-agent user invite --role member` (or
+**Users → invite** in the admin panel) prints a one-time invite link; that
+account signs in at `/login` and gets its own session, memory and toolset,
+never the admin pages (ADR-0004).
 
 A custom domain/relay: `ka-agent setup web` writes `web.bind` and
 `web.public_url`; keep the daemon behind a TLS reverse proxy (Caddy,

@@ -20,6 +20,7 @@ pub mod assistant;
 pub mod github;
 pub mod history;
 pub mod http;
+pub mod kb;
 pub mod memory;
 pub mod notes;
 pub mod plugins;
@@ -47,19 +48,39 @@ pub struct ToolCtx {
     pub runtime: Runtime,
     pub store: Arc<Store>,
     pub paths: Paths,
+    /// The user the relayed call acts for (from the bridge's env, role
+    /// re-derived here per call). In-process callers set it explicitly.
+    pub actor: ka_agent_core::Principal,
 }
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
-/// The role of the turn the tool call belongs to (`admin` when the key is
-/// absent: an in-flight turn from before RBAC, or a daemon-side call).
-pub(crate) fn turn_role(store: &Store) -> String {
-    store
-        .meta_get(ka_agent_core::layout::TURN_ROLE_META_KEY)
+/// The principal of the turn the tool call belongs to: the bridge pins the
+/// user per worker (`KA_AGENT_TOOLCTX`), and the role is re-derived from the
+/// user row on every call (never trusted from the relay).
+pub(crate) fn turn_principal(ctx: &ToolCtx) -> ka_agent_core::Principal {
+    let role = ctx
+        .store
+        .get_user(&ctx.actor.username)
         .ok()
         .flatten()
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string())
+        .filter(|u| !u.disabled)
+        .map(|u| u.role)
+        .unwrap_or_else(|| ctx.actor.role.clone());
+    ka_agent_core::Principal::new(&ctx.actor.username, &role)
+}
+
+/// A per-user turn-context meta key (see
+/// `ka_agent_core::layout::turnctx_key`).
+pub(crate) fn turnctx(ctx: &ToolCtx, field: &str) -> Option<String> {
+    ctx.store
+        .meta_get(&ka_agent_core::layout::turnctx_key(
+            &ctx.actor.username,
+            field,
+        ))
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
 }
 
 /// One registered tool.
@@ -93,6 +114,13 @@ pub static BUILTINS: &[ToolSpec] = &[
         schema: history::show_schema,
         effect: Effect::Read,
         run: history::show,
+    },
+    ToolSpec {
+        name: "kb_search",
+        description: "Search the knowledge bases you can read (title + snippet + citation). Every word in the query must appear; omit `kb` to search all of them. Cite what you use as `kb:<name>/<path>`.",
+        schema: kb::search_schema,
+        effect: Effect::Read,
+        run: kb::search,
     },
     ToolSpec {
         name: "notes_search",

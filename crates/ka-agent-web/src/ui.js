@@ -33,3 +33,43 @@
     });
   }
 })();
+
+// Forms: every mutating POST carries the panel's `X-Ka-Agent: 1` header (the
+// server refuses POSTs without it — the second CSRF lock beside
+// SameSite=Strict). Plain HTML forms cannot send headers, so their submits are
+// intercepted and replayed through fetch; the response replaces the document.
+(function () {
+  "use strict";
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (!form || form.tagName !== "FORM") return;
+    var method = (form.getAttribute("method") || "get").toLowerCase();
+    if (method !== "post") return;
+    ev.preventDefault();
+    var data = new FormData(form);
+    var action = form.getAttribute("action") || location.pathname;
+    fetch(action, {
+      method: "POST",
+      headers: { "X-Ka-Agent": "1" },
+      body: new URLSearchParams(data),
+      credentials: "same-origin",
+      redirect: "follow",
+    })
+      .then(function (r) {
+        if (r.status === 401) {
+          location.href = "/login";
+          return null;
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        if (html === null) return;
+        document.open();
+        document.write(html);
+        document.close();
+      })
+      .catch(function (e) {
+        alert("request failed: " + e);
+      });
+  });
+})();

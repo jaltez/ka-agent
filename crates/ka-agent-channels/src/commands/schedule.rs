@@ -70,7 +70,13 @@ pub fn cron_list_text(tasks: &[ka_agent_core::Task], now: &jiff::Zoned) -> Strin
 
 /// `/cron add …` → reply text. Shared by the router and the console.
 pub fn cron_add(runtime: &Runtime, args: &str) -> String {
-    cron_add_for(runtime, args, "operator", ka_agent_core::ADMIN_ROLE, true)
+    cron_add_for(
+        runtime,
+        args,
+        "operator",
+        &ka_agent_core::Principal::operator(),
+        true,
+    )
 }
 
 /// Shared by `/cron add` and `ka-agent cron add`. `allow_gate` false is the
@@ -81,9 +87,10 @@ pub fn cron_add_for(
     runtime: &Runtime,
     args: &str,
     source: &str,
-    role: &str,
+    who: &ka_agent_core::Principal,
     allow_gate: bool,
 ) -> String {
+    let role = who.role.as_str();
     let now = runtime.now_zoned();
     // `--if '<shell command>'` may appear anywhere; pull it out first so
     // the schedule words parse exactly as before.
@@ -114,7 +121,7 @@ pub fn cron_add_for(
     if role != ka_agent_core::ADMIN_ROLE {
         spec.role = Some(role.to_string());
     }
-    match runtime.add_cron(spec, first_at) {
+    match runtime.add_cron(spec, first_at, who) {
         Ok(id) => format!(
             "cron {} scheduled — {}",
             short_id(id.as_str()),
@@ -186,8 +193,8 @@ fn cron_add_usage() -> String {
 /// Cancel a reminder or cron by prefix; shared by `/remind rm` and
 /// `/cron rm`. Scoped to `role`: a subject never cancels the operator's
 /// (or another role's) job.
-async fn cancel_by_prefix(runtime: &Runtime, role: &str, prefix: &str) -> Outcome {
-    match runtime.cancel_scheduled_for(role, prefix.trim()) {
+async fn cancel_by_prefix(runtime: &Runtime, username: &str, prefix: &str) -> Outcome {
+    match runtime.cancel_scheduled_for(username, prefix.trim()) {
         Ok(ka_agent_runtime::CancelOutcome::Cancelled(title)) => {
             Outcome::Reply(format!("cancelled: {title}"))
         }
@@ -214,8 +221,7 @@ pub(super) fn run_remind<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             if prefix.is_empty() {
                 return Outcome::Reply("usage: /remind rm <id>".into());
             }
-            let role = runtime.role_for_source(ctx.source);
-            return cancel_by_prefix(runtime, &role, &prefix).await;
+            return cancel_by_prefix(runtime, &ctx.principal.username, &prefix).await;
         }
         // Leading `in` is grammar ("in 2h30m"), not part of the text.
         let now = runtime.now_zoned();
@@ -227,7 +233,7 @@ pub(super) fn run_remind<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         if text.is_empty() {
             return Outcome::Reply(remind_usage());
         }
-        match runtime.add_reminder_at(when.at_ms, &text) {
+        match runtime.add_reminder_at(when.at_ms, &text, &ctx.principal) {
             Ok(id) => Outcome::Reply(format!(
                 "⏰ {} — {} · id {}",
                 ka_agent_core::when::describe(when.at_ms, &now),
@@ -242,8 +248,7 @@ pub(super) fn run_remind<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 pub(super) fn run_reminders<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let runtime = ctx.runtime;
-        let role = runtime.role_for_source(ctx.source);
-        match runtime.scheduled_tasks_for(&role) {
+        match runtime.scheduled_tasks_for(&ctx.principal.username) {
             Ok(rows) if rows.is_empty() => {
                 Outcome::Reply("no reminders or crons — /remind <when> <text> schedules one".into())
             }
@@ -282,7 +287,7 @@ pub(super) fn run_cron<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args;
         let reply = match rest {
-            "" | "list" => match runtime.list_crons_for(&runtime.role_for_source(ctx.source)) {
+            "" | "list" => match runtime.list_crons_for_user(&ctx.principal.username) {
                 Ok(rows) if rows.is_empty() => "no crons (use /cron add)".to_string(),
                 Ok(rows) => cron_list_text(&rows, &runtime.now_zoned()),
                 Err(e) => format!("! [cron] {e}"),
@@ -290,17 +295,10 @@ pub(super) fn run_cron<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             other => match other.split_once(' ') {
                 Some(("add", args)) => {
                     let local = ka_agent_core::is_local_source(ctx.source);
-                    cron_add_for(
-                        runtime,
-                        args,
-                        "operator",
-                        &runtime.role_for_source(ctx.source),
-                        local,
-                    )
+                    cron_add_for(runtime, args, ctx.source, &ctx.principal, local)
                 }
                 Some(("rm", id)) => {
-                    let role = runtime.role_for_source(ctx.source);
-                    return cancel_by_prefix(runtime, &role, id).await;
+                    return cancel_by_prefix(runtime, &ctx.principal.username, id).await;
                 }
                 _ => cron_add_usage(),
             },
@@ -310,7 +308,7 @@ pub(super) fn run_cron<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 }
 
 pub(super) fn run_calendar<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
-    Box::pin(async move { calendar_command(ctx.runtime, ctx.args).await })
+    Box::pin(async move { calendar_command(ctx.runtime, ctx.args, &ctx.principal).await })
 }
 
 fn remind_usage() -> String {
@@ -319,7 +317,11 @@ fn remind_usage() -> String {
 
 /// `/calendar add <src>`: an anchored daily digest at the configured local
 /// time; `/calendar today`: render now.
-async fn calendar_command(runtime: &Runtime, rest: &str) -> Outcome {
+async fn calendar_command(
+    runtime: &Runtime,
+    rest: &str,
+    who: &ka_agent_core::Principal,
+) -> Outcome {
     let (verb, arg) = match rest.split_once(' ') {
         Some((v, a)) => (v, a.trim()),
         None => (rest, ""),
@@ -373,7 +375,7 @@ async fn calendar_command(runtime: &Runtime, rest: &str) -> Outcome {
                 ));
             };
             let now = runtime.now_zoned();
-            let spec = ka_agent_core::CronSpec {
+            let mut spec = ka_agent_core::CronSpec {
                 text: arg.to_string(),
                 source: "operator".into(),
                 recurrence_ms: Some(86_400_000),
@@ -383,11 +385,13 @@ async fn calendar_command(runtime: &Runtime, rest: &str) -> Outcome {
                 month_day: None,
                 gate: None,
                 role: None,
+                username: None,
                 tools: Vec::new(),
             };
+            spec.username = Some(who.username.clone());
             let first_at =
                 ka_agent_core::when::next_local(hh, mm, &ka_agent_core::when::DayRule::Daily, &now);
-            match runtime.add_cron(spec, first_at) {
+            match runtime.add_cron(spec, first_at, who) {
                 Ok(_) => Outcome::Reply(format!(
                     "calendar digest daily at {digest_time} ({tz_name})"
                 )),
@@ -433,6 +437,7 @@ mod tests {
             month_day: None,
             gate: None,
             role: None,
+            username: None,
             tools: Vec::new(),
         };
         let weekly = ka_agent_core::CronSpec {
@@ -440,6 +445,7 @@ mod tests {
             month_day: None,
             gate: None,
             role: None,
+            username: None,
             tools: Vec::new(),
             at_local: Some("09:00".into()),
             ..anchored.clone()

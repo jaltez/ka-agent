@@ -95,6 +95,14 @@ pub struct Approval {
     pub expires_at_ms: i64,
     pub decided_at_ms: Option<i64>,
     pub created_ms: i64,
+    /// The user acting in the turn that raised this card; `None` = the
+    /// admin queue's own card (pre-users rows and operator asks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Escalated to the admin queue (D9): the acting user may not decide
+    /// it. `false` = self-scope, decided on the acting user's surfaces.
+    #[serde(default)]
+    pub escalated: bool,
 }
 
 impl Approval {
@@ -109,7 +117,18 @@ impl Approval {
             expires_at_ms: now + ttl_secs * 1000,
             decided_at_ms: None,
             created_ms: now,
+            username: None,
+            escalated: false,
         }
+    }
+
+    /// Route this card (D9): `username` acts, and `escalated` says whether
+    /// the admin queue owns the decision (shared resource, over quota, or
+    /// an `escalate` hit).
+    pub fn routed_to(mut self, username: &str, escalated: bool) -> Self {
+        self.username = Some(username.to_string());
+        self.escalated = escalated;
+        self
     }
 
     pub fn is_expired(&self, now_ms: i64) -> bool {

@@ -56,8 +56,13 @@ pub(crate) fn watchdog_action(
 impl Runtime {
     /// Schedule a reminder at an absolute time (parsing is the router's
     /// job: every surface shares one grammar).
-    pub fn add_reminder_at(&self, at_ms: i64, text: &str) -> Result<ka_agent_core::TaskId, Error> {
-        if self.session_private() {
+    pub fn add_reminder_at(
+        &self,
+        at_ms: i64,
+        text: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<ka_agent_core::TaskId, Error> {
+        if self.session_private_for(who) {
             return Err(Error::Refused(
                 "this is a private conversation — nothing it schedules may outlive it; /new first"
                     .into(),
@@ -78,14 +83,21 @@ impl Runtime {
     /// `first_at_ms`.
     pub fn add_cron(
         &self,
-        spec: ka_agent_core::CronSpec,
+        mut spec: ka_agent_core::CronSpec,
         first_at_ms: i64,
+        who: &ka_agent_core::Principal,
     ) -> Result<ka_agent_core::TaskId, Error> {
-        if self.session_private() {
+        if self.session_private_for(who) {
             return Err(Error::Refused(
                 "this is a private conversation — nothing it schedules may outlive it; /new first"
                     .into(),
             ));
+        }
+        // The job belongs to its creator: the fire runs in that user's
+        // partition (a cron never inherits the config's default role).
+        spec.username = Some(who.username.clone());
+        if spec.role.is_none() {
+            spec.role = Some(who.role.clone());
         }
         let mut task = ka_agent_core::Task::new(spec.text.clone(), "cron", false);
         task.scheduled_at_ms = Some(first_at_ms);
@@ -100,22 +112,12 @@ impl Runtime {
         Ok(self.sh.store.cron_tasks()?)
     }
 
-    /// One role's cron jobs (`admin` sees every subject's).
-    pub fn list_crons_for(&self, role: &str) -> Result<Vec<ka_agent_core::Task>, Error> {
-        let all = self.list_crons()?;
-        if role == ka_agent_core::ADMIN_ROLE {
-            return Ok(all);
+    /// One user's cron jobs (the operator sees every subject's).
+    pub fn list_crons_for_user(&self, username: &str) -> Result<Vec<ka_agent_core::Task>, Error> {
+        if username == ka_agent_core::OPERATOR_USER {
+            return self.list_crons();
         }
-        Ok(all
-            .into_iter()
-            .filter(|t| {
-                t.payload
-                    .as_deref()
-                    .and_then(ka_agent_core::CronSpec::from_payload)
-                    .map(|c| c.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE) == role)
-                    .unwrap_or(false)
-            })
-            .collect())
+        Ok(self.sh.store.cron_tasks_for_user(username)?)
     }
 
     /// Live reminders and crons, next fire first (`/reminders`).
@@ -123,29 +125,29 @@ impl Runtime {
         Ok(self.sh.store.scheduled_tasks()?)
     }
 
-    /// One role's scheduled work: its own crons; reminders are the
+    /// One user's scheduled work: their own crons; reminders are the
     /// operator's and never shown to a subject.
-    pub fn scheduled_tasks_for(&self, role: &str) -> Result<Vec<ka_agent_core::Task>, Error> {
-        if role == ka_agent_core::ADMIN_ROLE {
+    pub fn scheduled_tasks_for(&self, username: &str) -> Result<Vec<ka_agent_core::Task>, Error> {
+        if username == ka_agent_core::OPERATOR_USER {
             return self.scheduled_tasks();
         }
-        let mut tasks = self.list_crons_for(role)?;
+        let mut tasks = self.list_crons_for_user(username)?;
         tasks.sort_by_key(|t| t.scheduled_at_ms.unwrap_or(i64::MAX));
         Ok(tasks)
     }
 
-    /// Cancel one scheduled task by id prefix, scoped to `role` (a subject
-    /// cannot cancel the operator's or another role's job).
+    /// Cancel one scheduled task by id prefix, scoped to `username` (a
+    /// subject cannot cancel the operator's or another user's job).
     pub fn cancel_scheduled_for(
         &self,
-        role: &str,
+        username: &str,
         id_prefix: &str,
     ) -> Result<CancelOutcome, Error> {
-        if role == ka_agent_core::ADMIN_ROLE {
+        if username == ka_agent_core::OPERATOR_USER {
             return self.cancel_scheduled(id_prefix);
         }
         let allowed: Vec<_> = self
-            .list_crons_for(role)?
+            .list_crons_for_user(username)?
             .into_iter()
             .filter(|t| ka_agent_core::ids::id_matches(t.id.as_str(), id_prefix.trim()))
             .collect();
@@ -371,8 +373,25 @@ impl Runtime {
                     // pause the job (it cannot succeed until the operator
                     // acts). Budget reached: skip this occurrence (the
                     // window rolls tomorrow).
+                    let fire_user = spec
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string());
+                    // The role is re-resolved from the user row at fire time:
+                    // a stale `spec.role` snapshot must never widen a
+                    // demoted user's cron (D9 re-auth rule).
+                    let fire_role = self
+                        .sh
+                        .store
+                        .get_user(&fire_user)
+                        .ok()
+                        .flatten()
+                        .map(|u| u.role)
+                        .or(spec.role.clone())
+                        .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+                    let fire_principal = ka_agent_core::Principal::new(&fire_user, &fire_role);
                     if spec.mode == ka_agent_core::CronMode::Agent {
-                        if let Err(why) = self.preflight() {
+                        if let Err(why) = self.preflight(&fire_principal) {
                             let _ = self.sh.store.set_task_status(&task.id, "interrupted");
                             self.sh.emit(AgentEvent::Notice {
                                 text: format!(
@@ -384,11 +403,7 @@ impl Runtime {
                             record(&task, "blocked", Some(&why));
                             continue;
                         }
-                        let role = spec
-                            .role
-                            .clone()
-                            .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
-                        let exceeded = self.budget_verdict_for(&role)
+                        let exceeded = self.budget_verdict_for(&fire_user)
                             == ka_agent_core::BudgetVerdict::Exceeded;
                         if exceeded {
                             let next = if recurring {
@@ -418,7 +433,10 @@ impl Runtime {
                     // occurrence deserves a turn at all.
                     let mut gate_output = String::new();
                     if let Some(gate) = &spec.gate {
-                        match run_gate(gate, &self.workspace()) {
+                        match run_gate(
+                            gate,
+                            &self.workspace_for_user(&fire_principal.username, &fire_principal.role),
+                        ) {
                             GateOutcome::Pass(out) => {
                                 gate_output = out;
                             }
@@ -458,7 +476,7 @@ impl Runtime {
                                     format!(
                                         "{}\n\n{}",
                                         crate::briefing::PROMPT,
-                                        self.briefing_context()
+                                        self.briefing_context(&fire_principal)
                                     ),
                                     "☀ daily briefing".to_string(),
                                 )
@@ -481,17 +499,14 @@ impl Runtime {
                             } else {
                                 "cron"
                             };
-                            let role = spec
-                                .role
-                                .clone()
-                                .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+
                             // Empty `spec.tools` = the job never asked to
                             // narrow; otherwise the clamp is the allowlist,
                             // even when it removed every tool.
                             let tools = (!spec.tools.is_empty())
-                                .then(|| self.clamp_cron_tools(&role, &spec.tools));
+                                .then(|| self.clamp_cron_tools(&fire_principal.role, &spec.tools));
                             match self
-                                .handle_cron_message(&prompt, turn_source, &role, tools)
+                                .handle_cron_message(&prompt, turn_source, &fire_principal, tools)
                                 .await
                             {
                                 Ok(()) => true,
@@ -588,19 +603,20 @@ impl Runtime {
             return;
         }
         let now = ka_agent_core::now_ms();
+        for (username, st) in self.users_by_activity() {
         let decided = {
-            let g = self.sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let g = st.lock();
             let Some(live) = g.live.as_ref() else {
-                return;
+                continue;
             };
             if !live.pending_asks.is_empty() {
-                return;
+                continue;
             }
             // An abort is already in flight (`/stop` or an earlier
             // watchdog pass): its grace/kill choreography owns the turn,
             // and re-deciding every pass would spam the phone.
             if g.session.status == SessionStatus::Stopping {
-                return;
+                continue;
             }
             // A turn is in flight until its own record says otherwise (or
             // its prompt is still being handed over: `running` with no
@@ -616,7 +632,7 @@ impl Runtime {
                 None => g.session.status == SessionStatus::Running,
             };
             if !turn_open {
-                return;
+                continue;
             }
             watchdog_action(
                 now - live.last_activity_ms,
@@ -628,14 +644,7 @@ impl Runtime {
         match decided {
             WatchdogAction::None => {}
             WatchdogAction::Notify { silent_for_secs } => {
-                if let Some(live) = self
-                    .sh
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .live
-                    .as_mut()
-                {
+                if let Some(live) = st.lock().live.as_mut() {
                     live.watchdog_notified = true;
                 }
                 self.sh.emit(AgentEvent::Notice {
@@ -646,23 +655,28 @@ impl Runtime {
                 });
             }
             WatchdogAction::Abort { silent_for_secs } => {
-                if let Some(live) = self
-                    .sh
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .live
-                    .as_mut()
-                {
+                if let Some(live) = st.lock().live.as_mut() {
                     live.watchdog_notified = false;
                 }
+                let username = username.clone();
                 self.sh.emit(AgentEvent::Notice {
                     text: format!(
                         "⏱ no engine activity for {} min — aborting; /retry re-sends it",
                         silent_for_secs.div_ceil(60)
                     ),
                 });
-                if let Err(e) = self.stop_turn().await {
+                let who = ka_agent_core::Principal::new(
+                    &username,
+                    &self
+                        .sh
+                        .store
+                        .get_user(&username)
+                        .ok()
+                        .flatten()
+                        .map(|u| u.role)
+                        .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string()),
+                );
+                if let Err(e) = self.stop_turn(&who, "console").await {
                     self.sh.emit(AgentEvent::Error {
                         class: "internal".into(),
                         message: format!("watchdog abort: {e}"),
@@ -670,6 +684,7 @@ impl Runtime {
                     });
                 }
             }
+        }
         }
     }
 
@@ -696,8 +711,9 @@ impl Runtime {
                     message: format!("scheduler: {e}"),
                 });
             }
-            self.reap_idle_worker().await;
+            self.reap_idle_workers().await;
             self.watch_config_file().await;
+            self.run_kb_sync();
             self.check_watchdog().await;
             self.watch_persona().await;
             // Bounded launchd/redirect logs (journal systems rotate alone).
@@ -731,6 +747,45 @@ impl Runtime {
         }
     }
 
+    /// Delete attachment files older than `days` (0 = keep forever). One
+    /// file per user partition, best effort; returns how many went away.
+    fn prune_attachments(&self, days: u32, now_ms: i64) -> usize {
+        if days == 0 {
+            return 0;
+        }
+        let cutoff = now_ms - (days as i64) * 86_400_000;
+        let mut removed = 0usize;
+        let mut roots = vec![self.sh.paths.attachments()];
+        roots.push(self.sh.paths.user_attachments(ka_agent_core::OPERATOR_USER));
+        if let Ok(entries) = std::fs::read_dir(self.sh.paths.users_root()) {
+            for e in entries.flatten() {
+                roots.push(e.path().join("attachments"));
+            }
+        }
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    continue;
+                }
+                let old = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| (d.as_millis() as i64) < cutoff)
+                    .unwrap_or(false);
+                if old && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// Store retention: prune terminal rows every 6 h (meta-keyed so a
     /// restarted daemon does not re-prune immediately).
     async fn maybe_prune(&self) {
@@ -747,10 +802,18 @@ impl Runtime {
         if !due {
             return;
         }
-        match self.sh.store.prune(now) {
+        let cfg = self.cfg();
+        match self
+            .sh
+            .store
+            .prune_with(now, cfg.retention.turns_days)
+        {
             Ok(report) => {
                 let _ = self.sh.store.meta_set("prune.last_ms", &now.to_string());
-                let pruned = report.runs
+                let attachments = self.prune_attachments(cfg.retention.attachments_days, now);
+                let pruned = report.turns
+                    + report.runs
+                    + attachments
                     + report.approvals
                     + report.intents
                     + report.memory_candidates
@@ -776,8 +839,11 @@ impl Runtime {
     }
 
     /// What the briefing prompt needs and the model cannot see: today's
-    /// reminders, what waits for the operator, calendar digests.
-    pub(super) fn briefing_context(&self) -> String {
+    /// reminders (the firing user's own), what waits for the operator
+    /// (admins only — a member's briefing must not leak queue depth),
+    /// calendar digests (the user's own calendar crons).
+    pub(super) fn briefing_context(&self, who: &ka_agent_core::Principal) -> String {
+        let is_admin = who.role == ka_agent_core::ADMIN_ROLE;
         let now = self.now_zoned();
         let end_of_day = now
             .date()
@@ -790,7 +856,14 @@ impl Runtime {
             "Context (now {}):",
             now.strftime("%A %Y-%m-%d %H:%M")
         )];
-        let tasks = self.sh.store.scheduled_tasks().unwrap_or_default();
+        let tasks: Vec<_> = self
+            .sh
+            .store
+            .scheduled_tasks()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| is_admin || ka_agent_store::task_username(t) == who.username)
+            .collect();
         let today: Vec<String> = tasks
             .iter()
             .filter(|t| t.kind == "reminder")
@@ -809,21 +882,23 @@ impl Runtime {
         } else {
             lines.extend(today);
         }
-        let approvals = self
-            .sh
-            .store
-            .pending_approvals(&self.session_id())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let review = self
-            .sh
-            .store
-            .pending_candidates_full()
-            .map(|c| c.len())
-            .unwrap_or(0);
-        lines.push(format!(
-            "- waiting for the operator: {approvals} approval(s), {review} memory proposal(s)"
-        ));
+        if is_admin {
+            let approvals = self
+                .sh
+                .store
+                .escalated_approvals(50)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let review = self
+                .sh
+                .store
+                .pending_candidates_full()
+                .map(|c| c.len())
+                .unwrap_or(0);
+            lines.push(format!(
+                "- waiting for the operator: {approvals} approval(s), {review} memory proposal(s)"
+            ));
+        }
         for t in &tasks {
             if let Some(spec) = t
                 .payload
@@ -831,6 +906,7 @@ impl Runtime {
                 .and_then(ka_agent_core::CronSpec::from_payload)
                 && let ka_agent_core::CronMode::NoAgent(kind) = &spec.mode
                 && kind == "calendar"
+                && (is_admin || ka_agent_store::task_username(t) == who.username)
                 && let Ok(digest) = self.run_no_agent(kind, &spec.text)
             {
                 lines.push(format!("- calendar:\n{digest}"));

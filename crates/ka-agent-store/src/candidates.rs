@@ -46,10 +46,34 @@ impl Store {
         file: Option<&str>,
         role: &str,
     ) -> Result<()> {
+        self.add_candidate_for_user(
+            id,
+            source,
+            text,
+            provenance,
+            file,
+            role,
+            &crate::user_for_role(role),
+        )
+    }
+
+    /// A candidate proposed by one user's turn; accepted memory lands in
+    /// that user's memory root.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_candidate_for_user(
+        &self,
+        id: &MemoryId,
+        source: &str,
+        text: &str,
+        provenance: Option<&str>,
+        file: Option<&str>,
+        role: &str,
+        username: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO memory_candidates(id, source, text, provenance, status, created_ms, file, role)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
+            "INSERT INTO memory_candidates(id, source, text, provenance, status, created_ms, file, role, username)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)",
             params![
                 id.as_str(),
                 source,
@@ -57,7 +81,8 @@ impl Store {
                 provenance,
                 ka_agent_core::now_ms(),
                 file,
-                role
+                role,
+                username
             ],
         )?;
         Ok(())
@@ -77,7 +102,7 @@ impl Store {
     pub fn pending_candidates_full(&self) -> Result<Vec<CandidateRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, source, text, provenance, created_ms, file, role
+            "SELECT id, source, text, provenance, created_ms, file, role, username
              FROM memory_candidates WHERE status = 'pending' ORDER BY created_ms",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -89,9 +114,19 @@ impl Store {
                 created_ms: r.get(4)?,
                 file: r.get(5)?,
                 role: r.get(6)?,
+                username: r.get(7)?,
             })
         })?;
         collect_rows(rows)
+    }
+
+    /// Pending candidates proposed by one user (their review inbox).
+    pub fn pending_candidates_for_user(&self, username: &str) -> Result<Vec<CandidateRow>> {
+        Ok(self
+            .pending_candidates_full()?
+            .into_iter()
+            .filter(|c| c.username == username)
+            .collect())
     }
 
     /// Set a candidate's review outcome (`accepted`/`rejected`/`discarded`;

@@ -72,9 +72,12 @@ pub struct Session {
     /// materialized yet (ka creates it on first append).
     pub strand_path: Option<PathBuf>,
     pub status: SessionStatus,
-    /// The role this conversation belongs to (`admin` for terminal, web
-    /// and CLI surfaces). A role's session never sees another role's
-    /// turns, memory or strand.
+    /// The user this conversation belongs to (the partition key). A user's
+    /// session never sees another user's turns, memory or strand.
+    #[serde(default = "crate::operator_user")]
+    pub username: String,
+    /// The role this conversation belongs to (`admin` for the operator's
+    /// terminal, web and CLI surfaces).
     #[serde(default = "crate::admin_role")]
     pub role: String,
     /// A private (incognito) conversation: turn text is never recorded,
@@ -88,11 +91,11 @@ pub struct Session {
 
 impl Session {
     pub fn new(workspace: PathBuf) -> Self {
-        Self::new_for_role(workspace, crate::ADMIN_ROLE)
+        Self::new_for_user(workspace, crate::OPERATOR_USER, crate::ADMIN_ROLE)
     }
 
-    /// A fresh session for one role.
-    pub fn new_for_role(workspace: PathBuf, role: &str) -> Self {
+    /// A fresh session for one user acting with one role.
+    pub fn new_for_user(workspace: PathBuf, username: &str, role: &str) -> Self {
         let now = crate::now_ms();
         Self {
             id: SessionId::generate(),
@@ -100,6 +103,7 @@ impl Session {
             strand_id: None,
             strand_path: None,
             status: SessionStatus::Idle,
+            username: username.to_string(),
             role: role.to_string(),
             private: false,
             created_ms: now,

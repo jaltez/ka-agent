@@ -158,16 +158,21 @@ async fn one_turn_started_per_live_turn() {
     rt.handle_message("first", "console").await.unwrap();
     wait_until("first turn", &rec, |evs| finished(evs) == 1).await;
     wait_until("first turn idle", &rec, |_| {
-        rt.session_status() == ka_agent_core::SessionStatus::Idle
+        rt.session_status_for(&op()) == ka_agent_core::SessionStatus::Idle
     })
     .await;
 
+    // The router resolves every source to a user: link this one (an
+    // unlinked sender is refused silently, as on the channels).
+    store
+        .link_identity_as("matrix", "u1", "test", "admin")
+        .unwrap();
     rt.handle_message("second", "matrix:u1").await.unwrap();
     wait_until("second turn", &rec, |evs| finished(evs) == 2).await;
 
     let events = rec.events();
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10, 0)
+        .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 2, "two runtime turns were recorded");
     assert_eq!(
@@ -203,6 +208,11 @@ async fn one_turn_started_per_live_turn() {
 /// same `submit → … → idle` cycle. The surface is still told once, so its
 /// stream is not reset under the running answer.
 #[cfg(unix)]
+/// The operator: the principal every local surface acts as.
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_turns_inside_one_runtime_turn_are_announced_once() {
     let steps = r#"{"call": {"tool": "todo", "args": {"items": [{"text": "still pending", "state": "pending"}]}}}, {"text": "working"}"#;
@@ -220,7 +230,7 @@ async fn engine_turns_inside_one_runtime_turn_are_announced_once() {
 
     let events = rec.events();
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10, 0)
+        .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 1, "one runtime turn was recorded");
     assert_eq!(

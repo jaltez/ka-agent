@@ -23,20 +23,37 @@ const DIR_MAX_ENTRIES: usize = 50;
 /// Directory listings: max depth.
 const DIR_MAX_DEPTH: usize = 2;
 
-/// Expand every `@reference` in `text`. Text without references is returned
-/// unchanged.
-pub async fn expand(store: &Store, workspace: &Path, text: &str) -> String {
+/// One source a reference pulled into the message (provenance for the
+/// share-time check). The store owns the type: it stages and records it.
+pub use ka_agent_store::StagedSource as RefSource;
+
+/// Expand every `@reference` in `text` for the acting principal. Text without
+/// references is returned unchanged. The returned sources are the ones that
+/// actually fed the text (`@kb:` always; `@file` only when the file was
+/// readable) — the runtime records them as `turn_sources`.
+pub async fn expand(
+    store: &Store,
+    workspace: &Path,
+    who: &ka_agent_core::Principal,
+    text: &str,
+) -> (String, Vec<RefSource>) {
     if !text.contains('@') {
-        return text.to_string();
+        return (text.to_string(), Vec::new());
     }
     let mut out = String::with_capacity(text.len());
     let mut word = String::new();
     let mut any = false;
+    let mut sources: Vec<RefSource> = Vec::new();
     for ch in text.chars() {
         if ch.is_whitespace() {
             if !word.is_empty() {
-                let expanded = expand_word(store, workspace, &word).await;
+                let (expanded, source) = expand_word(store, workspace, who, &word).await;
                 any = any || expanded != word;
+                if let Some(s) = source
+                    && !sources.contains(&s)
+                {
+                    sources.push(s);
+                }
                 out.push_str(&expanded);
                 word.clear();
             }
@@ -46,37 +63,67 @@ pub async fn expand(store: &Store, workspace: &Path, text: &str) -> String {
         }
     }
     if !word.is_empty() {
-        let expanded = expand_word(store, workspace, &word).await;
+        let (expanded, source) = expand_word(store, workspace, who, &word).await;
         any = any || expanded != word;
+        if let Some(s) = source
+            && !sources.contains(&s)
+        {
+            sources.push(s);
+        }
         out.push_str(&expanded);
     }
     if !any {
-        return text.to_string();
+        return (text.to_string(), Vec::new());
     }
-    if out.chars().count() > REF_BUDGET {
+    let out = if out.chars().count() > REF_BUDGET {
         let mut cut: String = out.chars().take(REF_BUDGET).collect();
         cut.push_str("… [refs truncated]");
         cut
     } else {
         out
-    }
+    };
+    (out, sources)
 }
 
-/// Expand one whitespace-delimited word, if it is a reference token.
-async fn expand_word(store: &Store, workspace: &Path, word: &str) -> String {
+/// Expand one reference word for the operator (CLI/terminal/API callers that
+/// have no per-user principal).
+pub async fn expand_operator(store: &Store, workspace: &Path, text: &str) -> String {
+    expand(store, workspace, &ka_agent_core::Principal::operator(), text)
+        .await
+        .0
+}
+
+/// Expand one whitespace-delimited word, if it is a reference token. The
+/// second value is the provenance record when the reference actually fed the
+/// text.
+async fn expand_word(
+    store: &Store,
+    workspace: &Path,
+    who: &ka_agent_core::Principal,
+    word: &str,
+) -> (String, Option<RefSource>) {
     if let Some(prefix) = word
         .strip_prefix("@turn:")
         .or_else(|| word.strip_prefix("@t:"))
     {
-        return turn_ref(store, prefix, word);
+        return (turn_ref(store, prefix, word), None);
     }
     if word.starts_with("@http://") || word.starts_with("@https://") {
-        return url_ref(store, word).await;
+        return (url_ref(store, word).await, None);
+    }
+    if let Some(rest) = word.strip_prefix("@kb:") {
+        return kb_ref(store, who, rest, word);
     }
     if let Some(path) = word.strip_prefix('@') {
-        return path_ref(workspace, path, word);
+        let expanded = path_ref(workspace, path, word);
+        let source = (!expanded.starts_with("[ref ")).then(|| RefSource {
+            kind: "file".into(),
+            reference: path.to_string(),
+            groups: Vec::new(),
+        });
+        return (expanded, source);
     }
-    word.to_string()
+    (word.to_string(), None)
 }
 
 /// `@<path>`: file content or a shallow directory listing.
@@ -214,6 +261,88 @@ async fn url_ref(store: &Store, token: &str) -> String {
     }
 }
 
+/// `@kb:<name>` (whole-basis digest) or `@kb:<name>/<path>` (one document):
+/// full content, behind the caller's KB access check. An unknown or
+/// unauthorized KB answers `no knowledge base matches` — no existence leak.
+fn kb_ref(
+    store: &Store,
+    who: &ka_agent_core::Principal,
+    rest: &str,
+    token: &str,
+) -> (String, Option<RefSource>) {
+    let (name, doc_path) = match rest.split_once('/') {
+        Some((n, p)) => (n, Some(p)),
+        None => (rest, None),
+    };
+    let Ok(effective) = store.kb_effective(&who.username, &who.role) else {
+        return (format!("[ref {token}: no knowledge base matches]"), None);
+    };
+    if !effective.iter().any(|k| k == name) {
+        return (format!("[ref {token}: no knowledge base matches]"), None);
+    }
+    let groups = store.kb_access(name).unwrap_or_default();
+    let source = |path: &str| RefSource {
+        kind: "kb".into(),
+        reference: format!("kb:{name}/{path}"),
+        groups: groups.clone(),
+    };
+    match doc_path {
+        Some(path) => {
+            match store.kb_get_doc(name, path) {
+                Ok(Some((title, content))) => {
+                    // One document is capped at 64 KiB (per the KB contract).
+                    let body = ka_agent_core::truncate_at_char(&content, 65_536);
+                    (
+                        format!("--- @kb:{name}/{path} ({title}) ---\n{body}"),
+                        Some(source(path)),
+                    )
+                }
+                _ => (format!("[ref {token}: no such document]"), None),
+            }
+        }
+        None => {
+            // The whole KB: every document, in path order, within the
+            // message budget.
+            let mut docs = String::new();
+            let mut used = 0usize;
+            let mut sources = Vec::new();
+            if let Ok(list) = store.kb_list_docs(name) {
+                for doc in list {
+                    if used >= REF_BUDGET {
+                        docs.push_str("\n… (more documents omitted)");
+                        break;
+                    }
+                    let Ok(Some((title, content))) = store.kb_get_doc(name, &doc.path) else {
+                        continue;
+                    };
+                    let body = ka_agent_core::truncate_at_char(&content, REF_ITEM_MAX);
+                    used += body.chars().count();
+                    docs.push_str(&format!("--- {title} ({}) ---\n{body}\n", doc.path));
+                    sources.push(source(&doc.path));
+                }
+            }
+            if docs.is_empty() {
+                return (format!("[ref {token}: knowledge base is empty]"), None);
+            }
+            // One token can cite several documents; the first is returned as
+            // the source and the rest are recorded by the runtime's staging
+            // path (this single-value shape keeps the expander simple).
+            (format!("--- @kb:{name} ---\n{docs}"), sources.into_iter().next())
+        }
+    }
+}
+
+/// Stage the sources of a message for the turn that is about to be submitted
+/// (`record_for_turn` moves them into `turn_sources`).
+pub fn stage_sources(store: &Store, source: &str, sources: &[RefSource]) {
+    store.stage_turn_sources(source, sources);
+}
+
+/// Move one source's staged references into `turn_sources`.
+pub fn record_for_turn(store: &Store, source: &str, turn_id: &str) -> usize {
+    store.record_staged_sources(source, turn_id)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -239,7 +368,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("nota.md"), "CONTENIDO-UNO").unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, "resume @nota.md please").await;
+        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "resume @nota.md please").await.0;
         assert_eq!(out, "resume --- @nota.md ---\nCONTENIDO-UNO please");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -253,7 +382,7 @@ mod tests {
         std::fs::write(ws.join("proj/sub/b.md"), "b").unwrap();
         std::fs::write(ws.join("proj/sub/deep/c.md"), "c").unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, "look @proj").await;
+        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "look @proj").await.0;
         assert!(out.contains("--- @proj ---"), "{out}");
         assert!(out.contains("a.md"), "{out}");
         assert!(out.contains("sub/b.md"), "{out}");
@@ -268,7 +397,7 @@ mod tests {
         let ws = root.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, "check @noexiste.md now").await;
+        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "check @noexiste.md now").await.0;
         assert_eq!(out, "check [ref @noexiste.md: not found] now");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -300,7 +429,7 @@ mod tests {
             })
             .unwrap();
         let prefix = ka_agent_core::ids::short_id(turn.id.as_str());
-        let out = expand(&store, &ws, &format!("@turn:{prefix}")).await;
+        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), &format!("@turn:{prefix}")).await.0;
         assert!(out.contains(&format!("--- @turn:{prefix} ---")), "{out}");
         assert!(out.contains("> pregunta sembrada"), "{out}");
         assert!(out.contains("respuesta sembrada"), "{out}");
@@ -314,7 +443,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let store = store_at(&root.join("data"));
         let text = "plain text\nsecond line, mail me at bob@example.com ok";
-        assert_eq!(expand(&store, &ws, text).await, text);
+        assert_eq!(expand(&store, &ws, &ka_agent_core::Principal::operator(), text).await.0, text);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -327,7 +456,7 @@ mod tests {
         // expansion truncated, never an unbounded load.
         std::fs::write(ws.join("huge.txt"), "y".repeat(400_000)).unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, "@huge.txt").await;
+        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "@huge.txt").await.0;
         assert!(out.contains("[ref truncated]"), "{out}");
         assert!(out.chars().count() < 9_000, "{}", out.chars().count());
         let _ = std::fs::remove_dir_all(&root);
@@ -343,7 +472,7 @@ mod tests {
             std::fs::write(ws.join(format!("f{i}.txt")), "x".repeat(9_000)).unwrap();
         }
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, "@f0.txt @f1.txt @f2.txt").await;
+        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "@f0.txt @f1.txt @f2.txt").await.0;
         assert!(
             out.chars().count() <= REF_BUDGET + 40,
             "{}",

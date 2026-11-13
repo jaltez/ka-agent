@@ -1,16 +1,21 @@
-//! Roles: source resolution, per-role specs, and the single-session role
-//! switch. One daemon, one store; a linked identity's role partitions the
-//! session, memory, workspace, grants, toolset, budget and commands.
+//! Users: source resolution, per-user state, and the role policy every
+//! worker composes from (ADR-0003 + ADR-0004).
 //!
-//! The switch is the `/new` pattern under one guard: take and kill the live
-//! port, park the outgoing role's whole conversation state, load the
-//! target's (parked, else its latest session row, else fresh). Terminal,
-//! web and CLI surfaces are the implicit `admin` role and keep the profile
-//! root layout untouched.
+//! One daemon, one store; a channel identity resolves to a **user**, and the
+//! user's role partitions the session, memory, workspace, grants, toolset,
+//! budget and commands. The terminal, web panel and CLI act as the operator
+//! (`operator`, role `admin`). Users run in parallel: each has its own
+//! `UserState`, its own worker when it is mid-turn, and its own queued
+//! messages.
 
 use super::intake::drain_queue;
 use super::*;
+use ka_agent_core::Principal;
 use ka_agent_core::config::RoleSpec;
+
+/// The channels whose identities resolve to a user. `web:<username>` is the
+/// account login's own identity row.
+pub const PRINCIPAL_CHANNELS: &[&str] = &["telegram", "matrix", "web", "slack", "discord"];
 
 /// The caps that bind `role` under `cfg`: the role's USD cap when set,
 /// else the profile's; tokens always follow the profile.
@@ -52,35 +57,39 @@ fn unknown_role_spec(name: &str) -> RoleSpec {
         workspace: None,
         budget_daily_usd: None,
         commands: Vec::new(),
+        escalate: Vec::new(),
         grants: Default::default(),
     }
 }
 
 impl Runtime {
-    /// The role a source acts as. Phone identities carry their linked
-    /// role; every local surface, scheduled source and unknown source is
-    /// admin (the link gates are the authorization).
-    pub fn role_for_source(&self, source: &str) -> String {
+    // ---- resolution ----------------------------------------------------
+
+    /// The principal a source acts as. `None` = refuse: an unlinked identity,
+    /// an identity with no user, or a disabled account. Phone and workplace
+    /// channels resolve through `identities`; local surfaces, the CLI, cron
+    /// fires without a creator and retries are the operator.
+    pub fn principal_for_source(&self, source: &str) -> Option<Principal> {
         // `cli-bg`/`api-bg` background asks speak as their channel.
         let base = source.strip_suffix("-bg").unwrap_or(source);
         if let Some((channel, address)) = base.split_once(':')
             && !address.is_empty()
-            && matches!(channel, "telegram" | "matrix" | "web")
+            && PRINCIPAL_CHANNELS.contains(&channel)
         {
             return self
                 .sh
                 .store
-                .identity_role(channel, address)
+                .identity_principal(channel, address)
                 .ok()
                 .flatten()
-                .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+                .map(Principal::from_pair);
         }
-        ka_agent_core::ADMIN_ROLE.to_string()
+        Some(Principal::operator())
     }
 
-    /// The role the live session belongs to.
-    pub fn active_role(&self) -> String {
-        self.lock().role.clone()
+    /// The role a source acts as, when it has one (a resolved principal).
+    pub fn role_for_source(&self, source: &str) -> Option<String> {
+        self.principal_for_source(source).map(|p| p.role)
     }
 
     /// The configured spec for a role (`None` for admin and for a role the
@@ -98,13 +107,33 @@ impl Runtime {
             .unwrap_or_else(|| unknown_role_spec(role))
     }
 
-    /// The active role's effective permission mode: a `/mode` choice made
-    /// inside the role's ceiling for this session, else the ceiling (the
-    /// profile mode for admin).
-    pub fn effective_mode(&self) -> String {
-        let (role, session_mode) = {
-            let g = self.lock();
-            (g.role.clone(), g.session_mode.clone())
+    /// The role's permission-mode ceiling.
+    pub fn role_mode_ceiling(&self, role: &str) -> Option<String> {
+        if role == ka_agent_core::ADMIN_ROLE {
+            return None;
+        }
+        self.effective_role(role).mode_canonical()
+    }
+
+    /// One user's effective permission mode: a `/mode` choice inside the
+    /// role's ceiling for their session, else the ceiling (the profile mode
+    /// for admin).
+    pub fn effective_mode_for(&self, username: &str) -> String {
+        let (role, session_mode) = match self.user_handle(username) {
+            Some(st) => {
+                let g = st.lock();
+                (g.role.clone(), g.session_mode.clone())
+            }
+            None => (
+                self.sh
+                    .store
+                    .get_user(username)
+                    .ok()
+                    .flatten()
+                    .map(|u| u.role)
+                    .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string()),
+                None,
+            ),
         };
         if role == ka_agent_core::ADMIN_ROLE {
             return self.cfg().mode.clone();
@@ -198,50 +227,290 @@ impl Runtime {
             .collect()
     }
 
-    /// A role's workspace: the explicit config path, else
-    /// `<data>/roles/<name>/workspace`; admin keeps the profile workspace.
-    pub fn workspace_for_role(&self, role: &str) -> std::path::PathBuf {
+    /// A user's workspace: the operator keeps the profile workspace, a role
+    /// with an explicit `workspace` keeps that directory, everyone else gets
+    /// `<data>/users/<name>/workspace`.
+    pub fn workspace_for_user(&self, username: &str, role: &str) -> std::path::PathBuf {
         if role == ka_agent_core::ADMIN_ROLE {
             return self.cfg().workspace_path();
         }
-        match self.role_spec(role) {
-            Some(spec) => spec.workspace_path(self.sh.paths.root()),
-            None => self.sh.paths.role_workspace(role),
+        if let Some(spec) = self.role_spec(role)
+            && spec.workspace.is_some()
+        {
+            return spec.workspace_path(self.sh.paths.root());
         }
+        self.sh.paths.user_workspace(username)
     }
 
-    /// The role's latest session, or a fresh one (inserted).
-    pub fn session_for_role(&self, role: &str) -> Result<Session, Error> {
-        if let Some(session) = self.sh.store.latest_session_for_role(role)? {
-            return Ok(session);
-        }
-        let session = Session::new_for_role(self.workspace_for_role(role), role);
-        self.sh.store.insert_session(&session)?;
-        Ok(session)
+    // ---- per-user state ------------------------------------------------
+
+    /// One user's state handle, when they have one (they do after their first
+    /// message).
+    pub fn user_handle(&self, username: &str) -> Option<UserHandle> {
+        self.sh
+            .users
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(username)
+            .cloned()
     }
 
-    /// The store meta key holding a role's budget window (admin keeps the
-    /// pre-RBAC `budget` key).
-    fn budget_meta_key(role: &str) -> String {
-        if role == ka_agent_core::ADMIN_ROLE {
+    /// Every user with state, ordered by last activity (least recent first):
+    /// the worker cap's eviction order and the fairness drain's rotation.
+    pub(super) fn users_by_activity(&self) -> Vec<(String, UserHandle)> {
+        let mut out: Vec<(String, UserHandle)> = self
+            .sh
+            .users
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by_key(|(_, st)| st.lock().last_active_ms);
+        out
+    }
+
+    /// The user's state, created on first use: their latest session (or a
+    /// fresh one), their own budget window and their partition directories.
+    pub fn ensure_user(&self, who: &Principal) -> Result<UserHandle, Error> {
+        if let Some(st) = self.user_handle(&who.username) {
+            let mut g = st.lock();
+            if g.role != who.role {
+                // The role changed (config reload, admin edit): the state
+                // follows, and the next worker composes the new policy.
+                g.role = who.role.clone();
+                g.session.role = who.role.clone();
+            }
+            drop(g);
+            return Ok(st);
+        }
+        // A user named by a source must exist as a row; an identity-less
+        // principal would be a config path we never take.
+        if self.sh.store.get_user(&who.username)?.is_none() {
+            return Err(Error::Refused(format!(
+                "unknown user {:?} — `ka-agent user invite` first",
+                who.username
+            )));
+        }
+        self.sh.paths.ensure_user_dirs(&who.username)?;
+        let mut session = match self.sh.store.latest_session_for_user(&who.username)? {
+            Some(mut session) => {
+                // A turn that died with a previous process must not leave
+                // the user looking busy (same policy as boot adoption).
+                if matches!(
+                    session.status,
+                    SessionStatus::Running
+                        | SessionStatus::AwaitingApproval
+                        | SessionStatus::Stopping
+                ) && session.transition(SessionStatus::Idle).is_ok()
+                {
+                    self.sh
+                        .store
+                        .update_session_status(&session.id, session.status)?;
+                }
+                // Pre-users sessions recorded the legacy `roles/<r>/workspace`
+                // path the v12 bootstrap moved to `users/<r>`: repoint the row,
+                // or the new guard lists would refuse every file tool.
+                let legacy = self.sh.paths.root().join("roles");
+                if session.workspace.starts_with(&legacy) {
+                    if let Ok(rest) = session.workspace.strip_prefix(&legacy) {
+                        let moved = self.sh.paths.users_root().join(rest);
+                        session.workspace = moved.clone();
+                        let _ = self
+                            .sh
+                            .store
+                            .set_session_workspace(&session.id, &moved);
+                    }
+                }
+                session
+            }
+            None => {
+                let session = Session::new_for_user(
+                    self.workspace_for_user(&who.username, &who.role),
+                    &who.username,
+                    &who.role,
+                );
+                self.sh.store.insert_session(&session)?;
+                let mut rec = AuditRecord::new(
+                    "system",
+                    audit_actions::SESSION_NEW,
+                    session.id.as_str(),
+                    Some(format!("user {} bootstrap", who.username)),
+                )
+                .with_role(&who.role)
+                .with_user(&who.username);
+                self.sh.store.append_audit(&mut rec)?;
+                session
+            }
+        };
+        session.role = who.role.clone();
+        // First state: compile persona/house rules + memory into the user's
+        // engine home, so their first worker already reads them.
+        if let Err(e) = self.refresh_compiled_memory_for(&who.username) {
+            eprintln!("runtime: MEMORY.md not written for {}: {e}", who.username);
+        }
+        let identity = crate::runtime::compile_identity(&self.persona_text());
+        let dir = self
+            .sh
+            .paths
+            .user_engine_home(&who.username)
+            .join(".config/ka");
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(dir.join("IDENTITY.md"), &identity))
+        {
+            eprintln!("runtime: IDENTITY.md not written for {}: {e}", who.username);
+        }
+        let budget = self.load_budget_for(&who.username, &who.role);
+        let state = UserState {
+            session,
+            role: who.role.clone(),
+            session_mode: None,
+            session_model: None,
+            agent: None,
+            session_allow: std::collections::HashSet::new(),
+            live: None,
+            budget,
+            crashes: Vec::new(),
+            restart_attempt: 0,
+            effort: None,
+            last_active_ms: ka_agent_core::now_ms(),
+        };
+        let handle = UserHandle::new(state);
+        // First-touch serialization: two simultaneous first messages must
+        // not both insert a session row. The map lock decides the winner;
+        // the loser adopts the winner's handle (its own row, if any slipped
+        // in, becomes the orphan `latest_session_for_user` already covers).
+        let mut map = self.sh.users.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&who.username) {
+            return Ok(existing.clone());
+        }
+        map.insert(who.username.clone(), handle);
+        Ok(map[&who.username].clone())
+    }
+
+    /// The model a turn of `who` runs on: their session choice, else the
+    /// policy default, else the configured model — always inside the user's
+    /// allowlist (an empty allowlist allows the whole catalog).
+    pub fn model_for(&self, who: &Principal, background: bool) -> Option<String> {
+        let cfg = self.cfg();
+        let (allow, default) = self
+            .sh
+            .store
+            .model_policy_for(&who.username)
+            .unwrap_or_default();
+        let ok = |m: &str| ka_agent_store::model_allowed(&allow, m);
+        if background && let Some(bg) = cfg.background_model.clone().filter(|m| ok(m)) {
+            return Some(bg);
+        }
+        if let Some(session) = self.user_handle(&who.username).and_then(|st| st.lock().session_model.clone())
+            && ok(&session)
+        {
+            return Some(session);
+        }
+        if let Some(default) = default.clone().filter(|d| ok(d)) {
+            return Some(default);
+        }
+        cfg.model.clone().filter(|m| ok(m))
+    }
+
+    /// Make sure the user's state exists (their partition directories, their
+    /// session row, their budget window), without exposing the handle.
+    pub fn ensure_user_state(&self, who: &Principal) -> Result<(), Error> {
+        self.ensure_user(who).map(|_| ())
+    }
+
+    /// `/agent <name>`: run this conversation as a shared agent the user may
+    /// use. `None` clears it. Returns the confirmation line.
+    pub fn set_agent(&self, who: &Principal, name: Option<&str>) -> Result<String, Error> {
+        let st = self.ensure_user(who)?;
+        let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
+            st.lock().agent = None;
+            return Ok("agent: off (back to your own assistant)".into());
+        };
+        let level = self
+            .sh
+            .store
+            .agent_level(name, &who.username, &who.role)?
+            .ok_or_else(|| Error::Refused(format!("no shared agent {name:?} you can use")))?;
+        st.lock().agent = Some(name.to_string());
+        Ok(format!(
+            "agent {name} on ({level}) — persona, skills and knowledge come from it"
+        ))
+    }
+
+    /// The agent this user's conversation runs as, when it still exists and
+    /// the user may use it.
+    pub fn active_agent(&self, who: &Principal) -> Option<ka_agent_store::AgentRow> {
+        let name = self.user_handle(&who.username)?.lock().agent.clone()?;
+        let row = self.sh.store.get_agent(&name).ok()??;
+        self.sh
+            .store
+            .agent_level(&name, &who.username, &who.role)
+            .ok()
+            .flatten()
+            .map(|_| row)
+    }
+
+    /// Provenance (M3): the first source of `turn` whose access groups the
+    /// recipient's groups do not cover. `None` = the delivery is allowed.
+    /// A source with an empty `group_names` row is unrestricted.
+    pub fn provenance_conflict(
+        &self,
+        turn: &str,
+        recipient_groups: &[String],
+    ) -> Option<ka_agent_store::TurnSourceRow> {
+        let rows = self.sh.store.turn_sources(turn).ok()?;
+        rows.into_iter().find(|row| {
+            !row.group_names.is_empty()
+                && !row
+                    .group_names
+                    .iter()
+                    .any(|g| recipient_groups.iter().any(|r| r == g))
+        })
+    }
+
+    /// The groups a delivery audience belongs to (a user's groups, or the
+    /// shared channel account's own).
+    pub fn groups_of_user(&self, username: &str) -> Vec<String> {
+        self.sh.store.groups_of(username).unwrap_or_default()
+    }
+
+    /// The user's current session, creating their state when needed.
+    pub fn session_for_user(&self, who: &Principal) -> Result<Session, Error> {
+        Ok(self.ensure_user(who)?.lock().session.clone())
+    }
+
+    /// The store meta key holding a user's budget window (the operator keeps
+    /// the pre-users `budget` key, so an existing install continues its day).
+    fn budget_meta_key(username: &str) -> String {
+        if username == ka_agent_core::OPERATOR_USER {
             "budget".to_string()
         } else {
-            format!("budget:{role}")
+            format!("budget:user:{username}")
         }
     }
 
-    /// The caps that bind a role: its own USD cap when set, else the
-    /// profile's; tokens always follow the profile.
-    fn budget_caps(&self, role: &str) -> (Option<f64>, Option<u64>) {
-        budget_caps_of(&self.cfg(), role)
+    /// The caps that bind a user: their own daily quota when set, else the
+    /// role's cap, else the profile's; tokens always follow the profile.
+    pub fn budget_caps_for(&self, username: &str, role: &str) -> (Option<f64>, Option<u64>) {
+        let cfg = self.cfg();
+        let quota = self
+            .sh
+            .store
+            .get_user(username)
+            .ok()
+            .flatten()
+            .and_then(|u| u.quota_daily_usd);
+        let (usd, tokens) = budget_caps_of(&cfg, role);
+        (quota.or(usd), tokens)
     }
 
-    /// A role's budget state: today's saved window when it matches, with
-    /// the current caps (a reload/role change always wins).
-    fn load_budget(&self, role: &str) -> BudgetState {
-        let (usd, tokens) = self.budget_caps(role);
+    /// A user's budget state: today's saved window when it matches, with the
+    /// current caps (a reload or quotal change always wins).
+    fn load_budget_for(&self, username: &str, role: &str) -> BudgetState {
+        let (usd, tokens) = self.budget_caps_for(username, role);
         let mut budget = BudgetState::new(usd, tokens);
-        if let Ok(Some(saved)) = self.sh.store.meta_get(&Self::budget_meta_key(role))
+        if let Ok(Some(saved)) = self.sh.store.meta_get(&Self::budget_meta_key(username))
             && let Ok(saved) = serde_json::from_str::<BudgetState>(&saved)
             && saved.day == ka_agent_core::day_key(ka_agent_core::now_ms())
         {
@@ -252,201 +521,117 @@ impl Runtime {
         budget
     }
 
-    /// A role's current budget verdict (the active role reads the live
-    /// state, a parked one its parked state, else today's saved window).
-    pub fn budget_verdict_for(&self, role: &str) -> BudgetVerdict {
-        if self.active_role() == role {
-            return self.lock().budget.verdict();
+    /// A user's current budget verdict (their live state when they have one,
+    /// else today's saved window).
+    pub fn budget_verdict_for(&self, username: &str) -> BudgetVerdict {
+        if let Some(st) = self.user_handle(username) {
+            return st.lock().budget.verdict();
         }
-        if let Some(parked) = self
+        let role = self
             .sh
-            .parked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(role)
-        {
-            return parked.budget.verdict();
-        }
-        self.load_budget(role).verdict()
+            .store
+            .get_user(username)
+            .ok()
+            .flatten()
+            .map(|u| u.role)
+            .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
+        self.load_budget_for(username, &role).verdict()
     }
 
-    /// Switch the live session to `role`. Returns whether it switched.
-    /// The outgoing role's conversation is parked whole (session, session
-    /// allows, budget, crash history, effort); the target's is restored,
-    /// else adopted from its latest session row, else created fresh.
-    pub(super) async fn switch_role(&self, role: &str) -> Result<bool, Error> {
-        if self.lock().role == role {
-            return Ok(false);
+    /// Persist a user's budget window under their key.
+    pub(super) fn persist_budget(&self, username: &str, budget: &BudgetState) {
+        if let Ok(json) = serde_json::to_string(budget) {
+            let _ = self.sh.store.meta_set(&Self::budget_meta_key(username), &json);
         }
-        let parked_in = self
-            .sh
-            .parked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(role);
-        let (session, session_allow, session_mode, budget, crashes, restart_attempt, effort) =
-            match parked_in {
-                Some(p) => (
-                    p.session,
-                    p.session_allow,
-                    p.session_mode,
-                    p.budget,
-                    p.crashes,
-                    p.restart_attempt,
-                    p.effort,
-                ),
-                None => {
-                    let mut session = self.session_for_role(role)?;
-                    // A turn that died with a previous process must not leave
-                    // the role looking busy (same policy as boot adoption).
-                    if matches!(
-                        session.status,
-                        SessionStatus::Running
-                            | SessionStatus::AwaitingApproval
-                            | SessionStatus::Stopping
-                    ) && session.transition(SessionStatus::Idle).is_ok()
-                    {
-                        self.sh
-                            .store
-                            .update_session_status(&session.id, session.status)?;
-                    }
-                    (
-                        session,
-                        std::collections::HashSet::new(),
-                        None,
-                        self.load_budget(role),
-                        Vec::new(),
-                        0,
-                        None,
-                    )
-                }
-            };
-        let status = session.status;
-        let private = session.private;
-        let live_port = {
-            let mut g = self.lock();
-            if g.role == role {
-                return Ok(false);
-            }
-            if let Some(live) = g.live.as_mut() {
-                live.deliberate_close = true;
-            }
-            let port = g.live.take().map(|l| l.port);
-            let outgoing_effort = self
-                .sh
-                .effort
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            let outgoing = ParkedRole {
-                session: std::mem::replace(&mut g.session, session),
-                session_allow: std::mem::take(&mut g.session_allow),
-                session_mode: g.session_mode.take(),
-                budget: std::mem::replace(&mut g.budget, budget),
-                crashes: std::mem::take(&mut g.crashes),
-                restart_attempt: std::mem::replace(&mut g.restart_attempt, 0),
-                effort: outgoing_effort,
-            };
-            let outgoing_role = g.role.clone();
-            self.sh
-                .parked
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(outgoing_role, outgoing);
-            g.role = role.to_string();
-            g.session_allow = session_allow;
-            g.session_mode = session_mode;
-            g.crashes = crashes;
-            g.restart_attempt = restart_attempt;
-            *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) = effort;
-            port
+    }
+
+    /// One user's reasoning effort (`/effort`; cleared by `/new`).
+    pub fn effort_for(&self, username: &str) -> Option<String> {
+        self.user_handle(username).and_then(|st| st.lock().effort.clone())
+    }
+
+    /// Make `who` ready to receive a turn. `false` while *that user's* own
+    /// session is mid-turn (the caller queues instead of disturbing it).
+    pub fn activate_user(&self, who: &Principal) -> bool {
+        let Ok(st) = self.ensure_user(who) else {
+            return false;
         };
-        if let Some(port) = live_port {
-            port.kill().await;
-        }
-        self.sh.emit(AgentEvent::Settings {
-            model: None,
-            mode: Some(self.effective_mode()),
-            effort: self.effort(),
-            private: Some(private),
-        });
-        self.sh.emit(AgentEvent::Session {
-            status: format!("{status:?}"),
-        });
-        Ok(true)
-    }
-
-    /// Switch to one role by name (admin UI session picker). Refuses while
-    /// another role's turn owns the core.
-    pub async fn use_role(&self, role: &str) -> bool {
-        if self.lock().role == role {
-            return true;
-        }
         if matches!(
-            self.session_status(),
+            st.lock().session.status,
             SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping
         ) {
             return false;
         }
-        self.switch_role(role).await.is_ok()
+        st.lock().last_active_ms = ka_agent_core::now_ms();
+        true
     }
 
-    /// Make `source`'s role the active one, when the live session is not
-    /// mid-turn. Returns `false` while another role's turn owns the
-    /// single-session core (the caller says so instead of disturbing it).
-    pub async fn activate_role(&self, source: &str) -> bool {
-        let role = self.role_for_source(source);
-        if self.lock().role == role {
-            return true;
-        }
-        if matches!(
-            self.session_status(),
-            SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping
-        ) {
-            return false;
-        }
-        self.switch_role(&role).await.is_ok()
+    /// Run the fairness drain on its own task. The spawn is what keeps the
+    /// supervisor acyclic: `drive` and the crash path await this, and the
+    /// drain awaits `ensure_worker`, which spawns `drive` — awaiting it
+    /// inline would make the futures recursively non-`Send`.
+    pub(super) fn spawn_drain(&self) {
+        let rt = Runtime {
+            sh: Arc::clone(&self.sh),
+        };
+        tokio::spawn(async move { rt.drain_waiting_users().await });
     }
 
-    /// After a turn settles: hand the core to a role with queued messages.
-    pub(super) async fn yield_to_waiting_role(&self) {
-        if self.session_status() != SessionStatus::Idle {
-            return;
-        }
-        let active = self.active_role();
-        let mut roles = vec![ka_agent_core::ADMIN_ROLE.to_string()];
-        roles.extend(self.cfg().roles.iter().map(|r| r.name.clone()));
-        for role in roles {
-            if role == active {
-                continue;
-            }
-            let Ok(Some(session)) = self.sh.store.latest_session_for_role(&role) else {
+    /// After a turn settles: hand a free worker slot to a user with queued
+    /// messages, least recently active first (one user's long turn never
+    /// head-of-line blocks another).
+    pub(super) async fn drain_waiting_users(&self) {
+        for (username, st) in self.users_by_activity() {
+            let Some(user) = self
+                .sh
+                .store
+                .get_user(&username)
+                .ok()
+                .flatten()
+                .filter(|u| !u.disabled)
+            else {
                 continue;
             };
-            if self.sh.store.queue_len(&session.id).unwrap_or(0) == 0 {
+            let who = Principal::new(&username, &user.role);
+            let (sid, status, has_live) = {
+                let g = st.lock();
+                (g.session.id.clone(), g.session.status, g.live.is_some())
+            };
+            if status != SessionStatus::Idle {
                 continue;
             }
-            if self.switch_role(&role).await.is_err() {
+            if self.sh.store.queue_len(&sid).unwrap_or(0) == 0 {
                 continue;
+            }
+            // Over the worker cap the message waits for a slot; an idle
+            // worker is evicted inside `ensure_worker`.
+            if !has_live && self.live_worker_count() >= self.max_workers() {
+                self.evict_lru_idle_worker(&username);
             }
             {
-                let mut g = self.lock();
-                if g.session.status != SessionStatus::Idle {
-                    return;
-                }
+                let mut g = st.lock();
                 if g.session.transition(SessionStatus::Running).is_err() {
-                    return;
+                    continue;
                 }
+                g.last_active_ms = ka_agent_core::now_ms();
             }
-            self.persist_session_status(SessionStatus::Running);
-            if !drain_queue(&self.sh).await {
-                {
-                    let mut g = self.lock();
-                    if g.session.status == SessionStatus::Running {
-                        g.session.transition(SessionStatus::Idle).ok();
-                    }
+            self.persist_session_status(&username, &sid, SessionStatus::Running);
+            if self.ensure_worker(&who, "console").await.is_err() {
+                let mut g = st.lock();
+                if g.session.status == SessionStatus::Running {
+                    g.session.transition(SessionStatus::Idle).ok();
                 }
-                self.persist_session_status(SessionStatus::Idle);
+                drop(g);
+                self.persist_session_status(&username, &sid, SessionStatus::Idle);
+                continue;
+            }
+            if !drain_queue(&self.sh, &who, &st).await {
+                let mut g = st.lock();
+                if g.session.status == SessionStatus::Running {
+                    g.session.transition(SessionStatus::Idle).ok();
+                }
+                drop(g);
+                self.persist_session_status(&username, &sid, SessionStatus::Idle);
             }
             return;
         }
@@ -460,7 +645,6 @@ mod tests {
     use super::*;
     use crate::paths::Paths;
     use crate::surface::Surface;
-    use ka_agent_core::DaemonConfig;
     use ka_agent_port::WorkerPort;
     use std::sync::Arc;
 
@@ -504,27 +688,38 @@ mod tests {
     }
 
     #[test]
-    fn sources_resolve_to_their_linked_role() {
+    fn sources_resolve_to_their_linked_user() {
         let rt = runtime(cfg_with_guest());
         rt.store()
             .link_identity_as("telegram", "42", "cli", "guest")
             .unwrap();
-        assert_eq!(rt.role_for_source("telegram:42"), "guest");
-        assert_eq!(rt.role_for_source("telegram:99"), "admin", "unlinked");
-        assert_eq!(rt.role_for_source("matrix:@a:b"), "admin");
-        // The web relay's role logins resolve like any other identity;
-        // bare `web` (the loopback panel) stays admin.
+        // Linking a guest identity created the role-named user.
+        assert_eq!(
+            rt.principal_for_source("telegram:42"),
+            Some(Principal::new("guest", "guest"))
+        );
+        // An unlinked sender has no principal: the runtime refuses it.
+        assert_eq!(rt.principal_for_source("telegram:99"), None);
+        // The web relay's logins are identities too; bare `web` (loopback)
+        // stays the operator.
         rt.store()
-            .link_identity_as("web", "u1", "pair", "guest")
+            .link_identity_to_user("web", "ana", "invite", "guest", "ana")
             .unwrap();
-        assert_eq!(rt.role_for_source("web:u1"), "guest");
-        assert_eq!(rt.role_for_source("web"), "admin");
-        for local in ["console", "cli", "web", "api", "cli-bg", "api-bg"] {
-            assert_eq!(rt.role_for_source(local), "admin", "{local}");
+        assert_eq!(
+            rt.principal_for_source("web:ana"),
+            Some(Principal::new("ana", "guest"))
+        );
+        assert_eq!(rt.principal_for_source("web"), Some(Principal::operator()));
+        for local in ["console", "cli", "api", "cli-bg", "api-bg", "cron", "briefing", "retry"] {
+            assert_eq!(
+                rt.principal_for_source(local),
+                Some(Principal::operator()),
+                "{local}"
+            );
         }
-        assert_eq!(rt.role_for_source("cron"), "admin");
-        assert_eq!(rt.role_for_source("briefing"), "admin");
-        assert_eq!(rt.role_for_source("retry"), "admin");
+        // A disabled account stops resolving.
+        rt.store().set_user_disabled("ana", true).unwrap();
+        assert_eq!(rt.principal_for_source("web:ana"), None);
     }
 
     #[test]
@@ -534,193 +729,117 @@ mod tests {
         assert_eq!(spec.mode_canonical().as_deref(), Some("readonly"));
         assert!(spec.disable.iter().any(|s| s == "tool:bash"));
         assert!(rt.role_spec("admin").is_none(), "admin is implicit");
-        assert_eq!(rt.effective_mode(), "ask");
+        assert_eq!(rt.effective_mode_for(ka_agent_core::OPERATOR_USER), "ask");
     }
 
     #[test]
-    fn guard_lists_separate_role_trees() {
+    fn guard_lists_separate_user_trees() {
         let rt = runtime(cfg_with_guest());
         let root = rt.sh.paths.root().to_path_buf();
-        let admin_write = rt.guard_write_paths("admin");
+        let admin_write = rt.guard_write_paths(ka_agent_core::OPERATOR_USER, "admin");
+        assert!(admin_write.contains(&root.join("users")));
         assert!(admin_write.contains(&root.join("roles")));
-        let guest_write = rt.guard_write_paths("guest");
-        assert!(!guest_write.contains(&root.join("roles")));
-        let own_ws = rt.workspace_for_role("guest");
+        // The pre-users role trees are not a subject's either.
+        let guest_write = rt.guard_write_paths("guest", "guest");
+        assert!(guest_write.contains(&root.join("roles")));
+        let own_ws = rt.workspace_for_user("guest", "guest");
         assert!(
             !guest_write.iter().any(|p| own_ws.starts_with(p)),
-            "a role may write its own workspace: {guest_write:?}"
+            "a user may write their own workspace: {guest_write:?}"
         );
-        let admin_ws = rt.workspace_for_role("admin");
+        let admin_ws = rt.workspace_for_user(ka_agent_core::OPERATOR_USER, "admin");
         assert!(
             guest_write.iter().any(|p| admin_ws.starts_with(p)),
-            "a role may not write the admin workspace"
+            "a user may not write the operator workspace"
         );
-        let guest_read = rt.guard_read_paths("guest");
+        let guest_read = rt.guard_read_paths("guest", "guest");
         for blocked in ["memory", "notes", "ka", "engine-home", "state.db"] {
             assert!(
                 guest_read.contains(&root.join(blocked)),
-                "role read guard misses {blocked}"
+                "guest reads must block {blocked}: {guest_read:?}"
             );
         }
-        assert!(
-            !guest_read.contains(&root.join("roles/guest")),
-            "a role reads its own tree"
-        );
-        let admin_read = rt.guard_read_paths("admin");
-        assert!(admin_read.contains(&root.join("roles/guest")));
+        // The operator keeps the profile root itself.
+        let op_ws = rt.workspace_for_user(ka_agent_core::OPERATOR_USER, "admin");
+        assert_eq!(op_ws, rt.config().workspace_path());
     }
 
     #[test]
     fn role_budget_caps_follow_the_config() {
         let mut cfg = cfg_with_guest();
-        cfg.budgets.daily_usd = Some(5.0);
+        cfg.budgets.daily_usd = Some(10.0);
         cfg.budgets.daily_tokens = Some(1000);
         cfg.roles[0].budget_daily_usd = Some(2.0);
-        let guest = budget_caps_of(&cfg, "guest");
-        assert_eq!(guest, (Some(2.0), Some(1000)));
-        let admin = budget_caps_of(&cfg, admin());
-        assert_eq!(admin, (Some(5.0), Some(1000)));
-        cfg.roles[0].budget_daily_usd = None;
-        assert_eq!(budget_caps_of(&cfg, "guest"), (Some(5.0), Some(1000)));
+        let rt = runtime(cfg);
+        rt.store()
+            .create_user(&ka_agent_store::UserRow {
+                username: "ana".into(),
+                display_name: "Ana".into(),
+                pw_hash: None,
+                role: "guest".into(),
+                quota_daily_usd: None,
+                disabled: false,
+                created_ms: 1,
+                created_by: Some("test".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            rt.budget_caps_for(ka_agent_core::OPERATOR_USER, "admin"),
+            (Some(10.0), Some(1000))
+        );
+        assert_eq!(rt.budget_caps_for("ana", "guest"), (Some(2.0), Some(1000)));
+        // A per-user quota overrides the role cap.
+        rt.store().set_user_quota("ana", Some(0.5)).unwrap();
+        assert_eq!(rt.budget_caps_for("ana", "guest").0, Some(0.5));
     }
 
     #[test]
     fn cron_tools_only_narrow_the_role_toolset() {
-        let mut cfg = cfg_with_guest();
-        cfg.roles[0].mode = "allow".into();
-        cfg.roles[0].allow = vec!["read".into(), "grep".into()];
-        let rt = runtime(cfg);
-        rt.validate_cron_tools("guest", &["read".into()]).unwrap();
-        let err = rt
-            .validate_cron_tools("guest", &["read".into(), "bash".into()])
-            .unwrap_err();
-        assert!(err.contains("bash"), "{err}");
+        let rt = runtime(cfg_with_guest());
+        assert!(
+            rt.validate_cron_tools("guest", &["read".into()]).is_ok(),
+            "an allowed tool passes"
+        );
+        assert!(
+            rt.validate_cron_tools("guest", &["bash".into()]).is_err(),
+            "a tool outside the role's allowlist is refused"
+        );
+        // Clamping never widens.
         assert_eq!(
             rt.clamp_cron_tools("guest", &["read".into(), "bash".into()]),
-            vec!["read"]
+            vec!["read".to_string()]
         );
-        // Disable-style roles reject a tool their specs mute.
-        let mut cfg = cfg_with_guest();
-        cfg.roles[0].allow.clear();
-        cfg.roles[0].disable = vec!["tool:bash".into()];
-        let rt = runtime(cfg);
-        assert!(rt.validate_cron_tools("guest", &["read".into()]).is_ok());
-        assert!(rt.validate_cron_tools("guest", &["bash".into()]).is_err());
-        assert!(rt.clamp_cron_tools("guest", &["bash".into()]).is_empty());
+        // Admin accepts any name.
+        assert!(rt.validate_cron_tools("admin", &["bash".into()]).is_ok());
     }
 
-    #[tokio::test]
-    async fn crons_are_scoped_to_their_role() {
+    #[test]
+    fn provenance_checks_the_audience() {
         let rt = runtime(cfg_with_guest());
-        let now = rt.now_zoned();
-        let (spec, at) =
-            ka_agent_core::CronSpec::from_words(&["every", "1h", "admin job"], "operator", &now)
-                .unwrap();
-        let admin_id = rt.add_cron(spec, at).unwrap();
-        let (mut guest_spec, at) =
-            ka_agent_core::CronSpec::from_words(&["every", "1h", "guest job"], "operator", &now)
-                .unwrap();
-        guest_spec.role = Some("guest".into());
-        let guest_id = rt.add_cron(guest_spec, at).unwrap();
-
-        let guest = rt.list_crons_for("guest").unwrap();
-        assert_eq!(guest.len(), 1, "{guest:?}");
-        assert_eq!(guest[0].id, guest_id);
-        assert_eq!(rt.list_crons_for("admin").unwrap().len(), 2);
-        // A subject cannot cancel (or even see) the operator's job.
-        assert!(matches!(
-            rt.cancel_scheduled_for("guest", admin_id.as_str()).unwrap(),
-            CancelOutcome::NotFound
-        ));
-        assert!(matches!(
-            rt.cancel_scheduled_for("guest", guest_id.as_str()).unwrap(),
-            CancelOutcome::Cancelled(_)
-        ));
+        rt.store()
+            .record_turn_source("turn_1", "kb", "kb:secret/a.md", &["ops".into()])
+            .unwrap();
+        rt.store()
+            .record_turn_source("turn_1", "file", "notes/plan.md", &[])
+            .unwrap();
+        // The ops group keeps it; anyone else is a conflict naming the
+        // restricted source.
+        assert!(rt.provenance_conflict("turn_1", &["ops".into()]).is_none());
+        let conflict = rt
+            .provenance_conflict("turn_1", &["dev".into()])
+            .expect("conflict");
+        assert_eq!(conflict.reference, "kb:secret/a.md");
+        assert_eq!(conflict.group_names, vec!["ops".to_string()]);
+        assert!(rt.provenance_conflict("turn_2", &[]).is_none());
     }
 
-    #[tokio::test]
-    async fn use_role_switches_when_idle() {
+    #[test]
+    fn mode_is_clamped_to_the_role_ceiling() {
         let rt = runtime(cfg_with_guest());
-        assert!(rt.use_role("guest").await);
-        assert_eq!(rt.active_role(), "guest");
-        assert!(rt.use_role("admin").await);
-        assert_eq!(rt.active_role(), "admin");
-    }
-
-    #[tokio::test]
-    async fn role_budget_state_is_parked_and_restored() {
-        let mut cfg = cfg_with_guest();
-        cfg.roles[0].budget_daily_usd = Some(2.0);
-        let rt = runtime(cfg);
-        assert!(rt.switch_role("guest").await.unwrap());
-        {
-            let mut g = rt.lock();
-            g.budget.record(3.0, 10, ka_agent_core::now_ms());
-        }
-        assert_eq!(
-            rt.budget_verdict_for("guest"),
-            ka_agent_core::BudgetVerdict::Exceeded
-        );
-        assert_ne!(
-            rt.budget_verdict_for("admin"),
-            ka_agent_core::BudgetVerdict::Exceeded,
-            "the admin's own budget is untouched"
-        );
-        // The spent window rides the switch away and back.
-        assert!(rt.switch_role("admin").await.unwrap());
-        assert_eq!(
-            rt.budget_verdict_for("guest"),
-            ka_agent_core::BudgetVerdict::Exceeded
-        );
-        assert_ne!(
-            rt.budget_verdict_for("admin"),
-            ka_agent_core::BudgetVerdict::Exceeded
-        );
-    }
-
-    #[tokio::test]
-    async fn subject_mode_is_clamped_to_the_ceiling() {
-        let rt = runtime(cfg_with_guest());
-        assert!(rt.switch_role("guest").await.unwrap());
-        let reply = rt.set_mode("allow", "telegram:77").await.unwrap();
-        assert!(reply.contains("readonly"), "{reply}");
-        assert_eq!(rt.effective_mode(), "readonly");
-        // Stricter than the ceiling is accepted as-is.
-        let reply = rt.set_mode("readonly", "telegram:77").await.unwrap();
-        assert_eq!(reply, "readonly");
-    }
-
-    fn admin() -> &'static str {
-        ka_agent_core::ADMIN_ROLE
-    }
-
-    #[tokio::test]
-    async fn switching_parks_and_restores_each_roles_conversation() {
-        let rt = runtime(cfg_with_guest());
-        let admin_session = rt.session_id();
-        assert_eq!(rt.active_role(), "admin");
-
-        assert!(rt.switch_role("guest").await.unwrap());
-        assert_eq!(rt.active_role(), "guest");
-        assert_eq!(rt.session_status(), SessionStatus::Idle);
-        let guest_session = rt.session_id();
-        assert_ne!(guest_session, admin_session);
-        assert_eq!(rt.effective_mode(), "readonly");
-        assert_eq!(
-            rt.workspace_for_role("guest"),
-            rt.sh.paths.root().join("roles/guest/workspace")
-        );
-        // The guest session row carries the role.
-        let row = rt.store().get_session(&guest_session).unwrap();
-        assert_eq!(row.role, "guest");
-
-        // Back to admin: the original conversation returns.
-        assert!(rt.switch_role("admin").await.unwrap());
-        assert_eq!(rt.session_id(), admin_session);
-        assert_eq!(rt.effective_mode(), "ask");
-
-        // And to guest again: the same guest session (adopted/parked).
-        assert!(rt.switch_role("guest").await.unwrap());
-        assert_eq!(rt.session_id(), guest_session);
+        rt.store()
+            .link_identity_as("telegram", "42", "test", "guest")
+            .unwrap();
+        assert_eq!(rt.effective_mode_for("guest"), "readonly");
+        assert_eq!(rt.effective_mode_for(ka_agent_core::OPERATOR_USER), "ask");
     }
 }

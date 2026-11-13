@@ -10,6 +10,8 @@ use super::{Store, StoreError};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PruneReport {
     pub runs: usize,
+    /// Turns deleted by `retention.turns_days` (0 = never).
+    pub turns: usize,
     pub approvals: usize,
     pub intents: usize,
     pub memory_candidates: usize,
@@ -28,8 +30,14 @@ const TASKS_DAYS: i64 = 90;
 
 impl Store {
     /// Delete terminal rows older than the retention windows. One
-    /// transaction; safe to run at any time.
+    /// transaction; safe to run at any time. Turns are only touched when
+    /// `turns_days > 0` (the RGPD knob, default keep-everything).
     pub fn prune(&self, now_ms: i64) -> Result<PruneReport, StoreError> {
+        self.prune_with(now_ms, 0)
+    }
+
+    /// The same, with an explicit turns window in days (0 = never).
+    pub fn prune_with(&self, now_ms: i64, turns_days: u32) -> Result<PruneReport, StoreError> {
         let day = 86_400_000i64;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -37,7 +45,29 @@ impl Store {
                     sql: &str,
                     cutoff: i64|
          -> Result<usize, StoreError> { Ok(tx.execute(sql, [cutoff])?) };
+        let turns = if turns_days == 0 {
+            0
+        } else {
+            // Their search rows go with them, or the FTS index would keep
+            // text the retention window promised to delete.
+            let cutoff = now_ms - (turns_days as i64) * day;
+            tx.execute(
+                "DELETE FROM episodes_fts WHERE turn IN \
+                 (SELECT id FROM turns WHERE status IN ('done','error','aborted','interrupted','killed') AND created_ms < ?1)",
+                [cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM turn_sources WHERE turn_id IN \
+                 (SELECT id FROM turns WHERE status IN ('done','error','aborted','interrupted','killed') AND created_ms < ?1)",
+                [cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM turns WHERE status IN ('done','error','aborted','interrupted','killed') AND created_ms < ?1",
+                [cutoff],
+            )?
+        };
         let report = PruneReport {
+            turns,
             runs: exec(
                 &tx,
                 "DELETE FROM runs WHERE ended_ms IS NOT NULL AND ended_ms < ?",

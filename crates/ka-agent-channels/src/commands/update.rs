@@ -25,7 +25,7 @@ pub(super) fn run_update<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         // gated.
         if !check_only
             && matches!(
-                runtime.session_status(),
+                runtime.session_status_for(&ctx.principal),
                 SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping
             )
         {

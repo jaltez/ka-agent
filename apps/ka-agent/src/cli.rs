@@ -146,7 +146,7 @@ pub(crate) enum Command {
         /// Config path.
         #[arg(short, long)]
         config: Option<PathBuf>,
-        /// Role the paired identity gets (`web` only; default admin).
+        /// Role the paired identity gets (default: the admin operator).
         #[arg(long)]
         role: Option<String>,
     },
@@ -243,6 +243,22 @@ pub(crate) enum Command {
     Identity {
         #[command(subcommand)]
         action: IdentityAction,
+    },
+    /// Accounts: invite, list, disable/enable, reset, export, purge.
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+    /// Knowledge bases: create, add documents, remove, grants.
+    Kb {
+        #[command(subcommand)]
+        action: KbAction,
+    },
+    /// Shared agents: persona + skills + knowledge + model, shared by group.
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
     },
     /// Install, inspect and manage signed, sandboxed plugins.
     #[command(hide = true)]
@@ -624,6 +640,171 @@ pub(crate) enum IdentityAction {
     },
     /// Unknown contacts that messaged the bot, with the link command.
     Pending,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub(crate) enum UserAction {
+    /// List accounts with role, state, groups and identities.
+    List,
+    /// Mint an invite code (24 h, single use) for a new account.
+    Invite {
+        /// Role the new account gets (default `member`).
+        #[arg(long, default_value = "member")]
+        role: String,
+        /// Groups to add the account to (repeatable or comma-separated).
+        #[arg(long = "group", value_delimiter = ',')]
+        groups: Vec<String>,
+        /// Days the code stays valid (default 1).
+        #[arg(long, default_value = "1")]
+        days: u32,
+        /// The profile config the role must be defined in (default: the
+        /// active profile's).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
+    /// Disable an account: sessions cleared, identities silent, crons paused.
+    Disable { username: String },
+    /// Re-enable a disabled account.
+    Enable { username: String },
+    /// Change an account's role or daily quota.
+    Set {
+        username: String,
+        #[arg(long)]
+        role: Option<String>,
+        /// Daily USD cap (`0` clears it back to the role/profile budget).
+        #[arg(long)]
+        quota: Option<f64>,
+        /// Replace the account's group membership (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        groups: Option<Vec<String>>,
+    },
+    /// Clear an account's password and drop its web sessions.
+    Reset { username: String },
+    /// Write a tar of the account's data trees under backups/.
+    Export { username: String },
+    /// Delete the account's data trees (the account row and audit stay).
+    Purge {
+        username: String,
+        /// Required: this deletes data.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub(crate) enum AgentAction {
+    /// List shared agents with their owner, model and grants.
+    List,
+    /// Create (or fail on) one shared agent.
+    Create {
+        name: Option<String>,
+        #[arg(long)]
+        persona: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        skills: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        kbs: Vec<String>,
+        /// The owning account (default: the operator).
+        #[arg(long, default_value = "operator")]
+        owner: String,
+    },
+    /// Grant a group access (viewer | editor | owner).
+    Share {
+        name: String,
+        #[arg(long)]
+        group: String,
+        #[arg(long, default_value = "viewer")]
+        level: String,
+    },
+    /// Remove a group's access.
+    Unshare {
+        name: String,
+        #[arg(long)]
+        group: String,
+    },
+    /// Transfer ownership to another account.
+    Transfer { name: String, owner: String },
+    /// Delete one shared agent (its grants go too).
+    Rm { name: String },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub(crate) enum KbAction {
+    /// List knowledge bases with access groups and document counts.
+    List,
+    /// Create a knowledge base readable by the given groups.
+    Create {
+        name: String,
+        #[arg(long, default_value = "")]
+        display_name: String,
+        #[arg(long = "group", value_delimiter = ',')]
+        groups: Vec<String>,
+    },
+    /// Add or replace one document from a file (`.md .txt .csv .json`).
+    Add {
+        kb: String,
+        /// The file to read (its base name becomes the document path).
+        path: std::path::PathBuf,
+        /// Document path inside the KB (default: the file's name).
+        #[arg(long)]
+        as_path: Option<String>,
+        /// Document title (default: the path).
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Remove one document by KB path.
+    Rm { kb: String, path: String },
+    /// Delete a knowledge base with every document.
+    Delete { kb: String },
+    /// Replace a knowledge base's access groups.
+    Grant {
+        kb: String,
+        #[arg(long = "group", value_delimiter = ',')]
+        groups: Vec<String>,
+    },
+    /// External sources feeding a knowledge base (Notion, Dropbox, git).
+    Source {
+        #[command(subcommand)]
+        action: KbSourceAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub(crate) enum KbSourceAction {
+    /// Add or replace one source.
+    Add {
+        kb: String,
+        /// notion | dropbox | git
+        kind: String,
+        /// Notion root page id, Dropbox folder path, or git URL.
+        target: String,
+        /// Secret-store name for the source token (notion/dropbox).
+        #[arg(long)]
+        token: Option<String>,
+        /// Only index files matching these globs (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+        /// Sync interval in minutes (default 15).
+        #[arg(long, default_value = "15")]
+        every_minutes: u32,
+    },
+    /// Remove one source.
+    Rm {
+        kb: String,
+        kind: String,
+        target: String,
+    },
+    /// List configured sources with their last result.
+    List,
+    /// Run one source (or every source of a KB) now.
+    Sync {
+        kb: String,
+        /// Kind (with `target`) or omit to sync every source of the KB.
+        kind: Option<String>,
+        target: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]

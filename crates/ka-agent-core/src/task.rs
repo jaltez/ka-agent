@@ -215,6 +215,10 @@ pub struct CronSpec {
     /// toolset (`None`/absent = admin, so old payloads load unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The creator's user: the fired turn runs in that user's partition
+    /// (`None`/absent = the operator, so old payloads load unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     /// Exact hand names this job may use; re-clamped to the role's
     /// effective toolset at every fire (config changes only narrow).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -285,6 +289,7 @@ impl CronSpec {
             month_day: None,
             gate: None,
             role: None,
+            username: None,
             tools: Vec::new(),
         };
         let now_ms = now.timestamp().as_millisecond();
@@ -368,6 +373,7 @@ mod cron_tests {
             month_day: None,
             gate: None,
             role: None,
+            username: None,
             tools: Vec::new(),
         };
         assert_eq!(
@@ -385,6 +391,7 @@ mod cron_tests {
             month_day: None,
             gate: None,
             role: None,
+            username: None,
             tools: Vec::new(),
         };
         let payload = recurring.to_payload();
@@ -405,14 +412,17 @@ mod cron_tests {
             month_day: None,
             gate: None,
             role: Some("guest".into()),
+            username: Some("guest".into()),
             tools: vec!["read".into(), "grep".into()],
         };
         let back = CronSpec::from_payload(&spec.to_payload()).unwrap();
         assert_eq!(back.role.as_deref(), Some("guest"));
+        assert_eq!(back.username.as_deref(), Some("guest"));
         assert_eq!(back.tools, vec!["read", "grep"]);
         // Absent fields mean admin with no narrowing: pre-RBAC payloads
         // load unchanged.
         spec.role = None;
+        spec.username = None;
         spec.tools.clear();
         let old =
             r#"{"text":"ping","source":"operator","recurrence_ms":null,"mode":{"mode":"agent"}}"#;

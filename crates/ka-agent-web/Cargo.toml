@@ -17,6 +17,9 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 ka-agent-channels = { workspace = true }
 ka-agent-plugins = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+password-hash = { workspace = true }
 jiff = { workspace = true }
 rand_core = { workspace = true }
 

@@ -34,7 +34,7 @@ fn run(
     config: PathBuf,
     role: Option<String>,
 ) -> Result<std::process::ExitCode, PairError> {
-    if !matches!(channel.as_str(), "telegram" | "matrix" | "web") {
+    if !matches!(channel.as_str(), "telegram" | "matrix") {
         return Err(PairError::UnknownChannel(channel));
     }
     let cfg = ka_agent_core::DaemonConfig::load(&config)
@@ -45,20 +45,6 @@ fn run(
             "role {role:?} (define [[role]] name = {role:?} in {} first)",
             config.display()
         )));
-    }
-    if channel == "web" {
-        // The browser redeems the code at `/pair`; nothing to poll here.
-        let paths = Paths::new(Paths::default_root());
-        let store = Store::open(&paths.state_db()).map_err(|_| PairError::NoDaemon)?;
-        let code = ka_agent_channels::pairing::issue_for_role(&store, "web", Some(&role))
-            .map_err(|e| PairError::NotEnabled(format!("web ({e})")))?;
-        println!("web pairing code: {code}  (valid 10 minutes)");
-        println!("  open http://127.0.0.1:{}/pair and enter it", cfg.web.port);
-        println!("  the browser links as role {role}");
-        if !admin::is_running(&paths) {
-            println!("  note: the daemon is not running — start it to redeem the code");
-        }
-        return Ok(std::process::ExitCode::SUCCESS);
     }
     let enabled = match channel.as_str() {
         "telegram" => cfg.telegram.enabled,

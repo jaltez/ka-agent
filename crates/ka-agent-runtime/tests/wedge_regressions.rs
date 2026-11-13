@@ -73,7 +73,7 @@ fn adopted_busy_session_returns_to_idle_on_startup() {
     // Restart the runtime over the same store.
     let rt = runtime_with(&root, Arc::clone(&store), config(&root));
     assert_eq!(
-        rt.session_status(),
+        rt.session_status_for(&op()),
         ka_agent_core::SessionStatus::Idle,
         "an adopted busy session must not stay busy"
     );
@@ -101,7 +101,7 @@ async fn expired_ask_is_dropped_from_the_pending_map() {
     // An approval that expired before this sweep, registered as if the engine
     // had asked and nobody answered.
     let mut session = Session::new(root.join("ws"));
-    session.id = rt.session_id();
+    session.id = rt.session_id_for(&op()).unwrap();
     if store.get_session(&session.id).is_err() {
         store.insert_session(&session).unwrap();
     }
@@ -127,7 +127,7 @@ async fn expired_ask_is_dropped_from_the_pending_map() {
 
     // The invariant that matters: nothing is left claiming a live ask, so the
     // next message is submitted (or queued for drain), never wedged.
-    let status = rt.session_status();
+    let status = rt.session_status_for(&op());
     assert_ne!(
         status,
         ka_agent_core::SessionStatus::AwaitingApproval,
@@ -147,7 +147,7 @@ async fn decide_after_ttl_is_refused() {
     let store = store_at(&root.join("data"));
     let rt = runtime_with(&root, Arc::clone(&store), config(&root));
     let mut session = Session::new(root.join("ws"));
-    session.id = rt.session_id();
+    session.id = rt.session_id_for(&op()).unwrap();
     if store.get_session(&session.id).is_err() {
         store.insert_session(&session).unwrap();
     }
@@ -209,12 +209,12 @@ fn resume_lifts_a_pause_and_refuses_on_budget() {
     let rt = runtime_with(&root, Arc::clone(&store), cfg.clone());
 
     // Not paused → nothing to resume.
-    assert!(!rt.resume().unwrap());
+    assert!(!futures_lite_block(rt.resume_for(&op())).unwrap());
 
     // Pause it as the guard would and try to lift it: refused, with the
     // reason, because the budget for this window is still exceeded.
     let mut session = Session::new(root.join("ws"));
-    session.id = rt.session_id();
+    session.id = rt.session_id_for(&op()).unwrap();
     if store.get_session(&session.id).is_err() {
         store.insert_session(&session).unwrap();
     }
@@ -222,7 +222,9 @@ fn resume_lifts_a_pause_and_refuses_on_budget() {
         .update_session_status(&session.id, ka_agent_core::SessionStatus::Paused)
         .ok();
     let paused_runtime = runtime_with(&root, Arc::clone(&store), cfg.clone());
-    let err = paused_runtime.resume().unwrap_err().to_string();
+    let err = futures_lite_block(paused_runtime.resume_for(&op()))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("budget still exceeded"), "{err}");
 
     // A new day window (fresh meta) makes resume work.
@@ -237,9 +239,9 @@ fn resume_lifts_a_pause_and_refuses_on_budget() {
         .meta_set("budget", &serde_json::to_string(&fresh).unwrap())
         .unwrap();
     let after_roll = runtime_with(&root, Arc::clone(&store), cfg);
-    assert!(after_roll.resume().unwrap());
+    assert!(futures_lite_block(after_roll.resume_for(&op())).unwrap());
     assert_eq!(
-        after_roll.session_status(),
+        after_roll.session_status_for(&op()),
         ka_agent_core::SessionStatus::Idle
     );
 
@@ -258,8 +260,8 @@ fn stop_escalates_on_the_turn_not_the_process() {
     let rt = runtime_with(&root, Arc::clone(&store), config(&root));
 
     // No live worker: a no-op, not an error.
-    futures_lite_block(rt.stop_turn()).unwrap();
-    assert_eq!(rt.session_status(), ka_agent_core::SessionStatus::Idle);
+    futures_lite_block(rt.stop_turn(&op(), "test")).unwrap();
+    assert_eq!(rt.session_status_for(&op()), ka_agent_core::SessionStatus::Idle);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -275,6 +277,11 @@ fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
 /// Restart with a durable queue: the message that wakes the daemon must not
 /// overtake what was already queued (the worker spawns lazily, so nothing
 /// drains the queue until a message arrives).
+/// The operator: the principal every local surface acts as.
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
+}
+
 #[tokio::test]
 async fn waking_message_does_not_overtake_the_durable_queue() {
     let root = std::env::temp_dir().join(format!("ka-fifo-{}", std::process::id()));
@@ -299,7 +306,7 @@ async fn waking_message_does_not_overtake_the_durable_queue() {
     let _ = rt.handle_message("sent after the restart", "console").await;
 
     // The new message went behind the old one, not in front of it.
-    let queued = store.queued_items(&rt.session_id()).unwrap();
+    let queued = store.queued_items(&rt.session_id_for(&op()).unwrap()).unwrap();
     let texts: Vec<&str> = queued.iter().map(|q| q.text.as_str()).collect();
     assert_eq!(
         texts,
@@ -307,6 +314,6 @@ async fn waking_message_does_not_overtake_the_durable_queue() {
         "queue order after the waking message"
     );
     // And the session is not wedged in `running` by the failed spawn.
-    assert_eq!(rt.session_status(), ka_agent_core::SessionStatus::Idle);
+    assert_eq!(rt.session_status_for(&op()), ka_agent_core::SessionStatus::Idle);
     let _ = std::fs::remove_dir_all(&root);
 }

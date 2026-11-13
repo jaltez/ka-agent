@@ -136,7 +136,7 @@ impl Backend {
                     ka_agent_channels::commands::Outcome::Silent => {}
                     ka_agent_channels::commands::Outcome::NotACommand => {
                         let expanded =
-                            ka_agent_channels::refs::expand(store, &runtime.workspace(), text)
+                            ka_agent_channels::refs::expand_operator(store, &runtime.workspace_for(&ka_agent_core::Principal::operator()), text)
                                 .await;
                         if let Err(e) = runtime.handle_message(&expanded, "console").await {
                             pending.push_back(Envelope::new(
@@ -164,7 +164,7 @@ impl Backend {
     async fn request_status(&mut self) -> Result<(), String> {
         match self {
             Self::Local { host, pending, .. } => {
-                match host.runtime.status_report() {
+                match host.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
                     Ok(report) => pending.push_back(Envelope::new(
                         0,
                         AgentEvent::Hello {
@@ -580,7 +580,7 @@ pub async fn chat(config: PathBuf, scenario: Option<PathBuf>) -> std::process::E
     // are TTYs; the piped path keeps the line reader untouched.
     let mut terminal = if interactive {
         let ws = match &backend {
-            Backend::Local { host, .. } => host.runtime.workspace(),
+            Backend::Local { host, .. } => host.runtime.workspace_for(&ka_agent_core::Principal::operator()),
             Backend::Attached { .. } => ka_agent_core::DaemonConfig::load(&config)
                 .map(|c| c.workspace_path())
                 .unwrap_or_else(|_| std::path::PathBuf::from(".")),

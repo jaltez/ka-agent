@@ -70,6 +70,11 @@ fn scripted_port(_root: &Path, _steps: &str) -> WorkerPort {
 }
 
 #[cfg(unix)]
+/// The operator: the principal every local surface acts as.
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_resends_after_a_protocol_error() {
     let root = std::env::temp_dir().join(format!("ka-retry-{}", std::process::id()));
@@ -107,7 +112,7 @@ async fn retry_resends_after_a_protocol_error() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let text = rt.retry_last().await.unwrap();
+    let text = rt.retry_last(&op()).await.unwrap();
     assert_eq!(text.as_deref(), Some("please answer"));
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {

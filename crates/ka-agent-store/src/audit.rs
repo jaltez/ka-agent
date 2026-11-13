@@ -74,8 +74,8 @@ impl Store {
         // `role` rides beside the chain, not inside the canonical payload:
         // rows written before roles existed keep verifying unchanged.
         tx.execute(
-            "INSERT INTO audit(seq, at_ms, actor, action, subject, detail, prev_hash, hash, role)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO audit(seq, at_ms, actor, action, subject, detail, prev_hash, hash, role, username)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 seq,
                 record.at_ms,
@@ -85,7 +85,8 @@ impl Store {
                 record.detail,
                 prev_hash,
                 hash,
-                record.role
+                record.role,
+                record.username
             ],
         )?;
         record.hash = hash;
@@ -148,7 +149,7 @@ impl Store {
     pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT seq, at_ms, actor, action, subject, detail, prev_hash, hash, role
+            "SELECT seq, at_ms, actor, action, subject, detail, prev_hash, hash, role, username
              FROM audit ORDER BY seq DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |r| {
@@ -162,6 +163,7 @@ impl Store {
                 prev_hash: r.get(6)?,
                 hash: r.get(7)?,
                 role: r.get(8)?,
+                username: r.get(9)?,
             })
         })?;
         let mut out = Vec::new();

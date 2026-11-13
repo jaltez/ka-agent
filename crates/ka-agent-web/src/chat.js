@@ -395,7 +395,11 @@
     var body = "id=" + encodeURIComponent(id) + "&decision=" + decision;
     fetch("/approvals/decide", {
       method: "POST",
-      headers: { "X-Ka-Agent": "1", "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "X-Ka-Agent": "1",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
       body: body,
     }).catch(function () {});
     var buttons = actions.querySelectorAll("button");
@@ -413,7 +417,11 @@
     var body = "text=" + encodeURIComponent(v);
     fetch("/chat/send", {
       method: "POST",
-      headers: { "X-Ka-Agent": "1", "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "X-Ka-Agent": "1",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
       body: body,
     })
       .then(function (r) {

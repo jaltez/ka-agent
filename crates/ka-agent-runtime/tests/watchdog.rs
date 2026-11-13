@@ -149,6 +149,11 @@ async fn watchdog_run(silent_secs: u32, abort_secs: u32) -> (Collect, TurnStatus
     )
     .unwrap();
 
+    // Every source resolves to a user: link this identity (an unlinked
+    // sender is refused silently, as on the channels).
+    store
+        .link_identity_as("telegram", "1", "test", "admin")
+        .unwrap();
     rt.handle_message("stall please", "telegram:1")
         .await
         .unwrap();
@@ -170,9 +175,9 @@ async fn watchdog_run(silent_secs: u32, abort_secs: u32) -> (Collect, TurnStatus
     // returns to idle.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let turn_status = loop {
-        let status = rt.status_report().unwrap().status;
+        let status = rt.status_report_for(&op()).unwrap().status;
         let latest = store
-            .latest_turns_for_session(&rt.session_id(), 1, 0)
+            .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 1, 0)
             .unwrap()
             .into_iter()
             .next()
@@ -188,6 +193,11 @@ async fn watchdog_run(silent_secs: u32, abort_secs: u32) -> (Collect, TurnStatus
     };
     maintenance.abort();
     (collect, turn_status)
+}
+
+/// The operator: the principal every local surface acts as.
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

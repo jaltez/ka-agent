@@ -61,7 +61,7 @@ fn handle(paths: &ka_agent_runtime::paths::Paths, msg: &Value) -> Value {
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "kagent", "version": env!("CARGO_PKG_VERSION")}
         }),
-        "tools/list" => match relay(paths, json!({"op": "tool_list"})) {
+        "tools/list" => match relay(paths, json!({"op": "tool_list", "user": tool_user()})) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
                 json!({"tools": v["tools"].clone()})
             }
@@ -80,7 +80,7 @@ fn handle(paths: &ka_agent_runtime::paths::Paths, msg: &Value) -> Value {
             let args = msg["params"]["arguments"].clone();
             match relay(
                 paths,
-                json!({"op": "tool_call", "name": name, "args": args}),
+                json!({"op": "tool_call", "name": name, "args": args, "user": tool_user()}),
             ) {
                 Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
                     let text = v["text"].as_str().unwrap_or("").to_string();
@@ -104,6 +104,12 @@ fn handle(paths: &ka_agent_runtime::paths::Paths, msg: &Value) -> Value {
         }
         _ => json!({"error": {"code": -32601, "message": format!("method not found: {method}")}}),
     }
+}
+
+/// The acting user this bridge serves: pinned into the worker env at spawn,
+/// because one worker (and so one bridge) only ever serves one user's turns.
+fn tool_user() -> String {
+    std::env::var("KA_AGENT_TOOLCTX").unwrap_or_default()
 }
 
 /// Entry point for `ka-agent __mcp`: blocking, one request at a time.

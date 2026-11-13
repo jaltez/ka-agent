@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::{Effect, ToolCtx, ToolFuture};
+use super::{Effect, ToolCtx, ToolFuture, turn_principal};
 
 pub(crate) fn propose_schema() -> Value {
     json!({
@@ -19,7 +19,7 @@ pub(crate) fn propose_schema() -> Value {
 pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
         let _ = Effect::Propose;
-        if ctx.runtime.session_private() {
+        if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
             return Err("this is a private conversation — memory proposals are off here".into());
         }
         let text = args["text"].as_str().ok_or("missing 'text'")?;
@@ -37,14 +37,16 @@ pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         let id = ka_agent_core::MemoryId::generate();
         // The proposal belongs to the role whose turn made it: accepted
         // memory lands in that role's root, never the admin's by accident.
+        let who = turn_principal(ctx);
         ctx.store
-            .add_candidate_for_role(
+            .add_candidate_for_user(
                 &id,
                 "model",
                 text,
                 None,
                 file,
-                &super::turn_role(&ctx.store),
+                who.role.as_str(),
+                &who.username,
             )
             .map_err(|e| format!("candidate: {e}"))?;
         Ok(format!(

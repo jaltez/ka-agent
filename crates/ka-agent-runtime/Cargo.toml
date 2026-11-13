@@ -17,6 +17,7 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 jiff = { workspace = true }
 sha2 = { workspace = true }
+tar = { workspace = true }
 
 [dev-dependencies]
 # Feature-enabled so `ka-port-test-worker` builds for this crate's

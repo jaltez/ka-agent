@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use super::{ToolCtx, ToolFuture};
+use super::{ToolCtx, ToolFuture, turn_principal};
 
 /// Shortest recurrence the model may schedule: every fire is a full agent
 /// turn, so a runaway `every 1s` would burn the budget in minutes.
@@ -55,7 +55,7 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             "schedule" => {
                 // A private conversation schedules nothing: the task row
                 // (and its agent turn) would outlive the session.
-                if ctx.runtime.session_private() {
+                if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
                     return Err(
                         "this is a private conversation — nothing it schedules may outlive it; /new first"
                             .into(),
@@ -66,7 +66,7 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                 // is the live one — no store meta row in between.
                 if ctx
                     .runtime
-                    .current_turn_source()
+                    .current_turn_source_for(&crate::tools::turn_principal(ctx))
                     .is_some_and(|s| s == "cron" || s.starts_with("cron:"))
                 {
                     return Err(
@@ -156,7 +156,7 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                 }
                 // The job belongs to the turn's role: a subject's scheduled
                 // prompt must fire as that subject, never as the operator.
-                let role = super::turn_role(&ctx.store);
+                let who = crate::tools::turn_principal(ctx);
                 let mut spec = ka_agent_core::CronSpec {
                     text: text.to_string(),
                     source: "kagent".into(),
@@ -168,7 +168,8 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                     weekdays: Vec::new(),
                     month_day: None,
                     gate: None,
-                    role: (role != ka_agent_core::ADMIN_ROLE).then_some(role),
+                    role: (who.role != ka_agent_core::ADMIN_ROLE).then_some(who.role.clone()),
+                    username: Some(who.username.clone()),
                     tools: Vec::new(),
                 };
                 if let Some((rule, _)) = &anchored {
@@ -199,7 +200,7 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                 use ka_agent_runtime::cron_ops;
                 let task = cron_ops::resolve(&ctx.store, args["id"].as_str().unwrap_or(""))?;
                 // A subject only manages its own jobs; admin manages all.
-                let role = super::turn_role(&ctx.store);
+                let role = turn_principal(ctx).role.clone();
                 let owner = task
                     .payload
                     .as_deref()

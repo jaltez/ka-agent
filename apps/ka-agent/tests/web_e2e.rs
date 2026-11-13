@@ -147,15 +147,15 @@ fn spawn_daemon_extra(root: &std::path::Path, port: u16, extra: &str) -> Daemon 
     Daemon { child, data, port }
 }
 
-/// `ka-agent pair web --role <role>` against the daemon's data dir.
-fn pair_web(daemon: &Daemon, role: &str) -> String {
+/// `ka-agent user invite --role <role>` against the daemon's data dir.
+fn mint_invite(daemon: &Daemon, role: &str) -> String {
     let config = daemon
         .data
         .parent()
         .expect("data root has a parent")
         .join("ka-agent.toml");
     let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
-        .args(["pair", "web", "--role", role])
+        .args(["user", "invite", "--role", role])
         .arg("--config")
         .arg(&config)
         .envs(daemon.env())
@@ -163,105 +163,135 @@ fn pair_web(daemon: &Daemon, role: &str) -> String {
         .unwrap();
     assert!(
         out.status.success(),
-        "pair web: {}",
+        "user invite: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout
         .lines()
-        .find_map(|l| l.strip_prefix("web pairing code: "))
-        .expect("pairing code on stdout")
-        .split_whitespace()
-        .next()
-        .expect("code word")
+        .find_map(|l| l.strip_prefix("invite code: "))
+        .expect("invite code on stdout")
+        .trim()
         .to_string()
 }
 
-/// ADR-0002: a paired browser gets a role session — chat only, its own
-/// history, and never an admin page. The operator's own session still sees
-/// everything.
+/// Redeem an invite in the panel and return the session cookie.
+fn redeem(port: u16, code: &str, username: &str, password: &str) -> Http {
+    let body = format!(
+        "code={}&username={}&password={}",
+        code.replace('-', "%2D"),
+        username,
+        password
+    );
+    request(port, "POST", "/invite", None, &body)
+}
+
+/// ADR-0004: a member account reaches the chat only; the operator sees the
+/// whole panel. The invite is minted by the real CLI and redeemed at
+/// `/invite`, so the account path itself is under test.
 #[test]
-fn web_role_pairing_is_chat_only() {
-    let root = temp_root("roleweb");
+fn member_realm_is_chat_only() {
+    let root = temp_root("role");
     let port = free_port();
+    // The invite is minted before the daemon takes the store (an admin
+    // would do this with the daemon stopped, or through the panel's Users
+    // page while it runs).
+    let cfg = root.join("ka-agent.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "workspace = {:?}\n[[role]]\nname = \"member\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
+            root.join("ws").display()
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["user", "invite", "--role", "member", "--config"])
+        .arg(&cfg)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "user invite: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("invite code: "))
+        .expect("invite code")
+        .trim()
+        .to_string();
     let mut daemon = spawn_daemon_extra(
         &root,
         port,
-        "[[role]]\nname = \"guest\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
+        "[[role]]\nname = \"member\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
     );
-    // Wait for the listener (and consume one admin login URL).
-    let _admin_url = daemon.web_token();
-
-    let code = pair_web(&daemon, "guest");
-    let resp = request(
-        port,
-        "POST",
-        "/pair",
-        None,
-        &format!("code={}", code.replace('-', "%2D")),
-    );
-    assert_eq!(resp.status, 303, "pairing redirects: {}", resp.body);
-    let set = resp.header("set-cookie").expect("Set-Cookie on pairing");
+    wait_web(port, Duration::from_secs(30));
+    let resp = redeem(port, &code, "ana", "longpassword");
+    assert_eq!(resp.status, 303, "invite redemption redirects: {}", resp.body);
+    let set = resp.header("set-cookie").expect("Set-Cookie on invite");
     assert!(set.contains("HttpOnly"), "cookie not HttpOnly: {set}");
     assert!(set.contains("SameSite=Strict"), "cookie not Strict: {set}");
     let cookie = resp.cookie();
 
-    // The role chat page renders, with its badge and no admin nav.
+    // The member's chat page renders without admin navigation.
     let page = request(port, "GET", "/", Some(&cookie), "");
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("role guest"), "{}", page.body);
     assert!(
         !page.body.contains("href=\"/approvals\""),
-        "no admin navigation on a role page"
+        "no admin navigation on a member page"
     );
     // Every admin surface is refused.
-    for path in ["/status", "/approvals", "/audit", "/memory", "/contacts"] {
+    for path in [
+        "/status",
+        "/approvals",
+        "/audit",
+        "/memory",
+        "/contacts",
+        "/users",
+        "/kb",
+    ] {
         let resp = request(port, "GET", path, Some(&cookie), "");
         assert_eq!(resp.status, 403, "{path} must be admin-only: {}", resp.body);
     }
     let resp = request(port, "POST", "/settings", Some(&cookie), "mode=allow");
-    assert_eq!(resp.status, 403, "a role cannot mutate settings");
-
-    // A chat post routes as `web:<id>`, so the role gates apply server-side.
-    let resp = request_h(
+    assert_eq!(resp.status, 403, "a member cannot mutate settings");
+    // A chat post routes as `web:ana`, so the role gates apply server-side.
+    // `/model` is a member command now (filtered by the group allowlist;
+    // this account has no groups, so the full catalog lists).
+    let resp = request(
         port,
         "POST",
         "/chat/send",
         Some(&cookie),
         "text=%2Fmodel",
-        &[("X-Ka-Agent", "1")],
     );
     assert_eq!(resp.status, 200);
-    assert!(
-        resp.body.contains("not available for role guest"),
-        "{}",
-        resp.body
-    );
+    assert!(!resp.body.contains("not available"), "{}", resp.body);
+    assert!(resp.body.contains("/model"), "{}", resp.body);
 
-    // The operator's session is unaffected and sees the profiles page.
+    // The operator's session is unaffected and sees the users page.
     let admin = login(&daemon);
     let status = request(port, "GET", "/status", Some(&admin), "");
     assert_eq!(status.status, 200);
-    let profiles = request(port, "GET", "/profiles", Some(&admin), "");
-    assert_eq!(profiles.status, 200);
-    assert!(
-        profiles.body.contains("linked identities"),
-        "{}",
-        profiles.body
-    );
-    assert!(
-        profiles.body.contains("guest"),
-        "the configured role is listed: {}",
-        profiles.body
-    );
+    let users = request(port, "GET", "/users", Some(&admin), "");
+    assert_eq!(users.status, 200);
+    assert!(users.body.contains("ana"), "{}", users.body);
+    assert!(users.body.contains("Accounts"), "{}", users.body);
+    // A disabled account stops resolving (the cookie is refused).
+    let disable = request(port, "POST", "/users/disable", Some(&admin), "username=ana");
+    assert_eq!(disable.status, 200);
+    let after = request(port, "GET", "/", Some(&cookie), "");
+    assert_eq!(after.status, 401, "a disabled user's cookie is refused");
     daemon.child.kill().ok();
     daemon.child.wait().ok();
 }
 
-/// Uploads, downloads and admin-issued pairing codes: the web chat's
-/// Telegram-parity file path, scoped to the caller role.
+/// Uploads and downloads: the web chat's Telegram-parity file path, scoped
+/// to the caller's own partition.
 #[test]
-fn web_uploads_files_and_pairing_codes() {
+fn web_uploads_files_in_the_users_partition() {
     let root = temp_root("webup");
     let port = free_port();
     let mut daemon = spawn_daemon_extra(
@@ -270,19 +300,12 @@ fn web_uploads_files_and_pairing_codes() {
         "[[role]]\nname = \"guest\"\nmode = \"readonly\"\nallow = [\"read\"]\n",
     );
     let admin = login(&daemon);
+    let code = mint_invite(&daemon, "guest");
+    let redeemed = redeem(port, &code, "ana", "longpassword");
+    assert_eq!(redeemed.status, 303, "{}", redeemed.body);
+    let guest = redeemed.cookie();
 
-    // Issue a guest pairing code from the admin UI (no CLI needed).
-    let issued = request(port, "POST", "/pair/issue", Some(&admin), "role=guest");
-    assert_eq!(issued.status, 200, "{}", issued.body);
-    let start = issued.body.find("<code>").expect("code block") + "<code>".len();
-    let end = issued.body[start..].find("</code>").unwrap() + start;
-    let code = issued.body[start..end].to_string();
-    assert!(code.contains('-'), "pairing code shape: {code}");
-    let paired = request(port, "POST", "/pair", None, &format!("code={code}"));
-    assert_eq!(paired.status, 303);
-    let guest = paired.cookie();
-
-    // Guest uploads one file; it lands under the role's own workspace.
+    // The member uploads one file; it lands under their own partition.
     let up = request_h(
         port,
         "POST",
@@ -300,11 +323,19 @@ fn web_uploads_files_and_pairing_codes() {
         .expect("upload name")
         .to_string();
     assert!(name.contains("note.txt"), "{name}");
-    let role_attachments = daemon.data.join("roles/guest/workspace/attachments");
+    let user_attachments = daemon.data.join("users/ana/workspace/attachments");
     assert!(
-        role_attachments.join(&name).is_file(),
-        "stored under the role tree: {}",
-        role_attachments.display()
+        user_attachments.join(&name).is_file(),
+        "stored under the user's partition: {}",
+        user_attachments.display()
+    );
+    assert!(
+        !daemon
+            .data
+            .join("roles/guest/workspace/attachments")
+            .join(&name)
+            .exists(),
+        "never the role tree"
     );
 
     // The guest can download its own file, but no traversal, and never a
@@ -410,7 +441,10 @@ fn admin_pages_cover_the_cli_surface() {
     for (path, marker) in [
         ("/models", "Provider catalog"),
         ("/config", "Every key"),
-        ("/sessions", "Recent conversations"),
+        ("/users", "Accounts"),
+        ("/groups", "Membership"),
+        ("/kb", "knowledge bases"),
+        ("/agents", "Shared agents"),
         ("/queue", "queue is empty"),
         ("/grants", "scope grants"),
         ("/keys", "provider keys"),
@@ -428,15 +462,12 @@ fn admin_pages_cover_the_cli_surface() {
             page.body
         );
     }
-    // Role sessions still cannot see any of it.
+    // A member account still cannot see any of it.
     let guest = {
-        let code = {
-            let issued = request(port, "POST", "/pair/issue", Some(&admin), "role=guest");
-            let start = issued.body.find("<code>").unwrap() + 6;
-            let end = issued.body[start..].find("</code>").unwrap() + start;
-            issued.body[start..end].to_string()
-        };
-        request(port, "POST", "/pair", None, &format!("code={code}")).cookie()
+        let code = mint_invite(&daemon, "guest");
+        let redeemed = redeem(port, &code, "guest", "longpassword");
+        assert_eq!(redeemed.status, 303, "{}", redeemed.body);
+        redeemed.cookie()
     };
     let denied = request(port, "GET", "/models", Some(&guest), "");
     assert_eq!(denied.status, 403);
@@ -665,16 +696,25 @@ fn admin_pages_cover_the_cli_surface() {
         .unwrap_or(0);
     assert!(backups >= 1, "a backup directory exists");
 
-    // Sessions: switch to guest and back through the page action.
-    let open = request(port, "POST", "/sessions/open", Some(&admin), "role=guest");
-    assert_eq!(open.status, 200, "{}", open.body);
-    assert!(
-        open.body.contains("now acting as role guest"),
-        "{}",
-        open.body
+    // Accounts: a group round-trips through the panel, and the invite form
+    // mints a code that is shown once.
+    let group = request(
+        port,
+        "POST",
+        "/groups/save",
+        Some(&admin),
+        "name=dev&models_allow=anthropic%2F*&models_default=anthropic%2Fclaude&members=",
     );
-    let back = request(port, "POST", "/sessions/open", Some(&admin), "role=admin");
-    assert_eq!(back.status, 200, "{}", back.body);
+    assert_eq!(group.status, 200, "{}", group.body);
+    let groups = request(port, "GET", "/groups", Some(&admin), "");
+    assert!(groups.body.contains("dev"), "{}", groups.body);
+    let minted = request(port, "POST", "/users/invite", Some(&admin), "role=member&groups=dev");
+    assert_eq!(minted.status, 200, "{}", minted.body);
+    assert!(
+        minted.body.contains("valid 24 h") || minted.body.contains("Invite code"),
+        "{}",
+        minted.body
+    );
 
     // Persona edit recompiles IDENTITY.md.
     let persona = request(
@@ -717,7 +757,20 @@ impl Http {
 }
 
 fn request(port: u16, method: &str, path: &str, cookie: Option<&str>, body: &str) -> Http {
-    request_h(port, method, path, cookie, body, &[])
+    // The panel's own JS submits every form with this header; the raw
+    // `request_h` is what proves a POST without it is refused.
+    if method == "POST" {
+        request_h(
+            port,
+            method,
+            path,
+            cookie,
+            body,
+            &[("X-Ka-Agent", "1")],
+        )
+    } else {
+        request_h(port, method, path, cookie, body, &[])
+    }
 }
 
 fn request_h(
@@ -785,6 +838,7 @@ fn seed_session(store: &ka_agent_store::Store, id: &str, workspace: &std::path::
             strand_id: None,
             strand_path: None,
             status: ka_agent_core::SessionStatus::Idle,
+            username: ka_agent_core::OPERATOR_USER.to_string(),
             role: ka_agent_core::ADMIN_ROLE.to_string(),
             private: false,
             created_ms: ka_agent_core::now_ms(),
@@ -980,7 +1034,7 @@ fn auth_flow_gates_every_page_and_token_is_single_use() {
     );
 
     // The chat-send endpoint is CSRF-guarded: no header, no service.
-    let no_header = request(port, "POST", "/chat/send", Some(&cookie), "text=hi");
+    let no_header = request_h(port, "POST", "/chat/send", Some(&cookie), "text=hi", &[]);
     assert_eq!(no_header.status, 403, "missing X-Ka-Agent must be refused");
     assert!(no_header.body.contains("X-Ka-Agent"));
 
@@ -2041,6 +2095,18 @@ fn usage_page_splits_spend_per_model() {
         "each model's cost stands on its own row: {}",
         usage.body
     );
+    // The per-user split and the CSV export share the same rows.
+    assert!(usage.body.contains("By user"), "{}", usage.body);
+    let csv = request(port, "GET", "/usage?format=csv", Some(&cookie), "");
+    assert_eq!(csv.status, 200);
+    assert_eq!(
+        csv.header("content-type").unwrap_or("").split(';').next(),
+        Some("text/csv"),
+        "csv content type"
+    );
+    assert!(csv.body.starts_with("day,user,model,turns,tokens,cost_usd"));
+    assert!(csv.body.contains("anthropic/claude-sonnet-4-5"), "{}", csv.body);
+    assert!(csv.body.contains("operator"), "{}", csv.body);
     daemon.child.kill().ok();
     daemon.child.wait().ok();
     let _ = std::fs::remove_dir_all(&root);
@@ -2120,7 +2186,7 @@ fn reminder_snooze_moves_the_next_fire() {
         "/tasks/snooze",
         Some(&cookie),
         &format!("id={id}&when=30m"),
-        &[],
+        &[("X-Ka-Agent", "1")],
     );
     assert_eq!(
         snoozed.status, 303,
@@ -2141,7 +2207,7 @@ fn reminder_snooze_moves_the_next_fire() {
         "/tasks/snooze",
         Some(&cookie),
         &format!("id={id}&when=sometime"),
-        &[],
+        &[("X-Ka-Agent", "1")],
     );
     assert_eq!(bad.status, 200);
     assert!(

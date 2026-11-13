@@ -1,4 +1,5 @@
-//! The runtime core: single-active-session orchestration over the port.
+//! The runtime core: per-user conversational state over one bounded pool of
+//! engine workers (ADR-0003).
 //!
 //! Responsibilities (SEED.md §3.5–§3.8): single-flight prompt submission with
 //! a durable queue, approval lifecycle with deny-on-expiry, budget
@@ -33,6 +34,7 @@ mod events;
 mod identity;
 mod intake;
 mod memory;
+mod policy;
 mod roles;
 mod scheduler;
 mod worker;
@@ -118,13 +120,20 @@ struct Live {
     last_call: Option<(String, String)>,
 }
 
-struct Inner {
-    session: Session,
-    /// The role the live session belongs to (`admin` for local surfaces).
-    role: String,
+/// One user's conversational state: what `Inner` carried when the daemon
+/// served a single subject, now one instance per user (ADR-0003).
+pub(super) struct UserState {
+    pub session: Session,
+    /// The role the user acts with (from `users.role`).
+    pub role: String,
     /// A `/mode` choice inside the role's ceiling for this session (a
-    /// non-admin role never persists it; a switch parks and restores it).
+    /// non-admin role never persists it).
     session_mode: Option<String>,
+    /// A `/model` choice inside the user's policy for this session (never
+    /// persisted outside the config for the operator).
+    session_model: Option<String>,
+    /// The shared agent this conversation runs as (`/agent <name>`), if any.
+    agent: Option<String>,
     /// Calls the operator allowed "for this session" (question + detail,
     /// exact): asked again, they are answered without a card. Cleared by
     /// `/new`.
@@ -134,19 +143,34 @@ struct Inner {
     /// Timestamps (ms) of recent worker crashes, for the crash-loop breaker.
     crashes: Vec<i64>,
     restart_attempt: u32,
+    /// This user's reasoning effort (`/effort`; cleared by `/new`).
+    effort: Option<String>,
+    /// Last time this user did anything: the LRU order the worker cap's
+    /// idle eviction uses.
+    last_active_ms: i64,
 }
 
-/// One role's conversation state while another role is active: the
-/// single-session core parks it whole and swaps it back on return.
-struct ParkedRole {
-    session: Session,
-    session_allow: std::collections::HashSet<String>,
-    session_mode: Option<String>,
-    budget: BudgetState,
-    crashes: Vec<i64>,
-    restart_attempt: u32,
-    effort: Option<String>,
+/// A user's state handle: cheap to clone, locked only for short critical
+/// sections (never across an await), so users' turns run in parallel.
+#[derive(Clone)]
+pub struct UserHandle(Arc<Mutex<UserState>>);
+
+impl UserHandle {
+    pub(super) fn new(state: UserState) -> Self {
+        Self(Arc::new(Mutex::new(state)))
+    }
+
+    /// The state; a poisoned lock (a panic elsewhere) still yields the data.
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, UserState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
+
+/// The host's knowledge-base sync entry: called on each maintenance tick, it
+/// decides which sources are due and spawns their connector (the HTTP and
+/// git work lives in the channels crate, which the runtime cannot depend
+/// on).
+pub type KbSyncFn = Arc<dyn Fn() + Send + Sync>;
 
 /// A no-agent cron handler: input is the spec text, output the digest text.
 pub type NoAgentFn = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
@@ -165,17 +189,22 @@ struct Shared {
     config_path: Mutex<Option<std::path::PathBuf>>,
     paths: Paths,
     store: Arc<Store>,
-    /// One memory store per role, opened lazily at the role's root
-    /// (`admin` keeps `<data>/memory`).
+    /// One memory store per user, opened lazily at the user's root
+    /// (the operator keeps `<data>/memory`).
     memories: Mutex<HashMap<String, ka_agent_memory::MemoryStore>>,
     port: WorkerPort,
     surface: Arc<dyn Surface>,
     /// The envelope sequence (starts at 1): every emitted envelope takes
     /// one, so any stream can name the last event it saw.
     seq: AtomicU64,
-    inner: Mutex<Inner>,
-    /// Conversation state of every role that is not the active one.
-    parked: Mutex<HashMap<String, ParkedRole>>,
+    /// Every user's conversational state, keyed by username (ADR-0003).
+    users: Mutex<HashMap<String, UserHandle>>,
+    /// Serializes the cross-user worker-cap check with the spawn handshake
+    /// (two users submitting in the same instant must not both spawn past
+    /// `runtime.max_workers`).
+    spawn_lock: tokio::sync::Mutex<()>,
+    /// The host's knowledge-base sync hook (`[kb_sources]` rows).
+    kb_sync: Mutex<Option<KbSyncFn>>,
     /// No-agent cron handlers, registered by kind (e.g. "calendar").
     /// Registered by the app binary; the runtime only dispatches (M11).
     no_agent: Mutex<HashMap<String, NoAgentFn>>,
@@ -207,8 +236,6 @@ struct Shared {
     /// Exact tool names that never ask (the app computes this from the
     /// tool registry and sets it at host start).
     auto_allow: Mutex<Vec<String>>,
-    /// Session-scoped reasoning effort (`/effort`; cleared by `/new`).
-    effort: Mutex<Option<String>>,
     /// Per-channel poll health, set by the channel tasks: a dead phone
     /// link must show in `status`, not only in the journal (F8).
     channel_health: Mutex<HashMap<String, crate::status::ChannelHealth>>,
@@ -282,6 +309,9 @@ impl Runtime {
         surface: Arc<dyn Surface>,
     ) -> Result<Self, Error> {
         paths.ensure_dirs()?;
+        // Pre-users installs kept each role's tree under `roles/<name>`:
+        // move them into the per-user partitions once (ADR-0004 bootstrap).
+        let moved = paths.migrate_role_trees()?;
         // Every configured role owns a disjoint tree; create it up front so
         // a role's first message never races directory creation.
         paths.ensure_role_dirs_for(&cfg.roles)?;
@@ -291,6 +321,14 @@ impl Runtime {
         let emit = |ev: AgentEvent| {
             surface.emit(&Envelope::new(seq.fetch_add(1, Ordering::Relaxed), ev));
         };
+        for (name, target) in &moved {
+            emit(AgentEvent::Notice {
+                text: format!(
+                    "moved the pre-users tree for {name} to {}",
+                    target.display()
+                ),
+            });
+        }
         let interrupted = store.reconcile_running_turns(ka_agent_core::now_ms())?;
         if !interrupted.is_empty() {
             emit(AgentEvent::Notice {
@@ -303,6 +341,18 @@ impl Runtime {
         // A crash mid-fire leaves scheduled tasks `running`; without this
         // they sit invisible to the scheduler forever while `/cron list`
         // still shows them. Marked `interrupted` (= paused, resumable).
+        // A crash between an external write and its result leaves the intent
+        // `executing`: book it as `unknown` so re-proposing the same action
+        // asks the admin to confirm instead of writing twice (ADR-0004).
+        let unknown_intents = store.reconcile_executing_intents()?;
+        if !unknown_intents.is_empty() {
+            emit(AgentEvent::Notice {
+                text: format!(
+                    "recovered after restart: {} external-write intent(s) had an unknown outcome — re-proposing the same action will ask you to confirm",
+                    unknown_intents.len()
+                ),
+            });
+        }
         let stuck_tasks = store.reconcile_running_tasks(ka_agent_core::now_ms())?;
         if !stuck_tasks.is_empty() {
             emit(AgentEvent::Notice {
@@ -316,7 +366,7 @@ impl Runtime {
         // (terminal, web, CLI) are the admin role; a role's session is
         // adopted on the first message from one of its identities.
         let mut session = store
-            .latest_session_for_role(ka_agent_core::ADMIN_ROLE)?
+            .latest_session_for_user(ka_agent_core::OPERATOR_USER)?
             .unwrap_or_else(|| Session::new(cfg.workspace_path()));
         // A fresh (or dangling) adopted session must exist as a row before
         // turns reference it.
@@ -399,7 +449,7 @@ impl Runtime {
             budget.daily_token_cap = cfg.budgets.daily_tokens;
         }
         let memory =
-            ka_agent_memory::MemoryStore::open(&paths.role_memory(ka_agent_core::ADMIN_ROLE))?;
+            ka_agent_memory::MemoryStore::open(&paths.user_memory(ka_agent_core::OPERATOR_USER))?;
         // Compile stable memory into each engine's user-tier MEMORY.md; ka
         // re-reads it per prompt (validation §5), so no worker restart is
         // needed after updates. Every role gets its own root compiled into
@@ -409,16 +459,47 @@ impl Runtime {
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
             &memory_preamble(&cfg),
         )?;
-        for role in &cfg.roles {
-            let role_memory = ka_agent_memory::MemoryStore::open(&paths.role_memory(&role.name))?;
-            role_memory.install_compiled(
-                &paths.role_engine_home(&role.name).join(".config/ka"),
-                ka_agent_memory::DEFAULT_BUDGET_BYTES,
-                &memory_preamble(&cfg),
-            )?;
+        // Legacy `roles/<r>` trees were moved to `users/<r>` above; compile
+        // MEMORY.md for every existing user instead, so invited users' first
+        // workers already speak the operator language.
+        for row in store.list_users().unwrap_or_default() {
+            if row.username == ka_agent_core::OPERATOR_USER {
+                continue;
+            }
+            paths.ensure_user_dirs(&row.username)?;
+            if let Ok(user_memory) =
+                ka_agent_memory::MemoryStore::open(&paths.user_memory(&row.username))
+            {
+                let _ = user_memory.install_compiled(
+                    &paths.user_engine_home(&row.username).join(".config/ka"),
+                    ka_agent_memory::DEFAULT_BUDGET_BYTES,
+                    &memory_preamble(&cfg),
+                );
+            }
         }
+        // The operator's own state; every other user is created on their
+        // first message (`ensure_user`).
+        let operator_state = UserState {
+            session,
+            role: ka_agent_core::ADMIN_ROLE.to_string(),
+            session_mode: None,
+            session_model: None,
+            agent: None,
+            session_allow: std::collections::HashSet::new(),
+            live: None,
+            budget,
+            crashes: Vec::new(),
+            restart_attempt: 0,
+            effort: None,
+            last_active_ms: ka_agent_core::now_ms(),
+        };
+        let mut users = HashMap::new();
+        users.insert(
+            ka_agent_core::OPERATOR_USER.to_string(),
+            UserHandle::new(operator_state),
+        );
         let mut memories = HashMap::new();
-        memories.insert(ka_agent_core::ADMIN_ROLE.to_string(), memory);
+        memories.insert(ka_agent_core::OPERATOR_USER.to_string(), memory);
         let runtime = Self {
             sh: Arc::new(Shared {
                 cfg: std::sync::RwLock::new(Arc::new(cfg)),
@@ -429,8 +510,10 @@ impl Runtime {
                 port,
                 surface,
                 seq,
+                kb_sync: Mutex::new(None),
                 no_agent: Mutex::new(HashMap::new()),
-                parked: Mutex::new(HashMap::new()),
+                users: Mutex::new(users),
+                spawn_lock: tokio::sync::Mutex::new(()),
                 selector_cache: Mutex::new(None),
                 env_cache: Mutex::new(None),
                 scheduler_tick: tokio::sync::Notify::new(),
@@ -439,23 +522,12 @@ impl Runtime {
                 persona_mtime: Mutex::new(None),
                 started_ms: ka_agent_core::now_ms(),
                 auto_allow: Mutex::new(Vec::new()),
-                effort: Mutex::new(None),
                 channel_health: Mutex::new(HashMap::new()),
                 live_model: Mutex::new(None),
                 update_available: Mutex::new(None),
                 updater: Mutex::new(None),
                 updating: std::sync::atomic::AtomicBool::new(false),
                 model_registry: Mutex::new(None),
-                inner: Mutex::new(Inner {
-                    session,
-                    role: ka_agent_core::ADMIN_ROLE.to_string(),
-                    session_mode: None,
-                    session_allow: std::collections::HashSet::new(),
-                    live: None,
-                    budget,
-                    crashes: Vec::new(),
-                    restart_attempt: 0,
-                }),
             }),
         };
         // The assistant's identity (persona + house rules) compiled into
@@ -467,7 +539,9 @@ impl Runtime {
         // Remove our own leftover seeded AGENTS.md (identity moved to
         // IDENTITY.md); an operator's modified copy is never touched
         // (doctor reports leftovers).
-        if let Some(path) = identity::legacy_agents_md_status(&runtime.workspace())
+        if let Some(path) = identity::legacy_agents_md_status(
+            &runtime.workspace_for(&ka_agent_core::Principal::operator()),
+        )
             && let Err(e) = std::fs::remove_file(&path)
         {
             eprintln!("runtime: legacy AGENTS.md not removed: {e}");
@@ -477,8 +551,10 @@ impl Runtime {
 
     // ---- introspection -------------------------------------------------
 
-    pub fn session_id(&self) -> SessionId {
-        self.lock().session.id.clone()
+    /// One user's current session id (`None` before their first message).
+    pub fn session_id_for(&self, who: &ka_agent_core::Principal) -> Option<SessionId> {
+        self.user_handle(&who.username)
+            .map(|st| st.lock().session.id.clone())
     }
 
     /// A snapshot of the live configuration.
@@ -513,20 +589,17 @@ impl Runtime {
         cfg_of(&self.sh)
     }
 
-    /// The active session's workspace: where `@` file references resolve
-    /// and where the engine's files live. It follows the live session (a
-    /// role's own tree), falling back to the configured workspace before
-    /// any session exists.
-    pub fn workspace(&self) -> std::path::PathBuf {
-        let session = {
-            let g = self.lock();
-            g.session.workspace.clone()
-        };
-        if session.as_os_str().is_empty() {
-            self.cfg().workspace_path()
-        } else {
-            session
+    /// The user's workspace: where `@` file references resolve and where the
+    /// engine's files live. It follows that user's live session, falling
+    /// back to their partition before any session exists.
+    pub fn workspace_for(&self, who: &ka_agent_core::Principal) -> std::path::PathBuf {
+        if let Some(st) = self.user_handle(&who.username) {
+            let session = st.lock().session.workspace.clone();
+            if !session.as_os_str().is_empty() {
+                return session;
+            }
         }
+        self.workspace_for_user(&who.username, &who.role)
     }
 
     /// Now, in the operator's zone (configured, else the system zone).
@@ -534,16 +607,22 @@ impl Runtime {
         jiff::Timestamp::now().to_zoned(self.cfg().time_zone())
     }
 
-    /// The current session status.
-    pub fn session_status(&self) -> SessionStatus {
-        self.lock().session.status
+    /// One user's session status (`Idle` for a user with no state yet).
+    pub fn session_status_for(&self, who: &ka_agent_core::Principal) -> SessionStatus {
+        self.user_handle(&who.username)
+            .map(|st| st.lock().session.status)
+            .unwrap_or(SessionStatus::Idle)
     }
 
-    /// Everything `/status` shows, in one struct.
-    pub fn status_report(&self) -> Result<crate::status::StatusReport, Error> {
+    /// Everything `/status` shows, for one principal, in one struct.
+    pub fn status_report_for(
+        &self,
+        who: &ka_agent_core::Principal,
+    ) -> Result<crate::status::StatusReport, Error> {
         let cfg = self.cfg();
+        let st = self.ensure_user(who)?;
         let (sid, status, strand, worker_running, budget, crashes, private, role) = {
-            let g = self.lock();
+            let g = st.lock();
             (
                 g.session.id.clone(),
                 g.session.status,
@@ -555,7 +634,7 @@ impl Runtime {
                 g.role.clone(),
             )
         };
-        let (limit_usd, limit_tokens) = roles::budget_caps_of(&cfg, &role);
+        let (limit_usd, limit_tokens) = self.budget_caps_for(&who.username, &role);
         let queue = self.sh.store.queue_len(&sid)?;
         let pending_approvals = self.sh.store.pending_approvals(&sid)?.len();
         let next_task = self
@@ -584,7 +663,7 @@ impl Runtime {
             private,
             strand_id: strand,
             model: cfg.model.clone(),
-            mode: self.effective_mode(),
+            mode: self.effective_mode_for(&who.username),
             worker_running,
             idle_timeout_secs: cfg.worker_idle_timeout_secs,
             spent_usd: budget.spent_usd,
@@ -597,11 +676,11 @@ impl Runtime {
             next_task,
             timezone: tz.iana_name().unwrap_or("UTC").to_string(),
             capabilities: crate::status::Capabilities::from_config(&cfg),
-            memory: self.memory_report().ok().map(|r| crate::status::MemoryUse {
+            memory: self.memory_report_for(who).ok().map(|r| crate::status::MemoryUse {
                 used_bytes: r.total_bytes,
                 budget_bytes: r.budget_bytes,
                 truncated: r.truncated,
-                to_review: self.pending_candidates().map(|c| c.len()).unwrap_or(0),
+                to_review: self.pending_candidates_for(who).map(|c| c.len()).unwrap_or(0),
             }),
             live_model: self
                 .sh
@@ -667,6 +746,24 @@ impl Runtime {
         }
     }
 
+    /// Register the host's knowledge-base sync hook.
+    pub fn set_kb_sync(&self, f: KbSyncFn) {
+        *self.sh.kb_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    /// One knowledge-sync tick: the hook decides what is due.
+    pub fn run_kb_sync(&self) {
+        let hook = self
+            .sh
+            .kb_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Register the host's `/update` implementation (the app binary; the
     /// release machinery lives there, not in the runtime).
     pub fn set_updater(&self, f: UpdateFn) {
@@ -727,25 +824,26 @@ impl Runtime {
         ka_agent_port::registry::listing(reg.as_ref(), current.as_deref())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.sh.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     // ---- operator operations -------------------------------------------
 
     /// `/new`: drop the live worker and start a fresh session/strand.
     /// `private` starts an incognito conversation instead: turn text is
     /// never recorded, memory/skill proposals are refused, and the
     /// strand plus ephemeral attachments are destroyed when it ends.
-    pub async fn new_session(&self, private: bool) -> Result<SessionId, Error> {
+    pub async fn new_session(
+        &self,
+        who: &ka_agent_core::Principal,
+        private: bool,
+    ) -> Result<SessionId, Error> {
         // `/new` kills the worker on purpose: its exit is not a crash, and a
         // fresh session starts with a clean crash history (five `/new` in ten
         // minutes used to degrade the brand-new session).
         // One critical section: mark the worker deliberately closed, take
         // the port, and swap the session — nothing can submit onto or
         // enqueue against the ended session once the guard releases.
+        let st = self.ensure_user(who)?;
         let (superseded, live_port, session) = {
-            let mut g = self.lock();
+            let mut g = st.lock();
             if let Some(live) = g.live.as_mut() {
                 live.deliberate_close = true;
             }
@@ -754,10 +852,14 @@ impl Runtime {
             // with it.
             g.session_allow.clear();
             g.session_mode = None;
-            *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            g.effort = None;
             let superseded = g.session.private.then(|| g.session.id.clone());
             let live_port = g.live.take().map(|l| l.port);
-            let mut s = Session::new_for_role(self.workspace_for_role(&g.role), &g.role);
+            let mut s = Session::new_for_user(
+                self.workspace_for_user(&who.username, &who.role),
+                &who.username,
+                &who.role,
+            );
             s.private = private;
             g.session = s;
             g.restart_attempt = 0;
@@ -778,7 +880,8 @@ impl Runtime {
         if superseded.is_some() {
             self.purge_private_remnants();
         }
-        self.audit(
+        self.audit_for(
+            who,
             audit_actions::SESSION_NEW,
             session.id.as_str(),
             private.then(|| "private".to_string()),
@@ -795,18 +898,22 @@ impl Runtime {
         Ok(session.id)
     }
 
-    /// Whether the live session is a private (incognito) conversation.
-    pub fn session_private(&self) -> bool {
-        self.lock().session.private
+    /// Whether this user's live session is a private (incognito)
+    /// conversation.
+    pub fn session_private_for(&self, who: &ka_agent_core::Principal) -> bool {
+        self.user_handle(&who.username)
+            .map(|st| st.lock().session.private)
+            .unwrap_or(false)
     }
 
     /// The ephemeral-storage token for a private session (`Some(short
     /// id)`), naming its `.private-<token>` attachment directory; `None`
     /// for a normal session.
-    pub fn private_session_token(&self) -> Option<String> {
+    pub fn private_session_token_for(&self, who: &ka_agent_core::Principal) -> Option<String> {
+        let st = self.user_handle(&who.username)?;
         // Both under one guard: a `/new` between two locks could pair the
         // old session's privacy with the new session's id.
-        let g = self.lock();
+        let g = st.lock();
         g.session
             .private
             .then(|| ka_agent_core::ids::short_id(g.session.id.as_str()).to_string())
@@ -825,8 +932,9 @@ impl Runtime {
     /// `/resume`: lift a pause (budget override or a fixed auth key) back to
     /// idle. Refuses when the budget verdict is still exceeded — the
     /// operator asked explicitly, so say why instead of silently ignoring.
-    pub fn resume(&self) -> Result<bool, Error> {
-        let mut g = self.lock();
+    pub async fn resume_for(&self, who: &ka_agent_core::Principal) -> Result<bool, Error> {
+        let st = self.ensure_user(who)?;
+        let mut g = st.lock();
         if g.session.status != SessionStatus::Paused {
             return Ok(false);
         }
@@ -840,19 +948,21 @@ impl Runtime {
             .transition(SessionStatus::Idle)
             .map_err(|t| illegal_session(from, t))?;
         let status = g.session.status;
+        let id = g.session.id.clone();
         drop(g);
-        self.persist_session_status(status);
-        self.audit(
-            audit_actions::SESSION_RESUME,
-            self.session_id().as_str(),
-            None,
-        )?;
+        self.persist_session_status(&who.username, &id, status);
+        self.audit_for(who, audit_actions::SESSION_RESUME, id.as_str(), None)?;
         Ok(true)
     }
 
-    fn persist_session_status(&self, status: SessionStatus) {
-        let id = self.session_id();
-        if let Err(e) = self.sh.store.update_session_status(&id, status) {
+    pub(super) fn persist_session_status(
+        &self,
+        username: &str,
+        id: &SessionId,
+        status: SessionStatus,
+    ) {
+        let _ = username;
+        if let Err(e) = self.sh.store.update_session_status(id, status) {
             self.sh.emit(AgentEvent::Error {
                 class: "internal".into(),
                 retryable: retryable_class("internal"),
@@ -864,8 +974,9 @@ impl Runtime {
     /// The source of the turn currently running (`console`, `cron:<id>`,
     /// `briefing`, …); `None` when idle. Read by the tool handlers' loop
     /// guards instead of a store meta row.
-    pub fn current_turn_source(&self) -> Option<String> {
-        self.lock()
+    pub fn current_turn_source_for(&self, who: &ka_agent_core::Principal) -> Option<String> {
+        self.user_handle(&who.username)?
+            .lock()
             .live
             .as_ref()
             .and_then(|l| l.current_turn_source.clone())
@@ -876,7 +987,7 @@ impl Runtime {
     /// other profile root and every other role's root. A role's own root
     /// (and workspace) stays writable; admin blocks the whole `roles/`
     /// tree.
-    fn guard_write_paths(&self, role: &str) -> Vec<std::path::PathBuf> {
+    fn guard_write_paths(&self, username: &str, role: &str) -> Vec<std::path::PathBuf> {
         let root = self.sh.paths.root();
         let base = ka_agent_core::layout::base_dir();
         let mut out = vec![
@@ -898,21 +1009,22 @@ impl Runtime {
         ];
         if role == ka_agent_core::ADMIN_ROLE {
             out.push(root.join("roles"));
+            out.push(self.sh.paths.users_root());
             // A role's workspace is not the operator's: admin may not
             // write into it either (the admin workspace stays free).
             out.extend(self.cfg().roles.iter().map(|r| r.workspace_path(root)));
         } else {
-            // Every role root but this worker's own (its workspace lives
-            // inside it).
-            let own = self.sh.paths.role_root(role);
-            if let Ok(entries) = std::fs::read_dir(root.join("roles")) {
+            // Every other user's root, the whole roles/ tree and the
+            // operator's profile tree are off limits.
+            let own = self.sh.paths.user_root(username);
+            if let Ok(entries) = std::fs::read_dir(self.sh.paths.users_root()) {
                 for e in entries.flatten() {
                     if e.path() != own {
                         out.push(e.path());
                     }
                 }
             }
-            // The profile's own tree is the admin's.
+            out.push(root.join("roles"));
             out.push(self.cfg().workspace_path());
         }
         if let Ok(entries) = std::fs::read_dir(base.join("profiles")) {
@@ -929,7 +1041,7 @@ impl Runtime {
     /// Files the engine may never read: the secret store, the admin token,
     /// the engine `.env`, every other profile's secrets and (for a role)
     /// the profile's own memory, notes, strands and store.
-    fn guard_read_paths(&self, role: &str) -> Vec<std::path::PathBuf> {
+    fn guard_read_paths(&self, username: &str, role: &str) -> Vec<std::path::PathBuf> {
         let root = self.sh.paths.root();
         let base = ka_agent_core::layout::base_dir();
         let mut out = vec![
@@ -937,15 +1049,16 @@ impl Runtime {
             root.join("admin.token"),
             self.sh.paths.engine_home().join(".config/ka/.env"),
         ];
-        // Every other role's root (and, for admin, every role root).
-        let own = self.sh.paths.role_root(role);
-        if let Ok(entries) = std::fs::read_dir(root.join("roles")) {
+        // Every other user's root, and the pre-users role trees.
+        let own = self.sh.paths.user_root(username);
+        if let Ok(entries) = std::fs::read_dir(self.sh.paths.users_root()) {
             for e in entries.flatten() {
                 if e.path() != own {
                     out.push(e.path());
                 }
             }
         }
+        out.push(root.join("roles"));
         if role != ka_agent_core::ADMIN_ROLE {
             // A subject never reads the operator's conversation, memory or
             // notes: the profile's own tree is off limits.
@@ -991,6 +1104,11 @@ impl Runtime {
 
     // ---- memory & history (SEED.md §4) --------------------------------
 
+    /// The instance's directory layout (export/purge and the web panel).
+    pub fn paths(&self) -> Paths {
+        self.sh.paths.clone()
+    }
+
     /// The data root this runtime was opened on.
     pub fn data_root(&self) -> std::path::PathBuf {
         self.sh.paths.root().to_path_buf()
@@ -1012,20 +1130,31 @@ impl Runtime {
         &self.sh.store
     }
 
-    fn live_port(&self) -> Option<Arc<PortSession>> {
-        self.lock().live.as_ref().map(|l| Arc::clone(&l.port))
+    fn live_port_for(&self, who: &ka_agent_core::Principal) -> Option<Arc<PortSession>> {
+        self.user_handle(&who.username)?
+            .lock()
+            .live
+            .as_ref()
+            .map(|l| Arc::clone(&l.port))
     }
 
     /// The live worker's bounded stderr tail (diagnostics: doctor, tests).
     pub fn worker_stderr_tail(&self) -> Vec<String> {
-        self.live_port()
+        self.live_port_for(&ka_agent_core::Principal::operator())
             .map(|p| p.stderr_tail())
             .unwrap_or_default()
     }
 
-    fn audit(&self, action: &str, subject: &str, detail: Option<String>) -> Result<(), Error> {
-        let role = self.active_role();
-        let mut rec = AuditRecord::new("operator", action, subject, detail).with_role(&role);
+    pub(super) fn audit_for(
+        &self,
+        who: &ka_agent_core::Principal,
+        action: &str,
+        subject: &str,
+        detail: Option<String>,
+    ) -> Result<(), Error> {
+        let mut rec = AuditRecord::new("operator", action, subject, detail)
+            .with_role(&who.role)
+            .with_user(&who.username);
         self.sh.store.append_audit(&mut rec)?;
         Ok(())
     }

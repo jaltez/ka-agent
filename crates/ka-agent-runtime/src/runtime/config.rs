@@ -71,11 +71,23 @@ impl Runtime {
         let engine_changed = changed
             .iter()
             .any(|k| k.apply == ka_agent_core::config_keys::Apply::Worker);
-        {
-            let mut g = self.lock();
-            // The active role's caps follow the reload: a role's own USD
-            // cap wins, else the profile's.
-            let (usd, tokens) = super::roles::budget_caps_of(&new, &g.role);
+        // Every user's caps follow the reload (their own quota wins, else
+        // their role's USD cap, else the profile's).
+        for (username, st) in self.users_by_activity() {
+            let role = st.lock().role.clone();
+            let cfg_new = &new;
+            let (usd, tokens) = {
+                let quota = self
+                    .sh
+                    .store
+                    .get_user(&username)
+                    .ok()
+                    .flatten()
+                    .and_then(|u| u.quota_daily_usd);
+                let (usd, tokens) = super::roles::budget_caps_of(cfg_new, &role);
+                (quota.or(usd), tokens)
+            };
+            let mut g = st.lock();
             g.budget.daily_usd_cap = usd;
             g.budget.daily_token_cap = tokens;
         }
@@ -232,7 +244,11 @@ impl Runtime {
 
     /// `/effort [level]`: session-scoped reasoning effort. "" clears it
     /// (the model's own default); it resets with every `/new`.
-    pub async fn set_effort(&self, level: &str) -> Result<String, Error> {
+    pub async fn set_effort(
+        &self,
+        level: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<String, Error> {
         let level = level.trim().to_ascii_lowercase();
         if !level.is_empty() && !matches!(level.as_str(), "off" | "low" | "medium" | "high" | "max")
         {
@@ -240,12 +256,13 @@ impl Runtime {
                 "unknown effort {level:?} (off|low|medium|high|max)"
             )));
         }
-        if let Some(port) = self.live_port() {
+        if let Some(port) = self.live_port_for(who) {
             port.set_effort(level.clone()).await.map_err(Error::Port)?;
         }
-        *self.sh.effort.lock().unwrap_or_else(|e| e.into_inner()) =
-            (!level.is_empty()).then(|| level.clone());
-        self.settings_event();
+        if let Some(st) = self.user_handle(&who.username) {
+            st.lock().effort = (!level.is_empty()).then(|| level.clone());
+        }
+        self.settings_event_for(who);
         Ok(if level.is_empty() {
             "effort: model default".to_string()
         } else {
@@ -253,35 +270,37 @@ impl Runtime {
         })
     }
 
-    /// The session's current effort level, when one was set.
-    pub fn effort(&self) -> Option<String> {
-        self.sh
-            .effort
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+    /// One user's current effort level, when one was set.
+    pub fn effort(&self, who: &ka_agent_core::Principal) -> Option<String> {
+        self.effort_for(&who.username)
     }
 
     /// `/undo`: ask the engine to revert its most recent file change; the
     /// engine's answer arrives as a Note.
-    pub async fn undo(&self) -> Result<(), Error> {
+    pub async fn undo(&self, who: &ka_agent_core::Principal) -> Result<(), Error> {
         let port = self
-            .live_port()
+            .live_port_for(who)
             .ok_or_else(|| Error::Refused("no live session — nothing to undo".into()))?;
         port.undo_file().await.map_err(Error::Port)
     }
 
     /// `/steer <text>`: force a steer into the running reply; when idle it
     /// is just a message.
-    pub async fn steer(&self, text: &str) -> Result<bool, Error> {
-        let Some(port) = self.live_port() else {
+    pub async fn steer(
+        &self,
+        text: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<bool, Error> {
+        let Some(port) = self.live_port_for(who) else {
             return Ok(false);
         };
-        if self.session_status() != ka_agent_core::SessionStatus::Running {
+        if self.session_status_for(who) != ka_agent_core::SessionStatus::Running {
             return Ok(false);
         }
         port.steer(text.to_string()).await.map_err(Error::Port)?;
-        if let Some(live) = self.lock().live.as_mut() {
+        if let Some(st) = self.user_handle(&who.username)
+            && let Some(live) = st.lock().live.as_mut()
+        {
             live.live_text
                 .push_str(&format!("\n\n[added while working] {text}"));
         }
@@ -292,8 +311,13 @@ impl Runtime {
     }
 
     /// Queue rows not yet turned (for `/queue`).
-    pub fn queued(&self) -> Result<Vec<(String, String, String)>, Error> {
-        let sid = self.session_id();
+    pub fn queued(
+        &self,
+        who: &ka_agent_core::Principal,
+    ) -> Result<Vec<(String, String, String)>, Error> {
+        let Some(sid) = self.session_id_for(who) else {
+            return Ok(Vec::new());
+        };
         let items = self.sh.store.queued_items(&sid)?;
         Ok(items
             .into_iter()
@@ -302,8 +326,10 @@ impl Runtime {
     }
 
     /// Clear the durable queue (`/queue clear`).
-    pub fn clear_queue(&self) -> Result<usize, Error> {
-        let sid = self.session_id();
+    pub fn clear_queue(&self, who: &ka_agent_core::Principal) -> Result<usize, Error> {
+        let Some(sid) = self.session_id_for(who) else {
+            return Ok(0);
+        };
         let items = self.sh.store.queued_items(&sid)?;
         for item in &items {
             self.sh
@@ -315,8 +341,14 @@ impl Runtime {
 
     /// Remove one queued message by id prefix (the `/queue` picker's ✕):
     /// `Ok(true)` removed, `Ok(false)` no such item, `Err` ambiguous.
-    pub fn remove_queued(&self, id_prefix: &str) -> Result<bool, Error> {
-        let sid = self.session_id();
+    pub fn remove_queued(
+        &self,
+        id_prefix: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<bool, Error> {
+        let Some(sid) = self.session_id_for(who) else {
+            return Ok(false);
+        };
         let hits: Vec<_> = self
             .sh
             .store
@@ -335,24 +367,26 @@ impl Runtime {
         }
     }
 
-    /// The engine's tool inventory, grouped as the engine discovered it.
-    pub fn tools(&self) -> Vec<String> {
-        self.lock()
-            .live
-            .as_ref()
-            .map(|l| l.tools.clone())
+    /// The user's engine tool inventory, as the engine discovered it.
+    pub fn tools(&self, who: &ka_agent_core::Principal) -> Vec<String> {
+        self.user_handle(&who.username)
+            .and_then(|st| st.lock().live.as_ref().map(|l| l.tools.clone()))
             .unwrap_or_default()
     }
 
     /// Broadcast the current model/mode/effort (surfaces show a status bar).
-    pub(crate) fn settings_event(&self) {
-        let cfg = self.cfg();
-        self.sh.emit(AgentEvent::Settings {
-            model: cfg.model.clone(),
-            mode: Some(self.effective_mode()),
-            effort: self.effort(),
-            private: Some(self.session_private()),
-        });
+    pub(crate) fn settings_event_for(&self, who: &ka_agent_core::Principal) {
+        let model = self.model_for(who, false);
+        let source = format!("web:{}", who.username);
+        self.sh.emit_from(
+            AgentEvent::Settings {
+                model,
+                mode: Some(self.effective_mode_for(&who.username)),
+                effort: self.effort(who),
+                private: Some(self.session_private_for(who)),
+            },
+            Some(&source),
+        );
     }
 
     /// Compile the persona into the engine's IDENTITY.md (re-read per
@@ -361,7 +395,7 @@ impl Runtime {
     pub fn refresh_identity(&self) -> Result<(), Error> {
         // Persona content is profile-wide policy; only the file location is
         // per role (each engine reads its own HOME).
-        let persona = self.memory_store(ka_agent_core::ADMIN_ROLE)?.persona_text();
+        let persona = self.memory_store(ka_agent_core::OPERATOR_USER)?.persona_text();
         let text = crate::runtime::compile_identity(&persona);
         let mut homes = vec![self.sh.paths.engine_home()];
         homes.extend(
@@ -370,6 +404,13 @@ impl Runtime {
                 .iter()
                 .map(|r| self.sh.paths.role_engine_home(&r.name)),
         );
+        // Every existing user's engine home reads its own compiled
+        // IDENTITY.md.
+        if let Ok(users) = self.sh.store.list_users() {
+            for row in users {
+                homes.push(self.sh.paths.user_engine_home(&row.username));
+            }
+        }
         for home in homes {
             let dir = home.join(".config/ka");
             std::fs::create_dir_all(&dir)?;
@@ -381,21 +422,21 @@ impl Runtime {
 
     /// The persona's display name (`Ka` by default).
     pub fn persona_name(&self) -> String {
-        self.memory_store(ka_agent_core::ADMIN_ROLE)
+        self.memory_store(ka_agent_core::OPERATOR_USER)
             .map(|m| m.persona_name())
             .unwrap_or_else(|_| "Ka".to_string())
     }
 
     /// The current persona text.
     pub fn persona_text(&self) -> String {
-        self.memory_store(ka_agent_core::ADMIN_ROLE)
+        self.memory_store(ka_agent_core::OPERATOR_USER)
             .map(|m| m.persona_text())
             .unwrap_or_default()
     }
 
     /// Persist a new persona and recompile IDENTITY.md in-process.
     pub fn set_persona(&self, text: &str) -> Result<(), Error> {
-        self.memory_store(ka_agent_core::ADMIN_ROLE)?
+        self.memory_store(ka_agent_core::OPERATOR_USER)?
             .write_persona(text)?;
         self.refresh_identity()
     }
@@ -460,10 +501,45 @@ impl Runtime {
         Ok(Some((sel.id, state)))
     }
 
-    /// `/model <provider/model>`: validate, save to the config file, apply
-    /// live. Returns the normalized selector for the reply.
-    pub async fn set_model(&self, sel: &str) -> Result<String, Error> {
+    /// `/model <provider/model>`: validate, then — for the operator — save
+    /// to the config file, or — for a subject — switch this session inside
+    /// the user's allowlist (never persisted). Returns the normalized
+    /// selector for the reply.
+    pub async fn set_model(
+        &self,
+        sel: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<String, Error> {
         let info = ka_agent_port::catalog::validate_selector(sel).map_err(Error::Refused)?;
+        let (allow, _) = self
+            .sh
+            .store
+            .model_policy_for(&who.username)
+            .unwrap_or_default();
+        if !ka_agent_store::model_allowed(&allow, &info.id) {
+            return Err(Error::Refused(format!(
+                "model {} is not allowed for {} (allowed: {})",
+                info.id,
+                who.username,
+                allow.join(", ")
+            )));
+        }
+        if !who.is_admin() {
+            if let Some(st) = self.user_handle(&who.username) {
+                st.lock().session_model = Some(info.id.clone());
+            }
+            if let Some(port) = self.live_port_for(who) {
+                let _ = port.set_model(info.id.clone()).await;
+            }
+            self.audit_for(
+                who,
+                audit_actions::MODE_SET,
+                &info.id,
+                Some("model (session)".into()),
+            )?;
+            self.settings_event_for(who);
+            return Ok(info.id);
+        }
         let path = self
             .config_path()
             .ok_or_else(|| Error::Refused("no config file — run ka-agent setup".into()))?;
@@ -471,7 +547,7 @@ impl Runtime {
         ka_agent_core::config_file::set(&path, "model", &info.id).map_err(Error::Config)?;
         let new = DaemonConfig::load(&path)?;
         self.reload_config_locked(new, false).await;
-        self.settings_event();
+        self.settings_event_for(who);
         Ok(info.id)
     }
 
@@ -479,7 +555,12 @@ impl Runtime {
     /// live worker at once. From a phone channel the mode may only get
     /// stricter (allow < accept_edits < ask < readonly): a lost phone must
     /// not be able to turn approvals off.
-    pub async fn set_mode(&self, mode: &str, source: &str) -> Result<String, Error> {
+    pub async fn set_mode(
+        &self,
+        mode: &str,
+        source: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<String, Error> {
         /// Strictness rank; `None` names no mode. The old spellings stay
         /// accepted here as a defense in depth — the daemon's config is
         /// normalized at load, but callers hand in raw operator input.
@@ -506,7 +587,7 @@ impl Runtime {
         // A role's mode is its ceiling: a request above it is clamped to
         // the ceiling (never an error), applies to this session only, and
         // is never written to the profile config.
-        let role = self.active_role();
+        let role = who.role.clone();
         if role != ka_agent_core::ADMIN_ROLE {
             let ceiling = self
                 .effective_role(&role)
@@ -520,16 +601,19 @@ impl Runtime {
             } else {
                 canonical.clone()
             };
-            if let Some(port) = self.live_port() {
+            if let Some(port) = self.live_port_for(who) {
                 let _ = port.set_mode(applied.clone()).await;
             }
-            self.lock().session_mode = Some(applied.clone());
-            self.audit(
+            if let Some(st) = self.user_handle(&who.username) {
+                st.lock().session_mode = Some(applied.clone());
+            }
+            self.audit_for(
+                who,
                 audit_actions::MODE_SET,
                 &applied,
                 Some(format!("by {source} (role {role})")),
             )?;
-            self.settings_event();
+            self.settings_event_for(who);
             return Ok(if applied != canonical {
                 format!("{applied} (role {role}'s ceiling is {ceiling})")
             } else {
@@ -557,17 +641,18 @@ impl Runtime {
         new_cfg.mode = canonical.clone();
         // Live worker: switch now (a turn in flight finishes under the old
         // mode); the config keeps it for the next worker.
-        if let Some(port) = self.live_port() {
+        if let Some(port) = self.live_port_for(who) {
             let _ = port.set_mode(canonical.clone()).await;
         }
         *self.sh.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_cfg);
         self.remember_config_mtime();
-        self.audit(
+        self.audit_for(
+            who,
             audit_actions::MODE_SET,
             &canonical,
             Some(format!("by {source}")),
         )?;
-        self.settings_event();
+        self.settings_event_for(who);
         Ok(canonical)
     }
 }

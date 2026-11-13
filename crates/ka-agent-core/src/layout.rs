@@ -50,6 +50,24 @@ pub const TURN_SOURCE_META_KEY: &str = "turn.source";
 /// the pre-RBAC behavior).
 pub const TURN_ROLE_META_KEY: &str = "turn.role";
 
+/// Store meta key holding the user of the turn being submitted: the bridge
+/// resolves notes/memory targets and KB access from it (a missing key =
+/// operator, the pre-users behavior).
+pub const TURN_USER_META_KEY: &str = "turn.username";
+
+/// Store meta key holding the id of the turn being submitted: the bridge
+/// records provenance (`turn_sources`) and per-turn bookkeeping against it.
+pub const TURN_ID_META_KEY: &str = "turn.id";
+
+/// Per-user turn-context key: `turnctx:<username>:<field>` with fields
+/// `source | role | username | id`. The global `turn.*` rows cannot carry
+/// per-turn context once users' turns run in parallel (ADR-0003), so every
+/// writer/reader is namespaced by the acting account (each worker — and so
+/// each bridge — serves exactly one user).
+pub fn turnctx_key(username: &str, field: &str) -> String {
+    format!("turnctx:{username}:{field}")
+}
+
 /// Process-wide profile chosen on the command line (`-p/--profile`).
 /// Set once by the binary before anything resolves a path.
 static PROFILE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

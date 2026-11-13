@@ -9,7 +9,7 @@ pub(super) fn run_remember<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         if fact.is_empty() {
             Outcome::Reply("usage: /remember <fact>".into())
         } else {
-            match ctx.runtime.remember(fact, ctx.source) {
+            match ctx.runtime.remember(fact, ctx.source, &ctx.principal) {
                 Ok(id) => Outcome::Reply(format!("remembered {id}")),
                 Err(e) => Outcome::Reply(format!("! [memory] {e}")),
             }
@@ -24,7 +24,7 @@ pub(super) fn run_forget<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         if prefix.is_empty() {
             return Outcome::Reply("usage: /forget <id> — /memory lists them".into());
         }
-        let entries = match runtime.memory_entries() {
+        let entries = match runtime.memory_entries(&ctx.principal) {
             Ok(e) => e,
             Err(e) => return Outcome::Reply(format!("! [memory] {e}")),
         };
@@ -34,7 +34,7 @@ pub(super) fn run_forget<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             .collect();
         match matches.as_slice() {
             [] => Outcome::Reply(format!("no memory matches {prefix}")),
-            [one] => match runtime.forget(&one.id) {
+            [one] => match runtime.forget(&one.id, &ctx.principal) {
                 Ok(true) => Outcome::Reply("forgotten".into()),
                 Ok(false) => Outcome::Reply("no such memory id".into()),
                 Err(e) => Outcome::Reply(format!("! [memory] {e}")),
@@ -55,7 +55,7 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args;
         let reply = match rest {
-            "log" => match runtime.memory_log(10) {
+            "log" => match runtime.memory_log(10, &ctx.principal) {
                 Ok(rows) if rows.is_empty() => "no memory commits yet".to_string(),
                 Ok(rows) => {
                     let mut out = String::from("recent memory changes (newest first):\n");
@@ -66,11 +66,11 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 }
                 Err(e) => format!("git not installed — memory history is off ({e})"),
             },
-            "undo" => match runtime.memory_undo() {
+            "undo" => match runtime.memory_undo(&ctx.principal) {
                 Ok(subject) => format!("undone: {subject}"),
                 Err(e) => format!("! [memory] {e}"),
             },
-            "files" => match runtime.memory_report() {
+            "files" => match runtime.memory_report_for(&ctx.principal) {
                 Ok(report) => {
                     let files: Vec<String> = report
                         .files
@@ -86,7 +86,7 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 Err(e) => format!("! [memory] {e}"),
             },
             "review" => {
-                return Outcome::Reply(match runtime.pending_candidates() {
+                return Outcome::Reply(match runtime.pending_candidates_for(&ctx.principal) {
                     Ok(rows) if rows.is_empty() => "no pending candidates".to_string(),
                     Ok(rows) => rows
                         .into_iter()
@@ -96,13 +96,13 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                     Err(e) => format!("! [memory] {e}"),
                 });
             }
-            "" => match runtime.memory_entries() {
+            "" => match runtime.memory_entries(&ctx.principal) {
                 Ok(entries) if entries.is_empty() => {
                     "nothing remembered yet — /remember <fact>".to_string()
                 }
                 Ok(entries) => {
-                    let budget = runtime.memory_report().map(|r| r.budget_bytes).unwrap_or(0);
-                    let total = runtime.memory_report().map(|r| r.total_bytes).unwrap_or(0);
+                    let budget = runtime.memory_report_for(&ctx.principal).map(|r| r.budget_bytes).unwrap_or(0);
+                    let total = runtime.memory_report_for(&ctx.principal).map(|r| r.total_bytes).unwrap_or(0);
                     let mut lines: Vec<String> = entries
                         .iter()
                         .take(15)
@@ -121,12 +121,12 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             other => {
                 let (verb, id) = other.split_once(' ').unwrap_or((other, ""));
                 match verb {
-                    "accept" => match runtime.accept_candidate(id.trim()) {
+                    "accept" => match runtime.accept_candidate(id.trim(), &ctx.principal) {
                         Ok(true) => "accepted into stable memory".to_string(),
                         Ok(false) => "no such pending candidate".to_string(),
                         Err(e) => format!("! [memory] {e}"),
                     },
-                    "reject" => match runtime.reject_candidate(id.trim()) {
+                    "reject" => match runtime.reject_candidate(id.trim(), &ctx.principal) {
                         Ok(true) => "rejected".to_string(),
                         Ok(false) => "no such pending candidate".to_string(),
                         Err(e) => format!("! [memory] {e}"),
@@ -144,13 +144,13 @@ pub(super) fn run_history<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args;
         let reply = if let Some(query) = rest.strip_prefix("show ") {
-            match runtime.history_show(query.trim()) {
+            match runtime.history_show(query.trim(), &ctx.principal) {
                 Ok(Some((inbound, answer))) => format!("> {inbound}\n{answer}"),
                 Ok(None) => "no such turn".to_string(),
                 Err(e) => format!("! [history] {e}"),
             }
         } else if rest.is_empty() {
-            match runtime.recent_turns(5, 0) {
+            match runtime.recent_turns(5, 0, &ctx.principal) {
                 Ok(turns) if turns.is_empty() => "no history yet — say something first".into(),
                 Ok(turns) => {
                     let now = runtime.now_zoned();
@@ -176,7 +176,7 @@ pub(super) fn run_history<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 Err(e) => format!("! [history] {e}"),
             }
         } else {
-            match runtime.history_search(rest, 5) {
+            match runtime.history_search(rest, 5, &ctx.principal) {
                 Ok(hits) if hits.is_empty() => format!("no history matches {rest:?}"),
                 Ok(hits) => {
                     let now = runtime.now_zoned();

@@ -36,8 +36,8 @@ impl Store {
     pub fn insert_task(&self, t: &ka_agent_core::Task) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO tasks(id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO tasks(id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms, username)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 t.id.as_str(),
                 t.session.as_ref().map(|s| s.as_str()),
@@ -48,7 +48,8 @@ impl Store {
                 t.scheduled_at_ms,
                 t.payload,
                 t.created_ms,
-                t.updated_ms
+                t.updated_ms,
+                task_username(t)
             ],
         )?;
         Ok(())
@@ -150,6 +151,33 @@ impl Store {
             params![now_ms],
         )?;
         Ok(ids)
+    }
+
+    /// Resume the crons `user disable` interrupted (account re-enabled).
+    /// Returns how many tasks resumed.
+    pub fn resume_user_crons(&self, username: &str) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE tasks SET status = 'queued', updated_ms = ?2
+             WHERE kind = 'cron' AND status = 'interrupted' AND username = ?1",
+            params![username, ka_agent_core::now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// Live cron jobs of one user (their partition; `admin` callers use
+    /// [`Self::cron_tasks`]).
+    pub fn cron_tasks_for_user(&self, username: &str) -> Result<Vec<ka_agent_core::Task>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
+             FROM tasks
+             WHERE kind = 'cron' AND status IN ('queued','running','interrupted')
+               AND username = ?1
+             ORDER BY scheduled_at_ms",
+        )?;
+        let rows = stmt.query_map(params![username], row_to_task)?;
+        collect_rows(rows)
     }
 
     /// Live cron tasks (queued, running or operator-paused), next fire
@@ -277,6 +305,22 @@ impl Store {
         let rows = stmt.query_map(params![limit as i64], row_to_run)?;
         collect_rows(rows)
     }
+}
+
+/// The user a task belongs to: a cron's creator (payload `username`, else
+/// its role mapped through the user rule), reminders always the operator.
+pub fn task_username(t: &ka_agent_core::Task) -> String {
+    if t.kind != "cron" {
+        return ka_agent_core::OPERATOR_USER.to_string();
+    }
+    t.payload
+        .as_deref()
+        .and_then(ka_agent_core::CronSpec::from_payload)
+        .map(|c| match c.username {
+            Some(u) => u,
+            None => crate::user_for_role(c.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE)),
+        })
+        .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string())
 }
 
 #[cfg(test)]

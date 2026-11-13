@@ -7,7 +7,7 @@ use ka_agent_runtime::Runtime;
 
 pub(super) fn run_status<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.status_report() {
+        match ctx.runtime.status_report_for(&ctx.principal) {
             Ok(report) => Outcome::Reply(report.render(&ctx.runtime.now_zoned())),
             Err(e) => Outcome::Reply(format!("! [status] {e}")),
         }
@@ -24,7 +24,7 @@ pub(super) fn run_new<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 return Outcome::Reply(format!("usage: /new [private] — unknown option {other:?}"));
             }
         };
-        match ctx.runtime.new_session(private).await {
+        match ctx.runtime.new_session(&ctx.principal, private).await {
             Ok(id) if private => Outcome::Reply(format!(
                 "🕶 private session {} — this conversation won't be remembered: no history, memory, skills or attachments; nothing it schedules outlives it",
                 short_id(id.as_str())
@@ -37,7 +37,7 @@ pub(super) fn run_new<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_stop<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.stop_turn().await {
+        match ctx.runtime.stop_turn(&ctx.principal, ctx.source).await {
             Ok(()) => Outcome::Silent,
             Err(e) => Outcome::Reply(format!("! [stop] {e}")),
         }
@@ -46,7 +46,7 @@ pub(super) fn run_stop<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_resume<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.resume() {
+        match ctx.runtime.resume_for(&ctx.principal).await {
             Ok(true) => Outcome::Reply("resumed".into()),
             Ok(false) => Outcome::Reply("nothing to resume (not paused)".into()),
             Err(e) => Outcome::Reply(format!("! [resume] {e}")),
@@ -57,7 +57,7 @@ pub(super) fn run_resume<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 /// `/retry`: re-send the newest turn when it ended in error/interrupted.
 pub(super) fn run_retry<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.retry_last().await {
+        match ctx.runtime.retry_last(&ctx.principal).await {
             Ok(Some(text)) => {
                 let head: String = text.lines().next().unwrap_or("").chars().take(60).collect();
                 Outcome::Reply(format!("↻ re-sending \"{head}\""))
@@ -81,8 +81,8 @@ pub const EFFORTS: &[&str] = &["off", "low", "medium", "high", "max"];
 
 /// The `/model` header: the current model and its key state. Shared by
 /// every surface's picker (Telegram builds its keyboard under it).
-pub async fn model_header(runtime: &Runtime) -> String {
-    let current = runtime.config().model.clone();
+pub async fn model_header(runtime: &Runtime, who: &ka_agent_core::Principal) -> String {
+    let current = runtime.model_for(who, false);
     let key = match runtime.model_key_state() {
         Ok(Some((_, state))) => match state {
             ka_agent_runtime::ModelKeyState::Present => None,
@@ -106,10 +106,33 @@ pub async fn model_header(runtime: &Runtime) -> String {
 
 /// `/model` with no argument: the current model plus every provider
 /// that has models to offer, numbered (`/model <n|provider>` opens one).
-pub async fn model_picker(runtime: &Runtime) -> String {
-    let listing = runtime.models_listing();
+/// The listing filtered to what `who` may actually use: a non-admin sees
+/// only the models their groups allow (an empty allowlist = the catalog).
+fn allowed_listing(
+    runtime: &Runtime,
+    who: &ka_agent_core::Principal,
+) -> ka_agent_runtime::registry::ModelsListing {
+    let mut listing = runtime.models_listing();
+    let (allow, _) = runtime
+        .store()
+        .model_policy_for(&who.username)
+        .unwrap_or_default();
+    if allow.is_empty() {
+        return listing;
+    }
+    for provider in &mut listing.providers {
+        provider
+            .models
+            .retain(|m| ka_agent_store::model_allowed(&allow, m));
+    }
+    listing.providers.retain(|p| !p.models.is_empty());
+    listing
+}
+
+pub async fn model_picker(runtime: &Runtime, who: &ka_agent_core::Principal) -> String {
+    let listing = allowed_listing(runtime, who);
     let current_vendor = listing.current_vendor().map(str::to_string);
-    let mut lines = vec![model_header(runtime).await];
+    let mut lines = vec![model_header(runtime, who).await];
     for (i, p) in listing.providers.iter().enumerate() {
         let mark = if Some(p.name.as_str()) == current_vendor.as_deref() {
             " ←"
@@ -132,16 +155,20 @@ pub async fn model_picker(runtime: &Runtime) -> String {
 
 /// `/model <provider>`: that provider's models, numbered over the full
 /// list — the display is capped, the numbers still reach the tail.
-pub async fn model_vendor_listing(runtime: &Runtime, vendor: &str) -> String {
+pub async fn model_vendor_listing(
+    runtime: &Runtime,
+    vendor: &str,
+    who: &ka_agent_core::Principal,
+) -> String {
     let reg = runtime.model_registry();
-    let listing = runtime.models_listing();
+    let listing = allowed_listing(runtime, who);
     let Some(p) = listing.providers.iter().find(|p| p.name == vendor) else {
         if ka_agent_runtime::catalog::provider(vendor).is_some() {
             return format!("no models listed for {vendor} — type the id: /model {vendor}/<model>");
         }
         return format!("unknown provider {vendor:?} — /model lists them");
     };
-    let current = listing.current.clone();
+    let current = runtime.model_for(who, false);
     let n = if p.models.len() == 1 {
         "1 model".to_string()
     } else {
@@ -214,8 +241,12 @@ fn model_pick(
 
 /// The switch path every pick funnels into (selector validation, live
 /// reload, the missing-key warning).
-async fn switch_model(runtime: &Runtime, sel: &str) -> Outcome {
-    match runtime.set_model(sel).await {
+async fn switch_model(
+    runtime: &Runtime,
+    sel: &str,
+    who: &ka_agent_core::Principal,
+) -> Outcome {
+    match runtime.set_model(sel, who).await {
         Ok(id) => {
             let mut reply = format!("model → {id} (next message uses it)");
             if let Ok(Some((_, ka_agent_runtime::ModelKeyState::Missing(env)))) =
@@ -234,7 +265,7 @@ pub(super) fn run_model<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args.trim();
         if rest.is_empty() {
-            return Outcome::Reply(model_picker(runtime).await);
+            return Outcome::Reply(model_picker(runtime, &ctx.principal).await);
         }
         let mut words = rest.split_whitespace();
         let first = words.next().unwrap_or_default();
@@ -245,20 +276,20 @@ pub(super) fn run_model<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             && !first.contains('/')
             && let Ok(n) = second.parse::<usize>()
         {
-            let listing = runtime.models_listing();
+            let listing = allowed_listing(runtime, &ctx.principal);
             return match model_pick(&listing, first, n) {
-                Ok(sel) => switch_model(runtime, &sel).await,
+                Ok(sel) => switch_model(runtime, &sel, &ctx.principal).await,
                 Err(e) => Outcome::Reply(format!("! [model] {e}")),
             };
         }
         // `/model <provider>` (or its number): the provider's models.
         if !first.contains('/') {
-            let listing = runtime.models_listing();
+            let listing = allowed_listing(runtime, &ctx.principal);
             if let Some(vendor) = resolve_vendor_in(&listing, first) {
-                return Outcome::Reply(model_vendor_listing(runtime, &vendor).await);
+                return Outcome::Reply(model_vendor_listing(runtime, &vendor, &ctx.principal).await);
             }
         }
-        switch_model(runtime, rest).await
+        switch_model(runtime, rest, &ctx.principal).await
     })
 }
 
@@ -267,7 +298,7 @@ pub(super) fn run_mode<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args.trim();
         if rest.is_empty() {
-            let current = runtime.effective_mode();
+            let current = runtime.effective_mode_for(&ctx.principal.username);
             let mut lines = vec![format!("mode: {current}")];
             for (i, (name, desc)) in MODES.iter().enumerate() {
                 let mark = if *name == current { " ←" } else { "" };
@@ -288,9 +319,23 @@ pub(super) fn run_mode<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             },
             Err(_) => rest.to_string(),
         };
-        match runtime.set_mode(&arg, ctx.source).await {
+        match runtime.set_mode(&arg, ctx.source, &ctx.principal).await {
             Ok(mode) => Outcome::Reply(format!("mode → {mode}")),
             Err(e) => Outcome::Reply(format!("! [mode] {e}")),
+        }
+    })
+}
+
+/// `/agent [name]`: run this conversation as a shared agent.
+pub(super) fn run_agent<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let name = ctx.args.trim();
+        match ctx.runtime.set_agent(
+            &ctx.principal,
+            (!name.is_empty()).then_some(name),
+        ) {
+            Ok(line) => Outcome::Reply(line),
+            Err(e) => Outcome::Reply(format!("! [agent] {e}")),
         }
     })
 }
@@ -315,7 +360,7 @@ pub(super) fn run_effort<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args.trim();
         if rest.is_empty() {
-            let current = runtime.effort().unwrap_or_else(|| "model default".into());
+            let current = runtime.effort(&ctx.principal).unwrap_or_else(|| "model default".into());
             let mut lines = vec![format!("effort: {current}")];
             for (i, level) in EFFORTS.iter().enumerate() {
                 let mark = if *level == current { " ←" } else { "" };
@@ -337,7 +382,7 @@ pub(super) fn run_effort<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             },
             Err(_) => rest.to_string(),
         };
-        match runtime.set_effort(&arg).await {
+        match runtime.set_effort(&arg, &ctx.principal).await {
             Ok(reply) => Outcome::Reply(reply),
             Err(e) => Outcome::Reply(format!("! [effort] {e}")),
         }
@@ -347,7 +392,7 @@ pub(super) fn run_effort<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 pub(super) fn run_undo<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let _ = ctx.args;
-        match ctx.runtime.undo().await {
+        match ctx.runtime.undo(&ctx.principal).await {
             Ok(()) => Outcome::Reply("undoing the last file change…".into()),
             Err(e) => Outcome::Reply(format!("! [undo] {e}")),
         }
@@ -360,7 +405,7 @@ pub(super) fn run_steer<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         if text.is_empty() {
             return Outcome::Reply("usage: /steer <text>".into());
         }
-        match ctx.runtime.steer(text).await {
+        match ctx.runtime.steer(text, &ctx.principal).await {
             Ok(true) => Outcome::Silent,
             Ok(false) => match ctx.runtime.handle_message(text, ctx.source).await {
                 Ok(()) => Outcome::Silent,
@@ -374,13 +419,13 @@ pub(super) fn run_steer<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 pub(super) fn run_queue<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         if ctx.args == "clear" {
-            return match ctx.runtime.clear_queue() {
+            return match ctx.runtime.clear_queue(&ctx.principal) {
                 Ok(0) => Outcome::Reply("the queue is empty".into()),
                 Ok(n) => Outcome::Reply(format!("cleared {n} queued message(s)")),
                 Err(e) => Outcome::Reply(format!("! [queue] {e}")),
             };
         }
-        match ctx.runtime.queued() {
+        match ctx.runtime.queued(&ctx.principal) {
             Ok(items) if items.is_empty() => Outcome::Reply("the queue is empty".into()),
             Ok(items) => {
                 let mut out = format!("{} queued:\n", items.len());
@@ -403,7 +448,7 @@ pub(super) fn run_queue<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_tools<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        let tools = ctx.runtime.tools();
+        let tools = ctx.runtime.tools(&ctx.principal);
         if tools.is_empty() {
             return Outcome::Reply(
                 "no tools discovered yet — they appear after the first turn".into(),

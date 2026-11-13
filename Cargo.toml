@@ -45,9 +45,11 @@ ka-agent-web = { path = "crates/ka-agent-web" }
 ka-agent-plugins = { path = "crates/ka-agent-plugins" }
 ka-agent-memory = { path = "crates/ka-agent-memory" }
 
+argon2 = { version = "0.5", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", default-features = false }
+password-hash = "0.5"
 fs2 = "0.4"
 ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
@@ -59,6 +61,8 @@ thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "net"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "multipart"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

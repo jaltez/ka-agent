@@ -44,6 +44,8 @@ pub struct Ctx<'a> {
     pub runtime: &'a Runtime,
     pub source: &'a str,
     pub args: &'a str,
+    /// Who is asking: every stateful command acts on this user.
+    pub principal: ka_agent_core::Principal,
 }
 
 /// Where a command can be used: everywhere, or only from local surfaces
@@ -78,6 +80,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &["start"],
         reach: Reach::Everywhere,
         run: misc::run_help,
+    },
+    CommandSpec {
+        name: "agent",
+        args: "[name]",
+        summary: "run this conversation as a shared agent (persona, skills, knowledge)",
+        example: "/agent reviewer",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_agent,
     },
     CommandSpec {
         name: "status",
@@ -450,7 +462,9 @@ pub fn allowed_for(runtime: &Runtime, role: &str, name: &str) -> bool {
     if role == ka_agent_core::ADMIN_ROLE {
         return true;
     }
-    const ADMIN_ONLY: &[&str] = &["update", "keys", "quit", "persona", "model", "config"];
+    // `model` is permission-filtered per caller (the group allowlist), so it
+    // left the hard admin-only set with the team edition.
+    const ADMIN_ONLY: &[&str] = &["update", "keys", "quit", "persona", "config"];
     const FLOOR: &[&str] = &["help", "status"];
     let Some(spec) = COMMANDS
         .iter()
@@ -499,19 +513,22 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
     // plus the help/status floor; a hard admin-only set stays unreachable
     // whatever the list says (config, keys, model and persona are the
     // operator's, not a subject's).
-    let role = runtime.role_for_source(source);
+    let Some(principal) = runtime.principal_for_source(source) else {
+        // An unlinked identity gets no command surface at all (the channel
+        // gate already logged the unauthorized contact).
+        return Outcome::Silent;
+    };
+    let role = principal.role.clone();
     if !allowed_for(runtime, &role, spec.name) {
         return Outcome::Reply(format!(
             "command /{} is not available for role {role}",
             spec.name
         ));
     }
-    // Commands act on the requesting role's session: hand the core over
-    // first (a running turn of another role is never disturbed).
-    if !runtime.activate_role(source).await {
-        return Outcome::Reply(
-            "another conversation is running — try again when its turn finishes".into(),
-        );
+    // Commands act on the requesting user's own state: make sure it exists
+    // (a running turn of another user is never disturbed — each has its own).
+    if let Err(e) = runtime.ensure_user_state(&principal) {
+        return Outcome::Reply(format!("{e}"));
     }
     let args = text
         .split_once(char::is_whitespace)
@@ -529,6 +546,7 @@ pub async fn route(runtime: &Runtime, source: &str, text: &str) -> Outcome {
         runtime,
         source,
         args,
+        principal,
     })
     .await
 }
@@ -643,6 +661,12 @@ mod tests {
     #[tokio::test]
     async fn start_deep_link_payload_is_ignored() {
         let runtime = test_runtime();
+        // The router resolves the sender to a user: link the identity the
+        // test speaks as (an unlinked source is refused silently).
+        runtime
+            .store()
+            .link_identity_as("telegram", "1", "test", "admin")
+            .unwrap();
         // Telegram deep links append a payload: `/start <payload>` answers
         // the command list like a bare `/start`, never "unknown command".
         assert_eq!(

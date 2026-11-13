@@ -24,27 +24,64 @@ impl Store {
         via: &str,
         role: &str,
     ) -> Result<bool, StoreError> {
+        self.link_identity_to_user(channel, address, via, role, &crate::user_for_role(role))
+    }
+
+    /// Link an identity to an explicit user (and, for display, a role).
+    /// The role-named user is created when missing so the identity always
+    /// resolves to a person.
+    pub fn link_identity_to_user(
+        &self,
+        channel: &str,
+        address: &str,
+        via: &str,
+        role: &str,
+        username: &str,
+    ) -> Result<bool, StoreError> {
         let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO users(username, display_name, role, created_ms, created_by)
+             VALUES (?1, ?1, ?2, ?3, 'identity-link')",
+            params![username, role, ka_agent_core::now_ms()],
+        )?;
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO identities(channel, address, linked_ms, via, role)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![channel, address, ka_agent_core::now_ms(), via, role],
+            "INSERT OR IGNORE INTO identities(channel, address, linked_ms, via, role, username)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                channel,
+                address,
+                ka_agent_core::now_ms(),
+                via,
+                role,
+                username
+            ],
         )?;
         Ok(changed == 1)
     }
 
     /// Reassign an identity's role; `Ok(false)` when the row does not
     /// exist or already carries that role.
+    /// Reassign an identity's role. In the user model this also rebinds the
+    /// identity to the user that role names (`admin` → `operator`, else the
+    /// role's own user, created on demand) — use `set_user_role` to change
+    /// a person's permissions across all their identities instead.
     pub fn set_identity_role(
         &self,
         channel: &str,
         address: &str,
         role: &str,
     ) -> Result<bool, StoreError> {
+        let username = crate::user_for_role(role);
         let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO users(username, display_name, role, created_ms, created_by)
+             VALUES (?1, ?1, ?2, ?3, 'identity-role')",
+            params![username, role, ka_agent_core::now_ms()],
+        )?;
         let changed = conn.execute(
-            "UPDATE identities SET role = ?3 WHERE channel = ?1 AND address = ?2 AND role != ?3",
-            params![channel, address, role],
+            "UPDATE identities SET role = ?3, username = ?4
+             WHERE channel = ?1 AND address = ?2 AND (role != ?3 OR username IS NULL OR username != ?4)",
+            params![channel, address, role, username],
         )?;
         Ok(changed == 1)
     }
@@ -79,7 +116,7 @@ impl Store {
     pub fn list_identities(&self) -> Result<Vec<IdentityRow>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT channel, address, linked_ms, via, role FROM identities \
+            "SELECT channel, address, linked_ms, via, role, username FROM identities \
              ORDER BY linked_ms, channel, address",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -89,6 +126,7 @@ impl Store {
                 linked_ms: r.get(2)?,
                 via: r.get(3)?,
                 role: r.get(4)?,
+                username: r.get(5)?,
             })
         })?;
         let mut out = Vec::new();

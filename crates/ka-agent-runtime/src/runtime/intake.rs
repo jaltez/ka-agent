@@ -1,17 +1,30 @@
-// Inbound handling: message routing, preflight, submit, the durable queue.
-// Split from runtime.rs (moves only).
+// Inbound handling per user: principal resolution, preflight, submit, the
+// durable queue, retry and stop. Split from runtime.rs (moves only).
 use super::worker::rt_on_engine_closed;
 use super::*;
+use ka_agent_core::Principal;
 
-/// Who started the turn being submitted and which role it acts as: the
-/// bridge's loop guard and its per-role notes/memory targets.
-fn publish_turn_context(store: &Store, source: &str, role: &str) {
+/// Who started the turn being submitted and which user/role it acts as: the
+/// bridge's loop guard and its per-user notes/memory targets.
+fn publish_turn_context(store: &Store, source: &str, who: &Principal) {
+    // Per-user keys: one worker (and one bridge) serves exactly one user, so
+    // this context can never be crossed between concurrent turns. The
+    // globals stay written for pre-users readers only.
+    for (field, value) in [
+        ("source", source.to_string()),
+        ("role", who.role.clone()),
+        ("username", who.username.clone()),
+    ] {
+        let _ = store.meta_set(
+            &ka_agent_core::layout::turnctx_key(&who.username, field),
+            &value,
+        );
+    }
     let _ = store.meta_set(ka_agent_core::layout::TURN_SOURCE_META_KEY, source);
-    let _ = store.meta_set(ka_agent_core::layout::TURN_ROLE_META_KEY, role);
+    let _ = store.meta_set(ka_agent_core::layout::TURN_ROLE_META_KEY, &who.role);
+    let _ = store.meta_set(ka_agent_core::layout::TURN_USER_META_KEY, &who.username);
 }
 
-/// Submit the next queued message, if any. Returns true when a new cycle is
-/// running (session stays `running`).
 /// The per-turn context line the model sees first: local clock, weekday,
 /// zone and channel; scheduled turns name their origin. `turns.inbound_text`
 /// and the FTS index keep the raw text.
@@ -55,45 +68,47 @@ fn ctx_line(now: &jiff::Zoned, source: &str) -> String {
     )
 }
 
-pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
+/// Submit the next queued message of one user, if any. Returns true when a
+/// new cycle is running (session stays `running`).
+pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHandle) -> bool {
     let (sid, private) = {
-        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // Same guard as the session id (see submit_text_with): a `/new`
-        // between two locks could pair the ended private session's id
-        // with the new session's privacy flag.
+        let g = st.lock();
+        // Same guard as the session id: a `/new` between two locks could
+        // pair the ended private session's id with the new session's
+        // privacy flag.
         (g.session.id.clone(), g.session.private)
     };
     let Some(item) = sh.store.next_queued(&sid).ok().flatten() else {
         return false;
     };
     let port = {
-        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = st.lock();
         g.live.as_ref().map(|l| Arc::clone(&l.port))
     };
     let Some(port) = port else {
         return false;
     };
-    // Queued messages cross channels too: the transcript sees them the
-    // same as directly-submitted ones (drain bypasses handle_message).
+    // Queued messages cross channels too: the transcript sees them the same
+    // as directly-submitted ones (drain bypasses handle_message).
     sh.emit(AgentEvent::Inbound {
         source: item.source.clone(),
         text: item.text.clone(),
     });
-    let item_role = {
-        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.role.clone()
-    };
-    publish_turn_context(&sh.store, &item.source, &item_role);
+    publish_turn_context(&sh.store, &item.source, who);
     // Background turns may run on the background model; the selector the
     // runtime submits on is recorded with the turn (per-model spend).
     let background = item.source.starts_with("cron")
         || item.source == "briefing"
         || item.source.ends_with("-bg");
-    let model = background
+    let configured = background
         .then(|| cfg_of(sh).background_model.clone())
         .flatten()
         .or_else(|| cfg_of(sh).model.clone());
-    // (privacy captured with `sid` above)
+    let model =
+        model_under_policy(&sh.store, &who.username, configured.as_deref()).unwrap_or_else(|e| {
+            sh.emit_from(AgentEvent::Notice { text: e }, Some(&item.source));
+            None
+        });
     // A private conversation records usage only: the row carries no text.
     let mut turn = Turn::new(
         sid.clone(),
@@ -112,6 +127,14 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
         });
         return false;
     }
+    let _ = sh.store.meta_set(
+        &ka_agent_core::layout::turnctx_key(&who.username, "id"),
+        turn.id.as_str(),
+    );
+    let _ = sh
+        .store
+        .meta_set(ka_agent_core::layout::TURN_ID_META_KEY, turn.id.as_str());
+    sh.store.record_staged_sources(&item.source, turn.id.as_str());
     if turn.transition(TurnStatus::Submitted).is_err() {
         return false;
     }
@@ -119,30 +142,20 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
     sh.store.mark_turned(&item.id, &turn.id).ok();
     // Claim the turn *before* the submit handshake, exactly like
     // `submit_text_with`: the engine can stream and finish while we are
-    // still awaiting `port.submit`, and a late claim attributes the finish
-    // to the previous turn (overwriting its chunks and cost) and strands
-    // this one `running`.
+    // still awaiting `port.submit`.
     {
-        let mut g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = st.lock();
         if let Some(live) = g.live.as_mut() {
             live.current_turn = Some(turn.id.clone());
             live.current_turn_source = Some(item.source.clone());
             live.turn_started_at = Some(Instant::now());
-            // The turn's own clock starts here: the watchdog measures
-            // silence from the last activity, which without this would
-            // be the PREVIOUS turn's last event (a long idle gap would
-            // read as an already-stalled turn seconds in).
             live.last_activity_ms = ka_agent_core::now_ms();
             live.watchdog_notified = false;
             live.live_text.clear();
         }
     }
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
-    let role = {
-        let g = sh.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.role.clone()
-    };
-    let allowed_tools = Runtime { sh: Arc::clone(sh) }.role_toolset(&role);
+    let allowed_tools = Runtime { sh: Arc::clone(sh) }.role_toolset(&who.role);
     match port
         .submit_full(wire, Vec::new(), Vec::new(), model, allowed_tools)
         .await
@@ -164,19 +177,46 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>) -> bool {
     }
 }
 
+/// The model a turn may actually use: the user's policy default when the
+/// configured one is not allowed, and a named refusal when nothing in the
+/// policy matches. `Ok(None)` = no model configured (allowed for scripted
+/// speakers).
+fn model_under_policy(
+    store: &Store,
+    username: &str,
+    configured: Option<&str>,
+) -> Result<Option<String>, String> {
+    let (allow, default) = store
+        .model_policy_for(username)
+        .map_err(|e| format!("model policy: {e}"))?;
+    let Some(configured) = configured else {
+        // Nothing configured: the policy default (if the group sets one).
+        return Ok(default.filter(|d| ka_agent_store::model_allowed(&allow, d)));
+    };
+    if ka_agent_store::model_allowed(&allow, configured) {
+        return Ok(Some(configured.to_string()));
+    }
+    // A model outside the policy is refused by name — never silently
+    // replaced by the group default.
+    Err(format!(
+        "model {configured} is not allowed for {username} (allowed: {}); ask an admin to widen your group",
+        allow.join(", ")
+    ))
+}
+
 impl Runtime {
-    /// Re-submit the session's newest turn when it ended in `error` or
-    /// `interrupted` (F2): the one-command / one-tap recovery after a
-    /// provider blip or a worker crash. Never automatic (ka-port.md §7):
-    /// only an operator act re-runs a turn that may have had side effects.
-    pub async fn retry_last(&self) -> Result<Option<String>, Error> {
-        if self.session_private() {
+    /// Re-submit the user's newest turn when it ended in `error` or
+    /// `interrupted` (F2): the one-command recovery after a provider blip or
+    /// a worker crash. Never automatic (ka-port.md §7): only an operator act
+    /// re-runs a turn that may have had side effects.
+    pub async fn retry_last(&self, who: &Principal) -> Result<Option<String>, Error> {
+        if self.session_private_for(who) {
             return Err(Error::Refused(
                 "this is a private conversation — its turns are not kept; /new starts a normal one"
                     .into(),
             ));
         }
-        let session = { self.lock().session.id.clone() };
+        let session = self.session_for_user(who)?.id;
         let Some(turn) = self
             .sh
             .store
@@ -193,77 +233,89 @@ impl Runtime {
             return Ok(None);
         }
         let text = turn.inbound_text.clone();
-        // Retry stays in the conversation it came from (never switches
-        // roles from under the operator).
-        let role = self.active_role();
-        self.handle_message_with_role(&text, "retry", &role).await?;
+        // A retry replays stored text that may already contain restricted
+        // `@kb:`/file content: carry the original turn's provenance rows so
+        // the share-time check sees the same sources (M3).
+        if let Ok(rows) = self.sh.store.turn_sources(turn.id.as_str())
+            && !rows.is_empty()
+        {
+            let staged: Vec<ka_agent_store::StagedSource> = rows
+                .into_iter()
+                .map(|r| ka_agent_store::StagedSource {
+                    kind: r.kind,
+                    reference: r.reference,
+                    groups: r.group_names,
+                })
+                .collect();
+            self.sh.store.stage_turn_sources("retry", &staged);
+        }
+        self.handle_message_as(&text, "retry", who).await?;
         Ok(Some(text))
     }
 
-    /// Inbound message: resolve the sender's role, make it active (or
-    /// queue onto its own session while another role's turn runs), then
-    /// submit.
+    /// Inbound message: resolve the sender's principal (an unlinked identity
+    /// or a disabled account is refused and audited), then submit or queue
+    /// for that user.
     pub async fn handle_message(&self, text: &str, source: &str) -> Result<(), Error> {
-        let role = self.role_for_source(source);
-        self.handle_message_with_role(text, source, &role).await
+        match self.principal_for_source(source) {
+            Some(who) => self.handle_message_as(text, source, &who).await,
+            None => {
+                self.refuse_unknown_sender(source);
+                Ok(())
+            }
+        }
     }
 
-    /// Inbound message for an explicit role (cron jobs carry their
-    /// creator's role; every surface resolves it from the source).
-    pub async fn handle_message_with_role(
+    /// Refuse an inbound message from a source with no principal: no reply,
+    /// one `<channel>.unauthorized` audit row (surfaced on `/contacts`).
+    fn refuse_unknown_sender(&self, source: &str) {
+        let channel = source
+            .strip_suffix("-bg")
+            .unwrap_or(source)
+            .split(':')
+            .next()
+            .unwrap_or(source)
+            .to_string();
+        let action = format!("{channel}.unauthorized");
+        let mut rec = AuditRecord::new(source, &action, "identity", Some("unlinked or disabled".into()));
+        let _ = self.sh.store.append_audit(&mut rec);
+    }
+
+    /// Inbound message for an explicit principal (cron jobs carry their
+    /// creator's user; every surface resolves it from the source).
+    pub async fn handle_message_as(
         &self,
         text: &str,
         source: &str,
-        role: &str,
+        who: &Principal,
     ) -> Result<(), Error> {
-        self.handle_message_inner(text, source, role, None).await
+        self.handle_message_inner(text, source, who, None).await
     }
 
-    /// A cron fire: its creator role and its (already clamped) tool
-    /// narrowing. `None` = the job requests no narrowing; `Some(list)` is
-    /// an allowlist even when the clamp emptied it (never a widening).
+    /// A cron fire: its creator's principal and its (already clamped) tool
+    /// narrowing. `None` = the job requests no narrowing; `Some(list)` is an
+    /// allowlist even when the clamp emptied it (never a widening).
     pub async fn handle_cron_message(
         &self,
         text: &str,
         source: &str,
-        role: &str,
+        who: &Principal,
         tools: Option<Vec<String>>,
     ) -> Result<(), Error> {
-        self.handle_message_inner(text, source, role, tools).await
+        self.handle_message_inner(text, source, who, tools).await
     }
 
     async fn handle_message_inner(
         &self,
         text: &str,
         source: &str,
-        role: &str,
+        who: &Principal,
         tool_override: Option<Vec<String>>,
     ) -> Result<(), Error> {
-        if self.active_role() != role {
-            // Never abort another role's live turn: its message waits on
-            // its own session's durable queue and the core is handed over
-            // at the next idle boundary.
-            if matches!(
-                self.session_status(),
-                SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping
-            ) {
-                let target = self.session_for_role(role)?;
-                let item = QueueItem::new(target.id.clone(), text.to_string(), source);
-                self.sh.store.enqueue(&item)?;
-                let n = self.sh.store.queue_len(&target.id)?;
-                self.sh.emit(AgentEvent::Inbound {
-                    source: source.to_string(),
-                    text: text.to_string(),
-                });
-                self.sh.emit(AgentEvent::Queue { depth: n as u32 });
-                self.sh.emit(AgentEvent::Notice {
-                    text: format!("queued for role {role} (#{n})"),
-                });
-                return Ok(());
-            }
-            self.switch_role(role).await?;
-        }
-        self.handle_message_active(text, source, tool_override)
+        let st = self.ensure_user(who)?;
+        // The user's own state decides: idle submits, a live turn steers or
+        // queues (see `handle_message_active`).
+        self.handle_message_active(text, source, who, &st, tool_override)
             .await
     }
 
@@ -273,6 +325,8 @@ impl Runtime {
         &self,
         text: &str,
         source: &str,
+        who: &Principal,
+        st: &UserHandle,
         tool_override: Option<Vec<String>>,
     ) -> Result<(), Error> {
         self.sh.emit(AgentEvent::Inbound {
@@ -281,7 +335,7 @@ impl Runtime {
         });
         let mut submit_head = false;
         let submit_now = {
-            let mut g = self.lock();
+            let mut g = st.lock();
             match g.session.status {
                 SessionStatus::Idle => {
                     // FIFO across restarts: the worker spawns lazily, so a
@@ -299,65 +353,65 @@ impl Runtime {
                         .map_err(|t| illegal_session(from, t))?;
                     true
                 }
-                SessionStatus::Running
-                | SessionStatus::AwaitingApproval
-                | SessionStatus::Stopping => false,
+                SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping => {
+                    false
+                }
                 SessionStatus::Paused => {
                     // A budget pause lifts itself when the day window rolls
                     // (the verdict is recomputed from the recorded window);
-                    // an auth pause needs /resume, which is why the note
-                    // says so honestly. `g` is already held — relocking the
-                    // non-reentrant mutex here deadlocked every message
-                    // after a pause.
+                    // an auth pause needs /resume.
                     if g.budget.verdict() == ka_agent_core::BudgetVerdict::Exceeded {
-                        self.sh.emit(AgentEvent::Notice {
-                            text: "paused: budget reached for this window; use /resume to override or wait for the window to roll"
-                                .into(),
-                        });
+                        self.sh.emit_from(
+                            AgentEvent::Notice {
+                                text: "paused: budget reached for this window; use /resume to override or wait for the window to roll"
+                                    .into(),
+                            },
+                            Some(source),
+                        );
                         false
                     } else {
-                        // Paused→Running is not a legal edge; go through
-                        // idle. Both writes are persisted: the store checks
-                        // transitions against the stored row, and skipping
-                        // the idle write would make the running write
-                        // illegal.
+                        // Paused→Running is not a legal edge; go through idle.
                         g.session
                             .transition(SessionStatus::Idle)
                             .map_err(|t| illegal_session(SessionStatus::Paused, t))?;
                         g.session
                             .transition(SessionStatus::Running)
                             .map_err(|t| illegal_session(SessionStatus::Idle, t))?;
+                        let sid = g.session.id.clone();
                         drop(g);
-                        self.persist_session_status(SessionStatus::Idle);
+                        self.persist_session_status(&who.username, &sid, SessionStatus::Idle);
                         true
                     }
                 }
                 SessionStatus::Degraded => {
-                    self.sh.emit(AgentEvent::Notice {
-                        text: "⚠ degraded — the worker keeps crashing; /new starts a fresh session"
-                            .into(),
-                    });
+                    self.sh.emit_from(
+                        AgentEvent::Notice {
+                            text: "⚠ degraded — the worker keeps crashing; /new starts a fresh session"
+                                .into(),
+                        },
+                        Some(source),
+                    );
                     false
                 }
             }
         };
         if submit_now {
             // Persist immediately: the store is the durable source of truth
-            // for recovery, and a row left at `idle` makes every later status
-            // write look like an illegal transition.
-            self.persist_session_status(SessionStatus::Running);
+            // for recovery.
+            let (sid, status) = {
+                let g = st.lock();
+                (g.session.id.clone(), g.session.status)
+            };
+            self.persist_session_status(&who.username, &sid, status);
         }
         if !submit_now {
-            match self.session_status() {
-                SessionStatus::Running
-                | SessionStatus::AwaitingApproval
-                | SessionStatus::Stopping => {
-                    // `busy_messages = "steer"`: an operator message lands
-                    // in the running reply at the next tool-batch boundary.
-                    // Scheduled turns stay uninterrupted, and a session
-                    // with no live turn (awaiting a crash recovery) queues.
-                    let live = self.live_port();
-                    let running = self.current_turn_source();
+            match self.session_status_for(who) {
+                SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping => {
+                    // `busy_messages = "steer"`: an operator message lands in
+                    // the running reply at the next tool-batch boundary.
+                    // Scheduled turns stay uninterrupted.
+                    let live = self.live_port_for(who);
+                    let running = self.current_turn_source_for(who);
                     let steerable = self.cfg().busy_messages == "steer"
                         && live.is_some()
                         && !running.as_deref().is_some_and(|s| {
@@ -367,78 +421,89 @@ impl Runtime {
                         && let Some(port) = live
                         && port.steer(text.to_string()).await.is_ok()
                     {
-                        // Record it on the turn (the durable transcript)
-                        // and in the live stream the surfaces show. A
-                        // private conversation records usage only, so
-                        // the durable append is skipped — the live
-                        // stream (memory only) still shows it.
                         let (turn_id, private) = {
-                            let g = self.lock();
-                            // One guard: the turn identity and the
-                            // privacy flag must not mix across a `/new`.
+                            let g = st.lock();
                             (
                                 g.live.as_ref().and_then(|l| l.current_turn.clone()),
                                 g.session.private,
                             )
                         };
                         if let (Some(id), false) = (&turn_id, private) {
-                            let _ = self.sh.store.append_turn_inbound(
-                                id,
-                                &format!("\n\n[added while working] {text}"),
-                            );
+                            let _ = self
+                                .sh
+                                .store
+                                .append_turn_inbound(id, &format!("\n\n[added while working] {text}"));
                         }
-                        if let Some(live) = self.lock().live.as_mut() {
+                        if let Some(live) = st.lock().live.as_mut() {
                             live.live_text
                                 .push_str(&format!("\n\n[added while working] {text}"));
                         }
-                        self.sh.emit(AgentEvent::Note {
-                            text: "steered into the running reply".into(),
-                        });
+                        self.sh.emit_from(
+                            AgentEvent::Note {
+                                text: "steered into the running reply".into(),
+                            },
+                            Some(source),
+                        );
                         return Ok(());
                     }
-                    let item = QueueItem::new(self.session_id(), text.to_string(), source);
+                    let item = QueueItem::new(
+                        st.lock().session.id.clone(),
+                        text.to_string(),
+                        source,
+                    );
                     self.sh.store.enqueue(&item)?;
-                    let n = self.sh.store.queue_len(&self.session_id())?;
+                    let n = self.sh.store.queue_len(&st.lock().session.id)?;
                     self.sh.emit(AgentEvent::Queue { depth: n as u32 });
-                    self.sh.emit(AgentEvent::Notice {
-                        text: format!("queued (#{n})"),
-                    });
+                    self.sh.emit_from(
+                        AgentEvent::Notice {
+                            text: format!("queued (#{n})"),
+                        },
+                        Some(source),
+                    );
                 }
                 _ => {}
             }
             return Ok(());
         }
         if submit_head {
-            // (drain_queue publishes the head item's own source.)
-            // The head item goes through the same handshake as a direct
-            // submit: the worker is spawned lazily, so it must exist before
-            // the drain (drain_queue only ever uses a live port).
-            if let Err(e) = self.ensure_worker().await {
-                let mut g = self.lock();
+            if let Err(e) = self.ensure_worker(who, source).await {
+                let mut g = st.lock();
                 if g.session.status == SessionStatus::Running {
                     g.session.transition(SessionStatus::Idle).ok();
                 }
+                let sid = g.session.id.clone();
                 drop(g);
-                self.persist_session_status(SessionStatus::Idle);
+                self.persist_session_status(&who.username, &sid, SessionStatus::Idle);
+                // Over the worker cap the message stays queued for a slot.
+                if matches!(e, Error::Refused(_)) {
+                    self.sh.emit_from(
+                        AgentEvent::Notice {
+                            text: e.to_string(),
+                        },
+                        Some(source),
+                    );
+                    return Ok(());
+                }
                 return Err(e);
             }
-            drain_queue(&self.sh).await;
+            drain_queue(&self.sh, who, st).await;
             return Ok(());
         }
         match self
-            .submit_text_with(text, Vec::new(), Some(source), tool_override)
+            .submit_text_with(text, Vec::new(), Some(source), who, tool_override)
             .await
         {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Never strand the session in `running`: the queue would
                 // swallow every later message (single-flight).
-                let mut g = self.lock();
+                let mut g = st.lock();
                 if g.session.status == SessionStatus::Running {
                     g.session.transition(SessionStatus::Idle).ok();
                 }
+                let sid = g.session.id.clone();
                 drop(g);
-                self.persist_session_status(SessionStatus::Idle);
+                self.persist_session_status(&who.username, &sid, SessionStatus::Idle);
                 Err(e)
             }
         }
@@ -446,13 +511,18 @@ impl Runtime {
 
     /// `/skill <name> <text>`: submit one turn with that skill's full body
     /// injected (SEED.md §2.6, §9.1). Fails closed: the skill must be
-    /// provisioned in the engine home, and the session must be idle — a
-    /// skill turn is never queued (the queue carries plain text only).
-    pub async fn handle_skill(&self, name: &str, text: &str, source: &str) -> Result<(), Error> {
-        // Skills are provisioned per role: the active role's engine home is
-        // the only one this turn's engine discovers.
-        let skills =
-            crate::skills::Skills::new(&self.sh.paths.role_engine_home(&self.active_role()));
+    /// provisioned in the user's engine home, and the session must be idle.
+    pub async fn handle_skill(
+        &self,
+        name: &str,
+        text: &str,
+        source: &str,
+        who: &Principal,
+    ) -> Result<(), Error> {
+        let st = self.ensure_user(who)?;
+        let skills = crate::skills::Skills::new(
+            &self.sh.paths.user_engine_home(&who.username),
+        );
         if !skills.is_enabled(name)? {
             return Err(Error::Refused(format!(
                 "skill {name:?} is not enabled — `ka-agent skills enable {name}`"
@@ -462,7 +532,7 @@ impl Runtime {
             return Err(Error::Refused("usage: /skill <name> <text>".into()));
         }
         {
-            let mut g = self.lock();
+            let mut g = st.lock();
             if g.session.status != SessionStatus::Idle {
                 return Err(Error::Refused(
                     "session busy — /skill runs when idle; nothing was queued".into(),
@@ -473,40 +543,47 @@ impl Runtime {
                 .transition(SessionStatus::Running)
                 .map_err(|t| illegal_session(from, t))?;
         }
-        self.persist_session_status(SessionStatus::Running);
+        {
+            let (sid, status) = {
+                let g = st.lock();
+                (g.session.id.clone(), g.session.status)
+            };
+            self.persist_session_status(&who.username, &sid, status);
+        }
         match self
-            .submit_text_with(text, vec![name.to_string()], Some(source), None)
+            .submit_text_with(text, vec![name.to_string()], Some(source), who, None)
             .await
         {
             Ok(()) => Ok(()),
             Err(e) => {
-                let mut g = self.lock();
+                let mut g = st.lock();
                 if g.session.status == SessionStatus::Running {
                     g.session.transition(SessionStatus::Idle).ok();
                 }
+                let sid = g.session.id.clone();
                 drop(g);
-                self.persist_session_status(SessionStatus::Idle);
+                self.persist_session_status(&who.username, &sid, SessionStatus::Idle);
                 Err(e)
             }
         }
     }
 
     /// Refuse a message that cannot possibly work, before any state moves:
-    /// no model configured, or the model's provider key missing. The
-    /// refusal is the operator's answer; the session returns to idle and
-    /// nothing is submitted or recorded.
-    pub(super) fn preflight(&self) -> Result<(), String> {
+    /// no model configured, the model's provider key missing, or a model
+    /// outside the user's policy.
+    pub(super) fn preflight(&self, who: &Principal) -> Result<(), String> {
         // Scripted speakers (e2e) legitimately run without model or keys.
         if self.sh.port.scenario_override.is_some() {
             return Ok(());
         }
         let cfg = self.cfg();
-        if cfg.model.is_none() && cfg.ka.engine_layer.is_none() {
+        let model = model_under_policy(&self.sh.store, &who.username, cfg.model.as_deref())?;
+        if model.is_none() && cfg.ka.engine_layer.is_none() {
             return Err(
                 "no model configured — run `ka-agent setup` (or /model provider/model)".into(),
             );
         }
-        if let Some(model) = &cfg.model {
+        if let Some(model) = &model {
             // Validate once per model string; re-read the .env file only
             // when its mtime moved (preflight runs on every submit).
             let sel = {
@@ -515,14 +592,10 @@ impl Runtime {
                     .selector_cache
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if let Some((cached_model, sel)) = cache.as_ref() {
-                    if cached_model == model {
-                        sel.clone()
-                    } else {
-                        let sel = ka_agent_port::catalog::validate_selector(model)?;
-                        *cache = Some((model.clone(), sel.clone()));
-                        sel
-                    }
+                if let Some((cached_model, sel)) = cache.as_ref()
+                    && cached_model == model
+                {
+                    sel.clone()
                 } else {
                     let sel = ka_agent_port::catalog::validate_selector(model)?;
                     *cache = Some((model.clone(), sel.clone()));
@@ -535,14 +608,10 @@ impl Runtime {
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             let env = {
                 let mut cache = self.sh.env_cache.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((cached_mtime, env)) = cache.as_ref() {
-                    if *cached_mtime == mtime {
-                        env.clone()
-                    } else {
-                        let env = ka_agent_port::catalog::read_env_file(&env_path);
-                        *cache = Some((mtime, env.clone()));
-                        env
-                    }
+                if let Some((cached_mtime, env)) = cache.as_ref()
+                    && *cached_mtime == mtime
+                {
+                    env.clone()
                 } else {
                     let env = ka_agent_port::catalog::read_env_file(&env_path);
                     *cache = Some((mtime, env.clone()));
@@ -565,39 +634,68 @@ impl Runtime {
     async fn submit_text_with(
         &self,
         text: &str,
-        skills: Vec<String>,
+        skills_extra: Vec<String>,
         source: Option<&str>,
+        who: &Principal,
         tool_override: Option<Vec<String>>,
     ) -> Result<(), Error> {
-        // The bridge reads the turn's source and role from the store while
-        // the turn runs (this is also the `/skill` path's only publisher).
-        let role = self.active_role();
-        publish_turn_context(&self.sh.store, source.unwrap_or("console"), &role);
-        if let Err(msg) = self.preflight() {
-            self.sh.emit(AgentEvent::Notice { text: msg });
-            let mut g = self.lock();
+        let st = self.ensure_user(who)?;
+        // The bridge reads the turn's source, user and role from the store
+        // while the turn runs.
+        publish_turn_context(&self.sh.store, source.unwrap_or("console"), who);
+        if let Err(msg) = self.preflight(who) {
+            self.sh.emit_from(
+                AgentEvent::Notice { text: msg },
+                source,
+            );
+            let mut g = st.lock();
             if g.session.status == SessionStatus::Running {
                 g.session.transition(SessionStatus::Idle).ok();
             }
+            let sid = g.session.id.clone();
             drop(g);
-            self.persist_session_status(SessionStatus::Idle);
-            // The submit was accepted but refused before any turn started:
-            // say the session is idle again, or a busy indicator (and a
-            // waiting `ask --wait`) would never clear.
+            self.persist_session_status(&who.username, &sid, SessionStatus::Idle);
             self.sh.emit(AgentEvent::Session {
                 status: "Idle".into(),
             });
             return Ok(());
         }
-        if let Err(e) = self.ensure_worker().await {
+        if let Err(e) = self.ensure_worker(who, source.unwrap_or("console")).await {
+            if matches!(e, Error::Refused(_)) {
+                // Over the worker cap: queue durably and try again when a
+                // slot frees (never a silent drop).
+                let sid = st.lock().session.id.clone();
+                let item = QueueItem::new(
+                    sid.clone(),
+                    text.to_string(),
+                    source.unwrap_or("console"),
+                );
+                self.sh.store.enqueue(&item)?;
+                let mut g = st.lock();
+                if g.session.status == SessionStatus::Running {
+                    g.session.transition(SessionStatus::Idle).ok();
+                }
+                drop(g);
+                self.persist_session_status(&who.username, &sid, SessionStatus::Idle);
+                self.sh.emit_from(
+                    AgentEvent::Notice {
+                        text: e.to_string(),
+                    },
+                    source,
+                );
+                return Ok(());
+            }
             // A dead worker at submit time behaves like an interruption:
             // surface it, never auto-retry (SEED.md §3.8).
-            self.sh.emit(AgentEvent::Error {
-                class: "internal".into(),
-                retryable: retryable_class("internal"),
-                message: format!("worker start failed: {e}"),
-            });
-            let mut g = self.lock();
+            self.sh.emit_from(
+                AgentEvent::Error {
+                    class: "internal".into(),
+                    retryable: retryable_class("internal"),
+                    message: format!("worker start failed: {e}"),
+                },
+                source,
+            );
+            let mut g = st.lock();
             let from = g.session.status;
             g.session
                 .transition(SessionStatus::Idle)
@@ -605,13 +703,10 @@ impl Runtime {
             return Ok(());
         }
         let (sid, private, port) = {
-            let g = self.lock();
+            let g = st.lock();
             let Some(live) = g.live.as_ref() else {
                 return Ok(());
             };
-            // Same guard as the session id: a `/new` between two locks
-            // could pair the ended private session's id with the new
-            // session's privacy flag.
             (
                 g.session.id.clone(),
                 g.session.private,
@@ -620,14 +715,25 @@ impl Runtime {
         };
         // Record the turn BEFORE submitting (gap G8: ka persists per cycle,
         // so Ka Agent's record is the durable one). Background turns (crons,
-        // the briefing, `-bg` asks) may run on a cheaper model; the selector
-        // this turn is submitted on is recorded with it (per-model spend).
+        // the briefing, `-bg` asks) may run on a cheaper model.
         let src = source.unwrap_or("");
         let background = src.starts_with("cron") || src == "briefing" || src.ends_with("-bg");
-        let model = background
-            .then(|| self.cfg().background_model.clone())
-            .flatten()
-            .or_else(|| self.cfg().model.clone());
+        let model = model_under_policy(
+            &self.sh.store,
+            &who.username,
+            background
+                .then(|| self.cfg().background_model.clone())
+                .flatten()
+                .or_else(|| self.cfg().model.clone())
+                .as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            self.sh.emit_from(
+                AgentEvent::Notice { text: e },
+                source,
+            );
+            None
+        });
         // A private conversation records usage only: the row carries no text.
         let mut turn = Turn::new(
             sid,
@@ -639,34 +745,84 @@ impl Runtime {
         );
         turn.model = model.clone();
         self.sh.store.insert_turn(&turn)?;
+        let _ = self.sh.store.meta_set(
+            &ka_agent_core::layout::turnctx_key(&who.username, "id"),
+            turn.id.as_str(),
+        );
+        let _ = self
+            .sh
+            .store
+            .meta_set(ka_agent_core::layout::TURN_ID_META_KEY, turn.id.as_str());
+        self.sh
+            .store
+            .record_staged_sources(source.unwrap_or("console"), turn.id.as_str());
         turn.transition(TurnStatus::Submitted)
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
-        // Claim the turn for this live session *before* the submit handshake:
-        // the engine can stream and finish the turn while we are still
-        // awaiting `port.submit`, and a late claim loses `turn_finished`
-        // (the record would never go terminal, and the session would never
-        // return to idle).
+        // Claim the turn for this live session *before* the submit handshake.
         {
-            let mut g = self.lock();
+            let mut g = st.lock();
             if let Some(live) = g.live.as_mut() {
                 live.current_turn = Some(turn.id.clone());
                 live.current_turn_source = source.map(str::to_string);
                 live.turn_started_at = Some(Instant::now());
-                // Same as the drain claim: silence starts at the turn,
-                // not at whatever the worker last emitted.
                 live.last_activity_ms = ka_agent_core::now_ms();
                 live.watchdog_notified = false;
             }
         }
+        // A shared agent contributes its persona, skills and model to this
+        // turn; the user's own policy still bounds the model.
+        let agent = self.active_agent(who);
+        let (agent_preamble, mut skills, agent_model) = match &agent {
+            Some(a) => (
+                format!(
+                    "<agent name=\"{}\" owner=\"{}\">\n{}\n</agent>\n",
+                    a.name, a.owner_username, a.persona
+                ),
+                a.skills.clone(),
+                a.model.clone(),
+            ),
+            None => (String::new(), Vec::new(), None),
+        };
+        skills.extend(skills_extra);
+        let model = match agent_model {
+            Some(m) => {
+                let (allow, _) = self
+                    .sh
+                    .store
+                    .model_policy_for(&who.username)
+                    .unwrap_or_default();
+                if !ka_agent_store::model_allowed(&allow, &m) {
+                    self.sh.emit_from(
+                        AgentEvent::Notice {
+                            text: format!(
+                                "agent model {m} is not allowed for {} — pick another agent or widen the group",
+                                who.username
+                            ),
+                        },
+                        source,
+                    );
+                    None
+                } else {
+                    Some(m)
+                }
+            }
+            None => model,
+        };
         let wire = format!(
-            "{}\n{text}",
-            context_line(&self.sh, source.unwrap_or("console"))
+            "{}{}\n{text}",
+            context_line(&self.sh, source.unwrap_or("console")),
+            agent_preamble
         );
-        // The selector was resolved before the turn was recorded above.
+        if let Some(a) = &agent {
+            let _ = self.sh.store.meta_set(
+                &ka_agent_core::layout::turnctx_key(&who.username, "agent"),
+                &a.name,
+            );
+        }
         // The per-turn allowlist: the role's toolset, narrowed by a cron's
         // own list (never widened).
-        let role_allow = self.role_toolset(&self.active_role());
+        let role_allow = self.role_toolset(&who.role);
         let allowed_tools = match tool_override {
             Some(tools) => Some(match role_allow {
                 Some(allow) => tools.into_iter().filter(|t| allow.contains(t)).collect(),
@@ -683,14 +839,13 @@ impl Runtime {
                 turn.transition(TurnStatus::Interrupted)
                     .map_err(|t| illegal_turn(turn.status, t))?;
                 self.sh.store.update_turn(&turn)?;
-                rt_on_engine_closed(&self.sh, port).await;
+                rt_on_engine_closed(&self.sh, &st, port).await;
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
         }
         // The engine may have finished the turn already (fast scripted
-        // speaker): its record is then terminal and there is nothing left
-        // for this handshake to record.
+        // speaker): its record is then terminal.
         if self
             .sh
             .store
@@ -704,17 +859,15 @@ impl Runtime {
         turn.transition(TurnStatus::Running)
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
-        // No `TurnStarted` here: `drive` announces the turn exactly once,
-        // when the engine's own `turn_started` arrives (earlier than this
-        // handshake, and before any delta).
         Ok(())
     }
 
     /// `/stop`: abort; escalate to SIGKILL after the configured grace
     /// (SEED.md §3.8).
-    pub async fn stop_turn(&self) -> Result<(), Error> {
+    pub async fn stop_turn(&self, who: &Principal, source: &str) -> Result<(), Error> {
+        let st = self.ensure_user(who)?;
         let port = {
-            let mut g = self.lock();
+            let mut g = st.lock();
             let status = g.session.status;
             let live_port = g.live.as_ref().map(|l| Arc::clone(&l.port));
             match (status, live_port) {
@@ -728,25 +881,26 @@ impl Runtime {
             }
         };
         let Some(port) = port else {
-            self.sh.emit(AgentEvent::Notice {
-                text: "nothing to stop".into(),
-            });
+            self.sh.emit_from(
+                AgentEvent::Notice {
+                    text: "nothing to stop".into(),
+                },
+                Some(source),
+            );
             return Ok(());
         };
-        self.sh.emit(AgentEvent::Notice {
-            text: "stopping…".into(),
-        });
+        self.sh.emit_from(
+            AgentEvent::Notice {
+                text: "stopping…".into(),
+            },
+            Some(source),
+        );
         port.abort().await.ok();
         let grace = Duration::from_secs(self.cfg().turn_grace_secs);
         // Escalate on the *turn*, not the process: a successful abort leaves
-        // the worker attached (it is reused for the next turn), and the old
-        // `is_closed()` test therefore always killed it — SIGKILLing a turn
-        // the abort had already drained into.
+        // the worker attached (it is reused for the next turn).
         let sh = Arc::clone(&self.sh);
-        let turn = {
-            let g = self.lock();
-            g.live.as_ref().and_then(|l| l.current_turn.clone())
-        };
+        let turn = { st.lock().live.as_ref().and_then(|l| l.current_turn.clone()) };
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
             let turn_still_open = turn
@@ -754,13 +908,7 @@ impl Runtime {
                 .and_then(|t| sh.store.get_turn(t).ok().flatten())
                 .is_some_and(|t| !t.status.is_terminal());
             if turn_still_open && !port.is_closed() {
-                if let Some(live) = sh
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .live
-                    .as_mut()
-                {
+                if let Some(live) = st.lock().live.as_mut() {
                     live.deliberate_close = true;
                 }
                 port.kill().await;
@@ -769,18 +917,15 @@ impl Runtime {
         Ok(())
     }
 
-    /// Skills the engine currently discovers (for `/skills` and doctor).
-    /// Provision one skill into the engine home (the `/skills accept`
-    /// path): true when the operator's library has it.
-    pub fn enable_skill(&self, name: &str) -> Result<bool, Error> {
-        let role = self.active_role();
-        let skills = crate::skills::Skills::new(&self.sh.paths.role_engine_home(&role));
+    /// Provision one skill into the user's engine home.
+    pub fn enable_skill(&self, name: &str, who: &Principal) -> Result<bool, Error> {
+        let skills = crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username));
         skills.enable(name).map_err(Error::Skills)
     }
 
-    pub fn skills_enabled(&self) -> Vec<crate::skills::SkillInfo> {
-        let role = self.active_role();
-        crate::skills::Skills::new(&self.sh.paths.role_engine_home(&role)).enabled()
+    /// Skills the user's engine currently discovers.
+    pub fn skills_enabled(&self, who: &Principal) -> Vec<crate::skills::SkillInfo> {
+        crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username)).enabled()
     }
 }
 
@@ -816,5 +961,47 @@ mod tests {
         assert!(brief.contains("via=\"briefing\""), "{brief}");
         assert!(brief.contains("scheduled=\"briefing\""), "{brief}");
         assert!(!ctx_line(&now(), "console").contains("scheduled="));
+    }
+
+    #[test]
+    fn model_policy_resolution() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_user(&ka_agent_store::UserRow {
+                username: "ana".into(),
+                display_name: "Ana".into(),
+                pw_hash: None,
+                role: "member".into(),
+                quota_daily_usd: None,
+                disabled: false,
+                created_ms: 1,
+                created_by: Some("test".into()),
+            })
+            .unwrap();
+        // No groups: every configured model is allowed.
+        assert_eq!(
+            model_under_policy(&store, "ana", Some("openai/gpt-5.2")).unwrap(),
+            Some("openai/gpt-5.2".into())
+        );
+        // A group with an allowlist refuses a foreign model by name.
+        store
+            .upsert_group("dev", &["anthropic/*".into()], Some("anthropic/claude"))
+            .unwrap();
+        store.add_user_group("ana", "dev").unwrap();
+        assert!(
+            model_under_policy(&store, "ana", Some("openai/gpt-5.2"))
+                .unwrap_err()
+                .contains("not allowed for ana"),
+            "a disallowed configured model is refused by name"
+        );
+        // No configured model: the policy default applies.
+        assert_eq!(
+            model_under_policy(&store, "ana", None).unwrap(),
+            Some("anthropic/claude".into())
+        );
+        assert_eq!(
+            model_under_policy(&store, "ana", Some("anthropic/claude-3")).unwrap(),
+            Some("anthropic/claude-3".into())
+        );
     }
 }

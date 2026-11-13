@@ -62,7 +62,11 @@ pub(crate) fn remind<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                 }
                 let id = ctx
                     .runtime
-                    .add_reminder_at(at_ms, &text)
+                    .add_reminder_at(
+                        at_ms,
+                        &text,
+                        &crate::tools::turn_principal(ctx),
+                    )
                     .map_err(|e| e.to_string())?;
                 let now = ctx.runtime.now_zoned();
                 let when_text = render_when(at_ms, &now);
@@ -148,16 +152,23 @@ pub(crate) fn send_file<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             .unwrap_or("")
             .to_string();
         let p = std::path::Path::new(raw);
+        let who = crate::tools::turn_principal(ctx);
+        let workspace = ctx.runtime.workspace_for(&who);
         let joined = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            ctx.runtime.workspace().join(p)
+            workspace.join(p)
         };
         let real = std::fs::canonicalize(&joined).map_err(|e| format!("{raw}: {e}"))?;
-        let ws = std::fs::canonicalize(ctx.runtime.workspace())
-            .unwrap_or_else(|_| ctx.runtime.workspace());
-        let attachments = std::fs::canonicalize(ctx.paths.root().join("attachments"))
-            .unwrap_or_else(|_| ctx.paths.root().join("attachments"));
+        let ws = std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+        let attachments = std::fs::canonicalize(
+            ctx.runtime
+                .data_root()
+                .join("users")
+                .join(&who.username)
+                .join("attachments"),
+        )
+        .unwrap_or_else(|_| ctx.paths.user_attachments(&who.username));
         if !real.starts_with(&ws) && !real.starts_with(&attachments) {
             return Err("send_file only sends files from the workspace or attachments".to_string());
         }
@@ -252,7 +263,7 @@ pub(crate) fn skill_propose_schema() -> Value {
 
 pub(crate) fn skill_propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
-        if ctx.runtime.session_private() {
+        if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
             return Err("this is a private conversation — skill proposals are off here".into());
         }
         let name = args["name"].as_str().unwrap_or("").trim();

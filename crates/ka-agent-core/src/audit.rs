@@ -22,6 +22,10 @@ pub struct AuditRecord {
     /// chain, not hashed into it, so pre-RBAC rows keep verifying.
     #[serde(default = "crate::admin_role")]
     pub role: String,
+    /// The user the acting subject was (`operator` for local surfaces and
+    /// every row that predates users). Also beside the chain.
+    #[serde(default = "crate::operator_user")]
+    pub username: String,
     /// Hash chain: `hash = sha256(prev_hash || canonical-json(record))`.
     /// Computed by the store; empty until persisted.
     pub prev_hash: String,
@@ -39,9 +43,17 @@ impl AuditRecord {
             subject: subject.to_string(),
             detail,
             role: crate::ADMIN_ROLE.to_string(),
+            username: crate::OPERATOR_USER.to_string(),
             prev_hash: String::new(),
             hash: String::new(),
         }
+    }
+
+    /// Stamp the acting user (beside the hash chain, exactly like `role`:
+    /// rows written before users existed keep verifying unchanged).
+    pub fn with_user(mut self, username: &str) -> Self {
+        self.username = username.to_string();
+        self
     }
 
     /// Stamp the acting role.
@@ -58,6 +70,9 @@ pub mod actions {
     pub const MODE_SET: &str = "mode.set";
     pub const APPROVAL_DECIDE: &str = "approval.decide";
     pub const APPROVAL_EXPIRE: &str = "approval.expire";
+    /// An approval whose actor lost the right to execute it (disabled user,
+    /// removed role, withdrawn grant): denied at execute time (D9).
+    pub const APPROVAL_STALE: &str = "approval.stale";
     pub const WORKER_RESTART: &str = "worker.restart";
     pub const MEMORY_ACCEPT: &str = "memory.accept";
     pub const MEMORY_EDIT: &str = "memory.edit";

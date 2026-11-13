@@ -9,23 +9,29 @@ links. A wildcard bind is not a URL: the local URL stays `127.0.0.1`.
 beyond loopback (pairing codes travel over it — put TLS/reverse proxy in
 front, `docs/design/web-relay.md`).
 
-## Roles (ADR-0002)
+## Accounts (ADR-0004, D8)
 
-- `ka-agent pair web --role <r>` → a one-time code; `POST /pair` redeems
-  it and sets a server-side `HttpOnly; SameSite=Strict` session cookie for
-  a fresh `web:<id>` identity with that role.
-- A role session is **chat-only**: `/`, `/chat/send`, `/events` and the
-  static chat script. Every other page answers `403 this web session is
-  chat-only`. `/events` is filtered to envelopes stamped with the role's
-  own `web:<id>` source, so approval cards and other roles' turns never
-  reach it.
-- The operator's one-shot login (`/auth?token=…`) keeps the full panel:
-  status, profiles (`/profiles`: profiles on disk, configured roles,
-  linked identities with role reassignment), config form (`/settings`),
-  tasks, memory, skills, approvals, audit.
-- `POST /profiles/create|use` and `POST /identities/role` run the same
-  CLI/store operations as the terminal and are audited with the admin
-  role; they are not offered under a pinned `KA_AGENT_DATA_DIR`.
+- `ka-agent user invite [--role member] [--group dev]` → a one-time code
+  (24 h, five attempts, table-backed so several invites can be
+  outstanding). `GET /invite` redeems it with a new password and creates
+  the account (argon2id PHC string in `users.pw_hash`).
+- `GET /login` (username + password) sets a server-side
+  `HttpOnly; SameSite=Strict` cookie backed by the `web_sessions` table, so
+  sessions survive a daemon restart; they are swept on access at expiry.
+- A non-admin user is **chat-only**: `/`, `/chat/send`, `/upload`,
+  `/file/*`, `/events` and the static scripts. Every other page answers
+  `403 this web session is chat-only`. `/events` is filtered to envelopes
+  stamped with the user's own `web:<username>` source, so escalations and
+  other users' turns never reach it.
+- The admin user (role `admin`) sees the full panel: status, profiles,
+  config form (`/settings`), tasks, memory, skills, approvals, audit, and
+  the account/resource pages (`/users`, `/groups`, `/kb`).
+- 5 failed password verifies per username per 15 minutes lock that
+  username out (audited).
+- Role is re-derived per request from the user row; the daemon never
+  trusts a role or username asserted by the client.
+- `ka-agent pair web` and `POST /pair` are gone; the account path is
+  `user invite`.
 
 _M7, SEED.md §10 Phase 4; redesigned v0.8._
 
@@ -57,19 +63,25 @@ dashboard` mints a one-shot token in the daemon's store (`meta` key
 
 ## Auth flow
 
-1. `GET /auth?token=<token>` — validates and **consumes** the token (a second
-   use is `401`), then answers `303` with
+1. `GET /auth?token=<token>` — the operator's one-shot login: validates and
+   **consumes** the token (a second use is `401`), then answers `303` with
    `Set-Cookie: ka_session=<32 random bytes hex>; HttpOnly; SameSite=Strict;
    Path=/; Max-Age=86400` (`; Secure` when `[web] public_url` is https) and
-   `Location: /`.
-2. Every other route requires a valid `ka_session` cookie; otherwise `401`.
-3. Sessions live in the daemon process (memory only) and expire after 24 h;
-   a daemon restart invalidates them.
+   `Location: /`. It authenticates the admin user.
+2. `GET|POST /login` and `GET|POST /invite` are the account entry points
+   (public, rate-limited by the username lockout).
+3. Every other route requires a valid `ka_session` cookie backed by
+   `web_sessions`; otherwise `401`. Sessions expire after 24 h and are
+   swept on access.
+4. Every mutating form POST requires the `X-Ka-Agent: 1` header —
+   `/chat/send`, `/upload`, `/pair` (removed), `/identities/*`, `/roles/*`,
+   `/settings`, `/approvals/decide` and every other mutation. A POST
+   without it is refused before it can act.
 
 ## Routes
 
-Everything except `/healthz`, `/auth` and the bearer-token `/api/*` group
-requires a valid session cookie.
+Everything except `/healthz`, `/auth`, `/login`, `/invite` and the
+bearer-token `/api/*` group requires a valid session cookie.
 
 | Method | Path | Content |
 |---|---|---|
@@ -82,12 +94,20 @@ requires a valid session cookie.
 | GET | `/events` | the SSE stream (one `data:` frame per sequenced bus envelope; `id:` carries the `seq` so a reconnect with `Last-Event-ID` replays exactly the gap) |
 | POST | `/api/notify` | `{"text"}` → a notice on every surface. **Bearer-only**: `Authorization: Bearer <web.api_token>`; `404` while no token is configured, `401` for a wrong one; 16 KiB bodies, 30 req/min |
 | POST | `/api/ask` | `{"text","background","wait"}` → queues a turn (`api` / `api-bg` source); with `wait:true` the reply is held until the turn settles (300 s cap) and carries `{"ok","queued","reply","stop"}`; same bearer auth as `/api/notify` |
-| GET | `/pair` | the public pairing form (a code from `ka-agent pair web --role <r>`); `POST /pair` redeems it and sets the role cookie |
-| GET | `/sessions` | recent sessions by role with an "open" action (adopts that role's latest conversation; a running turn is never disturbed) |
-| POST | `/sessions/open` | `role=` switches the active role when settled |
+| GET | `/login` · `/invite` | the account forms (password, or invite code + password) |
+| POST | `/login` · `/invite` | sign in / redeem an invite and create the account; sets the session cookie |
+| GET | `/users` | accounts: create (invite), disable/enable, reset password, export, purge, groups, role, quota |
+| POST | `/users/invite` · `/users/disable` · `/users/enable` · `/users/reset` · `/users/export` · `/users/purge` | the `ka-agent user …` operations (mutations require `X-Ka-Agent: 1`) |
+| GET | `/groups` | groups with membership, `models_allow` and `models_default` |
+| POST | `/groups/save` · `/groups/delete` | write one group and its membership |
+| GET | `/kb` | knowledge bases with their access groups, documents and upload form |
+| GET | `/agents` | shared agents the caller can see, with their level and (for editors/owners) the definition form |
+| POST | `/agents/create` · `/agents/save` · `/agents/rm` | create an agent (optionally shared with a group as viewer), edit it (editor/owner), delete it (owner) |
+| POST | `/kb/create` · `/kb/access` · `/kb/<name>/docs` · `/kb/rm` | create a KB, set its groups, upload a document (same path replaces), remove a document or the KB |
+| GET | `/usage?user=<u>` | the same view scoped to one account (admins only) |
 | POST | `/backup` | run the binary's own `backup` (default directory, pruned to 7) and show its output; restore stays in the CLI |
 | GET | `/status` | the operator report (state, model, mode/effort, budget bars, queue/approvals, memory, worker, role/tools, worker stderr tail) plus the settings form |
-| GET | `/profiles` | profiles on disk, configured `[[role]]` entries (each links to the editor), linked identities with role/link/unlink, the `[tools] disable` baseline, and the “new web user” code form |
+| GET | `/profiles` | profiles on disk, configured `[[role]]` entries (each links to the editor), linked identities with role/link/unlink, the `[tools] disable` baseline; web accounts are created on `/users` |
 | GET | `/roles/new` · `/roles/edit/<name>` | the role editor (name, mode, allow/disable, workspace, budget, commands) |
 | POST | `/roles/save` · `/roles/delete` | write `[[role]]` through the validated config editor and hot-reload; delete refuses while identities/crons reference the role unless `force=1` |
 | POST | `/tools/disable` | write the profile-wide `[tools] disable` baseline |
@@ -109,11 +129,10 @@ requires a valid session cookie.
 | GET | `/doctor` | the in-process health checks (config, model key, store, data-root permissions, web publication, channel tokens) plus the full `ka-agent doctor --json` (pin, contract hash, sandbox) |
 | POST | `/doctor/fix` | run the binary's safe repairs (0700 roots, 0600 secret files) and show their output |
 | GET | `/logs` | the tail (300 lines) of `<data>/logs/daemon.log`, the same file `ka-agent logs` reads |
-| POST | `/pair/issue` | mint a web pairing code for a role from the admin UI (audited; shown once) |
-| POST | `/upload` | one attachment (`X-Ka-Filename`, raw body, `X-Ka-Agent: 1`, max 8 MiB) under the caller role's `attachments/`; replies with the `@attachments/…` ref |
-| GET | `/file/<name>` | serve one direct child of the caller role's `attachments/` or workspace; traversal and symlink escapes are refused |
+| POST | `/upload` | one attachment (`X-Ka-Filename`, raw body, `X-Ka-Agent: 1`, max 8 MiB) under the caller user's `attachments/`; replies with the `@attachments/…` ref |
+| GET | `/file/<name>` | serve one direct child of the caller user's `attachments/` or workspace; traversal and symlink escapes are refused |
 | POST | `/settings` | the status page form, one control per `config_keys::KEYS` entry marked `web` (see below): format-preserving writes + live reload; each key shows when it applies; unknown keys are ignored; invalid values are refused |
-| GET | `/usage` | spend per day **and model** (30 d), CSS bars, today vs the cap |
+| GET | `/usage` | the status-page usage view: spend per day **and model** (30 d), CSS bars, today vs the cap (`?user=<u>` adds the per-user split, `?format=csv` downloads) |
 | GET | `/tasks` | reminders and crons, next fire first, with role/tools, the create forms (same grammar as `/cron add` and `/remind`), and pause/resume/run-now/remove per cron |
 | POST | `/tasks/add` | `kind=cron\|reminder` + `args=` runs the router's own command and shows its reply |
 | POST | `/tasks/calendar` | `args=` runs the router's `/calendar` (add/today) and shows its reply |

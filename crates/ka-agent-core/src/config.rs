@@ -119,6 +119,10 @@ pub struct RoleSpec {
     pub budget_daily_usd: Option<f64>,
     /// Chat-command allowlist (unset = every command the role may reach).
     pub commands: Vec<String>,
+    /// Tools that always escalate to the admin (D9): exact hand names and
+    /// `mcp:<server>[:<tool>]` — same spec grammar as `allow`.
+    #[serde(default)]
+    pub escalate: Vec<String>,
     /// Role grants; only `path` is honored (`install`/`full`/`advisory`
     /// stay admin-only and are refused when set non-default).
     pub grants: Grants,
@@ -134,6 +138,7 @@ impl Default for RoleSpec {
             workspace: None,
             budget_daily_usd: None,
             commands: Vec::new(),
+            escalate: Vec::new(),
             grants: Grants::default(),
         }
     }
@@ -288,6 +293,76 @@ impl Telegram {
         self.api_base
             .as_deref()
             .unwrap_or("https://api.telegram.org")
+    }
+}
+
+/// The Slack workspace app (`[slack]`): one app install serves the whole
+/// workspace, so the daemon must be the single process answering it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SlackSettings {
+    pub enabled: bool,
+    /// Secret-store name of the app-level token (`xapp-…`,
+    /// `connections:write`) used only to open the Socket Mode connection.
+    pub app_token_secret: Option<String>,
+    /// Secret-store name of the bot token (`xoxb-…`) used for Web API calls.
+    pub bot_token_secret: Option<String>,
+    /// Workspaces that may talk to this daemon (`T0123…`). Everything else
+    /// is ignored with one audit row.
+    pub teams: Vec<String>,
+    /// Create a user for an unknown sender in an allowed workspace (named
+    /// after the platform handle, with `channels.default_role`).
+    pub auto_provision: bool,
+    /// API base (tests point it at a local fake).
+    pub api_base: Option<String>,
+}
+
+impl SlackSettings {
+    pub fn api_base(&self) -> &str {
+        self.api_base.as_deref().unwrap_or("https://slack.com")
+    }
+}
+
+/// The Discord bot (`[discord]`): gateway WebSocket, guild allowlist.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscordSettings {
+    pub enabled: bool,
+    /// Secret-store name of the bot token.
+    pub bot_token_secret: Option<String>,
+    /// Guilds (servers) that may talk to this daemon.
+    pub guilds: Vec<String>,
+    pub auto_provision: bool,
+    /// API base (tests point it at a local fake).
+    pub api_base: Option<String>,
+}
+
+impl DiscordSettings {
+    pub fn api_base(&self) -> &str {
+        self.api_base
+            .as_deref()
+            .unwrap_or("https://discord.com")
+    }
+}
+
+/// Workplace-channel policy (`[channels]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Channels {
+    /// The role a shared-channel turn runs as (never a user's own memory or
+    /// grants leak into a shared surface). Default: the built-in `channel`
+    /// role (read-only, no personal data).
+    pub shared_channel_role: String,
+    /// The role an auto-provisioned workspace user gets.
+    pub default_role: String,
+}
+
+impl Default for Channels {
+    fn default() -> Self {
+        Self {
+            shared_channel_role: "channel".to_string(),
+            default_role: "member".to_string(),
+        }
     }
 }
 
@@ -544,6 +619,10 @@ pub struct McpServer {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// Roles allowed to see this server (absent = every role, including
+    /// admin). A user whose role is not listed gets the server subtracted.
+    #[serde(default)]
+    pub roles: Option<Vec<String>>,
 }
 
 impl McpServer {
@@ -555,6 +634,40 @@ impl McpServer {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
     }
+}
+
+/// Engine supervision (`[runtime]`): how many workers may run at once and
+/// whether each one is wrapped in the engine bubblewrap profile (ADR-0003).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RuntimeSettings {
+    /// Live engine workers at once (1..=64). Over the cap an idle worker is
+    /// evicted; if every worker is busy the message queues for a slot.
+    pub max_workers: usize,
+    /// Wrap each worker in the engine bubblewrap profile (mount + PID
+    /// namespace, shared network). Off by default: the P0 spike measured
+    /// 2.7x startup and +12% memory (ADR-0003).
+    pub sandbox_engine: bool,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            max_workers: 8,
+            sandbox_engine: false,
+        }
+    }
+}
+
+/// Retention knobs (D12): 0 = keep forever, the default (an internal tool
+/// keeps everything unless an organization asks otherwise).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Retention {
+    /// Delete turns (and their search rows) older than this many days.
+    pub turns_days: u32,
+    /// Delete attachment files older than this many days.
+    pub attachments_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -626,6 +739,17 @@ pub struct DaemonConfig {
     /// Per-profile engine feature baseline (`[tools]`), subtractive.
     #[serde(default)]
     pub tools: Tools,
+    /// Engine supervision (`[runtime]`): worker pool size and the engine
+    /// sandbox.
+    pub runtime: RuntimeSettings,
+    /// Data retention (`[retention]`): 0 = keep forever.
+    pub retention: Retention,
+    /// The Slack workspace app (`[slack]`).
+    pub slack: SlackSettings,
+    /// The Discord bot (`[discord]`).
+    pub discord: DiscordSettings,
+    /// Workplace-channel policy (`[channels]`).
+    pub channels: Channels,
     /// Roles for linked identities (`[[role]]`); `admin` is implicit.
     #[serde(rename = "role")]
     #[serde(default)]
@@ -666,6 +790,11 @@ impl Default for DaemonConfig {
             approvals: Approvals::default(),
             grants: Grants::default(),
             tools: Tools::default(),
+            runtime: RuntimeSettings::default(),
+            retention: Retention::default(),
+            slack: SlackSettings::default(),
+            discord: DiscordSettings::default(),
+            channels: Channels::default(),
             roles: Vec::new(),
             hooks: Vec::new(),
         }
@@ -764,6 +893,17 @@ impl DaemonConfig {
                     h.on
                 )));
             }
+        }
+        if self.runtime.max_workers == 0 || self.runtime.max_workers > 64 {
+            return Err(Error::Validate(
+                "runtime.max_workers must be in 1..=64".into(),
+            ));
+        }
+        if self.retention.turns_days > 3650 || self.retention.attachments_days > 3650 {
+            return Err(Error::Validate(
+                "retention.turns_days/attachments_days must be 0 (keep forever) or at most 3650"
+                    .into(),
+            ));
         }
         if let Some(effort) = &self.effort
             && !matches!(effort.as_str(), "off" | "low" | "medium" | "high" | "max")
@@ -866,6 +1006,40 @@ impl DaemonConfig {
         {
             return Err(Error::Validate("budgets.daily_usd must be positive".into()));
         }
+        if self.slack.enabled {
+            if self.slack.app_token_secret.is_none() || self.slack.bot_token_secret.is_none() {
+                return Err(Error::Validate(
+                    "slack.enabled requires slack.app_token_secret and slack.bot_token_secret (secret-store names)"
+                        .into(),
+                ));
+            }
+            if self.slack.teams.is_empty() {
+                return Err(Error::Validate(
+                    "slack.enabled requires slack.teams (a bot with no allowed workspace answers nobody)"
+                        .into(),
+                ));
+            }
+        }
+        if self.discord.enabled {
+            if self.discord.bot_token_secret.is_none() {
+                return Err(Error::Validate(
+                    "discord.enabled requires discord.bot_token_secret (a secret-store name)".into(),
+                ));
+            }
+            if self.discord.guilds.is_empty() {
+                return Err(Error::Validate(
+                    "discord.enabled requires discord.guilds (a bot with no allowed guild answers nobody)"
+                        .into(),
+                ));
+            }
+        }
+        if self.channels.shared_channel_role == crate::ADMIN_ROLE
+            || self.channels.default_role == crate::ADMIN_ROLE
+        {
+            return Err(Error::Validate(
+                "channels.shared_channel_role/default_role must not be \"admin\"".into(),
+            ));
+        }
         if self.telegram.enabled && self.telegram.token_secret.is_none() {
             return Err(Error::Validate(
                 "telegram.enabled requires telegram.token_secret (a secret-store name)".into(),
@@ -886,6 +1060,18 @@ impl DaemonConfig {
                 return Err(Error::Validate(
                     "matrix.enabled requires matrix.token_secret (a secret-store name)".into(),
                 ));
+            }
+        }
+        for server in &self.mcp {
+            if let Some(roles) = &server.roles
+                && let Some(bad) = roles.iter().find(|r| {
+                    **r != crate::ADMIN_ROLE && !self.roles.iter().any(|spec| spec.name == **r)
+                })
+            {
+                return Err(Error::Validate(format!(
+                    "mcp server {:?}: roles entry {bad:?} is not a configured [[role]] (or \"admin\")",
+                    server.name
+                )));
             }
         }
         if let Some(name) = &self.timezone
@@ -1087,6 +1273,29 @@ impl DaemonConfig {
                 if c.trim().is_empty() {
                     return Err(Error::Validate(format!(
                         "role {:?}: commands entries must not be empty",
+                        role.name
+                    )));
+                }
+            }
+            // Escalation specs use the same grammar as `allow`: an exact
+            // engine hand name, or `mcp:<server>[:<tool>]`.
+            for spec in &role.escalate {
+                let ok = if let Some(rest) = spec.strip_prefix("mcp:") {
+                    let (server, tool) = match rest.split_once(':') {
+                        Some((s, t)) => (s, Some(t)),
+                        None => (rest, None),
+                    };
+                    !server.is_empty()
+                        && server
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        && tool.is_none_or(|t| !t.is_empty() && !t.chars().any(char::is_whitespace))
+                } else {
+                    !spec.trim().is_empty() && !spec.chars().any(char::is_whitespace)
+                };
+                if !ok {
+                    return Err(Error::Validate(format!(
+                        "role {:?}: escalate entry {spec:?} must be one exact tool name                          or mcp:<server>[:<tool>]",
                         role.name
                     )));
                 }

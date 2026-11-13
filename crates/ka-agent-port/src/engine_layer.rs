@@ -241,7 +241,20 @@ pub fn compose_for_role(
             Some(_) => return Err("engine layer: `mcp` must be an array of tables".into()),
             None => Vec::new(),
         };
+        // MCP governance: a server with `roles` is visible only to those
+        // roles (the operator's own admin role is `None` here).
+        let role_name = role.map(|r| r.name.as_str());
         for m in &cfg.mcp {
+            let allowed = match (&m.roles, role_name) {
+                (None, _) => true,
+                (Some(roles), Some(name)) => roles.iter().any(|r| r == name),
+                (Some(roles), None) => roles
+                    .iter()
+                    .any(|r| r == ka_agent_core::ADMIN_ROLE),
+            };
+            if !allowed {
+                continue;
+            }
             servers.push(mcp_row(m, resolve_secret)?.into());
         }
         doc.insert("mcp".into(), toml::Value::Array(servers));
@@ -345,6 +358,56 @@ mod tests {
                 .as_deref(),
             Some("mode = \"plan\"\n")
         );
+    }
+
+    #[test]
+    fn mcp_servers_are_gated_by_role() {
+        let cfg: DaemonConfig = toml::from_str(
+            r#"
+[[mcp]]
+name = "shared"
+command = "shared-mcp"
+[[mcp]]
+name = "devonly"
+command = "dev-mcp"
+roles = ["dev"]
+[[mcp]]
+name = "adminonly"
+command = "admin-mcp"
+roles = ["admin"]
+[[role]]
+name = "dev"
+mode = "readonly"
+allow = ["read"]
+"#,
+        )
+        .unwrap();
+        let dev = cfg.roles.iter().find(|r| r.name == "dev").unwrap();
+        // The dev role sees the shared and dev servers, never the admin one.
+        let text = compose_for_role(&cfg, Some(dev), None, &secrets)
+            .unwrap()
+            .expect("a layer");
+        assert!(text.contains("shared-mcp"), "{text}");
+        assert!(text.contains("dev-mcp"), "{text}");
+        assert!(!text.contains("admin-mcp"), "{text}");
+        // Admin (no role spec) sees the shared and admin servers.
+        let text = compose_for_role(&cfg, None, None, &secrets)
+            .unwrap()
+            .expect("a layer");
+        assert!(text.contains("shared-mcp"), "{text}");
+        assert!(text.contains("admin-mcp"), "{text}");
+        assert!(!text.contains("dev-mcp"), "{text}");
+        // A validation error names a role that is not configured.
+        let bad: Result<DaemonConfig, _> = toml::from_str(
+            r#"
+[[mcp]]
+name = "x"
+command = "x"
+roles = ["ghost"]
+"#,
+        );
+        let bad = bad.unwrap();
+        assert!(bad.validate().is_err());
     }
 
     #[test]

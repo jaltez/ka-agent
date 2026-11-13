@@ -228,7 +228,7 @@ pub fn update_from_daemon(
     // A turn that started while the child downloaded must not be killed
     // by our own restart: skip the self-shutdown and say so.
     let turn_active = matches!(
-        runtime.session_status(),
+        runtime.session_status_for(&ka_agent_core::Principal::operator()),
         ka_agent_core::SessionStatus::Running
             | ka_agent_core::SessionStatus::AwaitingApproval
             | ka_agent_core::SessionStatus::Stopping
@@ -262,12 +262,7 @@ pub fn update_from_daemon(
         // A turn that started after the check above must not be killed
         // by our own restart: skip it; the next restart picks the new
         // binary up.
-        if matches!(
-            rt.session_status(),
-            ka_agent_core::SessionStatus::Running
-                | ka_agent_core::SessionStatus::AwaitingApproval
-                | ka_agent_core::SessionStatus::Stopping
-        ) {
+        if rt.any_turn_active() {
             eprintln!("update: a turn is in flight — skipping the self-restart");
             return;
         }

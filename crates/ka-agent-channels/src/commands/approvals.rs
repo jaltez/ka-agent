@@ -6,7 +6,7 @@ use ka_agent_runtime::Runtime;
 
 pub(super) fn run_approvals<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        match ctx.runtime.pending_approval_cards() {
+        match ctx.runtime.pending_approval_cards(&ctx.principal) {
             Ok(cards) if cards.is_empty() => Outcome::Reply("no pending approvals".into()),
             Ok(cards) => Outcome::Reply(
                 cards
@@ -29,16 +29,22 @@ pub(super) fn run_approvals<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 }
 
 pub(super) fn run_y<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
-    Box::pin(async move { decide(ctx.runtime, ctx.source, true, ctx.args).await })
+    Box::pin(async move { decide(ctx.runtime, ctx.source, true, ctx.args, &ctx.principal).await })
 }
 
 pub(super) fn run_n<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
-    Box::pin(async move { decide(ctx.runtime, ctx.source, false, ctx.args).await })
+    Box::pin(async move { decide(ctx.runtime, ctx.source, false, ctx.args, &ctx.principal).await })
 }
 
 /// `/y [id] [session]` / `/n [id]`: the shared decision flow. `allow` picks
 /// the `ApprovalDecision`.
-pub(super) async fn decide(runtime: &Runtime, source: &str, allow: bool, args: &str) -> Outcome {
+pub(super) async fn decide(
+    runtime: &Runtime,
+    source: &str,
+    allow: bool,
+    args: &str,
+    principal: &ka_agent_core::Principal,
+) -> Outcome {
     use ka_agent_core::ApprovalDecision;
     let decision = if allow {
         ApprovalDecision::Allow
@@ -57,7 +63,7 @@ pub(super) async fn decide(runtime: &Runtime, source: &str, allow: bool, args: &
             );
         }
         prefix = prefix.trim_end_matches("session").trim();
-        let cards = match runtime.pending_approval_cards() {
+        let cards = match runtime.pending_approval_cards(principal) {
             Ok(c) => c,
             Err(e) => return Outcome::Reply(format!("! [approval] {e}")),
         };
@@ -91,7 +97,7 @@ pub(super) async fn decide(runtime: &Runtime, source: &str, allow: bool, args: &
             Err(e) => Outcome::Reply(format!("! [approval] {e}")),
         }
     } else {
-        let cards = match runtime.pending_approval_cards() {
+        let cards = match runtime.pending_approval_cards(principal) {
             Ok(c) => c,
             Err(e) => return Outcome::Reply(format!("! [approval] {e}")),
         };

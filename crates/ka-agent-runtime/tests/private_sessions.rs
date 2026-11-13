@@ -106,7 +106,7 @@ async fn wait_idle(tag: &str, rt: &Runtime, rec: &Recorder) {
         rec.events()
             .iter()
             .any(|e| matches!(e, AgentEvent::TurnFinished { .. }))
-            && rt.session_status() == ka_agent_core::SessionStatus::Idle
+            && rt.session_status_for(&op()) == ka_agent_core::SessionStatus::Idle
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done(rec, rt) {
@@ -125,8 +125,8 @@ async fn wait_idle(tag: &str, rt: &Runtime, rec: &Recorder) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_turn_records_usage_without_text_or_episodes() {
     let (rt, store, rec, root) = runtime_with("turn", r#"{"text": "secret scripted answer"}"#);
-    rt.new_session(true).await.unwrap();
-    assert!(rt.session_private());
+    rt.new_session(&op(), true).await.unwrap();
+    assert!(rt.session_private_for(&op()));
 
     rt.handle_message("my sensitive question", "console")
         .await
@@ -134,7 +134,7 @@ async fn private_turn_records_usage_without_text_or_episodes() {
     wait_idle("private turn", &rt, &rec).await;
 
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10, 0)
+        .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 1, "one usage row for the private turn");
     assert_eq!(
@@ -170,7 +170,7 @@ async fn private_turn_records_usage_without_text_or_episodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn normal_turn_still_records_text_and_episodes() {
     let (rt, store, rec, root) = runtime_with("normal", r#"{"text": "public answer"}"#);
-    assert!(!rt.session_private());
+    assert!(!rt.session_private_for(&op()));
 
     rt.handle_message("ordinary question", "console")
         .await
@@ -178,7 +178,7 @@ async fn normal_turn_still_records_text_and_episodes() {
     wait_idle("normal turn", &rt, &rec).await;
 
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10, 0)
+        .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 10, 0)
         .unwrap();
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].inbound_text, "ordinary question");
@@ -208,21 +208,21 @@ async fn normal_turn_still_records_text_and_episodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_refuses_memory_and_scheduling() {
     let (rt, _store, _rec, root) = runtime_with("refuse", r#"{"text": "ok"}"#);
-    rt.new_session(true).await.unwrap();
+    rt.new_session(&op(), true).await.unwrap();
 
     let err = rt
-        .add_reminder_at(ka_agent_core::now_ms() + 60_000, "call the bank")
+        .add_reminder_at(ka_agent_core::now_ms() + 60_000, "call the bank", &op())
         .unwrap_err()
         .to_string();
     assert!(err.contains("private"), "reminder refused: {err}");
 
     let err = rt
-        .remember("a private fact", "console")
+        .remember("a private fact", "console", &op())
         .unwrap_err()
         .to_string();
     assert!(err.contains("private"), "memory refused: {err}");
 
-    let err = rt.retry_last().await.unwrap_err().to_string();
+    let err = rt.retry_last(&op()).await.unwrap_err().to_string();
     assert!(err.contains("private"), "retry refused: {err}");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -238,14 +238,14 @@ async fn steered_text_never_reaches_the_private_turn_row() {
         "steer",
         r#"{ "sleep_ms": 1500 }, { "text": "steered done" }"#,
     );
-    rt.new_session(true).await.unwrap();
+    rt.new_session(&op(), true).await.unwrap();
     rt.handle_message("first private question", "console")
         .await
         .unwrap();
     // Wait until the turn is running, then steer a second message into
     // it while the scripted speaker sleeps.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while rt.session_status() != ka_agent_core::SessionStatus::Running {
+    while rt.session_status_for(&op()) != ka_agent_core::SessionStatus::Running {
         assert!(Instant::now() < deadline, "turn never started running");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -255,7 +255,7 @@ async fn steered_text_never_reaches_the_private_turn_row() {
     wait_idle("steered turn", &rt, &rec).await;
 
     let turns = store
-        .latest_turns_for_session(&rt.session_id(), 10, 0)
+        .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 10, 0)
         .unwrap();
     assert!(!turns.is_empty(), "the steered turn was recorded");
     for t in &turns {
@@ -275,13 +275,13 @@ async fn steered_text_never_reaches_the_private_turn_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ending_private_session_destroys_remnants() {
     let (rt, store, rec, root) = runtime_with("end", r#"{"text": "ok"}"#);
-    rt.new_session(true).await.unwrap();
+    rt.new_session(&op(), true).await.unwrap();
     rt.handle_message("hi", "console").await.unwrap();
     wait_idle("warm", &rt, &rec).await;
 
     // The private conversation's engine state lives in its scratch
     // directory — the real strand lands there, not in the shared home.
-    let warm_token = rt.private_session_token().unwrap();
+    let warm_token = rt.private_session_token_for(&op()).unwrap();
     let scratch = root
         .join("tmp")
         .join(format!("private-engine-{warm_token}"));
@@ -293,7 +293,7 @@ async fn ending_private_session_destroys_remnants() {
     // Remnants a crash could leave: a strand file bound in the store, a
     // queued (not yet drained) message and an ephemeral attachment
     // directory.
-    let sid = rt.session_id();
+    let sid = rt.session_id_for(&op()).unwrap();
     let strand = root.join("strands").join("private.jsonl");
     std::fs::create_dir_all(strand.parent().unwrap()).unwrap();
     std::fs::write(&strand, "{}").unwrap();
@@ -305,7 +305,7 @@ async fn ending_private_session_destroys_remnants() {
             "telegram",
         ))
         .unwrap();
-    let token = rt.private_session_token().unwrap();
+    let token = rt.private_session_token_for(&op()).unwrap();
     let media = root
         .join("ws")
         .join("attachments")
@@ -313,7 +313,7 @@ async fn ending_private_session_destroys_remnants() {
     std::fs::create_dir_all(&media).unwrap();
     std::fs::write(media.join("photo-x.jpg"), b"x").unwrap();
 
-    rt.new_session(false).await.unwrap();
+    rt.new_session(&op(), false).await.unwrap();
 
     assert!(!strand.exists(), "the private strand file is destroyed");
     assert!(
@@ -325,7 +325,7 @@ async fn ending_private_session_destroys_remnants() {
         store.next_queued(&sid).unwrap().is_none(),
         "queued private text is purged"
     );
-    assert!(!rt.session_private(), "the new session is normal");
+    assert!(!rt.session_private_for(&op()), "the new session is normal");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -388,7 +388,7 @@ async fn boot_sweep_destroys_ended_private_remnants() {
         store.next_queued(&private.id).unwrap().is_none(),
         "the dead private queued text is swept at boot"
     );
-    assert_eq!(rt.session_id(), normal.id, "the normal session resumed");
+    assert_eq!(rt.session_id_for(&op()).unwrap(), normal.id, "the normal session resumed");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -396,12 +396,17 @@ async fn boot_sweep_destroys_ended_private_remnants() {
 /// `/status` and the Settings event tell every surface that the live
 /// conversation is private (the TUI shows 🕶, the web shows the line).
 #[cfg(unix)]
+/// The operator: the principal every local surface acts as.
+fn op() -> ka_agent_core::Principal {
+    ka_agent_core::Principal::operator()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_and_settings_report_private() {
     let (rt, _store, rec, root) = runtime_with("status", r#"{"text": "ok"}"#);
 
-    rt.new_session(true).await.unwrap();
-    assert!(rt.status_report().unwrap().private);
+    rt.new_session(&op(), true).await.unwrap();
+    assert!(rt.status_report_for(&op()).unwrap().private);
     assert!(
         rec.events().iter().any(|e| matches!(
             e,
@@ -414,8 +419,8 @@ async fn status_and_settings_report_private() {
         rec.events()
     );
 
-    rt.new_session(false).await.unwrap();
-    assert!(!rt.status_report().unwrap().private);
+    rt.new_session(&op(), false).await.unwrap();
+    assert!(!rt.status_report_for(&op()).unwrap().private);
     assert!(
         rec.events().iter().any(|e| matches!(
             e,

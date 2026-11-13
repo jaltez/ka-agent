@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// One admin usage row: `(created_ms, cost, tokens, model, username)`.
+#[allow(dead_code)]
+pub type UserUsageRow = (i64, f64, u64, Option<String>, String);
+
 impl Store {
     /// Persist a brand-new turn (status `queued`, gap G8 mitigation).
     pub fn insert_turn(&self, t: &Turn) -> Result<()> {
@@ -296,6 +300,76 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Usage rows with their user (the admin's per-user dashboard):
+    /// `(created_ms, cost_usd, tokens, model, username)`.
+    pub fn usage_rows_with_user(&self, since_ms: i64) -> Result<Vec<UserUsageRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT t.created_ms, t.cost_usd, t.tokens, t.model, COALESCE(s.username, 'operator')
+             FROM turns t LEFT JOIN sessions s ON s.id = t.session
+             WHERE t.created_ms >= ?1 ORDER BY t.created_ms",
+        )?;
+        let rows = stmt
+            .query_map(params![since_ms], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)?.max(0) as u64,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Episodes of one user's sessions only (a user never reads another's
+    /// conversation history; admin callers use [`Self::search_episodes`]).
+    pub fn search_episodes_for_user(
+        &self,
+        query: &str,
+        limit: usize,
+        username: &str,
+    ) -> Result<Vec<EpisodeHit>> {
+        let match_expr = fts_and_query(query);
+        if match_expr.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT f.session, f.turn, f.role,
+                    snippet(episodes_fts, 3, '[', ']', '…', 12), t.created_ms
+             FROM episodes_fts f
+             LEFT JOIN turns t ON t.id = f.turn
+             WHERE episodes_fts MATCH ?1
+               AND f.session IN (SELECT id FROM sessions WHERE username = ?3)
+             ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![match_expr, limit as i64, username], |r| {
+            Ok(EpisodeHit {
+                session: r.get(0)?,
+                turn: r.get(1)?,
+                role: r.get(2)?,
+                snippet: r.get(3)?,
+                at_ms: r.get(4).unwrap_or(0),
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// The user the session of a turn belongs to (`None` for an unknown
+    /// turn).
+    pub fn turn_username(&self, id: &TurnId) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT s.username FROM turns t JOIN sessions s ON s.id = t.session WHERE t.id = ?1",
+            params![id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
+    }
+
     /// The role of the session a turn belongs to (`None` for an unknown
     /// turn).
     pub fn turn_role(&self, id: &TurnId) -> Result<Option<String>> {
@@ -325,7 +399,7 @@ impl Store {
 /// literal characters, which the tokenizer treats as separators). Tokens
 /// that are nothing but quotes are dropped, so an empty or quote-only
 /// query yields no phrases and matches nothing.
-fn fts_and_query(query: &str) -> String {
+pub(crate) fn fts_and_query(query: &str) -> String {
     let mut terms: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;

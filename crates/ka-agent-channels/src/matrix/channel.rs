@@ -38,6 +38,14 @@ impl MatrixChannel {
         }
     }
 
+    /// Who a Matrix sender acts as (the gate refuses unlinked senders before
+    /// any of these paths run).
+    fn who_for(&self, source: &str) -> ka_agent_core::Principal {
+        self.runtime
+            .principal_for_source(source)
+            .unwrap_or_else(ka_agent_core::Principal::operator)
+    }
+
     /// Adopt `sender`'s room for per-identity delivery; the last room is
     /// persisted for proactive notices, but only an admin's room becomes
     /// the operator's fallback (a subject's room must never receive the
@@ -69,7 +77,14 @@ impl MatrixChannel {
     }
 
     fn is_linked(&self, sender: &str) -> bool {
+        // A row AND a working resolution: a disabled account holds its row
+        // but resolves to nothing, and is refused here (silent, one audit
+        // row) instead of falling through to the operator helpers.
         self.store.is_linked("matrix", sender).unwrap_or(false)
+            && self
+                .runtime
+                .principal_for_source(&format!("matrix:{sender}"))
+                .is_some()
     }
 
     /// One pending invite: join when a linked user invited us.
@@ -161,7 +176,8 @@ impl MatrixChannel {
         // Files land in the workspace attachments inbox, like Telegram's.
         let msgtype = event["content"]["msgtype"].as_str().unwrap_or("");
         if matches!(msgtype, "m.image" | "m.file" | "m.video") {
-            let reply = match self.save_media(&event["content"]).await {
+            let who = self.who_for(&format!("matrix:{sender}"));
+            let reply = match self.save_media(&event["content"], &who).await {
                 Ok(rel) => format!("saved {rel} — reference it with @{rel} in your next message"),
                 Err(e) => format!("! [attachment] {e}"),
             };
@@ -187,10 +203,15 @@ impl MatrixChannel {
             Outcome::Reply(reply) => self.surface.client.send_split(room, &reply).await,
             Outcome::Silent => {}
             Outcome::NotACommand => {
-                let body = crate::refs::expand(&self.store, &self.runtime.workspace(), body).await;
+                let source = format!("matrix:{sender}");
+            let who = self.who_for(&source);
+            let (body, refs) =
+                crate::refs::expand(&self.store, &self.runtime.workspace_for(&who), &who, body)
+                    .await;
+            crate::refs::stage_sources(&self.store, &source, &refs);
                 if let Err(e) = self
                     .runtime
-                    .handle_message(&body, &format!("matrix:{sender}"))
+                    .handle_message(&body, &source)
                     .await
                 {
                     eprintln!("matrix: handle_message: {e}");
@@ -235,11 +256,15 @@ impl MatrixChannel {
     }
 
     /// An `m.image`/`m.file`/`m.video` message → a workspace attachment.
-    async fn save_media(&self, content: &Value) -> Result<String, String> {
+    async fn save_media(
+        &self,
+        content: &Value,
+        who: &ka_agent_core::Principal,
+    ) -> Result<String, String> {
         // Resolved around the download, like Telegram's `save_attachment`:
         // a privacy change mid-download discards the file rather than
         // writing it to the wrong (or a destroyed) directory.
-        let before = self.runtime.private_session_token();
+        let before = self.runtime.private_session_token_for(who);
         let mxc = content["url"]
             .as_str()
             .filter(|u| !u.is_empty())
@@ -247,14 +272,18 @@ impl MatrixChannel {
             .ok_or_else(|| "message has no media url".to_string())?;
         let name = attachment_name(content, mxc);
         let bytes = self.surface.client.download_media(mxc).await?;
-        let after = self.runtime.private_session_token();
+        let after = self.runtime.private_session_token_for(who);
         match (&before, &after) {
             (None, None) => {
-                crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
+                crate::attachments::save_attachment_bytes(
+                &self.runtime.workspace_for(who),
+                &name,
+                &bytes,
+            )
             }
             (Some(short), Some(now)) if short == now => {
                 crate::attachments::save_private_attachment_bytes(
-                    &self.runtime.workspace(),
+                    &self.runtime.workspace_for(who),
                     short,
                     &name,
                     &bytes,
@@ -265,7 +294,11 @@ impl MatrixChannel {
                     .into(),
             ),
             (None, Some(_)) => {
-                crate::attachments::save_attachment_bytes(&self.runtime.workspace(), &name, &bytes)
+                crate::attachments::save_attachment_bytes(
+                &self.runtime.workspace_for(who),
+                &name,
+                &bytes,
+            )
             }
         }
     }
@@ -366,7 +399,14 @@ impl Channel for MatrixChannel {
             // the sender's backlog, not dropped).
             let recover = self
                 .store
-                .pending_chunks_for_session(&self.runtime.session_id())
+                .latest_session_for_user(ka_agent_core::OPERATOR_USER)
+                .ok()
+                .flatten()
+                .map(|s| {
+                    self.store
+                        .pending_chunks_for_session(&s.id)
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default();
             for chunk in &recover {
                 self.surface.enqueue(&chunk.text);

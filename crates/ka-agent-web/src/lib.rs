@@ -3,15 +3,15 @@
 //! JS frameworks. Every user-derived string goes through `escape_html`.
 
 pub mod pages;
+pub mod pages_accounts;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ka_agent_channels::pairing;
 use ka_agent_runtime::event::AgentEvent;
 use ka_agent_runtime::{Envelope, EventBus, Runtime};
-use ka_agent_store::{Store, StoreError};
+use ka_agent_store::Store;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -304,29 +304,139 @@ pub async fn write_response(socket: &mut tokio::net::TcpStream, resp: Response) 
 // Auth
 // ---------------------------------------------------------------------------
 
-/// Who a web session belongs to: the operator (every page) or one linked
-/// role (chat only). ADR-0002: the web realm never asserts a role itself —
-/// the daemon derives it from the identity behind the cookie.
+/// Who a web session belongs to: a **user** and the role their account
+/// carries (ADR-0004). One login; reach derives from the role — `admin`
+/// sees the whole panel, everyone else the chat-only allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Principal {
-    Admin,
-    Role { source: String, role: String },
+pub struct Principal {
+    /// The envelope source this session's turns are stamped with
+    /// (`web:<username>`), so `/events` filtering needs no new protocol.
+    pub source: String,
+    pub username: String,
+    pub role: String,
 }
 
-#[derive(Debug, Clone)]
-struct Session {
-    expires_ms: i64,
-    principal: Principal,
+impl Principal {
+    fn new(username: &str, role: &str) -> Self {
+        Self {
+            source: format!("web:{username}"),
+            username: username.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.role == ka_agent_core::ADMIN_ROLE
+    }
+
+    fn as_core(&self) -> ka_agent_core::Principal {
+        ka_agent_core::Principal::new(&self.username, &self.role)
+    }
 }
 
+/// Login and invite attempts allowed per key inside [`FAILURE_WINDOW_MS`].
+const MAX_FAILURES: usize = 5;
+const FAILURE_WINDOW_MS: i64 = 15 * 60 * 1000;
+
+/// Account failures: 5 wrong passwords (or invite redemptions) per username
+/// per 15 minutes, then a lockout that is itself audited.
+#[derive(Default)]
+struct Failures {
+    map: Mutex<HashMap<String, Vec<i64>>>,
+}
+
+impl Failures {
+    /// Whether `key` is currently locked out.
+    fn locked(&self, key: &str) -> bool {
+        let now = ka_agent_core::now_ms();
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let hits = map.entry(key.to_string()).or_default();
+        hits.retain(|t| now - *t < FAILURE_WINDOW_MS);
+        hits.len() >= MAX_FAILURES
+    }
+
+    fn record(&self, key: &str) {
+        let now = ka_agent_core::now_ms();
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let hits = map.entry(key.to_string()).or_default();
+        hits.retain(|t| now - *t < FAILURE_WINDOW_MS);
+        hits.push(now);
+    }
+
+    fn clear(&self, key: &str) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+}
+
+/// Accounts: password hashing, sessions and the login/invite flows. Sessions
+/// live in `web_sessions` (survive a daemon restart, swept on access); only
+/// the SHA-256 of a cookie is stored.
 struct Auth {
-    sessions: Mutex<HashMap<String, Session>>,
+    failures: Failures,
+}
+
+/// Why a login or invite redemption failed (all operator-facing).
+#[derive(Debug)]
+enum LoginError {
+    /// No such user, no password set, or a wrong password — one message, so
+    /// the form never enumerates accounts.
+    Credentials,
+    Locked,
+    Invite(String),
+}
+
+impl LoginError {
+    fn message(&self) -> String {
+        match self {
+            LoginError::Credentials => "wrong username or password".to_string(),
+            LoginError::Locked => {
+                "too many attempts — wait 15 minutes or ask an admin to reset the password".to_string()
+            }
+            LoginError::Invite(reason) => reason.clone(),
+        }
+    }
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Hash a password with argon2id (fresh salt from the OS).
+fn hash_password(password: &str) -> Result<String, String> {
+    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    let salt = SaltString::generate(&mut OsRng);
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| format!("password hash: {e}"))
+}
+
+/// Verify a password against a PHC string (constant-time inside argon2).
+fn verify_password(password: &str, phc: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(phc) else {
+        return false;
+    };
+    argon2::Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 impl Auth {
     fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            failures: Failures::default(),
         }
     }
 
@@ -361,56 +471,236 @@ impl Auth {
         if !store.consume_meta("web_auth_token", &raw).unwrap_or(false) {
             return None;
         }
-        self.new_session(Principal::Admin)
-    }
-
-    fn new_session(&self, principal: Principal) -> Option<String> {
-        let session = random_hex(32);
-        let now = ka_agent_core::now_ms();
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        // Drop expired sessions on every login: the map has no other
-        // eviction point and would otherwise grow with each login.
-        sessions.retain(|_, s| now < s.expires_ms);
-        sessions.insert(
-            session.clone(),
-            Session {
-                expires_ms: now + 86_400_000,
-                principal,
-            },
-        );
-        drop(sessions);
-        Some(session)
-    }
-
-    /// The principal behind the cookie, when the session is live.
-    fn is_valid(&self, cookies: &HashMap<String, String>) -> Option<Principal> {
-        let session = cookies.get("ka_session")?;
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(session)
-            .filter(|s| ka_agent_core::now_ms() < s.expires_ms)
-            .map(|s| s.principal.clone())
-    }
-
-    /// Redeem a `ka-agent pair web` code: the browser gets a fresh `web:<id>`
-    /// identity with the code's role and a session cookie for it.
-    fn pair(&self, store: &Store, code: &str) -> Result<Option<(String, Principal)>, StoreError> {
-        let address = random_hex(8);
-        if pairing::redeem_code(store, "web", &address, code) != pairing::Redeem::Linked {
-            return Ok(None);
-        }
+        // The one-shot URL belongs to the operator's account. Binding its
+        // `web:operator` identity here (not at boot) keeps a fresh profile
+        // identity-free until someone actually signs in.
         let role = store
-            .identity_role("web", &address)?
+            .get_user(ka_agent_core::OPERATOR_USER)
+            .ok()
+            .flatten()
+            .map(|u| u.role)
             .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string());
-        let principal = Principal::Role {
-            source: format!("web:{address}"),
-            role,
+        let _ = store.link_identity_to_user(
+            "web",
+            ka_agent_core::OPERATOR_USER,
+            "panel-login",
+            &role,
+            ka_agent_core::OPERATOR_USER,
+        );
+        self.new_session(store, ka_agent_core::OPERATOR_USER, &role)
+    }
+
+    /// Persist a fresh session and return the cookie value.
+    fn new_session(&self, store: &Store, username: &str, role: &str) -> Option<String> {
+        // Every web session speaks as `web:<username>`: make sure the identity
+        // row exists (a reset can reopen an account that never had one).
+        // Idempotent, like the operator's token path.
+        let _ = store.link_identity_to_user("web", username, "panel-login", role, username);
+        let token = random_hex(32);
+        let now = ka_agent_core::now_ms();
+        let _ = store.sweep_web_sessions(now);
+        store
+            .insert_web_session(&sha256_hex(&token), username, now, now + 86_400_000)
+            .ok()?;
+        Some(token)
+    }
+
+    /// The principal behind the cookie, when the session is live. The role is
+    /// re-derived from the user row on every request (never trusted from the
+    /// captured session), and a disabled account stops resolving.
+    fn principal(&self, store: &Store, cookies: &HashMap<String, String>) -> Option<Principal> {
+        let token = cookies.get("ka_session")?;
+        let username = store
+            .web_session_user(&sha256_hex(token), ka_agent_core::now_ms())
+            .ok()
+            .flatten()?;
+        let user = store.get_user(&username).ok().flatten()?;
+        if user.disabled {
+            return None;
+        }
+        Some(Principal::new(&user.username, &user.role))
+    }
+
+    /// Username + password login (argon2id verify, lockout after 5 failures).
+    fn login(
+        &self,
+        store: &Store,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<String>, LoginError> {
+        let username = username.trim().to_ascii_lowercase();
+        let key = format!("login:{username}");
+        if self.failures.locked(&key) {
+            return Err(LoginError::Locked);
+        }
+        let user = store
+            .get_user(&username)
+            .ok()
+            .flatten()
+            .filter(|u| !u.disabled);
+        let Some(user) = user else {
+            self.failures.record(&key);
+            return Err(LoginError::Credentials);
         };
-        let Some(session) = self.new_session(principal.clone()) else {
-            return Ok(None);
+        let Some(phc) = user.pw_hash.as_deref() else {
+            // No password set yet: the account exists but has never redeemed
+            // an invite. Same message as a wrong password (no enumeration).
+            self.failures.record(&key);
+            return Err(LoginError::Credentials);
         };
-        Ok(Some((session, principal)))
+        if !verify_password(password, phc) {
+            self.failures.record(&key);
+            let mut rec = ka_agent_core::AuditRecord::new(
+                &format!("web:{username}"),
+                "user.login_failed",
+                &username,
+                None,
+            )
+            .with_role(&user.role)
+            .with_user(&username);
+            let _ = store.append_audit(&mut rec);
+            return Err(LoginError::Credentials);
+        }
+        self.failures.clear(&key);
+        Ok(self.new_session(store, &user.username, &user.role))
+    }
+
+    /// Redeem an admin-minted invite: `code` + a chosen username + password.
+    /// A code can only ever create a *new* account (never take over one), and
+    /// it is single-use.
+    fn redeem_invite(
+        &self,
+        store: &Store,
+        code: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<String>, LoginError> {
+        let username = username.trim().to_ascii_lowercase();
+        // A targeted code names its account; a new-account code needs one.
+        let untargeted = store
+            .invite_verdict(&sha256_hex(code.trim()), ka_agent_core::now_ms())
+            .ok()
+            .and_then(|v| match v {
+                ka_agent_store::InviteVerdict::Valid(i) => Some(i.username.is_none()),
+                _ => None,
+            })
+            .unwrap_or(true);
+        if untargeted && !ka_agent_store::valid_username(&username) {
+            return Err(LoginError::Invite(
+                "username: lowercase letters, digits, dot, dash or underscore".into(),
+            ));
+        }
+        if password.chars().count() < 8 {
+            return Err(LoginError::Invite(
+                "password needs at least 8 characters".into(),
+            ));
+        }
+        let code_hash = sha256_hex(code.trim().to_ascii_lowercase().as_str());
+        let key = format!("invite:{}", &code_hash[..16]);
+        if self.failures.locked(&key) {
+            return Err(LoginError::Locked);
+        }
+        let verdict = store
+            .invite_verdict(&code_hash, ka_agent_core::now_ms())
+            .map_err(|e| LoginError::Invite(e.to_string()))?;
+        let invite = match verdict {
+            ka_agent_store::InviteVerdict::Valid(invite) => invite,
+            ka_agent_store::InviteVerdict::Unknown => {
+                self.failures.record(&key);
+                return Err(LoginError::Invite("invite code invalid".into()));
+            }
+            ka_agent_store::InviteVerdict::Expired(_) => {
+                self.failures.record(&key);
+                return Err(LoginError::Invite(
+                    "invite code expired — ask an admin for a new one".into(),
+                ));
+            }
+            ka_agent_store::InviteVerdict::Used(_) => {
+                self.failures.record(&key);
+                return Err(LoginError::Invite("invite code already used".into()));
+            }
+        };
+        // A targeted code (an admin reset) only ever sets that account's
+        // password; an untargeted one only ever creates a new account, so a
+        // leaked code can never take over an existing user.
+        if let Some(target) = &invite.username {
+            if !username.is_empty() && username != *target {
+                return Err(LoginError::Invite(format!(
+                    "this code resets {target}, not {username}"
+                )));
+            }
+            let Some(user) = store.get_user(target).ok().flatten() else {
+                return Err(LoginError::Invite(format!("{target} no longer exists")));
+            };
+            let phc = hash_password(password).map_err(LoginError::Invite)?;
+            store
+                .set_user_password(target, Some(&phc))
+                .map_err(|e| LoginError::Invite(e.to_string()))?;
+            let _ = store.delete_web_sessions_for(target);
+            if !store
+                .consume_invite(&code_hash, ka_agent_core::now_ms())
+                .unwrap_or(false)
+            {
+                return Err(LoginError::Invite("invite code already used".into()));
+            }
+            let mut rec = ka_agent_core::AuditRecord::new(
+                "web",
+                "user.password_reset",
+                target,
+                Some("redeemed a reset invite".into()),
+            )
+            .with_role(&user.role)
+            .with_user(target);
+            let _ = store.append_audit(&mut rec);
+            self.failures.clear(&key);
+            return Ok(self.new_session(store, &user.username, &user.role));
+        }
+        if store.get_user(&username).ok().flatten().is_some() {
+            return Err(LoginError::Invite(format!(
+                "{username} already exists — use the login form"
+            )));
+        }
+        let phc = hash_password(password).map_err(LoginError::Invite)?;
+        let user = ka_agent_store::UserRow {
+            username: username.clone(),
+            display_name: username.clone(),
+            pw_hash: Some(phc),
+            role: invite.role.clone(),
+            quota_daily_usd: None,
+            disabled: false,
+            created_ms: ka_agent_core::now_ms(),
+            created_by: Some(invite.created_by.clone()),
+        };
+        store
+            .create_user(&user)
+            .map_err(|e| LoginError::Invite(e.to_string()))?;
+        for group in &invite.groups {
+            let _ = store.ensure_group(group);
+            let _ = store.add_user_group(&username, group);
+        }
+        if !store.consume_invite(&code_hash, ka_agent_core::now_ms()).unwrap_or(false) {
+            // Someone else consumed it between the verdict and here.
+            return Err(LoginError::Invite("invite code already used".into()));
+        }
+        // The account is reachable from the panel's own identity source.
+        let _ = store.link_identity_to_user(
+            "web",
+            &username,
+            "invite",
+            &invite.role,
+            &username,
+        );
+        let mut rec = ka_agent_core::AuditRecord::new(
+            "web",
+            "invite.redeem",
+            &username,
+            Some(format!("role {}", invite.role)),
+        )
+        .with_role(&invite.role)
+        .with_user(&username);
+        let _ = store.append_audit(&mut rec);
+        self.failures.clear(&key);
+        Ok(self.new_session(store, &user.username, &user.role))
     }
 }
 
@@ -568,34 +858,42 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             .push(("Cache-Control", "no-store".to_string()));
         return r;
     }
-    if req.path == "/pair" {
+    if req.path == "/login" {
         return match req.method.as_str() {
-            "GET" => pages::pair_page(),
+            "GET" => pages_accounts::login_page(None),
             "POST" => {
-                let body = String::from_utf8_lossy(&req.body);
-                let mut code = String::new();
-                for pair in body.split('&') {
-                    if let Some((k, v)) = pair.split_once('=')
-                        && url_decode(k) == "code"
-                    {
-                        code = url_decode(v);
-                    }
-                }
-                match auth.pair(store, code.trim()) {
-                    Ok(Some((session, principal))) => {
+                let form = crate::pages_accounts::Form::parse(&req.body);
+                match auth.login(store, form.get("username"), form.get("password")) {
+                    Ok(Some(token)) => {
                         let mut resp = Response::redirect("/");
-                        resp.set_cookies.push(session_cookie(&session, runtime));
-                        let role = match principal {
-                            Principal::Role { role, .. } => role,
-                            Principal::Admin => ka_agent_core::ADMIN_ROLE.to_string(),
-                        };
-                        resp.extra_headers.push(("X-Ka-Role", role));
+                        resp.set_cookies.push(session_cookie(&token, runtime));
                         resp
                     }
-                    Ok(None) => Response::forbidden(
-                        "pairing code invalid or expired — run `ka-agent pair web` again",
-                    ),
-                    Err(e) => Response::base(500, "text/plain", format!("{e}\n")),
+                    Ok(None) => pages_accounts::login_page(Some("could not open a session")),
+                    Err(e) => pages_accounts::login_page(Some(&e.message())),
+                }
+            }
+            _ => Response::base(405, "text/plain", "method not allowed\n".into()),
+        };
+    }
+    if req.path == "/invite" {
+        return match req.method.as_str() {
+            "GET" => pages_accounts::invite_page(None),
+            "POST" => {
+                let form = crate::pages_accounts::Form::parse(&req.body);
+                match auth.redeem_invite(
+                    store,
+                    form.get("code"),
+                    form.get("username"),
+                    form.get("password"),
+                ) {
+                    Ok(Some(token)) => {
+                        let mut resp = Response::redirect("/");
+                        resp.set_cookies.push(session_cookie(&token, runtime));
+                        resp
+                    }
+                    Ok(None) => pages_accounts::invite_page(Some("could not open a session")),
+                    Err(e) => pages_accounts::invite_page(Some(&e.message())),
                 }
             }
             _ => Response::base(405, "text/plain", "method not allowed\n".into()),
@@ -616,69 +914,126 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
     if req.path.starts_with("/api/") {
         return api_route(req, runtime, store).await;
     }
-    let Some(principal) = auth.is_valid(&req.cookies) else {
+    let Some(principal) = auth.principal(store, &req.cookies) else {
         return Response::unauthorized();
     };
-    // Attachments work for both realms: the caller's role decides the
-    // directory, and a role can only ever see its own tree.
-    let (principal_role, _principal_source) = match &principal {
-        Principal::Admin => (ka_agent_core::ADMIN_ROLE.to_string(), "web".to_string()),
-        Principal::Role { source, role } => (role.clone(), source.clone()),
-    };
+    // CSRF: every mutating form POST must carry the panel's header (the
+    // pages' own `ui.js` submits through fetch with it). SameSite=Strict
+    // already blocks cross-site cookies; this is the second lock.
+    if req.method == "POST" && req.headers_get("x-ka-agent") != Some("1") {
+        return Response::forbidden("missing X-Ka-Agent header");
+    }
+    let role = principal.role.clone();
+    let source = principal.source.clone();
     if req.path == "/upload" {
         if req.method != "POST" {
             return Response::base(405, "text/plain", "method not allowed\n".into());
         }
-        if req.headers_get("x-ka-agent") != Some("1") {
-            return Response::forbidden("missing X-Ka-Agent header");
-        }
         let name = req.headers_get("x-ka-filename").unwrap_or("file");
-        return pages::web_upload(runtime, &principal_role, name, &req.body);
+        return pages::web_upload(runtime, &role, &principal.username, name, &req.body);
     }
     if let Some(raw) = req.path.strip_prefix("/file/") {
         if req.method != "GET" {
             return Response::base(405, "text/plain", "method not allowed\n".into());
         }
-        return pages::serve_file(runtime, &principal_role, &url_decode(raw));
+        return pages::serve_file(runtime, &role, &principal.username, &url_decode(raw));
     }
-    // ADR-0002: a role session is chat-only. Every admin page, config
-    // mutation and approval endpoint stays behind the operator's session.
-    if let Principal::Role { source, role } = principal {
+    // A non-admin session is chat-only: `/`, `/chat/send`, `/events` (SSE),
+    // `/upload`, `/file/*` and the static scripts. "Admin" is a property of
+    // the user, so the realms collapse to one login.
+    if !principal.is_admin() {
         return match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/") => {
-                // The page shows the role's own conversation; if another
-                // role's turn owns the core, show nothing instead of that
-                // role's history.
-                if runtime.activate_role(&source).await {
-                    pages::chat_page_role(runtime, store, &role)
+                if runtime.activate_user(&principal.as_core()) {
+                    pages::chat_page_user(runtime, store, &principal.as_core())
                 } else {
-                    pages::chat_page_busy(&role)
+                    pages::chat_page_busy(&principal.username)
                 }
             }
             ("POST", "/chat/send") => {
-                if req.headers_get("x-ka-agent") != Some("1") {
-                    return Response::forbidden("missing X-Ka-Agent header");
-                }
                 let body = String::from_utf8_lossy(&req.body);
-                pages::chat_send_for(runtime, store, &body, &source).await
+                pages::chat_send_for(runtime, store, &body, &source, &principal.as_core()).await
             }
             _ => Response::forbidden("this web session is chat-only"),
         };
     }
+    let who = principal.as_core();
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => pages::chat_page(runtime, store),
+        ("GET", "/") => pages::chat_page_user(runtime, store, &who),
         ("POST", "/chat/send") => {
-            if req.headers_get("x-ka-agent") != Some("1") {
-                return Response::forbidden("missing X-Ka-Agent header");
-            }
             let body = String::from_utf8_lossy(&req.body);
-            pages::chat_send(runtime, store, &body).await
+            pages::chat_send_for(runtime, store, &body, &source, &who).await
         }
-        ("GET", "/status") => pages::status(runtime),
-        ("GET", "/sessions") => pages::sessions(runtime, store),
-        ("POST", "/sessions/open") => {
-            let body = String::from_utf8_lossy(&req.body).into_owned();
-            pages::sessions_open(runtime, &body).await
+        ("GET", "/status") => pages::status(runtime, &who),
+        ("GET", "/users") => {
+            pages_accounts::users(runtime, store, req.query.get("msg").map(String::as_str))
+        }
+        ("POST", "/users/save") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_save(runtime, store, &req.body)
+        }
+        ("POST", "/users/invite") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_invite(store, &req.body)
+        }
+        ("POST", "/users/disable") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_state(store, &req.body, true)
+        }
+        ("POST", "/users/enable") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_state(store, &req.body, false)
+        }
+        ("POST", "/users/reset") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_reset(store, &req.body)
+        }
+        ("POST", "/users/export") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_export(runtime, &req.body)
+        }
+        ("POST", "/users/purge") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::users_purge(runtime, &req.body)
+        }
+        ("GET", "/agents") => pages_accounts::agents(store, &who),
+        ("POST", "/agents/create") => pages_accounts::agents_create(store, &req.body, &who),
+        ("POST", "/agents/save") => pages_accounts::agents_save(store, &req.body, &who),
+        ("POST", "/agents/rm") => pages_accounts::agents_rm(store, &req.body, &who),
+        ("GET", "/groups") => pages_accounts::groups(store),
+        ("POST", "/groups/save") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::groups_save(store, &req.body)
+        }
+        ("POST", "/groups/delete") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::groups_delete(store, &req.body)
+        }
+        ("GET", "/kb") => pages_accounts::kb_page(runtime, store),
+        ("POST", "/kb/create") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::kb_create(store, &req.body, &who)
+        }
+        ("POST", "/kb/access") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::kb_access(store, &req.body)
+        }
+        ("POST", "/kb/rm") => {
+            let _body = String::from_utf8_lossy(&req.body).into_owned();
+            pages_accounts::kb_rm(store, &req.body)
+        }
+        ("POST", p) if p.starts_with("/kb/") && p.ends_with("/docs") => {
+            let name = p
+                .trim_start_matches("/kb/")
+                .trim_end_matches("/docs")
+                .to_string();
+            pages_accounts::kb_upload(
+                store,
+                &url_decode(&name),
+                &req.body,
+                req.headers_get("x-ka-filename"),
+                req.headers_get("x-ka-title"),
+            )
         }
         ("GET", "/profiles") => pages::profiles(runtime, store),
         ("GET", "/roles/new") => pages::role_edit(runtime, None),
@@ -716,12 +1071,12 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             pages::persona_set(runtime, &body)
         }
         ("GET", "/config") => pages::config_page(runtime),
-        ("GET", "/queue") => pages::queue(runtime),
+        ("GET", "/queue") => pages::queue(runtime, &who),
         ("POST", "/queue/remove") => {
             let body = String::from_utf8_lossy(&req.body);
-            pages::queue_remove(runtime, &body)
+            pages::queue_remove(runtime, &body, &who)
         }
-        ("POST", "/queue/clear") => pages::queue_clear(runtime),
+        ("POST", "/queue/clear") => pages::queue_clear(runtime, &who),
         ("GET", "/grants") => pages::grants(runtime),
         ("POST", "/grants/add") => {
             let body = String::from_utf8_lossy(&req.body);
@@ -757,10 +1112,6 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             pages::keys_secret_rm(runtime, &body)
         }
         ("GET", "/logs") => pages::logs(runtime),
-        ("POST", "/pair/issue") => {
-            let body = String::from_utf8_lossy(&req.body);
-            pages::pair_issue(runtime, store, &body)
-        }
         ("POST", "/identities/link") => {
             let body = String::from_utf8_lossy(&req.body);
             pages::identity_link(runtime, &body)
@@ -785,12 +1136,16 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             let body = String::from_utf8_lossy(&req.body).into_owned();
             pages::profile_action("remove", &body).await
         }
-        ("GET", "/usage") => pages::usage(runtime, store),
+        ("GET", "/usage") => pages::usage(
+            runtime,
+            store,
+            req.query.get("format").map(String::as_str),
+        ),
         ("POST", "/settings") => {
             let body = String::from_utf8_lossy(&req.body).into_owned();
             pages::settings_apply(runtime, &body).await
         }
-        ("GET", "/tasks") => pages::tasks(runtime),
+        ("GET", "/tasks") => pages::tasks(runtime, &who),
         ("POST", "/tasks/add") => {
             let body = String::from_utf8_lossy(&req.body).into_owned();
             pages::tasks_add(runtime, &body).await
@@ -821,32 +1176,37 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             let body = String::from_utf8_lossy(&req.body);
             pages::memory_forget(runtime, &body).await
         }
-        ("GET", "/history") => pages::history(runtime, req.query.get("q").map(String::as_str)),
+        ("GET", "/history") => {
+            pages::history(runtime, req.query.get("q").map(String::as_str), &who)
+        }
         ("GET", p) if p.starts_with("/history/show/") => {
             let turn_id = p.strip_prefix("/history/show/").unwrap_or("");
-            pages::history_show(runtime, store, turn_id)
+            pages::history_show(runtime, store, turn_id, &who)
         }
-        ("GET", "/memory") => pages::memory(runtime),
+        ("GET", "/memory") => pages::memory(runtime, &who),
         ("POST", "/memory/remember") => {
             let body = String::from_utf8_lossy(&req.body);
-            pages::memory_remember(runtime, &body)
+            pages::memory_remember(runtime, &body, &who)
         }
-        ("POST", "/memory/undo") => pages::memory_undo(runtime),
+        ("POST", "/memory/undo") => pages::memory_undo(runtime, &who),
         ("POST", "/memory/edit") => {
             let body = String::from_utf8_lossy(&req.body);
-            pages::memory_edit(runtime, &body)
+            pages::memory_edit(runtime, &body, &who)
         }
         ("POST", "/memory/candidate") => {
             let body = String::from_utf8_lossy(&req.body);
-            pages::memory_candidate(runtime, &body)
+            pages::memory_candidate(runtime, &body, &who)
         }
-        ("GET", "/approvals") => pages::approvals(runtime, store),
+        ("GET", "/approvals") => pages::approvals(runtime, store, &who),
         ("POST", "/approvals/decide") => {
             let body = String::from_utf8_lossy(&req.body);
-            if req.headers_get("x-ka-agent") == Some("1") {
-                pages::approvals_decide_json(runtime, &body).await
+            let wants_json = req
+                .headers_get("accept")
+                .is_some_and(|a| a.contains("application/json"));
+            if wants_json {
+                pages::approvals_decide_json(runtime, &body, &source).await
             } else {
-                pages::approvals_decide(runtime, &body).await
+                pages::approvals_decide(runtime, &body, &source).await
             }
         }
         ("GET", "/audit") => pages::audit(runtime, store),
@@ -864,11 +1224,11 @@ async fn serve_events(
     req: &Request,
     auth: &Auth,
     _runtime: &Runtime,
-    _store: &Arc<Store>,
+    store: &Arc<Store>,
     bus: Arc<EventBus>,
     mut socket: tokio::net::TcpStream,
 ) {
-    let Some(principal) = auth.is_valid(&req.cookies) else {
+    let Some(principal) = auth.principal(store, &req.cookies) else {
         write_response(&mut socket, Response::unauthorized()).await;
         return;
     };
@@ -966,10 +1326,10 @@ fn session_cookie(session: &str, runtime: &Runtime) -> String {
 /// only events stamped with its own source; admin-only events (`source:
 /// None`) and every other role's turns stay out.
 fn envelope_visible(principal: &Principal, env: &Envelope) -> bool {
-    match principal {
-        Principal::Admin => true,
-        Principal::Role { source, .. } => env.source.as_deref() == Some(source.as_str()),
+    if principal.is_admin() {
+        return true;
     }
+    env.source.as_deref() == Some(principal.source.as_str())
 }
 
 /// One SSE frame: `id:` (the seq, for `Last-Event-ID` reconnects) +
@@ -1101,44 +1461,198 @@ mod tests {
     }
 
     #[test]
-    fn role_streams_only_carry_their_own_source() {
-        let guest = Principal::Role {
-            source: "web:abc".into(),
-            role: "guest".into(),
-        };
-        assert!(envelope_visible(&guest, &env(Some("web:abc"))));
+    fn user_streams_only_carry_their_own_source() {
+        let guest = Principal::new("guest", "guest");
+        assert_eq!(guest.source, "web:guest");
+        assert!(envelope_visible(&guest, &env(Some("web:guest"))));
         assert!(!envelope_visible(&guest, &env(Some("web:other"))));
         assert!(!envelope_visible(&guest, &env(Some("telegram:42"))));
-        // Admin-only events (approval cards, memory proposals) are None.
+        // Escalations (approval cards, memory proposals) carry no source.
         assert!(!envelope_visible(&guest, &env(None)));
         // The operator sees everything.
-        assert!(envelope_visible(&Principal::Admin, &env(None)));
-        assert!(envelope_visible(&Principal::Admin, &env(Some("web:abc"))));
+        let admin = Principal::new(ka_agent_core::OPERATOR_USER, "admin");
+        assert!(admin.is_admin());
+        assert!(envelope_visible(&admin, &env(None)));
+        assert!(envelope_visible(&admin, &env(Some("web:abc"))));
     }
 
     #[test]
-    fn pairing_creates_a_role_session_for_the_code() {
+    fn sessions_survive_in_the_store_and_expire() {
         let store = Store::open_in_memory().unwrap();
         let auth = Auth::new();
-        let code = pairing::issue_for_role(&store, "web", Some("guest")).unwrap();
-        let (_, principal) = auth.pair(&store, &code).unwrap().expect("paired");
-        match &principal {
-            Principal::Role { source, role } => {
-                assert_eq!(role, "guest");
-                assert!(source.starts_with("web:"));
-                assert_eq!(
-                    store
-                        .identity_role("web", source.strip_prefix("web:").unwrap())
-                        .unwrap()
-                        .as_deref(),
-                    Some("guest")
-                );
-            }
-            other => panic!("expected a role principal, got {other:?}"),
-        }
-        // Wrong codes pair nothing.
-        assert!(auth.pair(&store, "ZZZZ-ZZZZ").unwrap().is_none());
-        // The code is single-use.
-        assert!(auth.pair(&store, &code).unwrap().is_none());
+        let token = auth
+            .new_session(&store, ka_agent_core::OPERATOR_USER, "admin")
+            .expect("session");
+        let mut cookies = HashMap::new();
+        cookies.insert("ka_session".to_string(), token.clone());
+        let principal = auth.principal(&store, &cookies).expect("principal");
+        assert_eq!(principal.username, ka_agent_core::OPERATOR_USER);
+        assert!(principal.is_admin());
+        // A different Auth (a daemon restart) still resolves it: the table is
+        // the state.
+        let auth2 = Auth::new();
+        assert!(auth2.principal(&store, &cookies).is_some());
+        // Only the hash is stored.
+        let rows = store.list_web_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].token_hash, token);
+        // A disabled account stops resolving.
+        store
+            .set_user_disabled(ka_agent_core::OPERATOR_USER, true)
+            .unwrap();
+        assert!(auth.principal(&store, &cookies).is_none());
+        store
+            .set_user_disabled(ka_agent_core::OPERATOR_USER, false)
+            .unwrap();
+        // Logout.
+        assert!(store.delete_web_session(&sha256_hex(&token)).unwrap());
+        assert!(auth.principal(&store, &cookies).is_none());
     }
+
+    #[test]
+    fn login_verifies_argon2_and_locks_out_after_five_failures() {
+        let store = Store::open_in_memory().unwrap();
+        let auth = Auth::new();
+        let phc = hash_password("correct horse battery").unwrap();
+        assert!(verify_password("correct horse battery", &phc));
+        assert!(!verify_password("wrong", &phc));
+        store
+            .create_user(&ka_agent_store::UserRow {
+                username: "ana".into(),
+                display_name: "Ana".into(),
+                pw_hash: Some(phc),
+                role: "member".into(),
+                quota_daily_usd: None,
+                disabled: false,
+                created_ms: 1,
+                created_by: Some("test".into()),
+            })
+            .unwrap();
+        // Wrong password: refused, no session.
+        assert!(matches!(
+            auth.login(&store, "ana", "nope"),
+            Err(LoginError::Credentials)
+        ));
+        // Unknown user: the same message (no enumeration).
+        assert!(matches!(
+            auth.login(&store, "bob", "nope"),
+            Err(LoginError::Credentials)
+        ));
+        // The fifth failure locks the username out, even with the right
+        // password (the first wrong attempt above already counted).
+        for _ in 0..4 {
+            let _ = auth.login(&store, "ana", "nope");
+        }
+        assert!(matches!(
+            auth.login(&store, "ana", "correct horse battery"),
+            Err(LoginError::Locked)
+        ));
+        // Another account is unaffected.
+        assert!(matches!(
+            auth.login(&store, "bob", "x"),
+            Err(LoginError::Credentials | LoginError::Locked) | Ok(_)
+        ));
+        // A fresh limiter (daemon restart) lets the right password in.
+        let auth = Auth::new();
+        assert!(auth.login(&store, "ana", "correct horse battery").unwrap().is_some());
+    }
+
+    #[test]
+    fn reset_invite_sets_the_password_only_for_its_account() {
+        let store = Store::open_in_memory().unwrap();
+        let auth = Auth::new();
+        store
+            .create_user(&ka_agent_store::UserRow {
+                username: "ana".into(),
+                display_name: "Ana".into(),
+                pw_hash: Some(hash_password("old-password").unwrap()),
+                role: "member".into(),
+                quota_daily_usd: None,
+                disabled: false,
+                created_ms: 1,
+                created_by: Some("test".into()),
+            })
+            .unwrap();
+        let code = "b".repeat(32);
+        store
+            .insert_invite(&ka_agent_store::InviteRow {
+                code_hash: sha256_hex(&code),
+                role: "member".into(),
+                username: Some("ana".into()),
+                groups: Vec::new(),
+                created_ms: ka_agent_core::now_ms(),
+                expires_ms: ka_agent_core::now_ms() + 60_000,
+                used_ms: None,
+                created_by: ka_agent_core::OPERATOR_USER.to_string(),
+            })
+            .unwrap();
+        // A reset code cannot be aimed at a different account.
+        assert!(matches!(
+            auth.redeem_invite(&store, &code, "bob", "newpassword"),
+            Err(LoginError::Invite(_))
+        ));
+        // Redeeming it sets ana's new password and never creates an account.
+        let token = auth
+            .redeem_invite(&store, &code, "ana", "newpassword")
+            .unwrap()
+            .expect("session");
+        assert!(!token.is_empty());
+        assert!(store.get_user("bob").unwrap().is_none());
+        let phc = store.get_user("ana").unwrap().unwrap().pw_hash.unwrap();
+        assert!(verify_password("newpassword", &phc));
+        assert!(!verify_password("old-password", &phc));
+        // Single use.
+        assert!(auth
+            .redeem_invite(&store, &code, "ana", "another-password")
+            .is_err());
+    }
+
+    #[test]
+    fn invite_redeem_creates_the_account_once() {
+        let store = Store::open_in_memory().unwrap();
+        let auth = Auth::new();
+        let code = "a".repeat(32);
+        store
+            .insert_invite(&ka_agent_store::InviteRow {
+                code_hash: sha256_hex(&code),
+                role: "member".into(),
+                username: None,
+                groups: vec!["dev".into()],
+                created_ms: ka_agent_core::now_ms(),
+                expires_ms: ka_agent_core::now_ms() + 60_000,
+                used_ms: None,
+                created_by: ka_agent_core::OPERATOR_USER.to_string(),
+            })
+            .unwrap();
+        // A code never takes over an existing account.
+        assert!(matches!(
+            auth.redeem_invite(&store, &code, "operator", "longpassword"),
+            Err(LoginError::Invite(_))
+        ));
+        let token = auth
+            .redeem_invite(&store, &code, "ana", "longpassword")
+            .unwrap()
+            .expect("session");
+        assert!(!token.is_empty());
+        let ana = store.get_user("ana").unwrap().unwrap();
+        assert_eq!(ana.role, "member");
+        assert!(ana.pw_hash.is_some());
+        assert_eq!(store.groups_of("ana").unwrap(), vec!["dev"]);
+        // The panel's own identity source resolves to the account.
+        assert_eq!(
+            store.identity_principal("web", "ana").unwrap(),
+            Some(("ana".to_string(), "member".to_string()))
+        );
+        // Single use.
+        assert!(matches!(
+            auth.redeem_invite(&store, &code, "bea", "longpassword"),
+            Err(LoginError::Invite(_))
+        ));
+        // A wrong code is refused and counted.
+        assert!(matches!(
+            auth.redeem_invite(&store, "deadbeef", "bea", "longpassword"),
+            Err(LoginError::Invite(_))
+        ));
+    }
+
 }

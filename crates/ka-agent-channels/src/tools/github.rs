@@ -236,6 +236,13 @@ fn ensure_not_duplicate(
     hash: &str,
 ) -> Result<(), String> {
     match store.active_intent_by_hash(tool, hash) {
+        Ok(Some(prev)) if prev.status == "unknown" => Err(format!(
+            "previous attempt outcome unknown: {tool} with identical arguments was left \
+             {status} by a crash (intent {id}) — confirm in /intents whether it ran, then \
+             change the arguments (or retry with a fresh one) instead of writing twice",
+            status = prev.status,
+            id = prev.id
+        )),
         Ok(Some(prev)) => Err(format!(
             "duplicate external write refused: {tool} with identical arguments is already \
              {status} (intent {id}) — change the arguments if you meant a new effect",

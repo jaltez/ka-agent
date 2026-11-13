@@ -5,6 +5,7 @@
 mod admin;
 mod bridge;
 mod briefing_cli;
+mod agent_cli;
 mod chat;
 mod cli;
 mod config_cli;
@@ -36,14 +37,16 @@ mod skills_cli;
 mod term;
 mod triggers_cli;
 mod update_cli;
+mod user_cli;
 mod usage_cli;
 
 use clap::Parser as _;
 use std::path::PathBuf;
 
 pub(crate) use cli::{
-    ApprovalsAction, BriefingAction, ConfigAction, CronAction, GrantAction, IdentityAction,
-    ImportAction, McpAction, MemoryAction, PluginAction, ProfileAction, SkillsAction, UpdateAction,
+    AgentAction, ApprovalsAction, BriefingAction, ConfigAction, CronAction, GrantAction, IdentityAction,
+    ImportAction, KbAction, KbSourceAction, McpAction, MemoryAction, PluginAction, ProfileAction,
+    SkillsAction, UpdateAction, UserAction,
 };
 use cli::{Cli, Command};
 
@@ -412,6 +415,9 @@ fn main() -> std::process::ExitCode {
         Command::Export { out } => ops::export(&out),
         Command::Purge { confirm } => ops::purge(confirm),
         Command::Identity { action } => identity::identity_action(action),
+        Command::User { action } => user_cli::user_action(action),
+        Command::Kb { action } => user_cli::kb_action(action),
+        Command::Agent { action } => agent_cli::agent_action(action),
         Command::Plugin { action } => plugin_cli::plugin_action(action),
         Command::Key { action } => {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
