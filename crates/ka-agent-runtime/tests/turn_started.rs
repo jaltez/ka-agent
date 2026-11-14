@@ -242,3 +242,40 @@ async fn engine_turns_inside_one_runtime_turn_are_announced_once() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A cycle's answer is durable in the outbox from its first engine turn's
+/// finish on — not only at the `idle` handoff. The engine sends `idle`
+/// once per prompt cycle, after the whole auto-poke loop; before this, a
+/// crash or restart mid-cycle lost every turn the store already called
+/// done while their text lived only in the in-memory buffer. The rows
+/// are cumulative (each finish rewrites them from the whole buffered
+/// text) and the handoff marks them sent when the final chunks go out.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cycle_turns_keep_the_answer_durable_in_the_outbox() {
+    let steps = r#"{"call": {"tool": "todo", "args": {"items": [{"text": "still pending", "state": "pending"}]}}}, {"text": "part one. part two."}"#;
+    let (rt, store, rec, root) = runtime_with("outbox-cycle", steps);
+
+    rt.handle_message("do the work", "console").await.unwrap();
+    wait_until("cycle done", &rec, |evs| {
+        finished(evs) == 2
+            && evs
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Session { status } if status == "Idle"))
+    })
+    .await;
+
+    let sid = rt.session_id_for(&op()).unwrap();
+    let turns = store.latest_turns_for_session(&sid, 1, 0).unwrap();
+    assert_eq!(turns.len(), 1, "one runtime turn was recorded");
+    let chunks = store.chunks_for_turn(&turns[0].id).unwrap();
+    assert_eq!(chunks.len(), 1, "one chunk row for the whole answer");
+    assert_eq!(chunks[0].text, "part one. part two.");
+    assert_eq!(
+        chunks[0].status,
+        ka_agent_core::OutboxStatus::Sent,
+        "the idle handoff marks the row sent"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

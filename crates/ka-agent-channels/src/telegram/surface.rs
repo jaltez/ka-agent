@@ -722,9 +722,6 @@ impl Surface for TelegramSurface {
             // final chunks still carry the rendered answer.
             AgentEvent::Delta { text } => self.inner.push_draft(text),
             AgentEvent::FinalChunk { index, turn, text } => {
-                if self.inner.chat().is_none() {
-                    return;
-                }
                 let inner = Arc::clone(&self.inner);
                 let text = text.clone();
                 let turn = turn.clone();
@@ -733,14 +730,18 @@ impl Surface for TelegramSurface {
                     if inner.send_rich(&text).await.is_none()
                         && let Some(store) = inner.store.as_ref()
                     {
-                        // The send still failed after the flood-control
-                        // retry: requeue the outbox row so the startup
-                        // drain redelivers it (private sessions write no
-                        // rows — the requeue is a no-op then).
+                        // The send failed (flood control after the retry,
+                        // no chat known yet, network) or was never
+                        // attempted: mark the outbox row `failed` so the
+                        // channel's retry pass redelivers it within a
+                        // poll cycle — and the startup drain after a
+                        // restart. No row (private session): there was
+                        // nothing to mark; the loss window is the one
+                        // between the runtime's handoff and this send.
                         if let Err(e) =
-                            store.requeue_chunk(&ka_agent_core::TurnId(turn.clone()), chunk_index)
+                            store.mark_chunk_failed(&ka_agent_core::TurnId(turn.clone()), chunk_index)
                         {
-                            eprintln!("telegram: requeue chunk {turn}/{}: {e}", chunk_index + 1);
+                            eprintln!("telegram: fail chunk {turn}/{}: {e}", chunk_index + 1);
                         }
                     }
                 });

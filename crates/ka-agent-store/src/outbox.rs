@@ -24,9 +24,11 @@ impl Store {
         Ok(())
     }
 
-    /// Unsent chunks for a turn, in order.
     /// Every undelivered chunk for a session, oldest turn first — the
-    /// crash-recovery read a channel drains at startup (SEED §3.7).
+    /// crash-recovery read a channel drains at startup (SEED §3.7). Both
+    /// never-attempted (`queued`, the durable copy a cycle's turns push
+    /// before the `idle` handoff) and attempted-and-refused (`failed`)
+    /// rows go out: a restart must not lose either.
     pub fn pending_chunks_for_session(
         &self,
         session: &SessionId,
@@ -35,7 +37,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT o.turn, o.chunk_index, o.text, o.status, o.channel_message_id, o.created_ms
              FROM outbox o JOIN turns t ON t.id = o.turn
-             WHERE t.session = ?1 AND o.status = 'queued'
+             WHERE t.session = ?1 AND o.status IN ('queued', 'failed')
              ORDER BY o.created_ms, o.turn, o.chunk_index",
         )?;
         let rows = stmt.query_map(params![session.as_str()], |r| {
@@ -122,14 +124,50 @@ impl Store {
         Ok(())
     }
 
-    /// Put a delivered-but-undeliverable chunk back to `queued`, so the
-    /// startup drain redelivers it after a restart. No row changed (a
-    /// private session writes no outbox rows) is still success — there
-    /// was nothing to requeue.
-    pub fn requeue_chunk(&self, turn: &TurnId, chunk_index: u32) -> Result<()> {
+    /// Chunk rows whose delivery was attempted and refused, for one
+    /// session, oldest first — the in-run retry read the channel's poll
+    /// loop drains. Distinct from `queued` on purpose: a queued row has
+    /// not been handed to the surfaces yet (the `idle` boundary still
+    /// owes it a `FinalChunk`), so an in-run redelivery here would
+    /// duplicate it; a failed row's attempt already happened.
+    pub fn failed_chunks_for_session(
+        &self,
+        session: &SessionId,
+    ) -> Result<Vec<OutboxChunk>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT o.turn, o.chunk_index, o.text, o.status, o.channel_message_id, o.created_ms
+             FROM outbox o JOIN turns t ON t.id = o.turn
+             WHERE t.session = ?1 AND o.status = 'failed'
+             ORDER BY o.created_ms, o.turn, o.chunk_index",
+        )?;
+        let rows = stmt.query_map(params![session.as_str()], |r| {
+            Ok(OutboxChunk {
+                turn: TurnId(r.get::<_, String>(0)?),
+                chunk_index: r.get::<_, i64>(1)? as u32,
+                text: r.get(2)?,
+                status: parse_outbox_status(&r.get::<_, String>(3)?)
+                    .unwrap_or(OutboxStatus::Failed),
+                channel_message_id: r.get(4)?,
+                created_ms: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Mark a chunk whose send was refused back to `failed`, so a
+    /// redelivery pass picks it up (the poll-loop worker in-run, the
+    /// startup drain after a restart). No row changed (a private session
+    /// writes no outbox rows) is still success — there was nothing to
+    /// fail.
+    pub fn mark_chunk_failed(&self, turn: &TurnId, chunk_index: u32) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE outbox SET status = 'queued', channel_message_id = NULL
+            "UPDATE outbox SET status = 'failed', channel_message_id = NULL
              WHERE turn = ?1 AND chunk_index = ?2",
             params![turn.as_str(), chunk_index as i64],
         )?;
@@ -200,5 +238,42 @@ mod tests {
         let theirs = store.pending_chunks_for_session(&s2.id).unwrap();
         assert_eq!(theirs.len(), 1, "another session's chunks never leak");
         assert_eq!(theirs[0].text, "other");
+    }
+
+    /// A failed chunk leaves the pending (startup drain) read and joins
+    /// the failed (in-run retry) read; marking it sent clears both.
+    #[test]
+    fn failed_chunks_retry_read_scopes_and_clears() {
+        let store = Store::open_in_memory().unwrap();
+        let s = session();
+        store.insert_session(&s).unwrap();
+        let t = Turn::new(s.id.clone(), "one".into());
+        store.insert_turn(&t).unwrap();
+        store
+            .push_chunk(&OutboxChunk::new(t.id.clone(), 0, "a".into()))
+            .unwrap();
+        store
+            .push_chunk(&OutboxChunk::new(t.id.clone(), 1, "b".into()))
+            .unwrap();
+        store.mark_chunk_failed(&t.id, 0).unwrap();
+
+        let failed = store.failed_chunks_for_session(&s.id).unwrap();
+        assert_eq!(failed.len(), 1, "only the failed chunk is retryable");
+        assert_eq!(failed[0].text, "a");
+
+        let pending = store.pending_chunks_for_session(&s.id).unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "the startup drain redelivers queued and failed rows"
+        );
+
+        store.mark_sent(&t.id, 0, 7).unwrap();
+        assert!(
+            store.failed_chunks_for_session(&s.id).unwrap().is_empty(),
+            "delivered rows leave the retry read"
+        );
+        // A private session writes no rows: failing nothing stays success.
+        store.mark_chunk_failed(&TurnId::generate(), 0).unwrap();
     }
 }

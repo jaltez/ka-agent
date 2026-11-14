@@ -546,7 +546,7 @@ pub(super) async fn drive(
                 tokens,
             } => {
                 let turn_result = { st.lock().live.as_ref().and_then(|l| l.current_turn.clone()) };
-                if let Some(tid) = turn_result
+                if let Some(tid) = turn_result.clone()
                     && let Some(mut t) = sh.store.get_turn(&tid).ok().flatten()
                 {
                     t.stop = Some(stop.clone());
@@ -574,6 +574,43 @@ pub(super) async fn drive(
                             retryable: retryable_class("internal"),
                             message: format!("turn persist: {e}"),
                         });
+                    }
+                }
+                // Crash insurance (SEED §3.7): one prompt cycle can hold
+                // several engine turns (auto-poke, verify) under a single
+                // runtime turn, and the delivery boundary — `idle` — only
+                // fires after the last one. From the first `turn_finished`
+                // the answer so far is durable in the outbox: a crash or
+                // restart mid-cycle redelivers it at startup instead of
+                // losing turns the store already calls done while their
+                // text lived only in the in-memory buffer. The rows are
+                // cumulative — every finish rewrites them from the whole
+                // buffered text — and `idle` still owns the actual
+                // handoff: it re-pushes the final split and marks the rows
+                // sent as its `FinalChunk` events go out. A send that is
+                // refused later goes to `failed`, which the channel's
+                // retry pass redelivers in-run. Private conversations
+                // write no rows (their answers never outlive the session;
+                // delivery rides the FinalChunk events only).
+                if let Some(tid) = turn_result {
+                    let (full_text, private) = {
+                        let g = st.lock();
+                        (
+                            g.live
+                                .as_ref()
+                                .map(|l| l.live_text.clone())
+                                .unwrap_or_default(),
+                            g.session.private,
+                        )
+                    };
+                    let silent = full_text.trim_start().starts_with("[SILENT]");
+                    if !private && !silent && !full_text.trim().is_empty() {
+                        for (i, chunk) in
+                            split_final_text(&full_text, FINAL_CHUNK_MAX).iter().enumerate()
+                        {
+                            let oc = OutboxChunk::new(tid.clone(), i as u32, chunk.clone());
+                            sh.store.push_chunk(&oc).ok();
+                        }
                     }
                 }
                 let (verdict, budget) = {

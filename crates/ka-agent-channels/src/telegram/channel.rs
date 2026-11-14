@@ -275,6 +275,9 @@ impl TelegramChannel {
                             eprintln!("telegram: persist offset: {e}");
                         }
                     }
+                    // One redelivery pass per poll cycle, after the
+                    // updates: fresh traffic is answered first.
+                    self.retry_failed_chunks(&client, &surface).await;
                     if updates.is_empty() {
                         // The real server blocks for the long-poll window;
                         // a fake (or instantly-empty) reply gets a short
@@ -391,7 +394,13 @@ impl TelegramChannel {
         chat: i64,
         chunks: Vec<OutboxChunk>,
     ) {
-        for chunk in &chunks {
+        for (n, chunk) in chunks.iter().enumerate() {
+            if n > 0 {
+                // A recovered batch can be large (a whole lost cycle):
+                // pace it like the surface's own sends, or Telegram's
+                // flood control turns the recovery into refusals.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             match client.send_message(chat, &chunk.text, None).await {
                 Ok(message_id) => {
                     self.store
@@ -401,6 +410,31 @@ impl TelegramChannel {
                 Err(e) => eprintln!("telegram: recovered chunk: {e}"),
             }
         }
+    }
+
+    /// In-run redelivery: chunks whose send was refused (`failed` rows)
+    /// go out again once per poll cycle, so a transient refusal costs
+    /// one poll interval instead of silence until the next restart.
+    /// Same scope as the startup drain: the operator's latest session.
+    async fn retry_failed_chunks(&self, client: &TelegramClient, surface: &Arc<SurfaceInner>) {
+        let Some(chat) = surface.chat() else {
+            return;
+        };
+        let Ok(Some(session)) = self
+            .store
+            .latest_session_for_user(ka_agent_core::OPERATOR_USER)
+        else {
+            return;
+        };
+        let chunks = self
+            .store
+            .failed_chunks_for_session(&session.id)
+            .unwrap_or_default();
+        if chunks.is_empty() {
+            return;
+        }
+        eprintln!("telegram: retrying {} failed chunk(s)", chunks.len());
+        self.deliver_recovered(client, chat, chunks).await;
     }
 
     /// Unlinked private messages that may still get an answer: a correct

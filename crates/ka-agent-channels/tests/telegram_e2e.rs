@@ -2541,6 +2541,116 @@ async fn skills_picker_lists_pending_proposals() {
     stop(&mut stack).await;
 }
 
+/// M3b: a refused final send marks the outbox row `failed` — the retry
+/// pass's input — instead of dropping it. No chat is known here on
+/// purpose either: before the fix a chunk with no known chat was
+/// silently discarded and never retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_final_chunk_marks_the_outbox_row_failed() {
+    let (server, base) = FakeBotServer::spawn();
+    server.fail_method("sendMessage", 500, None, 30);
+    let dir = temp_dir();
+    let store = Arc::new(Store::open(&dir.join("state.db")).unwrap());
+    let session = ka_agent_core::Session::new(dir.clone());
+    store.insert_session(&session).unwrap();
+    let turn = ka_agent_core::Turn::new(session.id.clone(), "q".into());
+    store.insert_turn(&turn).unwrap();
+    store
+        .push_chunk(&ka_agent_core::OutboxChunk::new(
+            turn.id.clone(),
+            0,
+            "the answer".into(),
+        ))
+        .unwrap();
+    let surface = TelegramSurface::new(base, "tok-fail".to_string(), Some(7), Some(Arc::clone(&store)));
+    surface.emit(&env(
+        1,
+        AgentEvent::TurnStarted {
+            turn: String::new(),
+            source: String::new(),
+        },
+    ));
+    surface.emit(&env(
+        2,
+        AgentEvent::FinalChunk {
+            index: 1,
+            turn: turn.id.to_string(),
+            text: "the answer".into(),
+        },
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let chunks = store.chunks_for_turn(&turn.id).unwrap();
+        let status = chunks[0].status;
+        if status == ka_agent_core::OutboxStatus::Failed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "row never went failed (still {status:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// M3c: the poll loop's retry pass redelivers a `failed` chunk within a
+/// poll cycle — the in-run counterpart of the startup drain (SEED §3.7),
+/// so a transient refusal costs one poll interval instead of silence
+/// until the next restart. The row appears after startup on purpose: the
+/// startup drain would otherwise be the one delivering it.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_chunks_redeliver_on_the_poll_loop() {
+    let mut stack = spawn_channel(vec![42], "tok-retry").await;
+    // Adopt the chat first: the retry pass needs a known destination.
+    stack.server.push_text_message(1, 7, 42, "/help");
+    stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage" && c.body["text"].as_str().unwrap_or("").contains("/help")
+            },
+            Duration::from_secs(10),
+        )
+        .expect("help sent");
+
+    // The operator's latest session carries a chunk whose send was
+    // refused (runtime marked it sent, the surface refused it).
+    let session = ka_agent_core::Session::new(stack.db_path.parent().unwrap().to_path_buf());
+    stack.store.insert_session(&session).unwrap();
+    let turn = ka_agent_core::Turn::new(session.id.clone(), "q".into());
+    stack.store.insert_turn(&turn).unwrap();
+    stack
+        .store
+        .push_chunk(&ka_agent_core::OutboxChunk::new(
+            turn.id.clone(),
+            0,
+            "the lost answer".into(),
+        ))
+        .unwrap();
+    stack.store.mark_chunk_failed(&turn.id, 0).unwrap();
+
+    let redelivered = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("the lost answer"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("retry pass redelivered the failed chunk");
+    assert_eq!(redelivered.body["chat_id"].as_i64(), Some(7));
+    let chunks = stack.store.chunks_for_turn(&turn.id).unwrap();
+    assert_eq!(
+        chunks[0].status,
+        ka_agent_core::OutboxStatus::Sent,
+        "delivery marks the row sent"
+    );
+    stop(&mut stack).await;
+}
+
 /// `/history` renders the recent turns; ▸ opens one turn's detail.
 #[tokio::test(flavor = "multi_thread")]
 async fn history_picker_shows_turn_detail() {
