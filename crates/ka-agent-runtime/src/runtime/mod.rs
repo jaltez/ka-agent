@@ -83,6 +83,17 @@ fn illegal_turn(from: TurnStatus, to: TurnStatus) -> Error {
     }
 }
 
+/// Marks a queued follow-on as the empty-answer nudge: the runtime
+/// re-asks the model once when a turn finishes with no answer text at
+/// all (reasoning only), and this prefix is how the drain recognizes
+/// the turn it submitted itself.
+pub(super) const NUDGE_PREFIX: &str = "(ka nudge)";
+
+/// How much of the running turn's reasoning is kept around, in
+/// characters: an empty-final give-up quotes the model's last notes,
+/// and only the tail is ever quoted.
+pub(super) const THOUGHT_TAIL_MAX: usize = 2000;
+
 struct Live {
     port: Arc<PortSession>,
     /// ask_id of the engine ask behind each pending approval.
@@ -118,10 +129,16 @@ struct Live {
     /// permission question for MCP tools carries no command, so the card
     /// names the call instead of reading "run ``?".
     last_call: Option<(String, String)>,
-    /// The one automatic re-ask for an empty final answer was spent (a
-    /// reasoning-only reply: content empty, only thinking). Bounded to
-    /// once per worker so a model that never answers cannot loop nudges.
-    empty_nudge_used: bool,
+    /// The running turn was submitted by the empty-answer nudge (its
+    /// text starts with [`NUDGE_PREFIX`]): an empty finish here means
+    /// the re-ask failed too, so the cycle gives up with an explicit
+    /// message instead of nudging again — that is the loop bound, one
+    /// nudge per prompt.
+    turn_from_nudge: bool,
+    /// The tail of the running turn's reasoning, bounded to its last
+    /// [`THOUGHT_TAIL_MAX`] characters: what an empty-final give-up can
+    /// quote as the model's last notes.
+    thought_tail: String,
 }
 
 /// One user's conversational state: what `Inner` carried when the daemon

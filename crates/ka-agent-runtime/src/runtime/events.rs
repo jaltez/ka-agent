@@ -86,6 +86,20 @@ fn readable_question(question: &str, last_call: Option<&(String, String)>) -> St
     }
 }
 
+/// The model's last notes for an empty-final give-up: the final
+/// ~400 characters of the reasoning tail with whitespace collapsed to
+/// single spaces (it rides inside one message, not as a wall of log
+/// lines). Empty when the turn left no reasoning at all.
+fn thought_excerpt(tail: &str) -> String {
+    let collapsed: String = tail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = collapsed.chars().collect();
+    let start = chars.len().saturating_sub(400);
+    chars[start..].iter().collect()
+}
+
 /// Return the user's session to `idle` once nothing is left in flight: the
 /// turn's record is terminal (or no turn is recorded and no prompt is being
 /// handed over), no ask is pending and the queue is empty. Called from both
@@ -297,11 +311,22 @@ pub(super) async fn drive(
                 }
             }
             PortEvent::DeltaThought(t) => {
-                let scheduled = st
-                    .lock()
-                    .live
-                    .as_ref()
-                    .is_some_and(|l| is_scheduled(l.current_turn_source.as_deref()));
+                let scheduled = {
+                    let mut g = st.lock();
+                    let mut scheduled = false;
+                    if let Some(live) = g.live.as_mut() {
+                        // Keep the reasoning's tail: an empty-final
+                        // give-up quotes it as the model's last notes.
+                        live.thought_tail.push_str(&t);
+                        let len = live.thought_tail.chars().count();
+                        if len > THOUGHT_TAIL_MAX {
+                            let skip = len - THOUGHT_TAIL_MAX;
+                            live.thought_tail = live.thought_tail.chars().skip(skip).collect();
+                        }
+                        scheduled = is_scheduled(live.current_turn_source.as_deref());
+                    }
+                    scheduled
+                };
                 if !scheduled {
                     emit(AgentEvent::Thought { text: t });
                 }
@@ -774,10 +799,13 @@ pub(super) async fn drive(
                     // in total silence — the turn was done, nothing was
                     // delivered and nobody was told. The turn record
                     // carries stop `empty` (the finish handler rewrites
-                    // it); ask the model once more (the follow-on runs as
-                    // a normal queued turn), and if that comes back empty
-                    // too, say so on the channel instead of leaving a
-                    // dead "typing…" behind.
+                    // it). Ask the model once more (every fresh prompt
+                    // earns one nudge; a nudge turn never nudges again —
+                    // that is the loop bound), and when the re-ask comes
+                    // back empty too, deliver an explicit message through
+                    // the hardened chunk pipeline — a queued outbox row
+                    // plus a FinalChunk — never a bare Notice, which a
+                    // surface with no known chat drops on the floor.
                     if text.trim().is_empty()
                         && let Some(tid) = &turn_id
                         && sh
@@ -787,13 +815,12 @@ pub(super) async fn drive(
                             .flatten()
                             .is_some_and(|t| t.stop.as_deref() == Some("empty"))
                     {
-                        let nudge_available = {
-                            let mut g = st.lock();
-                            g.live
-                                .as_mut()
-                                .is_some_and(|l| !std::mem::replace(&mut l.empty_nudge_used, true))
-                        };
-                        if nudge_available {
+                        let turn_from_nudge = st
+                            .lock()
+                            .live
+                            .as_ref()
+                            .is_some_and(|l| l.turn_from_nudge);
+                        if !turn_from_nudge {
                             let source = st
                                 .lock()
                                 .live
@@ -805,9 +832,11 @@ pub(super) async fn drive(
                             });
                             let item = ka_agent_core::QueueItem::new(
                                 sid.clone(),
-                                "(ka nudge) Your last turn ended with no answer text — only \
-                                 reasoning. Send the actual answer now, as plain message text."
-                                    .into(),
+                                format!(
+                                    "{NUDGE_PREFIX} Your last turn ended with no answer \
+                                     text — only reasoning. Send the actual answer now, as \
+                                     plain message text."
+                                ),
                                 &source,
                             );
                             if let Err(e) = sh.store.enqueue(&item) {
@@ -818,11 +847,35 @@ pub(super) async fn drive(
                                 });
                             }
                         } else {
-                            emit(AgentEvent::Notice {
-                                text: "the model finished with an empty answer (reasoning \
-                                       only, no text) — nothing was delivered; /retry or \
-                                       rephrase"
-                                    .into(),
+                            // The re-ask failed too. Quote the model's
+                            // last notes when it left any — the reasoning
+                            // often carries the conclusion the answer
+                            // never did.
+                            let notes = {
+                                let g = st.lock();
+                                g.live
+                                    .as_ref()
+                                    .map(|l| thought_excerpt(&l.thought_tail))
+                                    .unwrap_or_default()
+                            };
+                            let mut give_up = "⚠️ the model returned an empty answer \
+                                               twice (reasoning only, no text was \
+                                               delivered)."
+                                .to_string();
+                            if !notes.is_empty() {
+                                give_up.push_str(&format!("\n\nIts last notes: “{notes}”"));
+                            }
+                            give_up.push_str("\n\n/retry or rephrase.");
+                            if !private {
+                                let oc =
+                                    OutboxChunk::new(tid.clone(), 0, give_up.clone());
+                                sh.store.push_chunk(&oc).ok();
+                                sh.store.mark_sent(tid, 0, 0).ok();
+                            }
+                            emit(AgentEvent::FinalChunk {
+                                index: 1,
+                                turn: tid.as_str().to_string(),
+                                text: give_up,
                             });
                         }
                     }

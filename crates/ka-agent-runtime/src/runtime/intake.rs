@@ -156,7 +156,12 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
             live.turn_started_at = Some(Instant::now());
             live.last_activity_ms = ka_agent_core::now_ms();
             live.watchdog_notified = false;
+            // A nudge item (the empty-answer re-ask) claims its turn as
+            // such: if it also comes back empty, the cycle gives up
+            // instead of nudging again.
+            live.turn_from_nudge = item.text.starts_with(NUDGE_PREFIX);
             live.live_text.clear();
+            live.thought_tail.clear();
         }
     }
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
@@ -778,6 +783,8 @@ impl Runtime {
                 live.turn_started_at = Some(Instant::now());
                 live.last_activity_ms = ka_agent_core::now_ms();
                 live.watchdog_notified = false;
+                live.turn_from_nudge = false;
+                live.thought_tail.clear();
             }
         }
         // A shared agent contributes its persona, skills and model to this
