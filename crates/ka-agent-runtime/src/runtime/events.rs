@@ -546,10 +546,29 @@ pub(super) async fn drive(
                 tokens,
             } => {
                 let turn_result = { st.lock().live.as_ref().and_then(|l| l.current_turn.clone()) };
+                let (full_text, private) = {
+                    let g = st.lock();
+                    (
+                        g.live
+                            .as_ref()
+                            .map(|l| l.live_text.clone())
+                            .unwrap_or_default(),
+                        g.session.private,
+                    )
+                };
+                // A done/length turn whose whole cycle streamed not one
+                // character of answer text (a reasoning-only reply:
+                // content empty, everything in thinking) is recorded with
+                // the stop word `empty` instead of `done` — the silent
+                // nothing-was-delivered family must be distinguishable
+                // from a real answer in telemetry and /history, not just
+                // cheaper to bill.
+                let empty_final = matches!(stop.as_str(), "done" | "length")
+                    && full_text.trim().is_empty();
                 if let Some(tid) = turn_result.clone()
                     && let Some(mut t) = sh.store.get_turn(&tid).ok().flatten()
                 {
-                    t.stop = Some(stop.clone());
+                    t.stop = Some(if empty_final { "empty".into() } else { stop.clone() });
                     t.cost_usd = cost_usd;
                     t.tokens = tokens;
                     // The engine can finish a turn before the submit
@@ -593,16 +612,6 @@ pub(super) async fn drive(
                 // write no rows (their answers never outlive the session;
                 // delivery rides the FinalChunk events only).
                 if let Some(tid) = turn_result {
-                    let (full_text, private) = {
-                        let g = st.lock();
-                        (
-                            g.live
-                                .as_ref()
-                                .map(|l| l.live_text.clone())
-                                .unwrap_or_default(),
-                            g.session.private,
-                        )
-                    };
                     let silent = full_text.trim_start().starts_with("[SILENT]");
                     if !private && !silent && !full_text.trim().is_empty() {
                         for (i, chunk) in
@@ -759,6 +768,64 @@ pub(super) async fn drive(
                     .as_ref()
                     .is_some_and(|l| !l.pending_asks.is_empty());
                 if !ask_pending && !turn_open {
+                    // A cycle that finished done/length without one
+                    // character of answer text (reasoning-only reply:
+                    // empty content, everything in thinking) used to end
+                    // in total silence — the turn was done, nothing was
+                    // delivered and nobody was told. The turn record
+                    // carries stop `empty` (the finish handler rewrites
+                    // it); ask the model once more (the follow-on runs as
+                    // a normal queued turn), and if that comes back empty
+                    // too, say so on the channel instead of leaving a
+                    // dead "typing…" behind.
+                    if text.trim().is_empty()
+                        && let Some(tid) = &turn_id
+                        && sh
+                            .store
+                            .get_turn(tid)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|t| t.stop.as_deref() == Some("empty"))
+                    {
+                        let nudge_available = {
+                            let mut g = st.lock();
+                            g.live
+                                .as_mut()
+                                .is_some_and(|l| !std::mem::replace(&mut l.empty_nudge_used, true))
+                        };
+                        if nudge_available {
+                            let source = st
+                                .lock()
+                                .live
+                                .as_ref()
+                                .and_then(|l| l.current_turn_source.clone())
+                                .unwrap_or_else(|| "console".into());
+                            emit(AgentEvent::Note {
+                                text: "empty reply from the model — asking again".into(),
+                            });
+                            let item = ka_agent_core::QueueItem::new(
+                                sid.clone(),
+                                "(ka nudge) Your last turn ended with no answer text — only \
+                                 reasoning. Send the actual answer now, as plain message text."
+                                    .into(),
+                                &source,
+                            );
+                            if let Err(e) = sh.store.enqueue(&item) {
+                                emit(AgentEvent::Error {
+                                    class: "internal".into(),
+                                    retryable: retryable_class("internal"),
+                                    message: format!("nudge enqueue: {e}"),
+                                });
+                            }
+                        } else {
+                            emit(AgentEvent::Notice {
+                                text: "the model finished with an empty answer (reasoning \
+                                       only, no text) — nothing was delivered; /retry or \
+                                       rephrase"
+                                    .into(),
+                            });
+                        }
+                    }
                     drain_queue(&sh, &who, &st).await;
                 }
                 rt_maybe_idle(&sh, &st);

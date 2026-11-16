@@ -118,6 +118,10 @@ struct Live {
     /// permission question for MCP tools carries no command, so the card
     /// names the call instead of reading "run ``?".
     last_call: Option<(String, String)>,
+    /// The one automatic re-ask for an empty final answer was spent (a
+    /// reasoning-only reply: content empty, only thinking). Bounded to
+    /// once per worker so a model that never answers cannot loop nudges.
+    empty_nudge_used: bool,
 }
 
 /// One user's conversational state: what `Inner` carried when the daemon

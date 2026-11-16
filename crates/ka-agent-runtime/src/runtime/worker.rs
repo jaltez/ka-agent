@@ -153,6 +153,7 @@ impl Runtime {
                 last_activity_ms: ka_agent_core::now_ms(),
                 watchdog_notified: false,
                 last_call: None,
+                empty_nudge_used: false,
             });
         }
         tokio::spawn(drive(
