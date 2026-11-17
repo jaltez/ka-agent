@@ -416,7 +416,7 @@ impl Runtime {
         }
         if !submit_now {
             match self.session_status_for(who) {
-                SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping => {
+                SessionStatus::Running => {
                     // `busy_messages = "steer"`: an operator message lands in
                     // the running reply at the next tool-batch boundary.
                     // Scheduled turns stay uninterrupted.
@@ -456,6 +456,27 @@ impl Runtime {
                         );
                         return Ok(());
                     }
+                    let item = QueueItem::new(
+                        st.lock().session.id.clone(),
+                        text.to_string(),
+                        source,
+                    );
+                    self.sh.store.enqueue(&item)?;
+                    let n = self.sh.store.queue_len(&st.lock().session.id)?;
+                    self.sh.emit(AgentEvent::Queue { depth: n as u32 });
+                    self.sh.emit_from(
+                        AgentEvent::Notice {
+                            text: format!("queued (#{n})"),
+                        },
+                        Some(source),
+                    );
+                }
+                SessionStatus::AwaitingApproval | SessionStatus::Stopping => {
+                    // No running reply to steer into (the engine is
+                    // blocked on a card, or a stop is in flight): the
+                    // message queues durably and drains when the
+                    // boundary closes. Steering here used to hand the
+                    // text to an idle engine that dropped it.
                     let item = QueueItem::new(
                         st.lock().session.id.clone(),
                         text.to_string(),

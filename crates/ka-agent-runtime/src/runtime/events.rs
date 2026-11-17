@@ -620,6 +620,52 @@ pub(super) async fn drive(
                         });
                     }
                 }
+                // An ask outlives nothing: with its turn terminal, no
+                // engine is blocked on the card's answer — waiting for
+                // the card's TTL only parks the session in
+                // `awaiting_approval`, during which inbound messages
+                // would steer into a reply that no longer runs and
+                // vanish (live finding, 2026-11-17: a `/stop` under an
+                // open card silently swallowed the next prompt). Deny
+                // the orphans now — same wording and settle path as a
+                // late ask — so the boundary can close.
+                let orphans: Vec<(ApprovalId, String, Arc<PortSession>)> = {
+                    let mut g = st.lock();
+                    g.live
+                        .as_mut()
+                        .map(|live| {
+                            live.pending_asks
+                                .drain()
+                                .map(|(id, ask)| (id, ask, Arc::clone(&live.port)))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                for (id, ask_id, port) in orphans {
+                    port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                        .await
+                        .ok();
+                    sh.store
+                        .decide_approval(&id, ApprovalStatus::Denied, ka_agent_core::now_ms())
+                        .ok();
+                    let mut rec = AuditRecord::new(
+                        "runtime",
+                        audit_actions::APPROVAL_DECIDE,
+                        id.as_str(),
+                        Some("deny: its turn already finished".into()),
+                    )
+                    .with_user(&who.username)
+                    .with_role(&who.role);
+                    let _ = sh.store.append_audit(&mut rec);
+                    sh.emit(AgentEvent::ApprovalSettled {
+                        id: id.as_str().to_string(),
+                        status: format!("{:?}", ApprovalStatus::Denied),
+                    });
+                    emit(AgentEvent::Notice {
+                        text: "ask auto-denied: its turn already finished (nothing to approve)"
+                            .into(),
+                    });
+                }
                 // Crash insurance (SEED §3.7): one prompt cycle can hold
                 // several engine turns (auto-poke, verify) under a single
                 // runtime turn, and the delivery boundary — `idle` — only
