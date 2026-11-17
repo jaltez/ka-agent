@@ -1,7 +1,13 @@
-.pi/
-.omp/
-
 /target
 *.db
 *.db-wal
 *.db-shm
+
+# agents
+.pi/
+.omp/
+.amp/
+.zcode/
+.opencode/
+.codegraph/
+.voyager/
