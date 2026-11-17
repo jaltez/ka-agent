@@ -564,6 +564,7 @@ pub(super) async fn drive(
                 emit(AgentEvent::Notice {
                     text: "ask auto-denied: its turn already finished (nothing to approve)".into(),
                 });
+                invariants::check_and_report(&sh, &st);
             }
             PortEvent::TurnFinished {
                 stop,
@@ -745,6 +746,7 @@ pub(super) async fn drive(
                 rt_maybe_idle(&sh, &st);
                 // Another user may be waiting for a worker slot.
                 Runtime { sh: Arc::clone(&sh) }.spawn_drain();
+                invariants::check_and_report(&sh, &st);
             }
             PortEvent::Idle => {
                 // Delivery boundary (SEED.md §3.7): flush the buffered final
@@ -928,6 +930,7 @@ pub(super) async fn drive(
                     drain_queue(&sh, &who, &st).await;
                 }
                 rt_maybe_idle(&sh, &st);
+                invariants::check_and_report(&sh, &st);
             }
             PortEvent::Note(t) => emit(AgentEvent::Note { text: t }),
             PortEvent::EngineError {
@@ -979,6 +982,7 @@ pub(super) async fn drive(
                     sh.store.update_turn(&t).ok();
                 }
                 rt_on_engine_closed(&sh, &st, port.clone()).await;
+                invariants::check_and_report(&sh, &st);
             }
         }
     }

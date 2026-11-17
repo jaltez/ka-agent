@@ -34,6 +34,7 @@ mod events;
 mod identity;
 mod intake;
 mod memory;
+mod invariants;
 mod policy;
 mod roles;
 mod scheduler;
