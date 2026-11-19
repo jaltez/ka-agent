@@ -42,9 +42,7 @@ impl Runtime {
         if user.disabled {
             return Err(format!("{username} is disabled"));
         }
-        if user.role != ka_agent_core::ADMIN_ROLE
-            && self.role_spec(&user.role).is_none()
-        {
+        if user.role != ka_agent_core::ADMIN_ROLE && self.role_spec(&user.role).is_none() {
             return Err(format!("role {:?} is no longer configured", user.role));
         }
         Ok(())
@@ -488,10 +486,7 @@ impl Runtime {
             }
             for (id, port, ask_id) in answers {
                 self.audit_for(
-                    &Principal::new(
-                        st.lock().session.username.as_str(),
-                        st.lock().role.as_str(),
-                    ),
+                    &Principal::new(st.lock().session.username.as_str(), st.lock().role.as_str()),
                     audit_actions::APPROVAL_EXPIRE,
                     &id,
                     None,
@@ -576,5 +571,4 @@ impl Runtime {
             .filter_map(crate::surface::ApprovalCard::from_approval)
             .collect())
     }
-
 }

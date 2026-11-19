@@ -93,9 +93,14 @@ pub async fn expand(
 /// Expand one reference word for the operator (CLI/terminal/API callers that
 /// have no per-user principal).
 pub async fn expand_operator(store: &Store, workspace: &Path, text: &str) -> String {
-    expand(store, workspace, &ka_agent_core::Principal::operator(), text)
-        .await
-        .0
+    expand(
+        store,
+        workspace,
+        &ka_agent_core::Principal::operator(),
+        text,
+    )
+    .await
+    .0
 }
 
 /// Expand one whitespace-delimited word, if it is a reference token. The
@@ -386,7 +391,10 @@ fn kb_ref(
             // One token can cite several documents; the first is returned as
             // the source and the rest are recorded by the runtime's staging
             // path (this single-value shape keeps the expander simple).
-            (format!("--- @kb:{name} ---\n{docs}"), sources.into_iter().next())
+            (
+                format!("--- @kb:{name} ---\n{docs}"),
+                sources.into_iter().next(),
+            )
         }
     }
 }
@@ -427,7 +435,14 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("nota.md"), "CONTENIDO-UNO").unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "resume @nota.md please").await.0;
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            "resume @nota.md please",
+        )
+        .await
+        .0;
         assert_eq!(out, "resume --- @nota.md ---\nCONTENIDO-UNO please");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -441,7 +456,14 @@ mod tests {
         std::fs::write(ws.join("proj/sub/b.md"), "b").unwrap();
         std::fs::write(ws.join("proj/sub/deep/c.md"), "c").unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "look @proj").await.0;
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            "look @proj",
+        )
+        .await
+        .0;
         assert!(out.contains("--- @proj ---"), "{out}");
         assert!(out.contains("a.md"), "{out}");
         assert!(out.contains("sub/b.md"), "{out}");
@@ -456,7 +478,14 @@ mod tests {
         let ws = root.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "check @noexiste.md now").await.0;
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            "check @noexiste.md now",
+        )
+        .await
+        .0;
         assert_eq!(out, "check [ref @noexiste.md: not found] now");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -488,7 +517,14 @@ mod tests {
             })
             .unwrap();
         let prefix = ka_agent_core::ids::short_id(turn.id.as_str());
-        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), &format!("@turn:{prefix}")).await.0;
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            &format!("@turn:{prefix}"),
+        )
+        .await
+        .0;
         assert!(out.contains(&format!("--- @turn:{prefix} ---")), "{out}");
         assert!(out.contains("> pregunta sembrada"), "{out}");
         assert!(out.contains("respuesta sembrada"), "{out}");
@@ -502,7 +538,12 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let store = store_at(&root.join("data"));
         let text = "plain text\nsecond line, mail me at bob@example.com ok";
-        assert_eq!(expand(&store, &ws, &ka_agent_core::Principal::operator(), text).await.0, text);
+        assert_eq!(
+            expand(&store, &ws, &ka_agent_core::Principal::operator(), text)
+                .await
+                .0,
+            text
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -515,7 +556,14 @@ mod tests {
         // expansion truncated, never an unbounded load.
         std::fs::write(ws.join("huge.txt"), "y".repeat(400_000)).unwrap();
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "@huge.txt").await.0;
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            "@huge.txt",
+        )
+        .await
+        .0;
         assert!(out.contains("[ref truncated]"), "{out}");
         assert!(out.chars().count() < 9_000, "{}", out.chars().count());
         let _ = std::fs::remove_dir_all(&root);
@@ -531,7 +579,14 @@ mod tests {
             std::fs::write(ws.join(format!("f{i}.txt")), "x".repeat(9_000)).unwrap();
         }
         let store = store_at(&root.join("data"));
-        let out = expand(&store, &ws, &ka_agent_core::Principal::operator(), "@f0.txt @f1.txt @f2.txt").await.0;
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            "@f0.txt @f1.txt @f2.txt",
+        )
+        .await
+        .0;
         assert!(
             out.chars().count() <= REF_BUDGET + 40,
             "{}",

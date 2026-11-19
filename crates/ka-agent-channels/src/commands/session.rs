@@ -266,11 +266,7 @@ fn model_pick(
 
 /// The switch path every pick funnels into (selector validation, live
 /// reload, the missing-key warning).
-async fn switch_model(
-    runtime: &Runtime,
-    sel: &str,
-    who: &ka_agent_core::Principal,
-) -> Outcome {
+async fn switch_model(runtime: &Runtime, sel: &str, who: &ka_agent_core::Principal) -> Outcome {
     match runtime.set_model(sel, who).await {
         Ok(id) => {
             let mut reply = format!("model → {id} (next message uses it)");
@@ -311,7 +307,9 @@ pub(super) fn run_model<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         if !first.contains('/') {
             let listing = allowed_listing(runtime, &ctx.principal);
             if let Some(vendor) = resolve_vendor_in(&listing, first) {
-                return Outcome::Reply(model_vendor_listing(runtime, &vendor, &ctx.principal).await);
+                return Outcome::Reply(
+                    model_vendor_listing(runtime, &vendor, &ctx.principal).await,
+                );
             }
         }
         switch_model(runtime, rest, &ctx.principal).await
@@ -355,10 +353,10 @@ pub(super) fn run_mode<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 pub(super) fn run_agent<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let name = ctx.args.trim();
-        match ctx.runtime.set_agent(
-            &ctx.principal,
-            (!name.is_empty()).then_some(name),
-        ) {
+        match ctx
+            .runtime
+            .set_agent(&ctx.principal, (!name.is_empty()).then_some(name))
+        {
             Ok(line) => Outcome::Reply(line),
             Err(e) => Outcome::Reply(format!("! [agent] {e}")),
         }
@@ -385,7 +383,9 @@ pub(super) fn run_effort<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let runtime = ctx.runtime;
         let rest = ctx.args.trim();
         if rest.is_empty() {
-            let current = runtime.effort(&ctx.principal).unwrap_or_else(|| "model default".into());
+            let current = runtime
+                .effort(&ctx.principal)
+                .unwrap_or_else(|| "model default".into());
             let mut lines = vec![format!("effort: {current}")];
             for (i, level) in EFFORTS.iter().enumerate() {
                 let mark = if *level == current { " ←" } else { "" };

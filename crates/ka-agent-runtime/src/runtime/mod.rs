@@ -34,8 +34,8 @@ mod config;
 mod events;
 mod identity;
 mod intake;
-mod memory;
 mod invariants;
+mod memory;
 mod policy;
 mod roles;
 mod scheduler;
@@ -564,8 +564,7 @@ impl Runtime {
         // (doctor reports leftovers).
         if let Some(path) = identity::legacy_agents_md_status(
             &runtime.workspace_for(&ka_agent_core::Principal::operator()),
-        )
-            && let Err(e) = std::fs::remove_file(&path)
+        ) && let Err(e) = std::fs::remove_file(&path)
         {
             eprintln!("runtime: legacy AGENTS.md not removed: {e}");
         }
@@ -699,12 +698,18 @@ impl Runtime {
             next_task,
             timezone: tz.iana_name().unwrap_or("UTC").to_string(),
             capabilities: crate::status::Capabilities::from_config(&cfg),
-            memory: self.memory_report_for(who).ok().map(|r| crate::status::MemoryUse {
-                used_bytes: r.total_bytes,
-                budget_bytes: r.budget_bytes,
-                truncated: r.truncated,
-                to_review: self.pending_candidates_for(who).map(|c| c.len()).unwrap_or(0),
-            }),
+            memory: self
+                .memory_report_for(who)
+                .ok()
+                .map(|r| crate::status::MemoryUse {
+                    used_bytes: r.total_bytes,
+                    budget_bytes: r.budget_bytes,
+                    truncated: r.truncated,
+                    to_review: self
+                        .pending_candidates_for(who)
+                        .map(|c| c.len())
+                        .unwrap_or(0),
+                }),
             live_model: self
                 .sh
                 .live_model

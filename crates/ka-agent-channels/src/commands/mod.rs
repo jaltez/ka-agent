@@ -11,6 +11,7 @@
 mod approvals;
 mod memory;
 mod misc;
+mod rules;
 mod schedule;
 mod session;
 mod update;

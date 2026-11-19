@@ -435,7 +435,8 @@ impl Runtime {
                     if let Some(gate) = &spec.gate {
                         match run_gate(
                             gate,
-                            &self.workspace_for_user(&fire_principal.username, &fire_principal.role),
+                            &self
+                                .workspace_for_user(&fire_principal.username, &fire_principal.role),
                         ) {
                             GateOutcome::Pass(out) => {
                                 gate_output = out;
@@ -606,87 +607,87 @@ impl Runtime {
         }
         let now = ka_agent_core::now_ms();
         for (username, st) in self.users_by_activity() {
-        let decided = {
-            let g = st.lock();
-            let Some(live) = g.live.as_ref() else {
-                continue;
-            };
-            if !live.pending_asks.is_empty() {
-                continue;
-            }
-            // An abort is already in flight (`/stop` or an earlier
-            // watchdog pass): its grace/kill choreography owns the turn,
-            // and re-deciding every pass would spam the phone.
-            if g.session.status == SessionStatus::Stopping {
-                continue;
-            }
-            // A turn is in flight until its own record says otherwise (or
-            // its prompt is still being handed over: `running` with no
-            // turn recorded yet — the same rule the `idle` handler uses).
-            let turn_open = match &live.current_turn {
-                Some(tid) => self
-                    .sh
-                    .store
-                    .get_turn(tid)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|t| !t.status.is_terminal()),
-                None => g.session.status == SessionStatus::Running,
-            };
-            if !turn_open {
-                continue;
-            }
-            watchdog_action(
-                now - live.last_activity_ms,
-                silent_secs,
-                abort_secs,
-                live.watchdog_notified,
-            )
-        };
-        match decided {
-            WatchdogAction::None => {}
-            WatchdogAction::Notify { silent_for_secs } => {
-                if let Some(live) = st.lock().live.as_mut() {
-                    live.watchdog_notified = true;
+            let decided = {
+                let g = st.lock();
+                let Some(live) = g.live.as_ref() else {
+                    continue;
+                };
+                if !live.pending_asks.is_empty() {
+                    continue;
                 }
-                self.sh.emit(AgentEvent::Notice {
-                    text: format!(
-                        "⏳ still working — no engine output for {} min; /stop cancels",
-                        silent_for_secs.div_ceil(60)
-                    ),
-                });
-            }
-            WatchdogAction::Abort { silent_for_secs } => {
-                if let Some(live) = st.lock().live.as_mut() {
-                    live.watchdog_notified = false;
+                // An abort is already in flight (`/stop` or an earlier
+                // watchdog pass): its grace/kill choreography owns the turn,
+                // and re-deciding every pass would spam the phone.
+                if g.session.status == SessionStatus::Stopping {
+                    continue;
                 }
-                let username = username.clone();
-                self.sh.emit(AgentEvent::Notice {
-                    text: format!(
-                        "⏱ no engine activity for {} min — aborting; /retry re-sends it",
-                        silent_for_secs.div_ceil(60)
-                    ),
-                });
-                let who = ka_agent_core::Principal::new(
-                    &username,
-                    &self
+                // A turn is in flight until its own record says otherwise (or
+                // its prompt is still being handed over: `running` with no
+                // turn recorded yet — the same rule the `idle` handler uses).
+                let turn_open = match &live.current_turn {
+                    Some(tid) => self
                         .sh
                         .store
-                        .get_user(&username)
+                        .get_turn(tid)
                         .ok()
                         .flatten()
-                        .map(|u| u.role)
-                        .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string()),
-                );
-                if let Err(e) = self.stop_turn(&who, "console").await {
-                    self.sh.emit(AgentEvent::Error {
-                        class: "internal".into(),
-                        message: format!("watchdog abort: {e}"),
-                        retryable: false,
+                        .is_some_and(|t| !t.status.is_terminal()),
+                    None => g.session.status == SessionStatus::Running,
+                };
+                if !turn_open {
+                    continue;
+                }
+                watchdog_action(
+                    now - live.last_activity_ms,
+                    silent_secs,
+                    abort_secs,
+                    live.watchdog_notified,
+                )
+            };
+            match decided {
+                WatchdogAction::None => {}
+                WatchdogAction::Notify { silent_for_secs } => {
+                    if let Some(live) = st.lock().live.as_mut() {
+                        live.watchdog_notified = true;
+                    }
+                    self.sh.emit(AgentEvent::Notice {
+                        text: format!(
+                            "⏳ still working — no engine output for {} min; /stop cancels",
+                            silent_for_secs.div_ceil(60)
+                        ),
                     });
                 }
+                WatchdogAction::Abort { silent_for_secs } => {
+                    if let Some(live) = st.lock().live.as_mut() {
+                        live.watchdog_notified = false;
+                    }
+                    let username = username.clone();
+                    self.sh.emit(AgentEvent::Notice {
+                        text: format!(
+                            "⏱ no engine activity for {} min — aborting; /retry re-sends it",
+                            silent_for_secs.div_ceil(60)
+                        ),
+                    });
+                    let who = ka_agent_core::Principal::new(
+                        &username,
+                        &self
+                            .sh
+                            .store
+                            .get_user(&username)
+                            .ok()
+                            .flatten()
+                            .map(|u| u.role)
+                            .unwrap_or_else(|| ka_agent_core::ADMIN_ROLE.to_string()),
+                    );
+                    if let Err(e) = self.stop_turn(&who, "console").await {
+                        self.sh.emit(AgentEvent::Error {
+                            class: "internal".into(),
+                            message: format!("watchdog abort: {e}"),
+                            retryable: false,
+                        });
+                    }
+                }
             }
-        }
         }
     }
 
@@ -820,11 +821,11 @@ impl Runtime {
             return;
         }
         let cfg = self.cfg();
-        match self
-            .sh
-            .store
-            .prune_with(now, cfg.retention.turns_days)
-        {
+        match self.sh.store.prune_with_checkpoints(
+            now,
+            cfg.retention.turns_days,
+            cfg.checkpoint.keep_days,
+        ) {
             Ok(report) => {
                 let _ = self.sh.store.meta_set("prune.last_ms", &now.to_string());
                 let attachments = self.prune_attachments(cfg.retention.attachments_days, now);

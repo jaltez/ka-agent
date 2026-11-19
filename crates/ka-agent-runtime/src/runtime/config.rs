@@ -286,11 +286,7 @@ impl Runtime {
 
     /// `/steer <text>`: force a steer into the running reply; when idle it
     /// is just a message.
-    pub async fn steer(
-        &self,
-        text: &str,
-        who: &ka_agent_core::Principal,
-    ) -> Result<bool, Error> {
+    pub async fn steer(&self, text: &str, who: &ka_agent_core::Principal) -> Result<bool, Error> {
         let Some(port) = self.live_port_for(who) else {
             return Ok(false);
         };
@@ -395,7 +391,9 @@ impl Runtime {
     pub fn refresh_identity(&self) -> Result<(), Error> {
         // Persona content is profile-wide policy; only the file location is
         // per role (each engine reads its own HOME).
-        let persona = self.memory_store(ka_agent_core::OPERATOR_USER)?.persona_text();
+        let persona = self
+            .memory_store(ka_agent_core::OPERATOR_USER)?
+            .persona_text();
         let text = crate::runtime::compile_identity(&persona);
         let mut homes = vec![self.sh.paths.engine_home()];
         homes.extend(

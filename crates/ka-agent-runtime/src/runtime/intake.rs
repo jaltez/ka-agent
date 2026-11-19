@@ -1,5 +1,6 @@
 // Inbound handling per user: principal resolution, preflight, submit, the
 // durable queue, retry and stop. Split from runtime.rs (moves only).
+use super::events::is_scheduled;
 use super::worker::rt_on_engine_closed;
 use super::*;
 use ka_agent_core::Principal;
@@ -139,7 +140,8 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
     let _ = sh
         .store
         .meta_set(ka_agent_core::layout::TURN_ID_META_KEY, turn.id.as_str());
-    sh.store.record_staged_sources(&item.source, turn.id.as_str());
+    sh.store
+        .record_staged_sources(&item.source, turn.id.as_str());
     if turn.transition(TurnStatus::Submitted).is_err() {
         return false;
     }
@@ -312,7 +314,12 @@ impl Runtime {
             .unwrap_or(source)
             .to_string();
         let action = format!("{channel}.unauthorized");
-        let mut rec = AuditRecord::new(source, &action, "identity", Some("unlinked or disabled".into()));
+        let mut rec = AuditRecord::new(
+            source,
+            &action,
+            "identity",
+            Some("unlinked or disabled".into()),
+        );
         let _ = self.sh.store.append_audit(&mut rec);
     }
 
@@ -388,9 +395,9 @@ impl Runtime {
                         .map_err(|t| illegal_session(from, t))?;
                     true
                 }
-                SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping => {
-                    false
-                }
+                SessionStatus::Running
+                | SessionStatus::AwaitingApproval
+                | SessionStatus::Stopping => false,
                 SessionStatus::Paused => {
                     // A budget pause lifts itself when the day window rolls
                     // (the verdict is recomputed from the recorded window);
@@ -464,10 +471,10 @@ impl Runtime {
                             )
                         };
                         if let (Some(id), false) = (&turn_id, private) {
-                            let _ = self
-                                .sh
-                                .store
-                                .append_turn_inbound(id, &format!("\n\n[added while working] {text}"));
+                            let _ = self.sh.store.append_turn_inbound(
+                                id,
+                                &format!("\n\n[added while working] {text}"),
+                            );
                         }
                         if let Some(live) = st.lock().live.as_mut() {
                             live.live_text
@@ -481,11 +488,8 @@ impl Runtime {
                         );
                         return Ok(());
                     }
-                    let item = QueueItem::new(
-                        st.lock().session.id.clone(),
-                        text.to_string(),
-                        source,
-                    );
+                    let item =
+                        QueueItem::new(st.lock().session.id.clone(), text.to_string(), source);
                     self.sh.store.enqueue(&item)?;
                     let n = self.sh.store.queue_len(&st.lock().session.id)?;
                     self.sh.emit(AgentEvent::Queue { depth: n as u32 });
@@ -502,11 +506,8 @@ impl Runtime {
                     // message queues durably and drains when the
                     // boundary closes. Steering here used to hand the
                     // text to an idle engine that dropped it.
-                    let item = QueueItem::new(
-                        st.lock().session.id.clone(),
-                        text.to_string(),
-                        source,
-                    );
+                    let item =
+                        QueueItem::new(st.lock().session.id.clone(), text.to_string(), source);
                     self.sh.store.enqueue(&item)?;
                     let n = self.sh.store.queue_len(&st.lock().session.id)?;
                     self.sh.emit(AgentEvent::Queue { depth: n as u32 });
@@ -576,9 +577,7 @@ impl Runtime {
         who: &Principal,
     ) -> Result<(), Error> {
         let st = self.ensure_user(who)?;
-        let skills = crate::skills::Skills::new(
-            &self.sh.paths.user_engine_home(&who.username),
-        );
+        let skills = crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username));
         if !skills.is_enabled(name)? {
             return Err(Error::Refused(format!(
                 "skill {name:?} is not enabled — `ka-agent skills enable {name}`"
@@ -700,10 +699,7 @@ impl Runtime {
         // while the turn runs.
         publish_turn_context(&self.sh.store, source.unwrap_or("console"), who);
         if let Err(msg) = self.preflight(who) {
-            self.sh.emit_from(
-                AgentEvent::Notice { text: msg },
-                source,
-            );
+            self.sh.emit_from(AgentEvent::Notice { text: msg }, source);
             let mut g = st.lock();
             if g.session.status == SessionStatus::Running {
                 g.session.transition(SessionStatus::Idle).ok();
@@ -721,11 +717,8 @@ impl Runtime {
                 // Over the worker cap: queue durably and try again when a
                 // slot frees (never a silent drop).
                 let sid = st.lock().session.id.clone();
-                let item = QueueItem::new(
-                    sid.clone(),
-                    text.to_string(),
-                    source.unwrap_or("console"),
-                );
+                let item =
+                    QueueItem::new(sid.clone(), text.to_string(), source.unwrap_or("console"));
                 self.sh.store.enqueue(&item)?;
                 let mut g = st.lock();
                 if g.session.status == SessionStatus::Running {
@@ -789,10 +782,7 @@ impl Runtime {
                 .as_deref(),
         )
         .unwrap_or_else(|e| {
-            self.sh.emit_from(
-                AgentEvent::Notice { text: e },
-                source,
-            );
+            self.sh.emit_from(AgentEvent::Notice { text: e }, source);
             None
         });
         // A private conversation records usage only: the row carries no text.

@@ -260,7 +260,6 @@ impl Runtime {
                 .store
                 .search_episodes_filtered(query, limit, filter)?
         } else {
-            self.sh.store.search_episodes_for_user(query, limit, &who.username)?
             self.sh
                 .store
                 .search_episodes_for_user_filtered(query, limit, &who.username, filter)?

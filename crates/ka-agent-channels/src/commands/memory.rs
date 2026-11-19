@@ -131,8 +131,14 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                     "nothing remembered yet — /remember <fact>".to_string()
                 }
                 Ok(entries) => {
-                    let budget = runtime.memory_report_for(&ctx.principal).map(|r| r.budget_bytes).unwrap_or(0);
-                    let total = runtime.memory_report_for(&ctx.principal).map(|r| r.total_bytes).unwrap_or(0);
+                    let budget = runtime
+                        .memory_report_for(&ctx.principal)
+                        .map(|r| r.budget_bytes)
+                        .unwrap_or(0);
+                    let total = runtime
+                        .memory_report_for(&ctx.principal)
+                        .map(|r| r.total_bytes)
+                        .unwrap_or(0);
                     let mut lines: Vec<String> = entries
                         .iter()
                         .take(15)

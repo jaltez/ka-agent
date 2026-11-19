@@ -91,10 +91,7 @@ fn readable_question(question: &str, last_call: Option<&(String, String)>) -> St
 /// single spaces (it rides inside one message, not as a wall of log
 /// lines). Empty when the turn left no reasoning at all.
 fn thought_excerpt(tail: &str) -> String {
-    let collapsed: String = tail
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = tail.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = collapsed.chars().collect();
     let start = chars.len().saturating_sub(400);
     chars[start..].iter().collect()
@@ -349,7 +346,10 @@ pub(super) async fn drive(
                 };
                 let excerpt = {
                     let g = st.lock();
-                    g.live.as_ref().and_then(|live| live.tool_excerpt.get(&id)).cloned()
+                    g.live
+                        .as_ref()
+                        .and_then(|live| live.tool_excerpt.get(&id))
+                        .cloned()
                 };
                 let ms = started.map_or(0, |t| t.elapsed().as_millis() as u64);
                 let error = if ok {
@@ -468,8 +468,12 @@ pub(super) async fn drive(
                 // D9: self-scope stays on the acting user's surface;
                 // anything shared, over quota or listed in `escalate` goes to
                 // the admin queue with the reason on the card.
-                let spec = (who.role != ka_agent_core::ADMIN_ROLE)
-                    .then(|| Runtime { sh: Arc::clone(&sh) }.effective_role(&who.role));
+                let spec = (who.role != ka_agent_core::ADMIN_ROLE).then(|| {
+                    Runtime {
+                        sh: Arc::clone(&sh),
+                    }
+                    .effective_role(&who.role)
+                });
                 let budget_exceeded = st.lock().budget.verdict() == BudgetVerdict::Exceeded;
                 let user_root = sh.paths.user_root(&who.username);
                 let ctx = AskContext {
@@ -589,7 +593,10 @@ pub(super) async fn drive(
                 }
                 if let Some(port) = live_port {
                     let _ = port
-                        .answer(approval_ask_id(&approval), ApprovalDecision::Deny.ka_choice())
+                        .answer(
+                            approval_ask_id(&approval),
+                            ApprovalDecision::Deny.ka_choice(),
+                        )
                         .await;
                 }
                 if let Err(e) = sh.store.decide_approval(
@@ -640,12 +647,16 @@ pub(super) async fn drive(
                 // nothing-was-delivered family must be distinguishable
                 // from a real answer in telemetry and /history, not just
                 // cheaper to bill.
-                let empty_final = matches!(stop.as_str(), "done" | "length")
-                    && full_text.trim().is_empty();
+                let empty_final =
+                    matches!(stop.as_str(), "done" | "length") && full_text.trim().is_empty();
                 if let Some(tid) = turn_result.clone()
                     && let Some(mut t) = sh.store.get_turn(&tid).ok().flatten()
                 {
-                    t.stop = Some(if empty_final { "empty".into() } else { stop.clone() });
+                    t.stop = Some(if empty_final {
+                        "empty".into()
+                    } else {
+                        stop.clone()
+                    });
                     t.cost_usd = cost_usd;
                     t.tokens = tokens;
                     // The engine can finish a turn before the submit
@@ -662,7 +673,9 @@ pub(super) async fn drive(
                         _ => None,
                     };
                     if let Some(next) = next {
-                        t.transition(next).map_err(|x| illegal_turn(t.status, x)).ok();
+                        t.transition(next)
+                            .map_err(|x| illegal_turn(t.status, x))
+                            .ok();
                     }
                     if let Err(e) = sh.store.update_turn(&t) {
                         emit(AgentEvent::Error {
@@ -737,8 +750,9 @@ pub(super) async fn drive(
                 if let Some(tid) = turn_result {
                     let silent = full_text.trim_start().starts_with("[SILENT]");
                     if !private && !silent && !full_text.trim().is_empty() {
-                        for (i, chunk) in
-                            split_final_text(&full_text, FINAL_CHUNK_MAX).iter().enumerate()
+                        for (i, chunk) in split_final_text(&full_text, FINAL_CHUNK_MAX)
+                            .iter()
+                            .enumerate()
                         {
                             let oc = OutboxChunk::new(tid.clone(), i as u32, chunk.clone());
                             sh.store.push_chunk(&oc).ok();
@@ -750,7 +764,10 @@ pub(super) async fn drive(
                     g.budget.record(cost_usd, tokens, ka_agent_core::now_ms());
                     (g.budget.verdict(), g.budget.clone())
                 };
-                Runtime { sh: Arc::clone(&sh) }.persist_budget(&who.username, &budget);
+                Runtime {
+                    sh: Arc::clone(&sh),
+                }
+                .persist_budget(&who.username, &budget);
                 let (ms, text) = {
                     let g = st.lock();
                     let live = g.live.as_ref();
@@ -782,7 +799,9 @@ pub(super) async fn drive(
                             Some(cap) => format!(
                                 "daily budget (${cap:.2}) reached — paused until tomorrow (override via CLI)"
                             ),
-                            None => "daily token budget reached — paused until tomorrow".to_string(),
+                            None => {
+                                "daily token budget reached — paused until tomorrow".to_string()
+                            }
                         },
                     });
                 }
@@ -794,9 +813,31 @@ pub(super) async fn drive(
                 // A cycle can emit several `turn_finished` events (auto-poke,
                 // verify): the first settles the status, the later ones only
                 // refresh the cumulative usage.
+                // B15b: a scheduled cycle ends here — restore the full
+                // compile before the idle boundary can drain another
+                // queued message against the lean one.
+                if st
+                    .lock()
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| is_scheduled(l.current_turn_source.as_deref()))
+                    && let Err(e) = (Runtime {
+                        sh: Arc::clone(&sh),
+                    })
+                    .refresh_compiled_memory_for(&who.username)
+                {
+                    emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        retryable: retryable_class("internal"),
+                        message: format!("memory restore: {e}"),
+                    });
+                }
                 rt_maybe_idle(&sh, &st);
                 // Another user may be waiting for a worker slot.
-                Runtime { sh: Arc::clone(&sh) }.spawn_drain();
+                Runtime {
+                    sh: Arc::clone(&sh),
+                }
+                .spawn_drain();
                 invariants::check_and_report(&sh, &st);
             }
             PortEvent::Idle => {
@@ -891,6 +932,20 @@ pub(super) async fn drive(
                     .live
                     .as_ref()
                     .is_some_and(|l| !l.pending_asks.is_empty());
+                // B15b: restore the full compile at the delivery boundary,
+                // before any drain starts another turn.
+                if scheduled
+                    && let Err(e) = (Runtime {
+                        sh: Arc::clone(&sh),
+                    })
+                    .refresh_compiled_memory_for(&who.username)
+                {
+                    emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        retryable: retryable_class("internal"),
+                        message: format!("memory restore: {e}"),
+                    });
+                }
                 if !ask_pending && !turn_open {
                     // A cycle that finished done/length without one
                     // character of answer text (reasoning-only reply:
@@ -914,11 +969,8 @@ pub(super) async fn drive(
                             .flatten()
                             .is_some_and(|t| t.stop.as_deref() == Some("empty"))
                     {
-                        let turn_from_nudge = st
-                            .lock()
-                            .live
-                            .as_ref()
-                            .is_some_and(|l| l.turn_from_nudge);
+                        let turn_from_nudge =
+                            st.lock().live.as_ref().is_some_and(|l| l.turn_from_nudge);
                         if !turn_from_nudge {
                             let source = st
                                 .lock()
@@ -966,8 +1018,7 @@ pub(super) async fn drive(
                             }
                             give_up.push_str("\n\n/retry or rephrase.");
                             if !private {
-                                let oc =
-                                    OutboxChunk::new(tid.clone(), 0, give_up.clone());
+                                let oc = OutboxChunk::new(tid.clone(), 0, give_up.clone());
                                 sh.store.push_chunk(&oc).ok();
                                 sh.store.mark_sent(tid, 0, 0).ok();
                             }
@@ -1033,6 +1084,24 @@ pub(super) async fn drive(
                     sh.store.update_turn(&t).ok();
                 }
                 rt_on_engine_closed(&sh, &st, port.clone()).await;
+                // B15b: the closed engine may have been mid-scheduled-turn
+                // — put the full compile back (boot also self-heals).
+                if st
+                    .lock()
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| is_scheduled(l.current_turn_source.as_deref()))
+                    && let Err(e) = (Runtime {
+                        sh: Arc::clone(&sh),
+                    })
+                    .refresh_compiled_memory_for(&who.username)
+                {
+                    emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        retryable: retryable_class("internal"),
+                        message: format!("memory restore: {e}"),
+                    });
+                }
                 invariants::check_and_report(&sh, &st);
             }
         }

@@ -19,7 +19,10 @@ pub(crate) fn propose_schema() -> Value {
 pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
         let _ = Effect::Propose;
-        if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
+        if ctx
+            .runtime
+            .session_private_for(&crate::tools::turn_principal(ctx))
+        {
             return Err("this is a private conversation — memory proposals are off here".into());
         }
         // Automation turns never write personal memory: a cron reading

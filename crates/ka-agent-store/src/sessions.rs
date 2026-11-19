@@ -91,11 +91,9 @@ impl Store {
     /// Most recently updated sessions first.
     pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            &format!(
-                "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC LIMIT ?1"
-            ),
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC LIMIT ?1"
+        ))?;
         let rows = stmt.query_map(params![limit as i64], row_to_session)?;
         collect_rows(rows)
     }
@@ -209,9 +207,9 @@ impl Store {
         )?;
         // Best-effort: a concurrent reader can hold the checkpoint busy.
         let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
-        let mut stmt = conn.prepare(
-            &format!("SELECT {SESSION_COLS} FROM sessions WHERE private = 1"),
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE private = 1"
+        ))?;
         let rows = stmt.query_map([], row_to_session)?;
         collect_rows(rows)
     }
@@ -316,7 +314,11 @@ mod tests {
         let found = store.latest_session_for_user("guest").unwrap().unwrap();
         assert_eq!(found.id, guest.id);
         assert_eq!(
-            store.latest_session_for_user("operator").unwrap().unwrap().id,
+            store
+                .latest_session_for_user("operator")
+                .unwrap()
+                .unwrap()
+                .id,
             admin.id
         );
         assert!(store.latest_session_for_user("nobody").unwrap().is_none());

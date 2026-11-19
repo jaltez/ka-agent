@@ -31,9 +31,9 @@ pub use approval::{Approval, ApprovalDecision, ApprovalKind, ApprovalStatus};
 pub use audit::AuditRecord;
 pub use budget::{BudgetState, BudgetVerdict};
 pub use config::{
-    Approvals, Calendar, DaemonConfig, Error as ConfigError, MatrixSettings, McpServer, Notify,
-    Channels, DiscordSettings, Retention, RoleSpec, RuntimeSettings, Search, SlackSettings, Tools, TurnWatchdog, Voice, Web, WorkerRestart,
-    valid_feature_spec, valid_role_name,
+    Approvals, Calendar, Channels, DaemonConfig, DiscordSettings, Error as ConfigError,
+    MatrixSettings, McpServer, Notify, Retention, RoleSpec, RuntimeSettings, Search, SlackSettings,
+    Tools, TurnWatchdog, Voice, Web, WorkerRestart, valid_feature_spec, valid_role_name,
 };
 pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RuleId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};

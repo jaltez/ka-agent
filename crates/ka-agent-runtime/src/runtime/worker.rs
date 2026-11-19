@@ -56,7 +56,9 @@ impl Runtime {
             .any(|st| {
                 matches!(
                     st.lock().session.status,
-                    SessionStatus::Running | SessionStatus::AwaitingApproval | SessionStatus::Stopping
+                    SessionStatus::Running
+                        | SessionStatus::AwaitingApproval
+                        | SessionStatus::Stopping
                 )
             })
     }
@@ -76,11 +78,7 @@ impl Runtime {
     /// Lazily (re)start `who`'s worker with backoff and the crash-loop
     /// breaker. Falls back to a fresh strand when the recorded strand file no
     /// longer exists (SEED.md §3.5).
-    pub(super) async fn ensure_worker(
-        &self,
-        who: &Principal,
-        source: &str,
-    ) -> Result<(), Error> {
+    pub(super) async fn ensure_worker(&self, who: &Principal, source: &str) -> Result<(), Error> {
         let state = self.ensure_user(who)?;
         // One spawn handshake at a time: the cross-user cap check and the
         // `live` claim must not interleave, or two simultaneous submits both
@@ -293,13 +291,7 @@ impl Runtime {
             let user_layer = cfg
                 .engine_layer_path()
                 .and_then(|p| std::fs::read_to_string(p).ok());
-            (
-                g.session.clone(),
-                mode,
-                env,
-                user_layer,
-                g.session.private,
-            )
+            (g.session.clone(), mode, env, user_layer, g.session.private)
         };
         let _ = user_root_marker(&self.sh.paths, &who.username);
         // Provider keys live in the profile engine home; a user's worker
@@ -310,8 +302,7 @@ impl Runtime {
         // layer; `secret:` values resolve here, in memory, from the secret
         // store.
         let secrets_dir = self.sh.paths.root().join("secrets");
-        let role_spec =
-            (role != ka_agent_core::ADMIN_ROLE).then(|| self.effective_role(&role));
+        let role_spec = (role != ka_agent_core::ADMIN_ROLE).then(|| self.effective_role(&role));
         let engine_layer_toml = ka_agent_port::engine_layer::compose_for_role(
             cfg,
             role_spec.as_ref(),
@@ -353,7 +344,9 @@ impl Runtime {
             return (exe, args);
         }
         let Some(bwrap) = which("bwrap") else {
-            eprintln!("runtime: sandbox_engine is on but bwrap is not in PATH; running unsandboxed");
+            eprintln!(
+                "runtime: sandbox_engine is on but bwrap is not in PATH; running unsandboxed"
+            );
             return (exe, args);
         };
         let user_root = self.sh.paths.user_root(username);
@@ -637,11 +630,7 @@ fn git_identity(
 }
 
 /// One user's worker died or was killed: book it against that user only.
-pub(super) async fn rt_on_engine_closed(
-    sh: &Arc<Shared>,
-    st: &UserHandle,
-    port: Arc<PortSession>,
-) {
+pub(super) async fn rt_on_engine_closed(sh: &Arc<Shared>, st: &UserHandle, port: Arc<PortSession>) {
     port.kill().await;
     let now = ka_agent_core::now_ms();
     let cfg = cfg_of(sh);

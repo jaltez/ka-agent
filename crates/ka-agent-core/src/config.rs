@@ -339,9 +339,7 @@ pub struct DiscordSettings {
 
 impl DiscordSettings {
     pub fn api_base(&self) -> &str {
-        self.api_base
-            .as_deref()
-            .unwrap_or("https://discord.com")
+        self.api_base.as_deref().unwrap_or("https://discord.com")
     }
 }
 
@@ -1099,7 +1097,8 @@ impl DaemonConfig {
         if self.discord.enabled {
             if self.discord.bot_token_secret.is_none() {
                 return Err(Error::Validate(
-                    "discord.enabled requires discord.bot_token_secret (a secret-store name)".into(),
+                    "discord.enabled requires discord.bot_token_secret (a secret-store name)"
+                        .into(),
                 ));
             }
             if self.discord.guilds.is_empty() {
