@@ -204,16 +204,12 @@ impl MatrixChannel {
             Outcome::Silent => {}
             Outcome::NotACommand => {
                 let source = format!("matrix:{sender}");
-            let who = self.who_for(&source);
-            let (body, refs) =
-                crate::refs::expand(&self.store, &self.runtime.workspace_for(&who), &who, body)
-                    .await;
-            crate::refs::stage_sources(&self.store, &source, &refs);
-                if let Err(e) = self
-                    .runtime
-                    .handle_message(&body, &source)
-                    .await
-                {
+                let who = self.who_for(&source);
+                let (body, refs) =
+                    crate::refs::expand(&self.store, &self.runtime.workspace_for(&who), &who, body)
+                        .await;
+                crate::refs::stage_sources(&self.store, &source, &refs);
+                if let Err(e) = self.runtime.handle_message(&body, &source).await {
                     eprintln!("matrix: handle_message: {e}");
                 }
             }
@@ -274,13 +270,11 @@ impl MatrixChannel {
         let bytes = self.surface.client.download_media(mxc).await?;
         let after = self.runtime.private_session_token_for(who);
         match (&before, &after) {
-            (None, None) => {
-                crate::attachments::save_attachment_bytes(
+            (None, None) => crate::attachments::save_attachment_bytes(
                 &self.runtime.workspace_for(who),
                 &name,
                 &bytes,
-            )
-            }
+            ),
             (Some(short), Some(now)) if short == now => {
                 crate::attachments::save_private_attachment_bytes(
                     &self.runtime.workspace_for(who),
@@ -293,13 +287,11 @@ impl MatrixChannel {
                 "the private conversation ended while this file was downloading — it was not saved"
                     .into(),
             ),
-            (None, Some(_)) => {
-                crate::attachments::save_attachment_bytes(
+            (None, Some(_)) => crate::attachments::save_attachment_bytes(
                 &self.runtime.workspace_for(who),
                 &name,
                 &bytes,
-            )
-            }
+            ),
         }
     }
 

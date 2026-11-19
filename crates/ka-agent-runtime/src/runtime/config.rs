@@ -1,5 +1,6 @@
 // Configuration: reload + report, the memory preamble, timezone publish.
 // Split from runtime.rs (moves only).
+use super::intake::drain_queue;
 use super::*;
 
 /// What a config reload changed: applied to the running agent, or waiting
@@ -361,6 +362,113 @@ impl Runtime {
                 ka_agent_core::ids::short_id(many[0].id.as_str())
             ))),
         }
+    }
+
+    /// Resolve a `/queue` position (1-based `#n`) or id prefix to the
+    /// pending item's full id. `Err` when nothing (or several) match.
+    fn queued_id(
+        &self,
+        who: &ka_agent_core::Principal,
+        key: &str,
+    ) -> Result<ka_agent_core::QueueId, Error> {
+        let items = self.queued(who)?;
+        let key = key.trim();
+        if let Ok(n) = key.parse::<usize>() {
+            return items
+                .get(n.wrapping_sub(1))
+                .map(|(id, _, _)| ka_agent_core::QueueId(id.clone()))
+                .ok_or_else(|| Error::Refused(format!("no queued message #{key}")));
+        }
+        let hits: Vec<&String> = items
+            .iter()
+            .filter(|(id, _, _)| ka_agent_core::ids::id_matches(id, key))
+            .map(|(id, _, _)| id)
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(ka_agent_core::QueueId((*one).clone())),
+            [] => Err(Error::Refused(format!("no queued message matches {key:?}"))),
+            many => Err(Error::Refused(format!(
+                "ambiguous id — {} matches ({} …)",
+                many.len(),
+                ka_agent_core::ids::short_id(many[0])
+            ))),
+        }
+    }
+
+    /// Move a queued message to 1-based position `to` (`/queue top|up|down`).
+    /// `Ok(true)` moved; `Ok(false)` no such pending item.
+    pub fn reorder_queued(
+        &self,
+        key: &str,
+        to: usize,
+        who: &ka_agent_core::Principal,
+    ) -> Result<bool, Error> {
+        let Some(sid) = self.session_id_for(who) else {
+            return Ok(false);
+        };
+        let id = self.queued_id(who, key)?;
+        self.sh
+            .store
+            .queue_reorder(&sid, &id, to)
+            .map_err(Error::Store)
+    }
+
+    /// Promote one queued message to the head (`/queue top 1`, the
+    /// Telegram `↑`): it is the next cycle the drain submits.
+    pub fn promote_queued(
+        &self,
+        id_prefix: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<bool, Error> {
+        self.reorder_queued(id_prefix, 1, who)
+    }
+
+    /// Rewrite one queued message's text (`/queue edit`).
+    pub fn edit_queued(
+        &self,
+        key: &str,
+        text: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<bool, Error> {
+        let id = self.queued_id(who, key)?;
+        self.sh
+            .store
+            .queue_set_text(&id, text)
+            .map_err(Error::Store)
+    }
+
+    /// `/queue now <n>`: make one queued message the *next* cycle. A live
+    /// turn takes `/stop`'s abort shape — the engine never sees a
+    /// mid-cycle prompt (single-writer, ka-port.md §4); the promoted item
+    /// is simply what `drain_queue` submits at the turn boundary. An idle
+    /// session drains immediately. Returns the promoted text.
+    pub async fn send_queued_now(
+        &self,
+        key: &str,
+        who: &ka_agent_core::Principal,
+    ) -> Result<Option<String>, Error> {
+        let st = self.ensure_user(who)?;
+        if !self.reorder_queued(key, 1, who)? {
+            return Ok(None);
+        }
+        let text = self
+            .queued(who)?
+            .first()
+            .map(|(_, _, t)| t.clone())
+            .unwrap_or_default();
+        let status = st.lock().session.status;
+        match status {
+            SessionStatus::Running | SessionStatus::AwaitingApproval => {
+                self.abort_live_cycle(&st).await;
+            }
+            SessionStatus::Idle => {
+                // Nothing in flight: the new head submits right away (a
+                // stopped worker keeps it queued for the next message).
+                drain_queue(&self.sh, who, &st).await;
+            }
+            _ => {}
+        }
+        Ok(Some(text))
     }
 
     /// The user's engine tool inventory, as the engine discovered it.

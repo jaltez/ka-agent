@@ -4,7 +4,7 @@
 
 use ka_agent_store::{KbSourceRow, Store};
 
-use super::{MAX_DOCS, MAX_BYTES, SyncReport, accepted};
+use super::{MAX_BYTES, MAX_DOCS, SyncReport, accepted};
 
 pub async fn sync(store: &Store, src: &KbSourceRow) -> Result<SyncReport, String> {
     // A dedicated checkout per (kb, url) keeps runs incremental.
@@ -19,10 +19,27 @@ pub async fn sync(store: &Store, src: &KbSourceRow) -> Result<SyncReport, String
     };
     let git = which_git().await?;
     if root.join(".git").exists() {
-        run(&git, &["-C", &root.to_string_lossy(), "fetch", "--depth", "1", "origin"]).await?;
         run(
             &git,
-            &["-C", &root.to_string_lossy(), "reset", "--hard", "origin/HEAD"],
+            &[
+                "-C",
+                &root.to_string_lossy(),
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+            ],
+        )
+        .await?;
+        run(
+            &git,
+            &[
+                "-C",
+                &root.to_string_lossy(),
+                "reset",
+                "--hard",
+                "origin/HEAD",
+            ],
         )
         .await?;
     } else {

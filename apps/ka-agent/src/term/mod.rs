@@ -549,6 +549,17 @@ pub fn show_event(term: &mut Terminal, env: &ka_agent_runtime::Envelope) {
         AgentEvent::TurnFinished { ms, .. } if *ms > 10_000 && !term.view.focused => {
             print!("\x07\x1b]9;{}: reply ready\x07", term.view.name);
         }
+        // `/rewind` re-proposes the checkpointed turn (B1/A1): the reply
+        // carries `re-propose: <text>` — put it in the composer so the
+        // operator can edit and resend instead of retyping.
+        AgentEvent::Reply { text } => {
+            if let Some(rest) = text.split_once("re-propose: ").map(|(_, t)| t)
+                && !rest.trim().is_empty()
+                && term.editor.text().trim().is_empty()
+            {
+                term.editor.set(rest.trim());
+            }
+        }
         _ => {}
     }
     term.draw();

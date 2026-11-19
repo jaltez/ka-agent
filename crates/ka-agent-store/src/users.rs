@@ -31,7 +31,8 @@ pub fn valid_username(name: &str) -> bool {
         _ => return false,
     }
     name.len() <= 64
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
@@ -153,7 +154,11 @@ impl Store {
     /// `None` for an unlinked identity, an identity without a bound user,
     /// or a disabled account — exactly the set of senders the runtime
     /// refuses.
-    pub fn identity_principal(&self, channel: &str, address: &str) -> Result<Option<(String, String)>> {
+    pub fn identity_principal(
+        &self,
+        channel: &str,
+        address: &str,
+    ) -> Result<Option<(String, String)>> {
         let conn = self.lock();
         conn.query_row(
             "SELECT i.username, COALESCE(u.role, i.role)
@@ -199,7 +204,10 @@ impl Store {
     /// Remove every web session of one user (disable, reset).
     pub fn delete_web_sessions_for(&self, username: &str) -> Result<usize> {
         let conn = self.lock();
-        Ok(conn.execute("DELETE FROM web_sessions WHERE username = ?1", params![username])?)
+        Ok(conn.execute(
+            "DELETE FROM web_sessions WHERE username = ?1",
+            params![username],
+        )?)
     }
 }
 
@@ -271,8 +279,13 @@ mod tests {
         store.set_user_role("ana", "guest").unwrap();
         assert_eq!(store.get_user("ana").unwrap().unwrap().role, "guest");
         store.set_user_quota("ana", Some(2.5)).unwrap();
-        assert_eq!(store.get_user("ana").unwrap().unwrap().quota_daily_usd, Some(2.5));
-        store.set_user_password("ana", Some("$argon2id$v=19$...")).unwrap();
+        assert_eq!(
+            store.get_user("ana").unwrap().unwrap().quota_daily_usd,
+            Some(2.5)
+        );
+        store
+            .set_user_password("ana", Some("$argon2id$v=19$..."))
+            .unwrap();
         assert!(store.get_user("ana").unwrap().unwrap().pw_hash.is_some());
         store.set_user_password("ana", None).unwrap();
         assert!(store.get_user("ana").unwrap().unwrap().pw_hash.is_none());
@@ -305,6 +318,11 @@ mod tests {
         store.set_user_disabled("dev", true).unwrap();
         assert_eq!(store.identity_principal("telegram", "43").unwrap(), None);
         store.set_user_disabled("dev", false).unwrap();
-        assert!(store.identity_principal("telegram", "43").unwrap().is_some());
+        assert!(
+            store
+                .identity_principal("telegram", "43")
+                .unwrap()
+                .is_some()
+        );
     }
 }

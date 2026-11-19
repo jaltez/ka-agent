@@ -64,15 +64,18 @@ impl Runtime {
     }
 
     /// How many users currently have a live worker (`/status`, doctor and
-    /// the concurrency tests read it).
+    /// the concurrency tests read it). Scout children hold a pool slot too
+    /// and live outside the `users` map, so they are summed in here.
     pub fn live_worker_count(&self) -> usize {
-        self.sh
-            .users
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|st| st.lock().live.is_some())
-            .count()
+        self.scouts_live()
+            + self
+                .sh
+                .users
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .filter(|st| st.lock().live.is_some())
+                .count()
     }
 
     /// Lazily (re)start `who`'s worker with backoff and the crash-loop
@@ -82,7 +85,9 @@ impl Runtime {
         let state = self.ensure_user(who)?;
         // One spawn handshake at a time: the cross-user cap check and the
         // `live` claim must not interleave, or two simultaneous submits both
-        // observe a free slot and the ceiling is exceeded.
+        // observe a free slot and the ceiling is exceeded. A scout spawn
+        // claims its slot under this same lock (`live_worker_count` counts
+        // scouts, `runtime/scout.rs`).
         let _permit = self.sh.spawn_lock.lock().await;
         if state.lock().live.is_some() {
             return Ok(());
@@ -167,8 +172,10 @@ impl Runtime {
 
     /// Everything a worker spawn needs, computed under short locks: the
     /// isolation environment, the permission mode, the engine layer and the
-    /// strand to attach to. `Err` is operator-facing (a refused spec).
-    fn prepare_open(
+    /// strand to attach to. `Err` is operator-facing (a refused spec). A
+    /// scout child reuses this partitioning with its own fresh strand
+    /// (`runtime/scout.rs`).
+    pub(super) fn prepare_open(
         &self,
         who: &Principal,
         state: &UserHandle,
@@ -442,7 +449,9 @@ impl Runtime {
 
     /// Evict one idle worker (LRU): deliberate close, the session and strand
     /// persist, the owner's next message reopens it. Never evicts a user
-    /// mid-turn.
+    /// mid-turn, and never a scout child: scouts have no `users` entry, are
+    /// mid-research by definition, and release their own slot when the run
+    /// ends (`runtime/scout.rs`).
     pub(super) fn evict_lru_idle_worker(&self, requester: &str) -> bool {
         for (username, st) in self.users_by_activity() {
             if username == requester {

@@ -144,7 +144,9 @@ async fn stop_under_an_open_ask_does_not_swallow_the_next_message() {
     let steps = r#"{"text": "the answer"}"#;
     let (rt, store, rec, root) = runtime_with("abort", steps);
 
-    rt.handle_message("run the gated thing", "console").await.unwrap();
+    rt.handle_message("run the gated thing", "console")
+        .await
+        .unwrap();
     // The spend guard raises a card and parks the session in
     // awaiting_approval before the model gets to answer.
     wait_until("approval card", &rec, |evs| {

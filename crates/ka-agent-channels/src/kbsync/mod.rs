@@ -128,7 +128,10 @@ pub fn index_doc(
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(content.as_bytes());
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     if let Ok(docs) = store.kb_list_docs(kb)
         && let Some(existing) = docs.iter().find(|d| d.path == path)
@@ -143,10 +146,12 @@ pub fn index_doc(
 
 /// A token from the secret store (required by notion/dropbox).
 pub fn token_of(src: &KbSourceRow, secrets: &Path) -> Result<String, String> {
-    let name = src
-        .token_secret
-        .as_deref()
-        .ok_or_else(|| format!("{} source {}: token_secret is missing", src.kind, src.target))?;
+    let name = src.token_secret.as_deref().ok_or_else(|| {
+        format!(
+            "{} source {}: token_secret is missing",
+            src.kind, src.target
+        )
+    })?;
     ka_agent_core::secret::resolve(name, secrets)
         .map_err(|e| format!("{} secret {name}: {e}", src.kind))
 }

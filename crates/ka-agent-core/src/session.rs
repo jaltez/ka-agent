@@ -87,6 +87,10 @@ pub struct Session {
     pub private: bool,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// Hidden from session lists (`/archive`); the transcript, turns and
+    /// usage rows are untouched, and `/archive undo` restores it.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Session {
@@ -106,6 +110,7 @@ impl Session {
             username: username.to_string(),
             role: role.to_string(),
             private: false,
+            archived: false,
             created_ms: now,
             updated_ms: now,
         }

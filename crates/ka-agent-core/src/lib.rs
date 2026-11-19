@@ -40,7 +40,7 @@ pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use principal::Principal;
 pub use queue::QueueItem;
 pub use session::{Session, SessionStatus};
-pub use task::{CronMode, CronSpec, Task, TaskStatus};
+pub use task::{CronMode, CronSpec, Task, TaskStatus, TriggerKind, TriggerSpec};
 pub use time::{fmt_interval, parse_duration};
 pub use turn::{Turn, TurnStatus};
 pub use when::When;

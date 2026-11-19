@@ -74,6 +74,85 @@ impl Store {
         Ok(conn.execute("DELETE FROM queue WHERE id = ?1", params![id.as_str()])? > 0)
     }
 
+    /// Enqueue at the FRONT of the session's pending queue (A2 `/queue
+    /// top`/`now`): the new row stamps `head_ms - 1` so it sorts before
+    /// the current head (`enqueued_ms, id` order). No schema change.
+    pub fn enqueue_front(&self, item: &QueueItem) -> Result<()> {
+        let conn = self.lock();
+        let head: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(enqueued_ms) FROM queue WHERE session = ?1 AND turned IS NULL",
+                params![item.session.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)?
+            .flatten();
+        let mut stamped = item.clone();
+        stamped.enqueued_ms = head.unwrap_or_else(ka_agent_core::now_ms) - 1;
+        conn.execute(
+            "INSERT INTO queue(id, session, text, source, enqueued_ms, turned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                stamped.id.as_str(),
+                stamped.session.as_str(),
+                stamped.text,
+                stamped.source,
+                stamped.enqueued_ms,
+                stamped.turned.as_ref().map(|t| t.as_str())
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite one pending item's text (A2 `/queue edit`). Pending rows
+    /// only — a turned item's text is history and must not change.
+    /// `Ok(false)` when the id is unknown or already turned.
+    pub fn queue_set_text(&self, id: &QueueId, text: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE queue SET text = ?2 WHERE id = ?1 AND turned IS NULL",
+            params![id.as_str(), text],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Reorder the session's pending block so the named item lands at
+    /// 1-based position `to_pos` (A2 `/queue top|up|down`): the pending
+    /// rows' `enqueued_ms` are rewritten oldest-first in the new order
+    /// inside one transaction. `Ok(false)` when `id` is not a pending row
+    /// of this session or `to_pos` is out of range.
+    pub fn queue_reorder(&self, session: &SessionId, id: &QueueId, to_pos: usize) -> Result<bool> {
+        let conn = self.lock();
+        let mut pending: Vec<(QueueId, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, enqueued_ms FROM queue
+                 WHERE session = ?1 AND turned IS NULL
+                 ORDER BY enqueued_ms, id",
+            )?;
+            let rows = stmt.query_map(params![session.as_str()], |r| {
+                Ok((QueueId(r.get::<_, String>(0)?), r.get(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let Some(from) = pending.iter().position(|(qid, _)| qid == id) else {
+            return Ok(false);
+        };
+        let to = to_pos.saturating_sub(1).min(pending.len() - 1);
+        let moved = pending.remove(from);
+        let to = to.min(pending.len());
+        pending.insert(to, moved);
+        let tx = conn.unchecked_transaction()?;
+        for (pos, (qid, _)) in pending.iter().enumerate() {
+            tx.execute(
+                "UPDATE queue SET enqueued_ms = ?2 WHERE id = ?1",
+                params![qid.as_str(), pos as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Record that a queue item became a turn.
     pub fn mark_turned(&self, id: &QueueId, turn: &TurnId) -> Result<()> {
         let conn = self.lock();

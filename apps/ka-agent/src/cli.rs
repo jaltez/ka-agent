@@ -311,6 +311,10 @@ pub(crate) enum Command {
         /// One JSON document (`{ok, checks: [{level, text}]}`).
         #[arg(long)]
         json: bool,
+        /// Write a support diagnostics bundle (doctor lines, config, live
+        /// status, recent turns, daemon prompt layers) to <path>.
+        #[arg(long, value_name = "PATH")]
+        bundle: Option<PathBuf>,
     },
     /// Print a shell completion script (`source <(ka-agent completions bash)`).
     #[command(hide = true)]
@@ -533,6 +537,9 @@ pub(crate) enum ConfigAction {
         /// Emit the registry as JSON.
         #[arg(long)]
         json: bool,
+        /// Emit the published JSON Schema for the config file.
+        #[arg(long)]
+        json_schema: bool,
     },
 }
 

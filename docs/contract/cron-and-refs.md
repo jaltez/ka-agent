@@ -122,3 +122,42 @@ ICS support:
 - URL sources need the `http:get:<host>` grant (plus `http:get:private` for
   private targets) exactly like the `http_get` tool; file paths are the
   operator's own machine, unrestricted (read-only).
+
+## Triggers (ADR-0005)
+
+An inbound trigger is a `kind = "trigger"` task row whose payload is a
+`TriggerSpec` (beside `CronSpec`), fired by the same scheduler. Exactly two
+kinds:
+
+- `schedule` — the cron grammar (`when.rs`: `every day at 09:00`, fixed
+  intervals, one-shots) with the optional zero-token shell `gate`; quiet
+  hours defer a scheduled fire exactly like a cron's.
+- `webhook` — fires when a delivery to `POST /api/hook/<hook-path>` is
+  accepted (see `web-ui.md`'s hook row): per-trigger secret as the only
+  auth, 16 KiB default / 64 KiB max body cap, optional regex `filter`
+  over the normalized body (match → fire; no match answers
+  `{"ok":true,"filtered":true}` and arms nothing), idempotency by the
+  sender's `event.id` (`X-Event-ID` header, else the body's
+  `id`/`event.id`) in the `trigger_events` table — replays answer
+  `{"ok":true,"dup":true}`.
+
+Both kinds run as their creator, under the cron identity rule verbatim:
+the role is re-resolved from the user row at fire time and `tools` are
+re-clamped against it — a demoted user's trigger narrows at the next fire,
+never widens. Every fire submits into the trigger's pinned lineage
+session (one session row per trigger, strand resumed across fires), never
+the creator's live chat; the turn's source is `trigger:<task id>`.
+
+Degradation contract: every fire appends a `runs` row
+(`kind = "trigger"`, `ref_id` = task id; the preflight gate adds
+`kind = "preflight"` rows for its own spend). Consecutive failed fires
+count on the spec (`error_streak`); at 3 (`TriggerSpec::ERROR_STRIKES`)
+the task pauses as `interrupted` with exactly one Error notice
+(`ka-agent cron resume <short>` re-arms it — a webhook delivers its
+queued event then); a success resets the streak. Per-trigger in-flight
+cap 1: a fire while the lineage session still holds a queued or running
+turn records `skipped: previous run still in flight` and does not stack;
+a *delivered event* is durable (`queue` rows on the lineage session) and
+delivers on the next armed fire. The optional preflight gate (cheap LLM
+triage, no memory/tools, scratch engine-home) answers `[SKIP]`/`[RUN]`
+and fails open.

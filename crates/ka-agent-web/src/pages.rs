@@ -198,10 +198,7 @@ pub fn admin_shell(active: &str, title: &str, subtitle: &str, body: String) -> R
         .iter()
         .map(|(href, label)| {
             let class = if *href == active { " class=active" } else { "" };
-            format!(
-                "<a href=\"{href}\"{class}>{}</a>",
-                escape_html(label)
-            )
+            format!("<a href=\"{href}\"{class}>{}</a>", escape_html(label))
         })
         .collect();
     let body = format!(
@@ -1397,7 +1394,7 @@ pub fn doctor(runtime: &Runtime) -> crate::Response {
         format!("state.db schema v{version}, {} sessions", {
             runtime
                 .store()
-                .list_recent_sessions(1000)
+                .list_recent_sessions(1000, false)
                 .map(|s| s.len())
                 .unwrap_or(0)
         }),
@@ -2374,12 +2371,7 @@ fn attachment_type(name: &str) -> (&'static str, bool) {
 /// `GET /file/<name>`: one attachment of the caller's role. Only direct
 /// children of that role's `attachments/` are served (traversal and
 /// symlinks are refused).
-pub fn serve_file(
-    runtime: &Runtime,
-    role: &str,
-    username: &str,
-    raw: &str,
-) -> crate::Response {
+pub fn serve_file(runtime: &Runtime, role: &str, username: &str, raw: &str) -> crate::Response {
     let Some(name) = upload_name(raw) else {
         return Response::bad_request("bad file name");
     };
@@ -3201,11 +3193,7 @@ pub async fn memory_forget(runtime: &Runtime, body: &str) -> crate::Response {
 }
 
 /// The fetch path of the approval card buttons (chat.js).
-pub async fn approvals_decide_json(
-    runtime: &Runtime,
-    body: &str,
-    source: &str,
-) -> crate::Response {
+pub async fn approvals_decide_json(runtime: &Runtime, body: &str, source: &str) -> crate::Response {
     let id = form_field(body, "id");
     let decision = match form_field(body, "decision").as_str() {
         "y" => ApprovalDecision::Allow,
@@ -3682,11 +3670,7 @@ pub fn approvals(
     )
 }
 
-pub async fn approvals_decide(
-    runtime: &Runtime,
-    body: &str,
-    source: &str,
-) -> crate::Response {
+pub async fn approvals_decide(runtime: &Runtime, body: &str, source: &str) -> crate::Response {
     let id = form_field(body, "id");
     if form_field(body, "decision") == "session" {
         return match runtime.decide_for_session(&id, source).await {

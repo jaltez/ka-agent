@@ -95,7 +95,11 @@ pub(super) async fn run_gateway(
             }
         }),
     };
-    if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
+    if ws
+        .send(Message::Text(payload.to_string().into()))
+        .await
+        .is_err()
+    {
         return GatewayEnd::Reconnect(session);
     }
     loop {
@@ -212,9 +216,9 @@ impl DiscordChannel {
         };
         let content = d["content"].as_str().unwrap_or("").to_string();
         let bot = self.bot_user();
-        let mentions_bot = bot
-            .as_ref()
-            .is_some_and(|b| content.contains(&format!("<@{b}>")) || content.contains(&format!("<@!{b}>")));
+        let mentions_bot = bot.as_ref().is_some_and(|b| {
+            content.contains(&format!("<@{b}>")) || content.contains(&format!("<@!{b}>"))
+        });
         let (principal, text) = if is_dm {
             (own.clone(), content)
         } else {
@@ -241,27 +245,26 @@ impl DiscordChannel {
         // Attachments land in the acting account's workspace.
         if let Some(files) = d["attachments"].as_array() {
             for file in files.iter().take(10) {
-                if let (Some(url), Some(name)) =
-                    (file["url"].as_str(), file["filename"].as_str())
+                if let (Some(url), Some(name)) = (file["url"].as_str(), file["filename"].as_str())
                     && let Ok(bytes) = self.client.download(url).await
-                        && bytes.len() <= 8 * 1024 * 1024
-                    {
-                        let dir = self.runtime.workspace_for(&principal).join("attachments");
-                        let _ = std::fs::create_dir_all(&dir);
-                        let safe: String = name
-                            .chars()
-                            .map(|c| {
-                                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                                    c
-                                } else {
-                                    '_'
-                                }
-                            })
-                            .collect();
-                        if std::fs::write(dir.join(&safe), &bytes).is_ok() {
-                            text.push_str(&format!("\n@attachments/{safe}"));
-                        }
+                    && bytes.len() <= 8 * 1024 * 1024
+                {
+                    let dir = self.runtime.workspace_for(&principal).join("attachments");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let safe: String = name
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                                c
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect();
+                    if std::fs::write(dir.join(&safe), &bytes).is_ok() {
+                        text.push_str(&format!("\n@attachments/{safe}"));
                     }
+                }
             }
         }
         self.remember_target(
@@ -315,7 +318,11 @@ impl DiscordChannel {
         let token = d["token"].as_str().unwrap_or("");
         match self.runtime.decide(approval, decision, &source).await {
             Ok(()) => {
-                let content = if approve { "✅ approved" } else { "❌ denied" };
+                let content = if approve {
+                    "✅ approved"
+                } else {
+                    "❌ denied"
+                };
                 let _ = self
                     .client
                     .interaction_callback(
@@ -345,4 +352,3 @@ impl DiscordChannel {
         }
     }
 }
-

@@ -165,7 +165,8 @@ async fn recurring_cron_skips_missed_occupations() {
     rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
 
     let now = ka_agent_core::now_ms();
-    rt.add_cron(spec("tick", Some(1_000)), now - 5_000, &op()).unwrap();
+    rt.add_cron(spec("tick", Some(1_000)), now - 5_000, &op())
+        .unwrap();
     rt.fire_due_tasks().await.unwrap();
 
     let after = ka_agent_core::now_ms();
@@ -197,7 +198,8 @@ async fn failing_no_agent_cron_fails_without_rearm() {
     let now = ka_agent_core::now_ms();
     // A long recurrence: a 1 s one can be overtaken by wall-clock drift
     // on a loaded box and get skipped as "missed" instead of run.
-    rt.add_cron(spec("bad", Some(60_000)), now - 1, &op()).unwrap();
+    rt.add_cron(spec("bad", Some(60_000)), now - 1, &op())
+        .unwrap();
     rt.fire_due_tasks().await.unwrap();
 
     assert!(
@@ -266,7 +268,9 @@ async fn concurrent_cancel_wins_over_rearm() {
     rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
 
     let now = ka_agent_core::now_ms();
-    let id = rt.add_cron(spec("tick", Some(60_000)), now - 1, &op()).unwrap();
+    let id = rt
+        .add_cron(spec("tick", Some(60_000)), now - 1, &op())
+        .unwrap();
 
     // Simulate the fire loop having claimed the row (queued -> running)…
     assert!(store.claim_task(&id).unwrap(), "first claim takes the row");
@@ -440,7 +444,9 @@ async fn agent_cron_without_a_model_pauses_and_records_a_blocked_run() {
     let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
     let mut agent = spec("summarise my inbox", Some(3_600_000));
     agent.mode = CronMode::Agent;
-    let id = rt.add_cron(agent, ka_agent_core::now_ms() - 1, &op()).unwrap();
+    let id = rt
+        .add_cron(agent, ka_agent_core::now_ms() - 1, &op())
+        .unwrap();
     rt.fire_due_tasks().await.unwrap();
 
     let task = store.get_task(&id).unwrap().unwrap();
@@ -472,7 +478,11 @@ async fn every_fire_leaves_a_run_row() {
     let rt = runtime_with(&root, Arc::clone(&store), Arc::clone(&notes));
     rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
     let id = rt
-        .add_cron(spec("tick", Some(3_600_000)), ka_agent_core::now_ms() - 1, &op())
+        .add_cron(
+            spec("tick", Some(3_600_000)),
+            ka_agent_core::now_ms() - 1,
+            &op(),
+        )
         .unwrap();
     rt.fire_due_tasks().await.unwrap();
     let runs = store.runs_for(id.as_str(), 10).unwrap();
@@ -566,7 +576,9 @@ async fn quiet_hours_defer_crons_but_not_reminders() {
     .unwrap();
     rt.set_no_agent_handler("echo", Arc::new(|arg: &str| Ok(format!("echo[{arg}]"))));
     let due = ka_agent_core::now_ms() - 1;
-    let cron = rt.add_cron(spec("nightly", Some(3_600_000)), due, &op()).unwrap();
+    let cron = rt
+        .add_cron(spec("nightly", Some(3_600_000)), due, &op())
+        .unwrap();
     let mut reminder = ka_agent_core::Task::new("drink water".into(), "reminder", false);
     reminder.scheduled_at_ms = Some(due);
     store.insert_task(&reminder).unwrap();
@@ -624,7 +636,9 @@ async fn cron_gates_skip_and_inject() {
 
     let mut spec2 = spec("report", Some(60_000));
     spec2.gate = Some("echo build red".into());
-    let ok = rt.add_cron(spec2, ka_agent_core::now_ms() - 1, &op()).unwrap();
+    let ok = rt
+        .add_cron(spec2, ka_agent_core::now_ms() - 1, &op())
+        .unwrap();
     let fired = rt.fire_due_tasks().await.unwrap();
     assert_eq!(fired.len(), 1, "a passing gate fires once");
     // The job ran (the NoAgent handler's output is the notice).

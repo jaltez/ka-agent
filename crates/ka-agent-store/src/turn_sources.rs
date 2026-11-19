@@ -64,8 +64,7 @@ impl Store {
         if raw.is_empty() {
             return 0;
         }
-        let mut batches: Vec<Vec<StagedSource>> =
-            serde_json::from_str(&raw).unwrap_or_default();
+        let mut batches: Vec<Vec<StagedSource>> = serde_json::from_str(&raw).unwrap_or_default();
         let Some(sources) = (!batches.is_empty()).then(|| batches.remove(0)) else {
             return 0;
         };
@@ -188,7 +187,12 @@ mod tests {
             .unwrap();
         // Same source recorded twice keeps one row.
         store
-            .record_turn_source("turn_1", "kb", "kb:docs/a.md", &["dev".into(), "ops".into()])
+            .record_turn_source(
+                "turn_1",
+                "kb",
+                "kb:docs/a.md",
+                &["dev".into(), "ops".into()],
+            )
             .unwrap();
         let rows = store.turn_sources("turn_1").unwrap();
         assert_eq!(rows.len(), 2);

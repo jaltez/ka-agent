@@ -94,7 +94,10 @@ impl Store {
     /// sweep is cheap and keeps the table from growing without a timer).
     pub fn web_session_user(&self, token_hash: &str, now_ms: i64) -> Result<Option<String>> {
         let conn = self.lock();
-        conn.execute("DELETE FROM web_sessions WHERE expires_ms <= ?1", params![now_ms])?;
+        conn.execute(
+            "DELETE FROM web_sessions WHERE expires_ms <= ?1",
+            params![now_ms],
+        )?;
         conn.query_row(
             "SELECT username FROM web_sessions WHERE token_hash = ?1",
             params![token_hash],
@@ -107,7 +110,10 @@ impl Store {
     /// Delete every expired session; returns how many rows went away.
     pub fn sweep_web_sessions(&self, now_ms: i64) -> Result<usize> {
         let conn = self.lock();
-        Ok(conn.execute("DELETE FROM web_sessions WHERE expires_ms <= ?1", params![now_ms])?)
+        Ok(conn.execute(
+            "DELETE FROM web_sessions WHERE expires_ms <= ?1",
+            params![now_ms],
+        )?)
     }
 
     pub fn delete_web_session(&self, token_hash: &str) -> Result<bool> {
@@ -184,8 +190,9 @@ impl Store {
 
     pub fn list_invites(&self) -> Result<Vec<InviteRow>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare(&format!("SELECT {INVITE_COLS} FROM invites ORDER BY created_ms DESC"))?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {INVITE_COLS} FROM invites ORDER BY created_ms DESC"
+        ))?;
         let rows = stmt.query_map([], row_to_invite)?;
         collect_rows(rows)
     }
@@ -214,15 +221,22 @@ mod tests {
     fn web_sessions_resolve_and_expire() {
         let store = Store::open_in_memory().unwrap();
         operator(&store);
-        store.insert_web_session("h1", "operator", 1_000, 2_000).unwrap();
-        store.insert_web_session("h2", "operator", 1_000, 5_000).unwrap();
+        store
+            .insert_web_session("h1", "operator", 1_000, 2_000)
+            .unwrap();
+        store
+            .insert_web_session("h2", "operator", 1_000, 5_000)
+            .unwrap();
         assert_eq!(
             store.web_session_user("h1", 1_500).unwrap().as_deref(),
             Some("operator")
         );
         // Reading past the expiry sweeps the row and answers nothing.
         assert_eq!(store.web_session_user("h1", 2_000).unwrap(), None);
-        assert_eq!(store.web_session_user("h2", 2_000).unwrap().as_deref(), Some("operator"));
+        assert_eq!(
+            store.web_session_user("h2", 2_000).unwrap().as_deref(),
+            Some("operator")
+        );
         assert_eq!(store.list_web_sessions().unwrap().len(), 1);
         assert_eq!(store.delete_web_sessions_for("operator").unwrap(), 1);
         assert_eq!(store.web_session_user("h2", 2_500).unwrap(), None);
@@ -246,7 +260,10 @@ mod tests {
         store.insert_invite(&invite).unwrap();
         assert_eq!(store.list_invites().unwrap(), vec![invite.clone()]);
 
-        assert_eq!(store.invite_verdict("nope", 1_500).unwrap(), InviteVerdict::Unknown);
+        assert_eq!(
+            store.invite_verdict("nope", 1_500).unwrap(),
+            InviteVerdict::Unknown
+        );
         match store.invite_verdict("c1", 1_500).unwrap() {
             InviteVerdict::Valid(row) => {
                 assert_eq!(row.groups, vec!["dev"]);

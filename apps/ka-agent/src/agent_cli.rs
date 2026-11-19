@@ -89,18 +89,19 @@ pub fn agent_action(action: AgentAction) -> ExitCode {
             };
             match store.create_agent(&agent) {
                 Ok(()) => {
-                    audit(&store, "agent.create", &name, Some(format!("owner {owner}")));
+                    audit(
+                        &store,
+                        "agent.create",
+                        &name,
+                        Some(format!("owner {owner}")),
+                    );
                     println!("created agent {name}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e),
             }
         }
-        AgentAction::Share {
-            name,
-            group,
-            level,
-        } => {
+        AgentAction::Share { name, group, level } => {
             if !matches!(level.as_str(), "viewer" | "editor" | "owner") {
                 return fail("level must be viewer, editor or owner");
             }

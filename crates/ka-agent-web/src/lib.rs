@@ -393,7 +393,8 @@ impl LoginError {
         match self {
             LoginError::Credentials => "wrong username or password".to_string(),
             LoginError::Locked => {
-                "too many attempts — wait 15 minutes or ask an admin to reset the password".to_string()
+                "too many attempts — wait 15 minutes or ask an admin to reset the password"
+                    .to_string()
             }
             LoginError::Invite(reason) => reason.clone(),
         }
@@ -678,18 +679,15 @@ impl Auth {
             let _ = store.ensure_group(group);
             let _ = store.add_user_group(&username, group);
         }
-        if !store.consume_invite(&code_hash, ka_agent_core::now_ms()).unwrap_or(false) {
+        if !store
+            .consume_invite(&code_hash, ka_agent_core::now_ms())
+            .unwrap_or(false)
+        {
             // Someone else consumed it between the verdict and here.
             return Err(LoginError::Invite("invite code already used".into()));
         }
         // The account is reachable from the panel's own identity source.
-        let _ = store.link_identity_to_user(
-            "web",
-            &username,
-            "invite",
-            &invite.role,
-            &username,
-        );
+        let _ = store.link_identity_to_user("web", &username, "invite", &invite.role, &username);
         let mut rec = ka_agent_core::AuditRecord::new(
             "web",
             "invite.redeem",
@@ -911,6 +909,14 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
     // Local triggers (plan 2.7): POST /api/notify and POST /api/ask take
     // `Authorization: Bearer <web.api_token>` instead of the panel cookie.
     // No secret configured → 404 (the API is off, not forbidden).
+    // Webhook triggers (ADR-0005) get their own lane BEFORE the bearer
+    // lane: inside `api_route` the shared-token gate and its `text`-shaped
+    // body parse run before path dispatch, so a hook there would demand
+    // the global token. The per-trigger secret is the hook lane's only
+    // auth; `web.api_token` presented to a hook is just a wrong bearer.
+    if let Some(prefix) = req.path.strip_prefix("/api/hook/") {
+        return hook_route(prefix, req, runtime, store).await;
+    }
     if req.path.starts_with("/api/") {
         return api_route(req, runtime, store).await;
     }
@@ -1136,11 +1142,9 @@ async fn route(req: &Request, auth: &Auth, runtime: &Runtime, store: &Arc<Store>
             let body = String::from_utf8_lossy(&req.body).into_owned();
             pages::profile_action("remove", &body).await
         }
-        ("GET", "/usage") => pages::usage(
-            runtime,
-            store,
-            req.query.get("format").map(String::as_str),
-        ),
+        ("GET", "/usage") => {
+            pages::usage(runtime, store, req.query.get("format").map(String::as_str))
+        }
         ("POST", "/settings") => {
             let body = String::from_utf8_lossy(&req.body).into_owned();
             pages::settings_apply(runtime, &body).await
@@ -1357,7 +1361,6 @@ pub fn escape_html(text: &str) -> String {
 /// Bearer-only; 404 when no token is configured; 16 KiB bodies; a small
 /// per-process token bucket (30/min).
 async fn api_route(req: &Request, runtime: &Runtime, _store: &Arc<Store>) -> Response {
-    use std::sync::atomic::{AtomicU64, Ordering};
     if req.method != "POST" {
         return Response::base(405, "application/json", "{}".into());
     }
@@ -1379,16 +1382,7 @@ async fn api_route(req: &Request, runtime: &Runtime, _store: &Arc<Store>) -> Res
             "{\"error\":\"unauthorized\"}".into(),
         );
     }
-    // 30 requests/min token bucket (process-wide).
-    static WINDOW: AtomicU64 = AtomicU64::new(0);
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let now_s = ka_agent_core::now_ms() as u64 / 1000;
-    let window = WINDOW.load(Ordering::Relaxed);
-    if now_s / 60 != window / 60 || window == 0 {
-        WINDOW.store(now_s, Ordering::Relaxed);
-        COUNT.store(0, Ordering::Relaxed);
-    }
-    if COUNT.fetch_add(1, Ordering::Relaxed) >= 30 {
+    if !rate_bucket_allow() {
         return Response::base(429, "application/json", "{\"error\":\"slow down\"}".into());
     }
     if req.body.len() > 16 * 1024 {
@@ -1436,6 +1430,179 @@ async fn api_route(req: &Request, runtime: &Runtime, _store: &Arc<Store>) -> Res
         }
         _ => Response::base(404, "application/json", "{}".into()),
     }
+}
+
+/// 30 requests/min token bucket, process-wide, shared by the bearer lane
+/// and the hook lane (ADR-0005 §6: one bucket — a burst through either
+/// degrades both).
+fn rate_bucket_allow() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WINDOW: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let now_s = ka_agent_core::now_ms() as u64 / 1000;
+    let window = WINDOW.load(Ordering::Relaxed);
+    if now_s / 60 != window / 60 || window == 0 {
+        WINDOW.store(now_s, Ordering::Relaxed);
+        COUNT.store(0, Ordering::Relaxed);
+    }
+    COUNT.fetch_add(1, Ordering::Relaxed) < 30
+}
+
+/// The sender's dedupe key (ADR-0005 §5): `X-Event-ID` first, then the
+/// body's `id`, `event.id` or `event_id` (string or number). `None` =
+/// the sender gave nothing to dedupe on.
+fn event_id_of(req: &Request, body: &serde_json::Value) -> Option<String> {
+    if let Some(id) = req
+        .headers_get("x-event-id")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(id.to_string());
+    }
+    let candidate = body
+        .get("id")
+        .or_else(|| body.get("event_id"))
+        .or_else(|| body.get("event").and_then(|e| e.get("id")));
+    match candidate {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// `POST /api/hook/<trigger-prefix>` (ADR-0005): the webhook ingress lane.
+/// The per-trigger secret is the lane's only auth — the shared
+/// `web.api_token` plays no part here. Order of evaluation is the
+/// security contract: unknown path → 404; the trigger's secret
+/// unresolved → 404 (off, not forbidden — never a probe oracle); wrong
+/// bearer → 401; then the shared 30/min bucket, the body cap, the
+/// regex filter (match → fire) and the `event.id` dedupe. `200` always
+/// means queued or intentionally ignored (at-least-once above that).
+async fn hook_route(
+    prefix: &str,
+    req: &Request,
+    runtime: &Runtime,
+    store: &Arc<Store>,
+) -> Response {
+    let prefix = prefix.trim_end_matches('/');
+    if req.method != "POST" || prefix.is_empty() {
+        return Response::base(405, "application/json", "{}".into());
+    }
+    let resolved = match runtime.trigger_for_hook(prefix) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            return Response::base(
+                500,
+                "application/json",
+                format!("{{\"error\":{}}}", serde_json::Value::String(e.to_string())),
+            );
+        }
+    };
+    let Some((task, spec)) = resolved else {
+        return Response::base(404, "application/json", "{}".into());
+    };
+    // The per-trigger secret: one `secret:` ref per trigger (ADR-0005
+    // §4), defaulting to `trigger.<hook-path>` — path separators become
+    // dashes, since a secret ref is a flat `secrets/` filename.
+    // Unresolved → 404: the hook is off, and the global token does not
+    // rescue it.
+    let secret_name = spec
+        .secret
+        .clone()
+        .unwrap_or_else(|| default_secret_name(prefix));
+    let secret = match ka_agent_core::secret::resolve(
+        &secret_name,
+        &ka_agent_core::layout::default_root().join("secrets"),
+    ) {
+        Ok(s) => s,
+        Err(_) => return Response::base(404, "application/json", "{}".into()),
+    };
+    let token = req
+        .headers_get("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_time_eq(token.as_bytes(), secret.trim().as_bytes()) {
+        return Response::base(
+            401,
+            "application/json",
+            "{\"error\":\"unauthorized\"}".into(),
+        );
+    }
+    if !rate_bucket_allow() {
+        return Response::base(429, "application/json", "{\"error\":\"slow down\"}".into());
+    }
+    if req.body.len() > spec.body_cap() {
+        return Response::base(413, "application/json", "{}".into());
+    }
+    let body_text = String::from_utf8_lossy(&req.body).trim().to_string();
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
+    let Some(event_id) = event_id_of(req, &body) else {
+        return Response::base(
+            400,
+            "application/json",
+            "{\"error\":\"event id required\"}".into(),
+        );
+    };
+    // Filter over the normalized body: match → fire, no match → ignored
+    // (200, no turn). A broken pattern is a config error, not traffic.
+    if let Some(pattern) = &spec.filter {
+        let re = match regex::Regex::new(pattern) {
+            Ok(re) => re,
+            Err(e) => {
+                return Response::base(
+                    500,
+                    "application/json",
+                    format!(
+                        "{{\"error\":{}}}",
+                        serde_json::Value::String(format!("bad trigger filter: {e}"))
+                    ),
+                );
+            }
+        };
+        if !re.is_match(&body_text) {
+            return Response::base(
+                200,
+                "application/json",
+                "{\"ok\":true,\"filtered\":true}".into(),
+            );
+        }
+    }
+    // Idempotency by event id: insert-or-ignore decides (Amp's contract
+    // — 200 = queued, replays answer dup and arm nothing).
+    match store.record_trigger_event(&event_id, task.id.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Response::base(200, "application/json", "{\"ok\":true,\"dup\":true}".into());
+        }
+        Err(e) => {
+            return Response::base(
+                500,
+                "application/json",
+                format!("{{\"error\":{}}}", serde_json::Value::String(e.to_string())),
+            );
+        }
+    }
+    match runtime.arm_trigger(&task, &spec, &body_text) {
+        Ok(()) => Response::base(
+            200,
+            "application/json",
+            "{\"ok\":true,\"queued\":true}".into(),
+        ),
+        Err(e) => Response::base(
+            500,
+            "application/json",
+            format!("{{\"error\":{}}}", serde_json::Value::String(e.to_string())),
+        ),
+    }
+}
+
+/// The default `secret:` ref for a webhook trigger (ADR-0005 §4):
+/// `trigger.<hook-path>`, with path/URL separators flattened to dashes —
+/// secret refs are flat `secrets/` filenames, and a hook path may carry
+/// slashes (`ci/ping`, `github/label`).
+fn default_secret_name(prefix: &str) -> String {
+    format!("trigger.{}", prefix.replace(['/', ':'], "-"))
 }
 
 /// Length-independent comparison for the bearer token.
@@ -1554,7 +1721,11 @@ mod tests {
         ));
         // A fresh limiter (daemon restart) lets the right password in.
         let auth = Auth::new();
-        assert!(auth.login(&store, "ana", "correct horse battery").unwrap().is_some());
+        assert!(
+            auth.login(&store, "ana", "correct horse battery")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1602,9 +1773,10 @@ mod tests {
         assert!(verify_password("newpassword", &phc));
         assert!(!verify_password("old-password", &phc));
         // Single use.
-        assert!(auth
-            .redeem_invite(&store, &code, "ana", "another-password")
-            .is_err());
+        assert!(
+            auth.redeem_invite(&store, &code, "ana", "another-password")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1654,5 +1826,4 @@ mod tests {
             Err(LoginError::Invite(_))
         ));
     }
-
 }

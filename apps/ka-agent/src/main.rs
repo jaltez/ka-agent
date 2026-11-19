@@ -3,9 +3,9 @@
 //! hidden `__worker` / `__mcp` subcommands the runtime and engine supervise.
 
 mod admin;
+mod agent_cli;
 mod bridge;
 mod briefing_cli;
-mod agent_cli;
 mod chat;
 mod cli;
 mod config_cli;
@@ -37,16 +37,16 @@ mod skills_cli;
 mod term;
 mod triggers_cli;
 mod update_cli;
-mod user_cli;
 mod usage_cli;
+mod user_cli;
 
 use clap::Parser as _;
 use std::path::PathBuf;
 
 pub(crate) use cli::{
-    AgentAction, ApprovalsAction, BriefingAction, ConfigAction, CronAction, GrantAction, IdentityAction,
-    ImportAction, KbAction, KbSourceAction, McpAction, MemoryAction, PluginAction, ProfileAction,
-    SkillsAction, UpdateAction, UserAction,
+    AgentAction, ApprovalsAction, BriefingAction, ConfigAction, CronAction, GrantAction,
+    IdentityAction, ImportAction, KbAction, KbSourceAction, McpAction, MemoryAction, PluginAction,
+    ProfileAction, SkillsAction, UpdateAction, UserAction,
 };
 use cli::{Cli, Command};
 
@@ -390,8 +390,8 @@ fn main() -> std::process::ExitCode {
                 config_cli::ConfigCommand::Edit,
                 config_path(&cfg2.or(config)),
             ),
-            ConfigAction::Schema { json } => config_cli::config(
-                config_cli::ConfigCommand::Schema { json },
+            ConfigAction::Schema { json, json_schema } => config_cli::config(
+                config_cli::ConfigCommand::Schema { json, json_schema },
                 config_path(&config),
             ),
         },
@@ -440,6 +440,7 @@ fn main() -> std::process::ExitCode {
             online,
             json,
             fix,
-        } => doctor::doctor(config_path(&config), online, json, fix),
+            bundle,
+        } => doctor::doctor(config_path(&config), online, json, fix, bundle),
     }
 }

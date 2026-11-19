@@ -261,7 +261,10 @@ fn stop_escalates_on_the_turn_not_the_process() {
 
     // No live worker: a no-op, not an error.
     futures_lite_block(rt.stop_turn(&op(), "test")).unwrap();
-    assert_eq!(rt.session_status_for(&op()), ka_agent_core::SessionStatus::Idle);
+    assert_eq!(
+        rt.session_status_for(&op()),
+        ka_agent_core::SessionStatus::Idle
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -306,7 +309,9 @@ async fn waking_message_does_not_overtake_the_durable_queue() {
     let _ = rt.handle_message("sent after the restart", "console").await;
 
     // The new message went behind the old one, not in front of it.
-    let queued = store.queued_items(&rt.session_id_for(&op()).unwrap()).unwrap();
+    let queued = store
+        .queued_items(&rt.session_id_for(&op()).unwrap())
+        .unwrap();
     let texts: Vec<&str> = queued.iter().map(|q| q.text.as_str()).collect();
     assert_eq!(
         texts,
@@ -314,6 +319,9 @@ async fn waking_message_does_not_overtake_the_durable_queue() {
         "queue order after the waking message"
     );
     // And the session is not wedged in `running` by the failed spawn.
-    assert_eq!(rt.session_status_for(&op()), ka_agent_core::SessionStatus::Idle);
+    assert_eq!(
+        rt.session_status_for(&op()),
+        ka_agent_core::SessionStatus::Idle
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

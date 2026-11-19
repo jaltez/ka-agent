@@ -159,7 +159,7 @@ mod tests {
         let fresh = now - day;
         store.insert_session(&crate::session()).unwrap();
         let s = store
-            .list_recent_sessions(1)
+            .list_recent_sessions(1, true)
             .unwrap()
             .pop()
             .map(|sess| sess.id.to_string())

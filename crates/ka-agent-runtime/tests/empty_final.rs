@@ -196,7 +196,9 @@ async fn reasoning_only_reply_nudges_then_delivers_the_give_up() {
         "the silent family is distinguishable in telemetry; turns: {turns:?}"
     );
     assert!(
-        turns.iter().all(|t| t.status == ka_agent_core::TurnStatus::Done),
+        turns
+            .iter()
+            .all(|t| t.status == ka_agent_core::TurnStatus::Done),
         "usage accounting still lands; turns: {turns:?}"
     );
     // The give-up is durable: one outbox chunk on the nudge turn, sent.

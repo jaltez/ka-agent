@@ -183,7 +183,11 @@ pub fn user_action(action: UserAction) -> ExitCode {
                     n
                 })
                 .unwrap_or(0);
-            audit("user.disable", &username, Some(format!("{paused} cron(s) paused")));
+            audit(
+                "user.disable",
+                &username,
+                Some(format!("{paused} cron(s) paused")),
+            );
             println!(
                 "disabled {username}: web sessions dropped, identities silent, {paused} cron(s) paused; its memory stays (export/purge decide its fate)"
             );
@@ -191,7 +195,9 @@ pub fn user_action(action: UserAction) -> ExitCode {
         }
         UserAction::Enable { username } => {
             if store.get_user(&username).ok().flatten().is_none() {
-                return fail(format!("no account {username} — `ka-agent user add {username}` first"));
+                return fail(format!(
+                    "no account {username} — `ka-agent user add {username}` first"
+                ));
             }
             if let Err(e) = store.set_user_disabled(&username, false) {
                 return fail(e);
@@ -200,7 +206,11 @@ pub fn user_action(action: UserAction) -> ExitCode {
                 .resume_user_crons(&username)
                 .map_err(fail)
                 .unwrap_or(0);
-            audit("user.enable", &username, Some(format!("{resumed} cron(s) resumed")));
+            audit(
+                "user.enable",
+                &username,
+                Some(format!("{resumed} cron(s) resumed")),
+            );
             println!(
                 "enabled {username}{}",
                 if resumed > 0 {
@@ -308,7 +318,9 @@ pub fn user_action(action: UserAction) -> ExitCode {
                 ));
             }
             if user_ops::latest_export(&paths, &username).is_none() {
-                eprintln!("ka-agent: warning: no export on record for {username} — this is irreversible");
+                eprintln!(
+                    "ka-agent: warning: no export on record for {username} — this is irreversible"
+                );
             }
             match user_ops::purge_user(&paths, &username) {
                 Ok(removed) => {
@@ -389,11 +401,14 @@ pub fn kb_action(action: KbAction) -> ExitCode {
             if let Err(e) = store.set_kb_access(&name, &groups) {
                 return fail(e);
             }
-            println!("created {name}{}", if groups.is_empty() {
-                " (no groups yet: only the owner and admins read it)".to_string()
-            } else {
-                format!(" readable by {}", groups.join(","))
-            });
+            println!(
+                "created {name}{}",
+                if groups.is_empty() {
+                    " (no groups yet: only the owner and admins read it)".to_string()
+                } else {
+                    format!(" readable by {}", groups.join(","))
+                }
+            );
             ExitCode::SUCCESS
         }
         KbAction::Add {
@@ -403,7 +418,9 @@ pub fn kb_action(action: KbAction) -> ExitCode {
             title,
         } => {
             if store.get_kb(&kb).ok().flatten().is_none() {
-                return fail(format!("no knowledge base {kb} — `ka-agent kb create {kb}`"));
+                return fail(format!(
+                    "no knowledge base {kb} — `ka-agent kb create {kb}`"
+                ));
             }
             let ext = path
                 .extension()
@@ -608,10 +625,7 @@ fn kb_source_action(action: crate::KbSourceAction) -> ExitCode {
             let secrets = paths.root().join("secrets");
             let mut failed = false;
             for src in selected {
-                let key = format!(
-                    "kbsync:last:{}:{}:{}",
-                    src.kb_name, src.kind, src.target
-                );
+                let key = format!("kbsync:last:{}:{}:{}", src.kb_name, src.kind, src.target);
                 // A manual sync clears a prior failure.
                 let _ = store.meta_set(&format!("{key}:error"), "");
                 let _ = store.meta_set(&key, &ka_agent_core::now_ms().to_string());

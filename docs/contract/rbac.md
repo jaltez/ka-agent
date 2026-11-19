@@ -139,6 +139,7 @@ default_role = "member"             # role an auto-provisioned user gets
 | --- | --- | --- |
 | Spawn | `[features] disable` = `[tools]` + role `disable`, merged under the operator layer, cross-checked with the engine parser | worker refuses to spawn, spec named |
 | Turn | `Submit.allowed_tools` = role `allow` (or cron `tools` ∩ role allow) | tool filtered from the model specs and rejected at admit |
+| Scout | the child opens through the parent user's `prepare_open` (same HOME/`KA_DATA_DIR`/grants, its own partition) on a fresh strand in `readonly` mode; `Submit.allowed_tools` = the role allowlist ∩ `read, glob, grep, web_search, web_fetch`, and an empty intersection is an empty allowlist (never `null` = every tool). It sees the question, not the parent transcript. A scout answer is labeled non-authoritative by contract | a child ask is denied fail-closed (audited); a full worker pool or scout queue answers busy, it never spawns past the cap |
 | Mode | role `mode` ceiling; worker re-asserts it after strand replay | a looser `/mode` clamps to the ceiling |
 | Commands | role `commands` + `help`/`status` floor; `update`, `keys`, `quit`, `persona`, `config` are admin-only whatever the list says; `model` follows the group allowlist | one-line refusal |
 | Files | `__guard`: every other user root, every role root and the profile tree are write-protected; user reads of the profile's memory/notes/strands/store are refused | tool call denied |
@@ -151,7 +152,7 @@ default_role = "member"             # role an auto-provisioned user gets
 | KBs | KBs whose `kb_access` intersects the user's groups, plus owned, plus all for admin; `kagent__kb_search`, `@kb:` refs and the web KB route share the check | `no knowledge base matches` |
 | Budget | the user's `quota_daily_usd` when set, else the role cap, else the profile; `meta["budget:user:<username>"]` | that user pauses; nobody else |
 | Audit | every row carries the acting username beside the chain, and the role | n/a (stamped) |
-| Cron | creator username in the payload; tools re-clamped at every fire; `/cron list`, `/reminders` and `/cron rm` are scoped to the caller's user | a user never sees or cancels another's jobs |
+| Cron, Trigger | creator username in the payload; tools re-clamped at every fire (a trigger's role is re-resolved from the user row first — ADR-0005); `/cron list`, `/reminders` and `/cron rm` are scoped to the caller's user | a user never sees or cancels another's jobs; a demoted user's trigger narrows at the next fire |
 | Users | `user disable` clears web sessions, silences identities, pauses crons; identity resolution refuses disabled users | no reply + one `<channel>.unauthorized` audit row |
 
 ## Web relay and browser sessions

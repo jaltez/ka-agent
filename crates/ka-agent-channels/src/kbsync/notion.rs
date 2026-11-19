@@ -29,7 +29,10 @@ pub async fn sync(
             body["start_cursor"] = json!(c);
         }
         let resp = client
-            .post(format!("{}/v1/search", endpoints.notion.trim_end_matches('/')))
+            .post(format!(
+                "{}/v1/search",
+                endpoints.notion.trim_end_matches('/')
+            ))
             .bearer_auth(&token)
             .header("Notion-Version", NOTION_VERSION)
             .json(&body)
@@ -39,7 +42,10 @@ pub async fn sync(
         if !resp.status().is_success() {
             return Err(format!("notion search: HTTP {}", resp.status()));
         }
-        let value: Value = resp.json().await.map_err(|e| format!("notion search: {e}"))?;
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("notion search: {e}"))?;
         for result in value["results"].as_array().cloned().unwrap_or_default() {
             let id = result["id"].as_str().unwrap_or("").to_string();
             if id.is_empty() {
@@ -79,8 +85,15 @@ pub async fn sync(
             continue;
         }
         let path = format!("{}.md", slug(title, id));
-        match index_doc(store, &src.kb_name, &path, title, &body, "notion", ka_agent_core::now_ms())
-        {
+        match index_doc(
+            store,
+            &src.kb_name,
+            &path,
+            title,
+            &body,
+            "notion",
+            ka_agent_core::now_ms(),
+        ) {
             Ok(true) => report.indexed += 1,
             Ok(false) => report.unchanged += 1,
             Err(_) => {}
@@ -105,7 +118,12 @@ fn slug(title: &str, id: &str) -> String {
         })
         .collect();
     slug.truncate(48);
-    let short: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).rev().take(8).collect();
+    let short: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .rev()
+        .take(8)
+        .collect();
     let short: String = short.chars().rev().collect();
     format!("{}-{short}", slug.trim_matches('-'))
 }
@@ -141,7 +159,10 @@ async fn render_page(
         if !resp.status().is_success() {
             return Err(format!("notion blocks: HTTP {}", resp.status()));
         }
-        let value: Value = resp.json().await.map_err(|e| format!("notion blocks: {e}"))?;
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("notion blocks: {e}"))?;
         for block in value["results"].as_array().cloned().unwrap_or_default() {
             let kind = block["type"].as_str().unwrap_or("");
             let payload = &block[kind];
@@ -162,7 +183,11 @@ async fn render_page(
                 "numbered_list_item" => out.push_str(&format!("1. {rich}\n")),
                 "to_do" => out.push_str(&format!(
                     "- [{}] {rich}\n",
-                    if payload["checked"].as_bool() == Some(true) { "x" } else { " " }
+                    if payload["checked"].as_bool() == Some(true) {
+                        "x"
+                    } else {
+                        " "
+                    }
                 )),
                 "code" => out.push_str(&format!("```\n{rich}\n```\n\n")),
                 "quote" => out.push_str(&format!("> {rich}\n\n")),

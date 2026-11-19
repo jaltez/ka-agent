@@ -9,6 +9,7 @@ description = "Ka Agent domain types and state machines (no I/O, no Ka dependenc
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { version = "1.2", features = ["derive"] }
 toml = { workspace = true }
 thiserror = { workspace = true }
 jiff = { workspace = true }

@@ -3,7 +3,7 @@
 //! command that fixes it when it is wrong. Exit 1 when any check failed
 //! (`✗`); warnings (`!`) do not fail.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ka_agent_core::DaemonConfig;
 use ka_agent_port::catalog::{self, CredentialCheck, KeyState};
@@ -81,28 +81,35 @@ static CONTRACT_DOCS: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// The checks as they run: printed line by line, or (`--json`) collected
-/// into one document printed at the end.
+/// The checks as they run: printed line by line, and always collected —
+/// `--json` prints the collection at the end, `--bundle` writes it into
+/// the diagnostics file.
 struct Report {
     failed: bool,
-    json: Option<std::cell::RefCell<Vec<serde_json::Value>>>,
+    json: bool,
+    rows: std::cell::RefCell<Vec<serde_json::Value>>,
 }
 
 impl Report {
     fn new(json: bool) -> Self {
         Self {
             failed: false,
-            json: json.then(|| std::cell::RefCell::new(Vec::new())),
+            json,
+            rows: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     fn emit(&self, level: &str, mark: &str, line: &str) {
-        match &self.json {
-            Some(rows) => rows
-                .borrow_mut()
-                .push(serde_json::json!({"level": level, "text": line})),
-            None => println!("{mark} {line}"),
+        self.rows
+            .borrow_mut()
+            .push(serde_json::json!({"level": level, "text": line}));
+        if !self.json {
+            println!("{mark} {line}");
         }
+    }
+
+    fn lines(&self) -> Vec<serde_json::Value> {
+        self.rows.borrow().clone()
     }
 
     fn ok(&self, line: String) {
@@ -178,7 +185,13 @@ fn grants_lines(cfg: &DaemonConfig) -> Vec<(&'static str, String)> {
     out
 }
 
-pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::process::ExitCode {
+pub fn doctor(
+    config: PathBuf,
+    online: bool,
+    json: bool,
+    fix: bool,
+    bundle: Option<PathBuf>,
+) -> std::process::ExitCode {
     let mut rep = Report::new(json);
     let paths = Paths::new(Paths::default_root());
     let header = format!(
@@ -704,18 +717,22 @@ pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::proc
         }
     }
 
-    if let Some(rows) = &rep.json {
+    if let Some(path) = &bundle {
+        write_bundle(&mut rep, &paths, cfg.as_ref(), path);
+    }
+
+    if rep.json {
         println!(
             "{}",
             serde_json::json!({
                 "ok": !rep.failed,
                 "version": env!("CARGO_PKG_VERSION"),
-                "checks": rows.borrow().clone(),
+                "checks": rep.lines(),
             })
         );
     }
     // Human closing line only: --json must stay one document.
-    if rep.json.is_none() {
+    if !rep.json {
         if rep.failed {
             println!("fix the ✗ lines above, then run `ka-agent doctor` again");
         } else {
@@ -726,6 +743,115 @@ pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::proc
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
+    }
+}
+
+/// B19: how much conversation the bundle carries — recent sessions and
+/// their newest turns.
+const BUNDLE_SESSIONS: usize = 5;
+const BUNDLE_TURNS: usize = 10;
+
+/// The compiled identity the engine reads (`IDENTITY.md` in the operator's
+/// synthetic HOME), else the persona compiled on the fly. Read-only: a
+/// missing persona file is not created here (doctor creates nothing).
+fn bundle_identity(paths: &Paths) -> Option<String> {
+    let compiled = paths.engine_home().join(".config/ka/IDENTITY.md");
+    if let Ok(text) = std::fs::read_to_string(&compiled) {
+        return Some(text);
+    }
+    let persona = std::fs::read_to_string(paths.root().join("memory/persona.md")).ok()?;
+    Some(ka_agent_runtime::runtime::compile_identity(&persona))
+}
+
+/// B19: write one support document — the doctor checks, the effective
+/// config (secret refs stay as written: `secret:<name>`), the live
+/// `StatusReport` over the admin socket, the daemon-side prompt layers,
+/// and the newest turns of recent sessions. Private sessions contribute
+/// their metadata and no turns; nothing here opens a network socket.
+fn write_bundle(rep: &mut Report, paths: &Paths, cfg: Option<&DaemonConfig>, path: &Path) {
+    let status = crate::admin::request(paths, &serde_json::json!({"op": "status"}))
+        .ok()
+        .and_then(|v| v.get("report").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let config = cfg
+        .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(serde_json::Value::Null);
+    let identity = bundle_identity(paths);
+    let skills: Vec<serde_json::Value> =
+        ka_agent_runtime::skills::Skills::new(&paths.engine_home())
+            .enabled()
+            .into_iter()
+            .map(|s| serde_json::json!({"name": s.name, "description": s.description}))
+            .collect();
+    let user_layer = cfg
+        .and_then(|c| c.engine_layer_path())
+        .and_then(|p| std::fs::read_to_string(p).ok());
+
+    let mut sessions: Vec<serde_json::Value> = Vec::new();
+    if paths.state_db().exists()
+        && let Ok(store) = ka_agent_store::Store::open(&paths.state_db())
+    {
+        for session in store
+            .list_recent_sessions(BUNDLE_SESSIONS, false)
+            .unwrap_or_default()
+        {
+            let turns: Vec<serde_json::Value> = if session.private {
+                // Contract: a private conversation records no turn text.
+                Vec::new()
+            } else {
+                store
+                    .latest_turns_for_session(&session.id, BUNDLE_TURNS, 0)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| serde_json::to_value(&t).unwrap_or(serde_json::Value::Null))
+                    .collect()
+            };
+            let mut row = serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("turns".into(), serde_json::Value::Array(turns));
+            }
+            sessions.push(row);
+        }
+    }
+
+    let doc = serde_json::json!({
+        "generated_ms": ka_agent_core::now_ms(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "ka_pin": ka_agent_port::KA_PIN,
+        "contracts_sha256": contract_suite_hash(),
+        "doctor": {"ok": !rep.failed, "checks": rep.lines()},
+        "config": config,
+        "status": status,
+        "prompt": {
+            "label": "daemon layers only; the engine assembles the final prompt",
+            "compiled_identity": identity,
+            "enabled_skills": skills,
+            "user_layer": user_layer,
+        },
+        "sessions": sessions,
+    });
+    let rendered = match serde_json::to_string_pretty(&doc) {
+        Ok(text) => text,
+        Err(e) => {
+            rep.fail(format!("bundle {}: {e}", path.display()));
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(path, rendered) {
+        rep.fail(format!("bundle {}: {e}", path.display()));
+        return;
+    }
+    rep.ok(format!("bundle {}", path.display()));
+    let warning = format!(
+        "bundle {} contains conversation text and instance state — review it \
+         before sharing; secrets stay as `secret:` refs",
+        path.display()
+    );
+    if rep.json {
+        // Keep stdout a single JSON document.
+        eprintln!("{warning}");
+    } else {
+        println!("{warning}");
     }
 }
 

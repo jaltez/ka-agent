@@ -62,11 +62,7 @@ pub(crate) fn remind<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
                 }
                 let id = ctx
                     .runtime
-                    .add_reminder_at(
-                        at_ms,
-                        &text,
-                        &crate::tools::turn_principal(ctx),
-                    )
+                    .add_reminder_at(at_ms, &text, &crate::tools::turn_principal(ctx))
                     .map_err(|e| e.to_string())?;
                 let now = ctx.runtime.now_zoned();
                 let when_text = render_when(at_ms, &now);
@@ -263,7 +259,10 @@ pub(crate) fn skill_propose_schema() -> Value {
 
 pub(crate) fn skill_propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
     Box::pin(async move {
-        if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
+        if ctx
+            .runtime
+            .session_private_for(&crate::tools::turn_principal(ctx))
+        {
             return Err("this is a private conversation — skill proposals are off here".into());
         }
         let name = args["name"].as_str().unwrap_or("").trim();

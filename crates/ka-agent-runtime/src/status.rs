@@ -54,6 +54,10 @@ pub struct StatusReport {
     /// says or is told persists beyond it.
     #[serde(default)]
     pub private: bool,
+    /// The engine hit a retryable rate limit (ms since epoch): the
+    /// runtime keeps retrying in-engine; the next settled turn clears it.
+    #[serde(default)]
+    pub throttled_since_ms: Option<i64>,
 }
 
 /// One channel's poll health (`status` renders failing channels).
@@ -257,6 +261,15 @@ impl StatusReport {
                 ));
             }
         }
+        if let Some(since_ms) = self.throttled_since_ms {
+            let since = jiff::Timestamp::from_millisecond(since_ms)
+                .map(|t| t.to_zoned(now.time_zone().clone()))
+                .map(|z| format!("{:02}:{:02}", z.hour(), z.minute()))
+                .unwrap_or_else(|_| "--:--".to_string());
+            out.push_str(&format!(
+                "\n⏳ rate-limited since {since} — retrying in-engine"
+            ));
+        }
         if let Some(version) = &self.update_available {
             out.push_str(&format!("\nupdate available: {version} — /update"));
         }
@@ -325,6 +338,7 @@ mod tests {
             live_model: None,
             update_available: None,
             channels: Vec::new(),
+            throttled_since_ms: None,
         }
     }
 
@@ -345,6 +359,20 @@ mod tests {
                 "queue 0 · approvals 0 · crashes 0",
                 "session a1b2c3d4 · strand (new) · Europe/Madrid",
             ]
+        );
+    }
+
+    #[test]
+    fn rate_limit_throttle_renders_the_cooldown_line() {
+        // No stamp: the default five lines carry no throttle notice.
+        let text = report().render(&now());
+        assert!(!text.contains("rate-limited"), "{text}");
+        let mut r = report();
+        r.throttled_since_ms = Some(1_793_361_200_000); // 12:53:20 in Madrid
+        let text = r.render(&now());
+        assert!(
+            text.contains("⏳ rate-limited since 12:53 — retrying in-engine"),
+            "{text}"
         );
     }
 

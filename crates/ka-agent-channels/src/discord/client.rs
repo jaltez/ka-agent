@@ -41,10 +41,8 @@ impl DiscordClient {
             .iter()
             .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let header_refs: Vec<(&str, String)> = headers
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
+        let header_refs: Vec<(&str, String)> =
+            headers.iter().map(|(k, v)| (*k, v.clone())).collect();
         self.limiter
             .apply_headers(key, &header_refs, ka_agent_core::now_ms());
         if status.as_u16() == 429 {

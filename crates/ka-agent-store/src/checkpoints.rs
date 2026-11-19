@@ -120,7 +120,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert_session(&session()).unwrap();
         let sid = store
-            .list_recent_sessions(1)
+            .list_recent_sessions(1, true)
             .unwrap()
             .pop()
             .map(|s| s.id)
@@ -155,7 +155,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert_session(&session()).unwrap();
         let sid = store
-            .list_recent_sessions(1)
+            .list_recent_sessions(1, true)
             .unwrap()
             .pop()
             .map(|s| s.id)

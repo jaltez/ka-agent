@@ -85,6 +85,10 @@ pub mod actions {
     pub const RULE_ADD: &str = "rule.add";
     /// A durable allow-rule was removed (`/rules rm <id>`).
     pub const RULE_RM: &str = "rule.rm";
+    /// A plan verify gate ran (v4 F12): every execution of the
+    /// operator-approved command, pass or fail, with outcome and exit in
+    /// the detail — a local shell, exactly like a cron gate.
+    pub const PLAN_VERIFY: &str = "plan.verify";
 }
 
 #[cfg(test)]

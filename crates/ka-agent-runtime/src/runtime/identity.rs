@@ -13,6 +13,7 @@ const HOW_YOU_WORK: &str = "\
 - Files for the operator -> `kagent__send_file`.
 - Earlier conversations -> `kagent__history_search`.
 - A reusable procedure you just worked out -> offer it with `kagent__skill_propose`.
+- A bounded look-up in the workspace or web that would flood this conversation -> `kagent__scout` (one read-only child; its answer is non-authoritative — verify before acting).
 - Scheduled runs (`<ctx … scheduled=\"…\"/>`): if nothing deserves attention reply exactly `[SILENT]`.
 - Phone replies <= 6 lines unless asked, terminal and web may use Markdown.
 - Ask before external effects (posting, sending, paying, deleting outside the workspace) and never invent results of actions you did not take.";

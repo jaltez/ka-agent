@@ -182,7 +182,10 @@ pub(crate) async fn serve_admin(stream: IpcStream, ctx: AdminCtx) -> std::io::Re
             .and_then(|o| o.as_str())
             .map(str::to_string);
         match (req, op.as_deref()) {
-            (Some(_), Some("status")) => match ctx.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
+            (Some(_), Some("status")) => match ctx
+                .runtime
+                .status_report_for(&ka_agent_core::Principal::operator())
+            {
                 Ok(report) => serde_json::json!({"ok": true, "report": report}),
                 Err(e) => serde_json::json!({"error": e.to_string()}),
             },
@@ -324,7 +327,10 @@ async fn serve_attach(
             Err(_) => true,
         }
     };
-    match ctx.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
+    match ctx
+        .runtime
+        .status_report_for(&ka_agent_core::Principal::operator())
+    {
         Ok(report) => {
             send(
                 &tx,
@@ -391,7 +397,10 @@ async fn serve_attach(
         // `status` answers this client with a fresh `hello`, ordered after
         // everything it said before (a piped chat waits for idle with it).
         if req.get("op").and_then(|o| o.as_str()) == Some("status") {
-            if let Ok(report) = ctx.runtime.status_report_for(&ka_agent_core::Principal::operator()) {
+            if let Ok(report) = ctx
+                .runtime
+                .status_report_for(&ka_agent_core::Principal::operator())
+            {
                 send(
                     &tx,
                     &Envelope::new(
@@ -420,9 +429,13 @@ async fn serve_attach(
             }
             ka_agent_channels::commands::Outcome::Silent => {}
             ka_agent_channels::commands::Outcome::NotACommand => {
-                let expanded =
-                    ka_agent_channels::refs::expand_operator(&ctx.store, &ctx.runtime.workspace_for(&ka_agent_core::Principal::operator()), text)
-                        .await;
+                let expanded = ka_agent_channels::refs::expand_operator(
+                    &ctx.store,
+                    &ctx.runtime
+                        .workspace_for(&ka_agent_core::Principal::operator()),
+                    text,
+                )
+                .await;
                 if let Err(e) = ctx.runtime.handle_message(&expanded, "console").await {
                     send(
                         &tx,

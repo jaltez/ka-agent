@@ -1122,6 +1122,7 @@ name = "ka-agent-core"
 version = "0.14.5"
 dependencies = [
  "jiff",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -1192,6 +1193,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1222,6 +1225,7 @@ dependencies = [
  "ka-agent-store",
  "password-hash",
  "rand_core 0.6.4",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

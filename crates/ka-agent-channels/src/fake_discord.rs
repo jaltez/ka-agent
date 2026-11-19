@@ -77,7 +77,12 @@ impl FakeDiscord {
 
     pub async fn wait_socket(&self) {
         for _ in 0..600 {
-            if self.state.lock().unwrap_or_else(|e| e.into_inner()).connected {
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .connected
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -127,11 +132,18 @@ impl FakeDiscord {
     }
 
     pub fn sessions(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).sessions
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
     }
 
     pub fn resumes(&self) -> Vec<(i64, String)> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).resumes.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resumes
+            .clone()
     }
 }
 
@@ -245,12 +257,7 @@ fn parse_request(head: &str) -> (String, String) {
     (method, path)
 }
 
-fn api_response(
-    method: &str,
-    path: &str,
-    body: &[u8],
-    state: &Arc<Mutex<State>>,
-) -> String {
+fn api_response(method: &str, path: &str, body: &[u8], state: &Arc<Mutex<State>>) -> String {
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     if path.ends_with("/gateway/bot") {

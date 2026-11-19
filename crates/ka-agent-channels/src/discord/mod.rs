@@ -143,12 +143,8 @@ impl Surface for DiscordSurface {
                 expires_at_ms,
                 ..
             } => {
-                let (id, question, detail, expires) = (
-                    id.clone(),
-                    question.clone(),
-                    detail.clone(),
-                    *expires_at_ms,
-                );
+                let (id, question, detail, expires) =
+                    (id.clone(), question.clone(), detail.clone(), *expires_at_ms);
                 tokio::spawn(async move {
                     let mut content = format!("**Approval needed**\n{question}");
                     if let Some(d) = detail.filter(|d| !d.trim().is_empty()) {
@@ -243,7 +239,12 @@ pub struct DiscordChannel {
 }
 
 impl DiscordChannel {
-    pub fn new(cfg: DiscordConfig, runtime: Runtime, store: Arc<Store>, parts: DiscordParts) -> Self {
+    pub fn new(
+        cfg: DiscordConfig,
+        runtime: Runtime,
+        store: Arc<Store>,
+        parts: DiscordParts,
+    ) -> Self {
         Self {
             cfg,
             runtime,
@@ -353,7 +354,13 @@ impl DiscordChannel {
         };
         self.store.create_user(&user_row).ok()?;
         self.store
-            .link_identity_to_user("discord", &address, "discord", &self.cfg.default_role, &username)
+            .link_identity_to_user(
+                "discord",
+                &address,
+                "discord",
+                &self.cfg.default_role,
+                &username,
+            )
             .ok()?;
         let mut rec = ka_agent_core::AuditRecord::new(
             "discord",

@@ -20,8 +20,8 @@ use ka_agent_store::Store;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use client::SlackClient;
 use crate::ratelimit::RateLimiter;
+use client::SlackClient;
 
 /// Everything the connector needs, resolved once at startup.
 #[derive(Clone)]
@@ -37,7 +37,10 @@ pub struct SlackConfig {
 
 impl SlackConfig {
     /// Resolve `[slack]` + the secret store; `None` when disabled.
-    pub fn from_config(cfg: &DaemonConfig, secrets: &std::path::Path) -> Result<Option<Self>, String> {
+    pub fn from_config(
+        cfg: &DaemonConfig,
+        secrets: &std::path::Path,
+    ) -> Result<Option<Self>, String> {
         if !cfg.slack.enabled {
             return Ok(None);
         }
@@ -167,16 +170,17 @@ impl Surface for SlackSurface {
                 expires_at_ms,
                 ..
             } => {
-                let (id, question, detail, expires) = (
-                    id.clone(),
-                    question.clone(),
-                    detail.clone(),
-                    *expires_at_ms,
-                );
+                let (id, question, detail, expires) =
+                    (id.clone(), question.clone(), detail.clone(), *expires_at_ms);
                 tokio::spawn(async move {
                     let blocks = approval_blocks(&id, &question, detail.as_deref(), expires);
                     if let Err(e) = client
-                        .post_blocks(&target.channel, &question, target.thread_ts.as_deref(), blocks)
+                        .post_blocks(
+                            &target.channel,
+                            &question,
+                            target.thread_ts.as_deref(),
+                            blocks,
+                        )
                         .await
                     {
                         eprintln!("slack: approval card: {e}");
@@ -348,8 +352,7 @@ impl SlackChannel {
                 }
             };
             attempt = 0;
-            match socket::run_session(&url, &self, &mut shutdown).await
-            {
+            match socket::run_session(&url, &self, &mut shutdown).await {
                 socket::SessionEnd::Shutdown => return,
                 socket::SessionEnd::Disconnected => {
                     // `disconnect` (refresh_requested) is routine: reconnect
@@ -399,7 +402,9 @@ impl SlackChannel {
                 h.to_ascii_lowercase()
                     .chars()
                     .map(|c| {
-                        if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+                        if c.is_ascii_lowercase()
+                            || c.is_ascii_digit()
+                            || matches!(c, '.' | '_' | '-')
                         {
                             c
                         } else {
@@ -411,7 +416,10 @@ impl SlackChannel {
             .filter(|h| ka_agent_store::valid_username(h))
             .unwrap_or_else(|| format!("slack-{}", user.to_ascii_lowercase()));
         let username = if self.store.get_user(&candidate).ok().flatten().is_some() {
-            format!("{candidate}-{}", user.chars().rev().take(4).collect::<String>())
+            format!(
+                "{candidate}-{}",
+                user.chars().rev().take(4).collect::<String>()
+            )
         } else {
             candidate
         };
@@ -427,7 +435,13 @@ impl SlackChannel {
         };
         self.store.create_user(&user_row).ok()?;
         self.store
-            .link_identity_to_user("slack", &address, "slack", &self.cfg.default_role, &username)
+            .link_identity_to_user(
+                "slack",
+                &address,
+                "slack",
+                &self.cfg.default_role,
+                &username,
+            )
             .ok()?;
         let mut rec = ka_agent_core::AuditRecord::new(
             "slack",

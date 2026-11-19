@@ -1,9 +1,17 @@
 # v4 feature catalog — 2026-11-18
 
+> **Landed (2026-11-19):** features 1–18 of this catalog are implemented and
+> verified (`cargo test --workspace` green, `clippy -D warnings` clean), except
+> the explicitly staged/handoff items noted per feature and in the sections
+> below. See the per-feature Adaptation blocks for the shipped shape; commits
+> `23bea89`, `7b56d77` and successors.
+
 Baseline: v0.14.5, `main` @ `2dcb699`, engine pin `247e99e`. Companion to
 `v3-features.md` (same bands: priority = impact × frequency, P0 ≥ 6, P1 3–5, P2 ≤ 2;
 effort S < 1 day, M = days, L ≥ week; risk 2 = approvals/security/engine pin/protocol).
-This document is a catalog only — nothing here is implemented.
+This document records what was planned and what shipped; per-feature status
+follows the catalog's own Adaptation blocks. (Superseded the earlier
+"nothing here is implemented" stance — the catalog became the spec.)
 
 ## Method
 

@@ -1,0 +1,1105 @@
+{
+  "$defs": {
+    "Access": {
+      "description": "One `[[grants.path]]` entry's reach.",
+      "oneOf": [
+        {
+          "const": "allow",
+          "description": "Writable without asking (the engine's sandbox allowlist plus\nallow rules for `write`/`edit`).",
+          "type": "string"
+        },
+        {
+          "const": "ask",
+          "description": "The engine's own ask flow decides (the same as no entry).",
+          "type": "string"
+        },
+        {
+          "const": "deny",
+          "description": "Blocked in every mode, for bash and the file tools alike.",
+          "type": "string"
+        }
+      ]
+    },
+    "Approvals": {
+      "additionalProperties": false,
+      "description": "Approval tuning: strict `[approvals]`.",
+      "properties": {
+        "auto_review": {
+          "default": false,
+          "description": "Let the engine's fast model auto-allow unmistakably safe commands\n(it never denies; anything uncertain still asks you). Off by default.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Budgets": {
+      "additionalProperties": false,
+      "properties": {
+        "daily_tokens": {
+          "default": null,
+          "description": "Daily token cap (input+output+cache); the only cap that binds for\nunpriced models.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "daily_usd": {
+          "default": null,
+          "description": "Daily USD cap across sessions (ka usage accounting).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Calendar": {
+      "additionalProperties": false,
+      "description": "The calendar digest: strict `[calendar]` section.",
+      "properties": {
+        "digest_time": {
+          "default": "08:00",
+          "description": "Local clock time (operator zone) of the daily digest, `HH:MM`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Channels": {
+      "additionalProperties": false,
+      "description": "Workplace-channel policy (`[channels]`).",
+      "properties": {
+        "default_role": {
+          "default": "member",
+          "description": "The role an auto-provisioned workspace user gets.",
+          "type": "string"
+        },
+        "shared_channel_role": {
+          "default": "channel",
+          "description": "The role a shared-channel turn runs as (never a user's own memory or\ngrants leak into a shared surface). Default: the built-in `channel`\nrole (read-only, no personal data).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Checkpoint": {
+      "additionalProperties": false,
+      "description": "Shadow-git checkpoints (`[checkpoint]`, v4 B1): the safety net under\napproved writes.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Snapshot the workspace before every approved write. `false` turns\nthe net off entirely (`/rewind` answers \"no checkpoints\").",
+          "type": "boolean"
+        },
+        "keep_days": {
+          "default": 30,
+          "description": "How long checkpoint rows and their shadow repos live (Gemini's\ndocumented 30-day default); pruning is destructive.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "DiscordSettings": {
+      "additionalProperties": false,
+      "description": "The Discord bot (`[discord]`): gateway WebSocket, guild allowlist.",
+      "properties": {
+        "api_base": {
+          "default": null,
+          "description": "API base (tests point it at a local fake).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auto_provision": {
+          "default": false,
+          "type": "boolean"
+        },
+        "bot_token_secret": {
+          "default": null,
+          "description": "Secret-store name of the bot token.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "guilds": {
+          "default": [],
+          "description": "Guilds (servers) that may talk to this daemon.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Git": {
+      "additionalProperties": false,
+      "description": "Agent commit attribution (`[git]`, A14): the identity any git the\nengine's shell tool runs commits under. `None` keeps today's behavior\n(no env pinned); a set field pulls its per-username default.",
+      "properties": {
+        "email": {
+          "default": null,
+          "description": "Author/committer email; default `<username>@ka-agent.local`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "default": null,
+          "description": "Author/committer name; default `ka-agent (<username>)`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Grants": {
+      "additionalProperties": false,
+      "description": "Operator grants (`[grants]`): what the engine may do without an\napproval card — pre-approved directories, installs, or everything.",
+      "properties": {
+        "advisory": {
+          "default": true,
+          "description": "Keep the one-line full-access advisory in `status` and `doctor`\n(`false` silences it; the access itself is unchanged).",
+          "type": "boolean"
+        },
+        "full": {
+          "default": false,
+          "description": "Full access: the OS sandbox is off, installs are granted and\npath denies are ignored. ka-agent's own files stay protected.",
+          "type": "boolean"
+        },
+        "install": {
+          "default": false,
+          "description": "App/package installs (`sudo apt-get install`, `npm i -g`,\n`pip install`, `cargo install`, `go install`, `nix-env -i`, …)\nrun without asking; `false` denies them naming this switch.",
+          "type": "boolean"
+        },
+        "path": {
+          "default": [],
+          "description": "Per-directory grants (`[[grants.path]]`).",
+          "items": {
+            "$ref": "#/$defs/PathGrant"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "HookSpec": {
+      "additionalProperties": false,
+      "description": "One operator hook (`[[hooks]]`, plan 2.7).",
+      "properties": {
+        "command": {
+          "default": "",
+          "description": "`sh -c <command>` (agent events) / the engine's own hook contract\n(engine events).",
+          "type": "string"
+        },
+        "on": {
+          "default": "",
+          "description": "The event to react to: an agent event (`message_received`,\n`turn_finished`, `approval_requested`, `approval_settled`,\n`reminder_fired`, `cron_finished`, `session_paused`,\n`memory_proposed`) or an engine event (`pre_tool_use`,\n`post_tool_use`, `user_prompt_submit`, `session_start`,\n`session_end`, `stop`, `turn_end`, `pre_compact`).",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "default": null,
+          "description": "Agent-event timeout (1–60 s; default 10). Engine events use the\nengine's own 30 s ceiling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tool": {
+          "default": null,
+          "description": "Only this tool (engine tool-call events only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Ka": {
+      "additionalProperties": false,
+      "properties": {
+        "engine_layer": {
+          "default": null,
+          "description": "Optional ka engine layer (ka's own strict `ka.toml` format), validated\nwith `Config::parse_layer` by the worker.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "MatrixSettings": {
+      "additionalProperties": false,
+      "description": "The Matrix channel (Phase 6): strict `[matrix]` section.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "homeserver": {
+          "default": null,
+          "description": "Base URL of the homeserver; tests point it at a local fake.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_secret": {
+          "default": null,
+          "description": "Name of the access token in the secret store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_id": {
+          "default": "",
+          "description": "The bot account, `@ka-agent:example.org`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "McpServer": {
+      "additionalProperties": false,
+      "description": "One operator-declared MCP server (`[[mcp]]`). Values written\n`secret:<name>` in `env`/`headers` resolve from the secret store when the\nworker starts, so tokens never live in the config file.",
+      "properties": {
+        "args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "default": null,
+          "description": "stdio transport: the executable (exclusive with `url`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "name": {
+          "description": "Tool prefix: tools appear to the model as `<name>.<tool>`.",
+          "type": "string"
+        },
+        "roles": {
+          "default": null,
+          "description": "Roles allowed to see this server (absent = every role, including\nadmin). A user whose role is not listed gets the server subtracted.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "url": {
+          "default": null,
+          "description": "Streamable-HTTP transport (exclusive with `command`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "Memory": {
+      "additionalProperties": false,
+      "description": "Memory extraction gating (`[memory]`, B15c).",
+      "properties": {
+        "extraction_min_turns": {
+          "default": 5,
+          "description": "Recorded turns a session needs before `memory_propose` is allowed\n(the warm-up gate); `0` turns the gate off.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Notify": {
+      "additionalProperties": false,
+      "description": "Proactive-message manners: strict `[notify]`.",
+      "properties": {
+        "quiet_hours": {
+          "default": null,
+          "description": "`\"22:00-07:00\"`: scheduled prompts (crons, the briefing) that fall\ndue inside this local window wait until it ends. Reminders and\napprovals are never held.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PathGrant": {
+      "additionalProperties": false,
+      "description": "One per-directory grant (`[[grants.path]]`).",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/Access",
+          "description": "The grant's reach: allow | ask | deny (`always` = allow)."
+        },
+        "dir": {
+          "description": "Absolute directory the grant covers.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dir",
+        "access"
+      ],
+      "type": "object"
+    },
+    "Retention": {
+      "additionalProperties": false,
+      "description": "Retention knobs (D12): 0 = keep forever, the default (an internal tool\nkeeps everything unless an organization asks otherwise).",
+      "properties": {
+        "attachments_days": {
+          "default": 0,
+          "description": "Delete attachment files older than this many days.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turns_days": {
+          "default": 0,
+          "description": "Delete turns (and their search rows) older than this many days.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RoleSpec": {
+      "additionalProperties": false,
+      "description": "One role (`[[role]]`): a linked identity's slice of the instance.\n`admin` is implicit (terminal, web panel, CLI) and cannot be defined.",
+      "properties": {
+        "allow": {
+          "default": [],
+          "description": "Per-turn allowlist of exact hand names. Mutually exclusive with\n`disable`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "budget_daily_usd": {
+          "default": null,
+          "description": "Daily USD cap for the role (unset = the profile budget applies).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "commands": {
+          "default": [],
+          "description": "Chat-command allowlist (unset = every command the role may reach).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "disable": {
+          "default": [],
+          "description": "Subtractive engine feature specs for this role's workers.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "escalate": {
+          "default": [],
+          "description": "Tools that always escalate to the admin (D9): exact hand names and\n`mcp:<server>[:<tool>]` — same spec grammar as `allow`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "grants": {
+          "$ref": "#/$defs/Grants",
+          "default": {
+            "advisory": true,
+            "full": false,
+            "install": false,
+            "path": []
+          },
+          "description": "Role grants; only `path` is honored (`install`/`full`/`advisory`\nstay admin-only and are refused when set non-default)."
+        },
+        "mode": {
+          "default": "ask",
+          "description": "Permission-mode ceiling AND default for the role's sessions\n(`ask|accept_edits|allow|readonly`, old aliases accepted).",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "description": "`[a-z0-9-]{1,32}`, unique, never `admin`.",
+          "type": "string"
+        },
+        "workspace": {
+          "default": null,
+          "description": "The role's workspace; default `<data>/roles/<name>/workspace`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RuntimeSettings": {
+      "additionalProperties": false,
+      "description": "Engine supervision (`[runtime]`): how many workers may run at once and\nwhether each one is wrapped in the engine bubblewrap profile (ADR-0003).",
+      "properties": {
+        "max_workers": {
+          "default": 8,
+          "description": "Live engine workers at once (1..=64). Over the cap an idle worker is\nevicted; if every worker is busy the message queues for a slot.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sandbox_engine": {
+          "default": false,
+          "description": "Wrap each worker in the engine bubblewrap profile (mount + PID\nnamespace, shared network). Off by default: the P0 spike measured\n2.7x startup and +12% memory (ADR-0003).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Scout": {
+      "additionalProperties": false,
+      "description": "Read-only research children (`[scout]`, v4 F13/C1 slice).",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Offer `kagent__scout` to the model at all.",
+          "type": "boolean"
+        },
+        "max_concurrent": {
+          "default": 2,
+          "description": "Children allowed to run at once (the rest queue; over the queue a\nspawn answers busy).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_summary_chars": {
+          "default": 6000,
+          "description": "Cap on the summary returned to the parent (chars).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_secs": {
+          "default": 90,
+          "description": "Per-child deadline in seconds — kept under the `__mcp` relay's\n120 s IPC read timeout.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Search": {
+      "additionalProperties": false,
+      "description": "Web search for the engine's `web_search` tool: strict `[search]`.",
+      "properties": {
+        "base_url": {
+          "default": null,
+          "description": "API base override (proxies, test fixtures).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "`tavily` | `brave` | `bing`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "type": "object"
+    },
+    "SlackSettings": {
+      "additionalProperties": false,
+      "description": "The Slack workspace app (`[slack]`): one app install serves the whole\nworkspace, so the daemon must be the single process answering it.",
+      "properties": {
+        "api_base": {
+          "default": null,
+          "description": "API base (tests point it at a local fake).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "app_token_secret": {
+          "default": null,
+          "description": "Secret-store name of the app-level token (`xapp-…`,\n`connections:write`) used only to open the Socket Mode connection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auto_provision": {
+          "default": false,
+          "description": "Create a user for an unknown sender in an allowed workspace (named\nafter the platform handle, with `channels.default_role`).",
+          "type": "boolean"
+        },
+        "bot_token_secret": {
+          "default": null,
+          "description": "Secret-store name of the bot token (`xoxb-…`) used for Web API calls.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "teams": {
+          "default": [],
+          "description": "Workspaces that may talk to this daemon (`T0123…`). Everything else\nis ignored with one audit row.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Telegram": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_user_ids": {
+          "default": [],
+          "description": "Deprecated: paired operator user ids. Migrated into the identities\ntable at startup (SEED.md §8.1); link identities with\n`ka-agent identity link` instead.",
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "api_base": {
+          "default": null,
+          "description": "Bot API base URL. Default `https://api.telegram.org`; tests point it\nat a local fake server.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "description": "Enable the Telegram channel in the daemon.",
+          "type": "boolean"
+        },
+        "stream": {
+          "default": true,
+          "description": "Stream replies as they are written (Bot API `sendMessageDraft`,\nprivate chats). Falls back to the finished message by itself when\nthe API refuses drafts. Default on.",
+          "type": "boolean"
+        },
+        "token_secret": {
+          "default": null,
+          "description": "Name of the bot token in the secret store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Tools": {
+      "additionalProperties": false,
+      "description": "The profile-wide engine feature baseline (`[tools]`): subtractive specs\nin the engine's own `[features] disable` grammar. Every worker spawns\nwith them (the admin role included); a role may narrow further.",
+      "properties": {
+        "disable": {
+          "default": [],
+          "description": "Engine feature specs disabled for every worker.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "TurnWatchdog": {
+      "additionalProperties": false,
+      "description": "The turn watchdog: a staged deadline for a wedged-but-alive engine.\n`silent_secs` after the last engine event a \"still working\" notice\ngoes out (once per turn); `abort_secs` after the last event the turn\nis aborted like `/stop`. `0` disables either stage.",
+      "properties": {
+        "abort_secs": {
+          "default": 900,
+          "description": "Seconds of engine silence before the turn is aborted; `0` = never.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "silent_secs": {
+          "default": 180,
+          "description": "Seconds of engine silence before the \"still working\" notice.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Voice": {
+      "additionalProperties": false,
+      "description": "Voice-note transcription: strict `[voice]`. OpenAI-compatible\n`/audio/transcriptions` — OpenAI, Groq, or a local Whisper server.",
+      "properties": {
+        "base_url": {
+          "default": null,
+          "description": "API base (required for `local`, e.g. `http://127.0.0.1:8000/v1`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "description": "Transcription model; a sensible default per provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "`openai` | `groq` | `local`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "type": "object"
+    },
+    "Web": {
+      "additionalProperties": false,
+      "description": "The local web control panel: strict `[web]` section.",
+      "properties": {
+        "bind": {
+          "default": "127.0.0.1",
+          "description": "Interface to bind (`127.0.0.1` by default; `0.0.0.0` only with TLS\nor a reverse proxy in front — see `docs/design/web-relay.md`).",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Serve the web UI.",
+          "type": "boolean"
+        },
+        "port": {
+          "default": 8480,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "public_url": {
+          "default": null,
+          "description": "Public base URL printed in login/pairing links\n(e.g. `https://agent.example.com`). `None` = the local URL.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WorkerRestart": {
+      "additionalProperties": false,
+      "properties": {
+        "backoff_max_ms": {
+          "default": 60000,
+          "description": "Backoff ceiling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backoff_start_ms": {
+          "default": 1000,
+          "description": "First backoff after a worker crash.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "crash_max": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "crash_window_secs": {
+          "default": 600,
+          "description": "Crash-loop window and threshold: N crashes inside the window degrade\nthe session.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "description": "Editor hint: the URL of this schema. Ignored by the daemon.",
+      "type": "string"
+    },
+    "approval_ttl_secs": {
+      "default": 900,
+      "description": "Approval card TTL; deny on expiry.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "approvals": {
+      "$ref": "#/$defs/Approvals",
+      "default": {
+        "auto_review": false
+      }
+    },
+    "background_model": {
+      "default": null,
+      "description": "Model for background turns (crons, the briefing, `--background`\nasks and `-bg` sources); `None` uses the main model.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "budgets": {
+      "$ref": "#/$defs/Budgets",
+      "default": {
+        "daily_tokens": null,
+        "daily_usd": null
+      }
+    },
+    "busy_messages": {
+      "default": "steer",
+      "description": "A message that arrives mid-turn: `steer` (default, rides the\nrunning reply) or `queue` (durable, next turn).",
+      "type": "string"
+    },
+    "calendar": {
+      "$ref": "#/$defs/Calendar",
+      "default": {
+        "digest_time": "08:00"
+      }
+    },
+    "channels": {
+      "$ref": "#/$defs/Channels",
+      "default": {
+        "default_role": "member",
+        "shared_channel_role": "channel"
+      },
+      "description": "Workplace-channel policy (`[channels]`)."
+    },
+    "checkpoint": {
+      "$ref": "#/$defs/Checkpoint",
+      "default": {
+        "enabled": true,
+        "keep_days": 30
+      },
+      "description": "Shadow-git checkpoints (`[checkpoint]`)."
+    },
+    "discord": {
+      "$ref": "#/$defs/DiscordSettings",
+      "default": {
+        "api_base": null,
+        "auto_provision": false,
+        "bot_token_secret": null,
+        "enabled": false,
+        "guilds": []
+      },
+      "description": "The Discord bot (`[discord]`)."
+    },
+    "effort": {
+      "default": null,
+      "description": "Reasoning effort sent to the engine (`off|low|medium|high|max`);\n`None` keeps the model's own default.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fallback": {
+      "default": [],
+      "description": "Models tried in order when the main one fails (outage, rate\nlimit); at most two hops per turn.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "git": {
+      "$ref": "#/$defs/Git",
+      "default": {
+        "email": null,
+        "name": null
+      },
+      "description": "Agent commit attribution (`[git]`)."
+    },
+    "grants": {
+      "$ref": "#/$defs/Grants",
+      "default": {
+        "advisory": true,
+        "full": false,
+        "install": false,
+        "path": []
+      },
+      "description": "Operator grants (`[grants]`): paths, installs, full access."
+    },
+    "hooks": {
+      "default": [],
+      "description": "Operator hooks ([[hooks]]).",
+      "items": {
+        "$ref": "#/$defs/HookSpec"
+      },
+      "type": "array"
+    },
+    "interrupts": {
+      "default": "on",
+      "description": "Bare interrupt keywords (`stop`, `wait`, …): `on` (default) aborts\nthe running turn when such a short message arrives mid-cycle and\nmakes it the next one; `off` keeps the plain `busy_messages`\nbehavior.",
+      "type": "string"
+    },
+    "ka": {
+      "$ref": "#/$defs/Ka",
+      "default": {
+        "engine_layer": null
+      }
+    },
+    "language": {
+      "default": "en",
+      "description": "Operator language for assistant replies and channel chrome\n(`en` | `es`; default `en`).",
+      "type": "string"
+    },
+    "matrix": {
+      "$ref": "#/$defs/MatrixSettings",
+      "default": {
+        "enabled": false,
+        "homeserver": null,
+        "token_secret": null,
+        "user_id": ""
+      },
+      "description": "The Matrix channel (Phase 6)."
+    },
+    "mcp": {
+      "default": [],
+      "description": "Operator-declared MCP servers.",
+      "items": {
+        "$ref": "#/$defs/McpServer"
+      },
+      "type": "array"
+    },
+    "memory": {
+      "$ref": "#/$defs/Memory",
+      "default": {
+        "extraction_min_turns": 5
+      },
+      "description": "Memory extraction gating (`[memory]`)."
+    },
+    "mode": {
+      "default": "ask",
+      "description": "`ask` (default) | `accept_edits` | `allow` | `readonly`. The old\nnames (`guarded`, `free`, `plan`, `accept-edits`) are accepted\nforever and normalized at load ([`normalize_mode`]).",
+      "type": "string"
+    },
+    "model": {
+      "default": null,
+      "description": "Default ka model selector for new sessions.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "notify": {
+      "$ref": "#/$defs/Notify",
+      "default": {
+        "quiet_hours": null
+      }
+    },
+    "retention": {
+      "$ref": "#/$defs/Retention",
+      "default": {
+        "attachments_days": 0,
+        "turns_days": 0
+      },
+      "description": "Data retention (`[retention]`): 0 = keep forever."
+    },
+    "role": {
+      "default": [],
+      "description": "Roles for linked identities (`[[role]]`); `admin` is implicit.",
+      "items": {
+        "$ref": "#/$defs/RoleSpec"
+      },
+      "type": "array"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeSettings",
+      "default": {
+        "max_workers": 8,
+        "sandbox_engine": false
+      },
+      "description": "Engine supervision (`[runtime]`): worker pool size and the engine\nsandbox."
+    },
+    "sandbox": {
+      "default": "auto",
+      "description": "OS sandbox for bash: `auto` (default: fs when a backend exists) |\n`fs` | `off`.",
+      "type": "string"
+    },
+    "scout": {
+      "$ref": "#/$defs/Scout",
+      "default": {
+        "enabled": false,
+        "max_concurrent": 2,
+        "max_summary_chars": 6000,
+        "timeout_secs": 90
+      },
+      "description": "Read-only research children (`[scout]`)."
+    },
+    "search": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Search"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Web search for the engine (`None` = the `web_search` tool is off)."
+    },
+    "slack": {
+      "$ref": "#/$defs/SlackSettings",
+      "default": {
+        "api_base": null,
+        "app_token_secret": null,
+        "auto_provision": false,
+        "bot_token_secret": null,
+        "enabled": false,
+        "teams": []
+      },
+      "description": "The Slack workspace app (`[slack]`)."
+    },
+    "telegram": {
+      "$ref": "#/$defs/Telegram",
+      "default": {
+        "allow_user_ids": [],
+        "api_base": null,
+        "enabled": false,
+        "stream": true,
+        "token_secret": null
+      }
+    },
+    "timezone": {
+      "default": null,
+      "description": "Operator timezone (IANA name, e.g. `Europe/Madrid`). `None` uses the\nsystem zone (UTC when it cannot be determined).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tools": {
+      "$ref": "#/$defs/Tools",
+      "default": {
+        "disable": []
+      },
+      "description": "Per-profile engine feature baseline (`[tools]`), subtractive."
+    },
+    "turn_grace_secs": {
+      "default": 10,
+      "description": "Grace after `/stop` before SIGTERM/SIGKILL escalation.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "turn_watchdog": {
+      "$ref": "#/$defs/TurnWatchdog",
+      "default": {
+        "abort_secs": 900,
+        "silent_secs": 180
+      }
+    },
+    "voice": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Voice"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Voice-note transcription (`None` = voice notes get a setup hint)."
+    },
+    "web": {
+      "$ref": "#/$defs/Web",
+      "default": {
+        "bind": "127.0.0.1",
+        "enabled": true,
+        "port": 8480,
+        "public_url": null
+      }
+    },
+    "worker_idle_timeout_secs": {
+      "default": 900,
+      "description": "Stop an engine worker after this many idle seconds (no live turn,\nno pending ask) to release its process; the next message restarts\nit and resumes the strand. `0` keeps the worker forever. A resident\ndaemon that answers once a day should not pay 24/7 for it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "worker_restart": {
+      "$ref": "#/$defs/WorkerRestart",
+      "default": {
+        "backoff_max_ms": 60000,
+        "backoff_start_ms": 1000,
+        "crash_max": 5,
+        "crash_window_secs": 600
+      }
+    },
+    "workspace": {
+      "default": "~/.ka-agent/profiles/default/workspace",
+      "description": "The single workspace directory every engine runs in (MVP). The\ndefault lives under the default data root — a relative default\nwould silently create `ka-agent-workspace/` wherever the operator\nhappened to stand.",
+      "type": "string"
+    }
+  },
+  "title": "DaemonConfig",
+  "type": "object"
+}

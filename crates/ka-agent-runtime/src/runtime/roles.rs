@@ -317,10 +317,7 @@ impl Runtime {
                 {
                     let moved = self.sh.paths.users_root().join(rest);
                     session.workspace = moved.clone();
-                    let _ = self
-                        .sh
-                        .store
-                        .set_session_workspace(&session.id, &moved);
+                    let _ = self.sh.store.set_session_workspace(&session.id, &moved);
                 }
                 session
             }
@@ -368,11 +365,13 @@ impl Runtime {
             session_model: None,
             agent: None,
             session_allow: std::collections::HashSet::new(),
+            paths_pending: std::collections::BTreeSet::new(),
             live: None,
             budget,
             crashes: Vec::new(),
             restart_attempt: 0,
             effort: None,
+            throttled_since_ms: None,
             last_active_ms: ka_agent_core::now_ms(),
         };
         let handle = UserHandle::new(state);
@@ -391,7 +390,8 @@ impl Runtime {
     /// The acting user's live `/model` pick for this session, if any
     /// (policy was already enforced when it was set).
     pub fn session_model_for(&self, username: &str) -> Option<String> {
-        self.user_handle(username).and_then(|st| st.lock().session_model.clone())
+        self.user_handle(username)
+            .and_then(|st| st.lock().session_model.clone())
     }
 
     /// The model a turn of `who` runs on: their session choice, else the
@@ -408,7 +408,9 @@ impl Runtime {
         if background && let Some(bg) = cfg.background_model.clone().filter(|m| ok(m)) {
             return Some(bg);
         }
-        if let Some(session) = self.user_handle(&who.username).and_then(|st| st.lock().session_model.clone())
+        if let Some(session) = self
+            .user_handle(&who.username)
+            .and_then(|st| st.lock().session_model.clone())
             && ok(&session)
         {
             return Some(session);
@@ -547,13 +549,17 @@ impl Runtime {
     /// Persist a user's budget window under their key.
     pub(super) fn persist_budget(&self, username: &str, budget: &BudgetState) {
         if let Ok(json) = serde_json::to_string(budget) {
-            let _ = self.sh.store.meta_set(&Self::budget_meta_key(username), &json);
+            let _ = self
+                .sh
+                .store
+                .meta_set(&Self::budget_meta_key(username), &json);
         }
     }
 
     /// One user's reasoning effort (`/effort`; cleared by `/new`).
     pub fn effort_for(&self, username: &str) -> Option<String> {
-        self.user_handle(username).and_then(|st| st.lock().effort.clone())
+        self.user_handle(username)
+            .and_then(|st| st.lock().effort.clone())
     }
 
     /// Make `who` ready to receive a turn. `false` while *that user's* own
@@ -716,7 +722,9 @@ mod tests {
             Some(Principal::new("ana", "guest"))
         );
         assert_eq!(rt.principal_for_source("web"), Some(Principal::operator()));
-        for local in ["console", "cli", "api", "cli-bg", "api-bg", "cron", "briefing", "retry"] {
+        for local in [
+            "console", "cli", "api", "cli-bg", "api-bg", "cron", "briefing", "retry",
+        ] {
             assert_eq!(
                 rt.principal_for_source(local),
                 Some(Principal::operator()),

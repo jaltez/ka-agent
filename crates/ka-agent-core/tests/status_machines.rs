@@ -123,7 +123,8 @@ where
             let wanted = edges.contains(&(*from, *to));
             let got = from.can_transition_to_value(*to);
             assert_eq!(
-                got, wanted,
+                got,
+                wanted,
                 "{name}: {from:?} -> {to:?} should be {}",
                 if wanted { "legal" } else { "illegal" }
             );
@@ -131,7 +132,10 @@ where
     }
     // No edge names a state outside the machine.
     for (from, to) in edges {
-        assert!(states.contains(from), "{name}: edge from unknown state {from:?}");
+        assert!(
+            states.contains(from),
+            "{name}: edge from unknown state {from:?}"
+        );
         assert!(states.contains(to), "{name}: edge to unknown state {to:?}");
     }
 }

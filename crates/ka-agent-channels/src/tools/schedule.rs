@@ -55,7 +55,10 @@ pub(crate) fn manage<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             "schedule" => {
                 // A private conversation schedules nothing: the task row
                 // (and its agent turn) would outlive the session.
-                if ctx.runtime.session_private_for(&crate::tools::turn_principal(ctx)) {
+                if ctx
+                    .runtime
+                    .session_private_for(&crate::tools::turn_principal(ctx))
+                {
                     return Err(
                         "this is a private conversation — nothing it schedules may outlive it; /new first"
                             .into(),

@@ -10,17 +10,27 @@
 //! (`Command::Prompt.skills`; the TUI's `/skill:<name>` interception does
 //! not exist headless, so the channel router drives it).
 //!
+//! B12 widens the frontmatter: `triggers` fire a skill on a keyword,
+//! `paths` park it when a call touches a matching file, and
+//! `allowed_tools` narrows that turn's toolset. The operator's source copy
+//! owns those keys; the engine copy is stripped of them (the pinned engine
+//! never sees unknown keys), so [`Skills::resolved`] joins the two views.
+//!
 //! A skill is text, not code (SEED.md §2.6): it changes what the model
-//! knows how to do, never what it is allowed to do.
+//! knows how to do, never what it is allowed to do. `allowed_tools` only
+//! ever narrows (the runtime intersects it with the role's toolset).
 
 use std::path::{Path, PathBuf};
 
+use ka_agent_store::{Store, model_matches};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("skill name {0:?}: [a-z0-9-] only, 1..=48 chars")]
     BadName(String),
+    #[error("skill {name:?}: {reason}")]
+    BadFrontmatter { name: String, reason: String },
     #[error("skill {name:?}: no SKILL.md in {dir}")]
     NoSkillMd { name: String, dir: PathBuf },
     #[error("skill {name:?} too large: {bytes} bytes (cap {cap})")]
@@ -34,15 +44,43 @@ pub enum Error {
 const MAX_SKILL_BYTES: u64 = 256 * 1024;
 /// At most this many files per skill directory.
 const MAX_SKILL_FILES: u64 = 64;
-/// How much of SKILL.md is read for the frontmatter description.
-const DESC_SCAN_BYTES: u64 = 4096;
+/// Frontmatter bounds (B12): each list is capped, so a malformed skill
+/// cannot turn every turn into a keyword scan.
+const MAX_TRIGGERS: usize = 8;
+const MAX_PATHS: usize = 8;
+const MAX_TOOLS: usize = 8;
+/// Frontmatter scan cap: the keys are small; reading a whole body on every
+/// submit would make trigger matching proportional to skill size.
+const META_SCAN_BYTES: u64 = 8 * 1024;
 
-/// One skill as the surfaces list it.
+/// One skill as the surfaces list it. The engine copy carries the
+/// description (progressive disclosure) but never the three B12 keys; use
+/// [`Skills::resolved`] for the firing view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillInfo {
     pub name: String,
-    /// Frontmatter `description` line, when present.
+    /// Frontmatter `description`, when present.
     pub description: String,
+    /// Whole-word triggers (`triggers = ["deploy"]`).
+    pub triggers: Vec<String>,
+    /// File globs that park the skill on a matching call
+    /// (`paths = ["docs/*"]`).
+    pub paths: Vec<String>,
+    /// Exact hand names this skill's turn may use
+    /// (`allowed_tools = ["read", "grep"]`).
+    pub allowed_tools: Vec<String>,
+}
+
+/// A skill as the runtime can fire it: the enabled name + advertisable
+/// description joined with the operator library's firing frontmatter.
+/// `source_copy` is false for the `[enabled, no source copy]` restore case
+/// (explicit `/skill` only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSkill {
+    pub info: SkillInfo,
+    pub source_copy: bool,
+    /// The provisioned `SKILL.md` size, what a `/skill` turn injects.
+    pub body_bytes: u64,
 }
 
 /// Where the operator keeps skills and where the engine discovers them.
@@ -56,6 +94,12 @@ pub struct Skills {
 
 pub fn valid_skill_name(s: &str) -> bool {
     (1..=48).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn valid_trigger(s: &str) -> bool {
+    (1..=32).contains(&s.len())
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
@@ -94,6 +138,157 @@ pub fn user_skills_dir() -> PathBuf {
         .unwrap_or_else(|| ka_agent_core::layout::base_dir().join("skills"))
 }
 
+/// The frontmatter keys B12 owns. The engine copy is stripped of them.
+const ENGINE_KEYS: [&str; 4] = ["triggers", "paths", "allowed_tools", "allowed-tools"];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Meta {
+    description: String,
+    triggers: Vec<String>,
+    paths: Vec<String>,
+    allowed_tools: Vec<String>,
+}
+
+impl Meta {
+    fn validate(&self, name: &str) -> Result<(), Error> {
+        if self.triggers.len() > MAX_TRIGGERS {
+            return Err(Error::BadFrontmatter {
+                name: name.to_string(),
+                reason: format!("at most {MAX_TRIGGERS} triggers"),
+            });
+        }
+        if let Some(bad) = self.triggers.iter().find(|t| !valid_trigger(t)) {
+            return Err(Error::BadFrontmatter {
+                name: name.to_string(),
+                reason: format!("trigger {bad:?}: [a-z0-9-] only, 1..=32 chars"),
+            });
+        }
+        if self.paths.len() > MAX_PATHS {
+            return Err(Error::BadFrontmatter {
+                name: name.to_string(),
+                reason: format!("at most {MAX_PATHS} paths"),
+            });
+        }
+        if let Some(bad) = self.paths.iter().find(|p| !valid_path_glob(p)) {
+            return Err(Error::BadFrontmatter {
+                name: name.to_string(),
+                reason: format!("path glob {bad:?}: not a usable glob"),
+            });
+        }
+        if self.allowed_tools.len() > MAX_TOOLS {
+            return Err(Error::BadFrontmatter {
+                name: name.to_string(),
+                reason: format!("at most {MAX_TOOLS} allowed_tools"),
+            });
+        }
+        if let Some(bad) = self.allowed_tools.iter().find(|t| t.trim().is_empty()) {
+            return Err(Error::BadFrontmatter {
+                name: name.to_string(),
+                reason: format!("allowed_tools entry {bad:?} is empty"),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A flat `*` glob (the house matcher, `ka_agent_store::model_matches`) is
+/// the whole grammar; the only invalid shape is an empty pattern or a
+/// parent-escape segment.
+fn valid_path_glob(glob: &str) -> bool {
+    let glob = glob.trim();
+    !glob.is_empty() && !glob.contains('\0') && !glob.split('/').any(|segment| segment == "..")
+}
+
+/// The frontmatter block: `(inner_start, inner_end, body_start)`.
+fn frontmatter_range(text: &str) -> Option<(usize, usize, usize)> {
+    let inner_start = if text.starts_with("---\n") {
+        4
+    } else if text.starts_with("---\r\n") {
+        5
+    } else {
+        return None;
+    };
+    let mut pos = inner_start;
+    for line in text[inner_start..].split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == "---" {
+            return Some((inner_start, pos, pos + line.len()));
+        }
+        pos += line.len();
+    }
+    None
+}
+
+fn parse_meta(text: &str) -> Meta {
+    let Some((start, end, _)) = frontmatter_range(text) else {
+        return Meta::default();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text[start..end]) else {
+        return Meta::default();
+    };
+    let strings = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut tools = strings("allowed_tools");
+    if tools.is_empty() {
+        tools = strings("allowed-tools");
+    }
+    Meta {
+        description: value
+            .get("description")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        triggers: strings("triggers"),
+        paths: strings("paths"),
+        allowed_tools: tools,
+    }
+}
+
+fn read_meta(skill_md: &Path) -> Meta {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(skill_md) else {
+        return Meta::default();
+    };
+    let mut buf = vec![0u8; META_SCAN_BYTES as usize];
+    let n = file.read(&mut buf).unwrap_or(0);
+    parse_meta(&String::from_utf8_lossy(&buf[..n]))
+}
+
+/// Remove exactly the three ka-agent keys from the copied `SKILL.md`,
+/// preserving every other key, comment and the operator's ordering.
+/// `toml_edit` is document-level: a typed round-trip would mangle or drop
+/// comments, and line deletion would break multi-line arrays.
+fn strip_engine_keys(text: &str) -> String {
+    let Some((start, end, _)) = frontmatter_range(text) else {
+        return text.to_string();
+    };
+    let Ok(mut doc) = text[start..end].parse::<toml_edit::DocumentMut>() else {
+        return text.to_string();
+    };
+    let mut removed = false;
+    for key in ENGINE_KEYS {
+        removed |= doc.as_table_mut().remove(key).is_some();
+    }
+    if !removed {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(doc.to_string().trim_end_matches(['\n', '\r']));
+    out.push('\n');
+    out.push_str(&text[end..]);
+    out
+}
+
 impl Skills {
     pub fn new(engine_home: &Path) -> Self {
         Self {
@@ -116,9 +311,13 @@ impl Skills {
             if !path.is_file() {
                 continue;
             }
+            let meta = read_meta(&path);
             out.push(SkillInfo {
                 name,
-                description: read_description(&path),
+                description: meta.description,
+                triggers: meta.triggers,
+                paths: meta.paths,
+                allowed_tools: meta.allowed_tools,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -154,6 +353,34 @@ impl Skills {
         Self::scan(&self.engine_dir)
     }
 
+    /// The firing view: enabled names joined with the operator library's
+    /// `triggers`/`paths`/`allowed_tools` under `user_dirs` precedence.
+    /// An enabled copy without a source copy resolves with empty firing
+    /// metadata (explicit `/skill` only) and `source_copy = false`.
+    pub fn resolved(&self) -> Vec<ResolvedSkill> {
+        self.enabled()
+            .into_iter()
+            .map(|mut info| {
+                let source = self.source_of(&info.name);
+                if let Some(dir) = &source {
+                    let meta = read_meta(&dir.join("SKILL.md"));
+                    info.triggers = meta.triggers;
+                    info.paths = meta.paths;
+                    info.allowed_tools = meta.allowed_tools;
+                }
+                let body_bytes =
+                    std::fs::metadata(self.engine_dir.join(&info.name).join("SKILL.md"))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                ResolvedSkill {
+                    info,
+                    source_copy: source.is_some(),
+                    body_bytes,
+                }
+            })
+            .collect()
+    }
+
     pub fn is_enabled(&self, name: &str) -> Result<bool, Error> {
         if !valid_skill_name(name) {
             return Err(Error::BadName(name.to_string()));
@@ -163,7 +390,8 @@ impl Skills {
 
     /// Copy one skill directory into the engine home. `Ok(false)` when the
     /// operator has no such skill. The copy is bounded (files + bytes) and
-    /// replaces any earlier provisioning atomically-ish: stage, then swap.
+    /// replaces any earlier provisioning atomically-ish: stage, strip the
+    /// ka-agent frontmatter keys, then swap.
     pub fn enable(&self, name: &str) -> Result<bool, Error> {
         if !valid_skill_name(name) {
             return Err(Error::BadName(name.to_string()));
@@ -171,12 +399,20 @@ impl Skills {
         let Some(src) = self.source_of(name) else {
             return Ok(false);
         };
+        read_meta(&src.join("SKILL.md")).validate(name)?;
         self.check_bounds(name, &src)?;
         std::fs::create_dir_all(&self.engine_dir)?;
         let dst = self.engine_dir.join(name);
         let staging = self.engine_dir.join(format!("{name}.enabling"));
         let _ = std::fs::remove_dir_all(&staging);
         copy_dir(&src, &staging)?;
+        let md = staging.join("SKILL.md");
+        if let Ok(text) = std::fs::read_to_string(&md) {
+            let stripped = strip_engine_keys(&text);
+            if stripped != text {
+                std::fs::write(&md, stripped)?;
+            }
+        }
         if let Err(e) = std::fs::rename(&staging, &dst) {
             // Destination exists (rename onto a non-empty dir fails on
             // Linux): remove the old provisioning, then swap.
@@ -225,6 +461,142 @@ impl Skills {
     }
 }
 
+/// Does `needle` occur in `hay` as a whole word? Whole-word means the
+/// characters around the match are not alphanumeric or `-` (a trigger is
+/// `[a-z0-9-]`), so `deploy` does not fire inside `deployment`.
+fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    let mut from = 0;
+    while let Some(offset) = hay[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before = hay[..start].chars().next_back();
+        let after = hay[end..].chars().next();
+        if !before.is_some_and(is_word) && !after.is_some_and(is_word) {
+            return true;
+        }
+        from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// The skills a plain message fires: case-insensitive whole-word triggers,
+/// all hits, name-ordered, at most three skills per turn.
+pub fn matched_triggers(text: &str, resolved: &[ResolvedSkill]) -> Vec<String> {
+    let hay = text.to_lowercase();
+    let mut out: Vec<String> = resolved
+        .iter()
+        .filter(|skill| {
+            skill
+                .info
+                .triggers
+                .iter()
+                .any(|trigger| contains_word(&hay, trigger))
+        })
+        .map(|skill| skill.info.name.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(3);
+    out
+}
+
+/// The path-like tokens in a tool call's argument summary. `read` reports
+/// just the file name, `bash` the flattened command; both are what the
+/// engine's `CallStarted.detail` carries.
+fn path_tokens(detail: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for raw in detail.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | ','
+                    | ';'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '='
+            )
+    }) {
+        let token = raw
+            .trim_matches(|c: char| matches!(c, '.' | ':' | '!' | '?'))
+            .trim_start_matches("./");
+        if token.is_empty() || token.starts_with('-') {
+            continue;
+        }
+        // Path-like: a directory separator or a file extension.
+        let has_slash = token.contains('/');
+        let has_ext = token
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
+        if has_slash || has_ext {
+            out.push(token);
+        }
+    }
+    out
+}
+
+/// The skills a call's detail touches: every token (and every suffix after
+/// a `/`, so an absolute workspace path still matches `docs/*`) checked
+/// against each skill's globs with the house matcher. Name-ordered, no
+/// duplicates.
+pub fn matched_paths(detail: &str, resolved: &[ResolvedSkill]) -> Vec<String> {
+    let tokens = path_tokens(detail);
+    let mut out: Vec<String> = resolved
+        .iter()
+        .filter(|skill| {
+            skill.info.paths.iter().any(|glob| {
+                tokens.iter().any(|token| {
+                    model_matches(glob, token)
+                        || token
+                            .match_indices('/')
+                            .any(|(i, _)| model_matches(glob, &token[i + 1..]))
+                })
+            })
+        })
+        .map(|skill| skill.info.name.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The store meta key that marks a paths attach for one conversation.
+/// `""` means "cleared by compaction, eligible again".
+pub fn path_marker_key(session: &str, skill: &str) -> String {
+    format!("skillpath:{session}:{skill}")
+}
+
+/// Is the once-per-conversation marker set? A cleared marker (`""`) or a
+/// missing key both mean "eligible".
+pub fn path_marked(store: &Store, session: &str, skill: &str) -> bool {
+    store
+        .meta_get(&path_marker_key(session, skill))
+        .ok()
+        .flatten()
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// Compaction reset: every attach-time marker of this session becomes
+/// eligible again. The next matching touch re-parks; nothing is re-injected
+/// eagerly.
+pub fn clear_path_markers(store: &Store, session: &str, engine_home: &Path) {
+    for skill in Skills::new(engine_home).resolved() {
+        let _ = store.meta_set(&path_marker_key(session, &skill.info.name), "");
+    }
+}
+
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -259,35 +631,6 @@ fn dir_size(dir: &Path) -> (u64, u64) {
     (files, bytes)
 }
 
-/// The frontmatter `description = "…"` line, best-effort. Progressive
-/// disclosure shows one line per skill; a missing description is fine.
-fn read_description(skill_md: &Path) -> String {
-    use std::io::Read;
-    let mut buf = vec![0u8; DESC_SCAN_BYTES as usize];
-    let text = std::fs::File::open(skill_md)
-        .and_then(|mut f| {
-            let n = f.read(&mut buf)?;
-            Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
-        })
-        .unwrap_or_default();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("description") {
-            let rest = rest.trim_start();
-            if let Some(v) = rest.strip_prefix('=') {
-                return v
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .chars()
-                    .take(120)
-                    .collect();
-            }
-        }
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -299,7 +642,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
-            format!("---\nname = {name}\ndescription = \"{description}\"\n---\n\nDo the thing.\n"),
+            format!(
+                "---\nname = \"{name}\"\ndescription = \"{description}\"\n---\n\nDo the thing.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn skill_with_frontmatter(base: &Path, name: &str, frontmatter: &str) {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{frontmatter}\n---\n\nDo the thing.\n"),
         )
         .unwrap();
     }
@@ -368,5 +723,127 @@ mod tests {
             engine_dir: tmp.path().join("engine/.config/ka/skills"),
         };
         assert!(skills.enable("big").is_err());
+    }
+
+    #[test]
+    fn frontmatter_strip_preserves_the_rest_and_resolved_joins_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("user");
+        skill_with_frontmatter(
+            &user,
+            "deploy",
+            "name = \"deploy\"\n# operator note\ndescription = \"ship it\"\ntriggers = [\"deploy\", \"release\"]\npaths = [\"docs/*\"]\nallowed_tools = [\"read\", \"bash\"]\nmodel = \"openai/gpt-5.2\"",
+        );
+        let skills = Skills {
+            user_dirs: vec![user.clone()],
+            engine_dir: tmp.path().join("engine/.config/ka/skills"),
+        };
+        assert!(skills.enable("deploy").unwrap());
+        let engine_md = std::fs::read_to_string(skills.engine_dir.join("deploy/SKILL.md")).unwrap();
+        assert!(!engine_md.contains("triggers"), "{engine_md}");
+        assert!(!engine_md.contains("paths"), "{engine_md}");
+        assert!(!engine_md.contains("allowed_tools"), "{engine_md}");
+        assert!(engine_md.contains("# operator note"), "{engine_md}");
+        assert!(
+            engine_md.contains("model = \"openai/gpt-5.2\""),
+            "{engine_md}"
+        );
+        // The operator's copy is untouched.
+        let source_md = std::fs::read_to_string(user.join("deploy/SKILL.md")).unwrap();
+        assert!(source_md.contains("triggers"), "{source_md}");
+
+        let resolved = skills.resolved();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].source_copy);
+        assert_eq!(resolved[0].info.triggers, ["deploy", "release"]);
+        assert_eq!(resolved[0].info.paths, ["docs/*"]);
+        assert_eq!(resolved[0].info.allowed_tools, ["read", "bash"]);
+    }
+
+    #[test]
+    fn enable_refuses_bad_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("user");
+        skill_with_frontmatter(&user, "loud", "triggers = [\"Deploy!\"]");
+        let skills = Skills {
+            user_dirs: vec![user.clone()],
+            engine_dir: tmp.path().join("engine/.config/ka/skills"),
+        };
+        assert!(skills.enable("loud").is_err());
+
+        skill_with_frontmatter(&user, "escape", "paths = [\"../secrets/*\"]");
+        assert!(skills.enable("escape").is_err());
+
+        skill_with_frontmatter(
+            &user,
+            "many",
+            "triggers = [\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]",
+        );
+        assert!(skills.enable("many").is_err());
+    }
+
+    fn resolved(name: &str, triggers: &[&str], paths: &[&str]) -> ResolvedSkill {
+        ResolvedSkill {
+            info: SkillInfo {
+                name: name.into(),
+                description: String::new(),
+                triggers: triggers.iter().map(|s| s.to_string()).collect(),
+                paths: paths.iter().map(|s| s.to_string()).collect(),
+                allowed_tools: Vec::new(),
+            },
+            source_copy: true,
+            body_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn triggers_match_whole_words_case_insensitively_and_cap_at_three() {
+        let skills = vec![
+            resolved("alpha", &["deploy"], &[]),
+            resolved("beta", &["deploy"], &[]),
+            resolved("gamma", &["deploy"], &[]),
+            resolved("delta", &["deploy"], &[]),
+        ];
+        assert_eq!(
+            matched_triggers("How do we DEPLOY this?", &skills),
+            ["alpha", "beta", "delta"]
+        );
+        assert!(matched_triggers("deployment pipeline", &skills).is_empty());
+        assert!(matched_triggers("re-deploy", &skills).is_empty());
+        assert_eq!(matched_triggers("deploy", &skills[..1]), ["alpha"]);
+    }
+
+    #[test]
+    fn paths_match_tokens_and_absolute_suffixes() {
+        let skills = vec![resolved("docs", &[], &["docs/*"])];
+        assert_eq!(matched_paths("cat docs/release.md", &skills), ["docs"]);
+        assert_eq!(matched_paths("read /ws/docs/release.md", &skills), ["docs"]);
+        // A bare file name (the read tool's detail) has no directory part.
+        assert!(matched_paths("release.md", &skills).is_empty());
+        // Globs are flat: `docs/*` does not match a sibling directory.
+        assert!(matched_paths("cat notes/release.md", &skills).is_empty());
+    }
+
+    #[test]
+    fn path_markers_are_written_and_cleared_without_deleting_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("state.db")).unwrap();
+        let engine_home = tmp.path().join("engine-home");
+        let user = tmp.path().join("user");
+        skill_with_frontmatter(&user, "docs", "paths = [\"docs/*\"]");
+        let skills = Skills {
+            user_dirs: vec![user],
+            engine_dir: engine_home.join(".config/ka/skills"),
+        };
+        skills.enable("docs").unwrap();
+        assert!(!path_marked(&store, "s1", "docs"));
+        store.meta_set(&path_marker_key("s1", "docs"), "1").unwrap();
+        assert!(path_marked(&store, "s1", "docs"));
+        clear_path_markers(&store, "s1", &engine_home);
+        assert!(!path_marked(&store, "s1", "docs"));
+        assert_eq!(
+            store.meta_get(&path_marker_key("s1", "docs")).unwrap(),
+            Some(String::new())
+        );
     }
 }

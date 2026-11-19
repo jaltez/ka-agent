@@ -9,6 +9,7 @@ use super::*;
 use crate::event::{PlanItem, turn_text};
 use crate::surface::ApprovalCard;
 use ka_agent_core::Principal;
+use ka_agent_store::{PlanRow, PlanStatus};
 
 /// Final-answer chunk ceiling before splitting (Telegram 4096 minus margin;
 /// SEED.md §5.4).
@@ -329,6 +330,31 @@ pub(super) async fn drive(
                 }
             }
             PortEvent::CallStarted { tool, id, detail } => {
+                // B12 paths: a touch parks the skill for the *next*
+                // submit (single-writer — never mid-cycle). The
+                // once-per-conversation marker is written at attach time,
+                // so a touch whose marker is still set is a no-op.
+                let sid = st.lock().session.id.clone();
+                if !is_scheduled(turn_source.as_deref()) {
+                    let resolved =
+                        crate::skills::Skills::new(&sh.paths.user_engine_home(&who.username))
+                            .resolved();
+                    let hits = crate::skills::matched_paths(&detail, &resolved);
+                    // A name already parked (or attached, marker set) is a
+                    // no-op: the once-per-conversation rule.
+                    let pending = st.lock().paths_pending.clone();
+                    let mut park = Vec::new();
+                    for name in hits {
+                        if !pending.contains(&name)
+                            && !crate::skills::path_marked(&sh.store, sid.as_str(), &name)
+                        {
+                            park.push(name);
+                        }
+                    }
+                    if !park.is_empty() {
+                        st.lock().paths_pending.extend(park);
+                    }
+                }
                 let mut g = st.lock();
                 if let Some(live) = g.live.as_mut() {
                     live.last_call = Some((tool.clone(), detail.clone()));
@@ -403,7 +429,20 @@ pub(super) async fn drive(
                     }
                 }
             }
-            PortEvent::Compacting { done } => emit(AgentEvent::Compacting { done }),
+            PortEvent::Compacting { done } => {
+                // B12: compaction resets the session's paths markers so the
+                // next matching touch re-parks. Lazy re-attach only — no
+                // eager re-injection across the port.
+                if done {
+                    let sid = st.lock().session.id.clone();
+                    crate::skills::clear_path_markers(
+                        &sh.store,
+                        sid.as_str(),
+                        &sh.paths.user_engine_home(&who.username),
+                    );
+                }
+                emit(AgentEvent::Compacting { done });
+            }
             PortEvent::Inventory { tools } => {
                 let mut g = st.lock();
                 if let Some(live) = g.live.as_mut() {
@@ -629,6 +668,9 @@ pub(super) async fn drive(
                 cost_usd,
                 tokens,
             } => {
+                // A settled turn ends any rate-limit throttle: the stamp
+                // only survives while the engine is still retrying.
+                st.lock().throttled_since_ms = None;
                 let turn_result = { st.lock().live.as_ref().and_then(|l| l.current_turn.clone()) };
                 let (full_text, private) = {
                     let g = st.lock();
@@ -968,6 +1010,12 @@ pub(super) async fn drive(
                             .ok()
                             .flatten()
                             .is_some_and(|t| t.stop.as_deref() == Some("empty"))
+                        // F12: an `executing` plan's empty answer is the
+                        // verify cycle's problem (its repair queue owns
+                        // the re-feed); nudging too would double-feed
+                        // the same failure. A `drafting` plan keeps the
+                        // nudge — its capture has no other retry.
+                        && !nudge_suppressed_for_plan(&sh, &st)
                     {
                         let turn_from_nudge =
                             st.lock().live.as_ref().is_some_and(|l| l.turn_from_nudge);
@@ -1029,6 +1077,13 @@ pub(super) async fn drive(
                             });
                         }
                     }
+                    // v4 F12 plan boundary: a `plan:<id>` turn either
+                    // captures its answer into a drafting artifact or
+                    // settles an executing one through the verify/repair
+                    // cycle — before the drain, so a repair enqueued here
+                    // starts in this same drain (single-writer untouched:
+                    // the repair is an ordinary queued inbound).
+                    plan_boundary(&sh, &who, &st, &text, turn_id.as_ref(), &sid).await;
                     drain_queue(&sh, &who, &st).await;
                 }
                 rt_maybe_idle(&sh, &st);
@@ -1040,6 +1095,13 @@ pub(super) async fn drive(
                 message,
                 retryable,
             } => {
+                // A retryable rate limit keeps retrying in-engine (the
+                // port's backoff owns the loop): stamp the start so every
+                // status surface shows the cooldown instead of a bare
+                // error. The next settled turn clears it (TurnFinished).
+                if class == "rate_limit" && retryable {
+                    st.lock().throttled_since_ms = Some(ka_agent_core::now_ms());
+                }
                 emit(AgentEvent::Error {
                     class: class.clone(),
                     message: message.clone(),
@@ -1116,11 +1178,528 @@ fn approval_ask_id(a: &Approval) -> String {
     }
 }
 
+/// Outcome of one plan verify run: the zero-token gate's shape (exit
+/// word) with the raw exit code for the audit row and the capped output
+/// for the repair prompt.
+#[derive(Debug)]
+enum VerifyOutcome {
+    /// Exit 0 (output discarded — nothing to repair).
+    Pass { exit: i32 },
+    /// Non-zero exit, or the gate could not run (spawn error, timeout).
+    Fail {
+        output: String,
+        exit: Option<i32>,
+        why: String,
+    },
+}
+
+/// The `plan:<id>` source family (v4 F12): the plan id a turn belongs to.
+fn plan_source(source: Option<&str>) -> Option<String> {
+    source
+        .and_then(|s| s.strip_prefix("plan:"))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// The v4 F12 plan boundary, run inside `Idle` before the queue drain:
+/// a `plan:<id>` turn either captures its answer into a `drafting`
+/// artifact or settles an `executing` one through the verify/repair
+/// cycle. Anything else (a plan another user owns, an unknown id) is a
+/// no-op: the turn's answer still delivers as ordinary chat output.
+async fn plan_boundary(
+    sh: &Arc<Shared>,
+    who: &Principal,
+    st: &UserHandle,
+    text: &str,
+    turn_id: Option<&TurnId>,
+    sid: &SessionId,
+) {
+    let source = st
+        .lock()
+        .live
+        .as_ref()
+        .and_then(|l| l.current_turn_source.clone());
+    let Some(plan_id) = plan_source(source.as_deref()) else {
+        return;
+    };
+    let Ok(Some(plan)) = sh.store.get_plan(&plan_id) else {
+        return;
+    };
+    // The artifact belongs to its owner: a repair or capture never
+    // lands on another user's plan.
+    if plan.username != who.username {
+        return;
+    }
+    match plan.status {
+        PlanStatus::Drafting => plan_capture(sh, &plan, text, source.as_deref().unwrap_or("")),
+        PlanStatus::Executing => {
+            // The repair queues into the *live* session (where the
+            // cycle's drain runs), not the plan's creation session.
+            plan_verify_cycle(
+                sh,
+                who,
+                st,
+                &plan,
+                turn_id,
+                sid,
+                source.as_deref().unwrap_or(""),
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
+/// Lift every `Verify:` line out of a captured plan body into the verify
+/// column — the last one wins. `` `cmd` `` is unwrapped; `Verify: none`
+/// (or a bare `Verify:`) records no gate.
+fn split_verify_lines(body: &str) -> (String, Option<String>) {
+    let mut verify: Option<String> = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("Verify:")
+            .or_else(|| trimmed.strip_prefix("verify:"));
+        match rest {
+            Some(rest) => {
+                let cmd = rest.trim().trim_matches('`').trim();
+                verify =
+                    (!cmd.is_empty() && !cmd.eq_ignore_ascii_case("none")).then(|| cmd.to_string());
+            }
+            None => kept.push(line),
+        }
+    }
+    (kept.join("\n").trim().to_string(), verify)
+}
+
+/// Capture (v4 F12): the finished `plan:<id>` turn's whole cycle text
+/// becomes the body of its `drafting` plan, the `Verify:` line lifts
+/// into the column, and the row flips to `draft` (approval arms the
+/// gate from here). An empty answer writes nothing — the empty-answer
+/// nudge's re-ask (same source) appends instead; a still-empty cycle
+/// stays `drafting` with the nudge's own notice.
+fn plan_capture(sh: &Arc<Shared>, plan: &PlanRow, text: &str, source: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let emit = |ev: AgentEvent| sh.emit_from(ev, Some(source));
+    let combined = if plan.body.trim().is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{}\n\n{trimmed}", plan.body.trim_end())
+    };
+    let (body, verify) = split_verify_lines(&combined);
+    if let Err(e) = sh.store.set_plan_body(&plan.id, &body) {
+        emit(AgentEvent::Error {
+            class: "internal".into(),
+            retryable: retryable_class("internal"),
+            message: format!("plan capture: {e}"),
+        });
+        return;
+    }
+    if let Some(v) = verify.as_deref()
+        && let Err(e) = sh.store.set_plan_verify(&plan.id, Some(v))
+    {
+        emit(AgentEvent::Error {
+            class: "internal".into(),
+            retryable: retryable_class("internal"),
+            message: format!("plan capture: {e}"),
+        });
+        return;
+    }
+    match sh
+        .store
+        .transition_plan(&plan.id, PlanStatus::Drafting, PlanStatus::Draft)
+    {
+        Ok(()) => {
+            let armed = verify
+                .as_deref()
+                .map(|v| format!("verify `{v}` unarmed until /plan approve"))
+                .unwrap_or_else(|| "no verify line — runs gateless".into());
+            emit(AgentEvent::Notice {
+                text: format!(
+                    "plan {} captured as a draft — {armed}",
+                    ka_agent_core::ids::short_id(&plan.id)
+                ),
+            });
+        }
+        Err(e) => emit(AgentEvent::Error {
+            class: "internal".into(),
+            retryable: retryable_class("internal"),
+            message: format!("plan capture: {e}"),
+        }),
+    }
+}
+
+/// Which finished turns owe a verify gate run: everything except the
+/// engine-failure family — a turn ending `error`/`aborted`/`interrupted`
+/// runs no gate and auto-submits nothing (SEED §7.3). `empty` is a
+/// done-family stop (the model said nothing): the gate is still the
+/// authority on done-ness.
+fn plan_turn_gates(stop: Option<&str>) -> bool {
+    !matches!(stop, Some("error") | Some("aborted") | Some("interrupted"))
+}
+
+/// Whether the empty-answer nudge must stand down for this cycle: an
+/// `executing` plan's re-feed belongs to its repair queue (nudging too
+/// would double-feed the same failure); a `drafting` plan keeps the
+/// nudge — its capture has no other retry.
+fn nudge_suppressed_for_plan(sh: &Arc<Shared>, st: &UserHandle) -> bool {
+    st.lock()
+        .live
+        .as_ref()
+        .and_then(|l| l.current_turn_source.as_deref())
+        .and_then(|s| plan_source(Some(s)))
+        .is_some_and(|id| {
+            sh.store
+                .get_plan(&id)
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.status == PlanStatus::Executing)
+        })
+}
+
+/// Verify/repair (v4 F12): a gate-eligible turn of an `executing` plan
+/// runs its verify gate — `sh -c`, the session workspace, 30 s ceiling,
+/// capped output, `spawn_blocking`-wrapped so this async `drive` task
+/// never blocks. Pass (or no verify at all) settles `done`; a failure
+/// spends one repair iteration and enqueues exactly one follow-up turn
+/// whose gate output rides the `<gate-output>` envelope; at the cap the
+/// plan settles `failed`.
+async fn plan_verify_cycle(
+    sh: &Arc<Shared>,
+    who: &Principal,
+    st: &UserHandle,
+    plan: &PlanRow,
+    turn_id: Option<&TurnId>,
+    sid: &SessionId,
+    source: &str,
+) {
+    let emit = |ev: AgentEvent| sh.emit_from(ev, Some(source));
+    let clean = turn_id
+        .and_then(|tid| sh.store.get_turn(tid).ok().flatten())
+        .is_some_and(|t| plan_turn_gates(t.stop.as_deref()));
+    if !clean {
+        return;
+    }
+    // Gateless approved plan: a clean turn is the whole check.
+    let Some(gate) = plan.verify.clone() else {
+        match sh
+            .store
+            .transition_plan(&plan.id, PlanStatus::Executing, PlanStatus::Done)
+        {
+            Ok(()) => emit(AgentEvent::Notice {
+                text: format!(
+                    "plan {} done — clean turn, no verify command",
+                    ka_agent_core::ids::short_id(&plan.id)
+                ),
+            }),
+            Err(e) => emit(AgentEvent::Error {
+                class: "internal".into(),
+                retryable: retryable_class("internal"),
+                message: format!("plan settle: {e}"),
+            }),
+        }
+        return;
+    };
+    let workspace = Runtime { sh: Arc::clone(sh) }.workspace_for(who);
+    let run = move || run_verify_gate(&gate, &workspace);
+    let outcome = match tokio::task::spawn_blocking(run).await {
+        Ok(outcome) => outcome,
+        Err(e) => VerifyOutcome::Fail {
+            output: String::new(),
+            exit: None,
+            why: format!("gate task: {e}"),
+        },
+    };
+    // Every gate execution lands an audit row — outcome and exit — a
+    // local shell exactly like a cron gate (README's intents rule stays
+    // scoped to external writes).
+    let (word, outcome_detail) = match &outcome {
+        VerifyOutcome::Pass { exit } => ("pass", format!("exit {exit}")),
+        VerifyOutcome::Fail { exit, why, .. } => (
+            "fail",
+            match exit {
+                Some(code) => format!("exit {code}: {why}"),
+                None => why.clone(),
+            },
+        ),
+    };
+    let mut rec = AuditRecord::new(
+        "runtime",
+        audit_actions::PLAN_VERIFY,
+        &plan.id,
+        Some(format!(
+            "{word}; repair {}/{}; {outcome_detail}",
+            plan.iterations, plan.max_iterations
+        )),
+    )
+    .with_user(&who.username)
+    .with_role(&who.role);
+    let _ = sh.store.append_audit(&mut rec);
+    match outcome {
+        VerifyOutcome::Pass { .. } => {
+            match sh
+                .store
+                .transition_plan(&plan.id, PlanStatus::Executing, PlanStatus::Done)
+            {
+                Ok(()) => emit(AgentEvent::Notice {
+                    text: format!(
+                        "plan {} done — verify passed",
+                        ka_agent_core::ids::short_id(&plan.id)
+                    ),
+                }),
+                Err(e) => emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    retryable: retryable_class("internal"),
+                    message: format!("plan settle: {e}"),
+                }),
+            }
+        }
+        VerifyOutcome::Fail { output, why, .. } => {
+            // The gate ran for up to 30 s: an inbound message may have
+            // claimed the cycle in the meantime. Never race a live turn
+            // (SEED §7.3 — the runtime does not auto-submit into a
+            // running cycle); the plan stays `executing` and the
+            // operator re-runs it.
+            let boundary_taken = st.lock().live.as_ref().is_some_and(|l| {
+                !l.pending_asks.is_empty()
+                    || l.current_turn
+                        .as_ref()
+                        .and_then(|tid| sh.store.get_turn(tid).ok().flatten())
+                        .is_some_and(|t| !t.status.is_terminal())
+            });
+            if boundary_taken {
+                return;
+            }
+            // The cron budget check gates each repair: a window with
+            // nothing left stays `executing` for the operator to re-run.
+            if (Runtime { sh: Arc::clone(sh) }).budget_verdict_for(&who.username)
+                == ka_agent_core::BudgetVerdict::Exceeded
+            {
+                emit(AgentEvent::Notice {
+                    text: format!(
+                        "plan {}: verify failed ({why}) — repair deferred, today's budget is reached",
+                        ka_agent_core::ids::short_id(&plan.id)
+                    ),
+                });
+                return;
+            }
+            match sh.store.bump_plan_iteration(&plan.id) {
+                Ok(spent) => {
+                    let shown = if output.trim().is_empty() {
+                        why.clone()
+                    } else {
+                        output
+                    };
+                    let prompt = format!(
+                        "The verify gate of plan {} failed (repair {}/{}). Make the \
+                         workspace pass the gate, then summarize what you changed.\n\n\
+                         <plan>\n{}\n</plan>\n\n<gate-output>\n{}\n</gate-output>",
+                        plan.id,
+                        spent,
+                        plan.max_iterations,
+                        plan.body,
+                        shown.trim_end()
+                    );
+                    let item = ka_agent_core::QueueItem::new(sid.clone(), prompt, source);
+                    match sh.store.enqueue(&item) {
+                        Ok(()) => emit(AgentEvent::Notice {
+                            text: format!(
+                                "plan {}: verify failed ({why}) — repair {spent}/{} queued",
+                                ka_agent_core::ids::short_id(&plan.id),
+                                plan.max_iterations
+                            ),
+                        }),
+                        Err(e) => emit(AgentEvent::Error {
+                            class: "internal".into(),
+                            retryable: retryable_class("internal"),
+                            message: format!("plan repair enqueue: {e}"),
+                        }),
+                    }
+                }
+                // At the cap (or the plan settled underneath us).
+                Err(e) => match sh.store.transition_plan(
+                    &plan.id,
+                    PlanStatus::Executing,
+                    PlanStatus::Failed,
+                ) {
+                    Ok(()) => emit(AgentEvent::Notice {
+                        text: format!(
+                            "plan {} failed after {} repair(s) — verify: {why} ({e})",
+                            ka_agent_core::ids::short_id(&plan.id),
+                            plan.iterations
+                        ),
+                    }),
+                    Err(settle) => emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        retryable: retryable_class("internal"),
+                        message: format!("plan settle: {settle}"),
+                    }),
+                },
+            }
+        }
+    }
+}
+
+/// Run one plan verify gate: `sh -c <gate>` (Windows `cmd /C`) in the
+/// session workspace, 30 s ceiling (kill), stdout+stderr capped at
+/// 4 KiB — the `run_gate` shape, sync so it can sit in
+/// `spawn_blocking`. Blocks the calling thread; never call from the
+/// drive task directly.
+fn run_verify_gate(gate: &str, workspace: &std::path::Path) -> VerifyOutcome {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", gate]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", gate]);
+        c
+    };
+    // A workspace that does not exist yet (a fresh instance, a test
+    // harness) falls back to the process cwd rather than failing the
+    // gate with ENOENT — the same fallback `run_gate` uses.
+    let cwd = if workspace.is_dir() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+    };
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return VerifyOutcome::Fail {
+                output: String::new(),
+                exit: None,
+                why: format!("spawn: {e}"),
+            };
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut buf = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_end(&mut buf);
+                }
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_end(&mut buf);
+                }
+                let output = String::from_utf8_lossy(&buf);
+                let output: String = output.chars().take(4096).collect();
+                let code = status.code();
+                return if status.success() {
+                    VerifyOutcome::Pass {
+                        exit: code.unwrap_or(0),
+                    }
+                } else {
+                    VerifyOutcome::Fail {
+                        output,
+                        exit: code,
+                        why: format!(
+                            "gate `{gate}` exited {}",
+                            code.map(|c| c.to_string())
+                                .unwrap_or_else(|| "by signal".into())
+                        ),
+                    }
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return VerifyOutcome::Fail {
+                        output: String::new(),
+                        exit: None,
+                        why: "timed out after 30s".into(),
+                    };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                return VerifyOutcome::Fail {
+                    output: String::new(),
+                    exit: None,
+                    why: format!("wait: {e}"),
+                };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::TurnAnnouncements;
+
+    #[test]
+    fn verify_line_lifts_out_of_the_body() {
+        let body = "# Plan\n1. step\nVerify: `cargo test -q`\n2. more";
+        let (body, verify) = super::split_verify_lines(body);
+        assert_eq!(body, "# Plan\n1. step\n2. more");
+        assert_eq!(verify.as_deref(), Some("cargo test -q"));
+        // `none` records no gate; last one wins.
+        let (body, verify) = super::split_verify_lines("Verify: a\nb\nverify: none");
+        assert_eq!(body, "b");
+        assert_eq!(verify, None);
+        let (_, verify) = super::split_verify_lines("a\nverify: none\nVerify: `true`");
+        assert_eq!(verify.as_deref(), Some("true"));
+        // No line, no gate — and the body passes through untouched.
+        let (body, verify) = super::split_verify_lines("just steps");
+        assert_eq!(body, "just steps");
+        assert_eq!(verify, None);
+    }
+
+    #[test]
+    fn plan_source_parses_the_family() {
+        assert_eq!(
+            super::plan_source(Some("plan:plan_ab-12")),
+            Some("plan_ab-12".to_string())
+        );
+        assert_eq!(super::plan_source(Some("cron")), None);
+        assert_eq!(super::plan_source(Some("plan:")), None);
+        assert_eq!(super::plan_source(None), None);
+    }
+
+    #[test]
+    fn gate_runs_on_everything_but_engine_failures() {
+        assert!(super::plan_turn_gates(Some("done")));
+        assert!(super::plan_turn_gates(Some("length")));
+        assert!(super::plan_turn_gates(Some("empty")));
+        assert!(!super::plan_turn_gates(Some("error")));
+        assert!(!super::plan_turn_gates(Some("aborted")));
+        assert!(!super::plan_turn_gates(Some("interrupted")));
+        assert!(super::plan_turn_gates(None));
+    }
+
+    #[test]
+    fn verify_gate_runs_and_reports_exits() {
+        let ws = std::env::temp_dir();
+        match super::run_verify_gate("echo ok", &ws) {
+            super::VerifyOutcome::Pass { exit } => {
+                assert_eq!(exit, 0);
+            }
+            other => panic!("expected pass, got {other:?}"),
+        }
+        match super::run_verify_gate("echo bad >&2; exit 3", &ws) {
+            super::VerifyOutcome::Fail { output, exit, .. } => {
+                assert_eq!(exit, Some(3));
+                assert!(output.contains("bad"), "{output}");
+            }
+            other => panic!("expected fail, got {other:?}"),
+        }
+    }
 
     #[test]
     fn one_announcement_per_runtime_turn() {

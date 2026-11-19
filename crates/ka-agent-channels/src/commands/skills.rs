@@ -38,7 +38,11 @@ pub(super) fn run_skill<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         let rest = ctx.args;
         match rest.split_once(' ') {
             Some((name, prompt)) if !name.is_empty() && !prompt.is_empty() => {
-                match ctx.runtime.handle_skill(name, prompt, ctx.source, &ctx.principal).await {
+                match ctx
+                    .runtime
+                    .handle_skill(name, prompt, ctx.source, &ctx.principal)
+                    .await
+                {
                     // The turn itself streams back through the surface.
                     Ok(()) => Outcome::Silent,
                     Err(e) => Outcome::Reply(format!("! [skill] {e}")),
@@ -143,4 +147,79 @@ async fn skill_review(ctx: Ctx<'_>, verb: &str, arg: &str) -> Outcome {
             }
         }
     }
+}
+
+/// `/skill-doctor`: per-skill context cost and attach counts. The engine
+/// assembles the prompt, so token figures are labeled estimates (bytes/4).
+pub(super) fn run_skill_doctor<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let resolved = ctx.runtime.skills_resolved(&ctx.principal);
+        if resolved.is_empty() {
+            return Outcome::Reply(
+                "no skills enabled — `ka-agent skills enable <name>` provisions one".into(),
+            );
+        }
+        let usage = ctx
+            .runtime
+            .store()
+            .skill_usage(&ctx.principal.username)
+            .unwrap_or_default();
+        let by_name: std::collections::BTreeMap<&str, &ka_agent_store::SkillUsage> =
+            usage.iter().map(|row| (row.skill.as_str(), row)).collect();
+        let now = ctx.runtime.now_zoned();
+        let mut lines =
+            vec!["skills — context cost (estimates; the engine assembles the prompt)".to_string()];
+        let mut total_tokens = 0u64;
+        let mut total_bytes = 0u64;
+        for skill in resolved {
+            let info = &skill.info;
+            let advertised = info.name.len() + info.description.len();
+            let tokens = (advertised as u64).div_ceil(4);
+            let kib = skill.body_bytes.div_ceil(1024);
+            total_tokens += tokens;
+            total_bytes += skill.body_bytes;
+            let mut line = format!(
+                "  {}  ~{} tok advertised · {}KiB body",
+                info.name, tokens, kib
+            );
+            match by_name.get(info.name.as_str()) {
+                Some(row) => {
+                    let mut kinds = Vec::new();
+                    if row.explicit > 0 {
+                        kinds.push(format!("{}× (explicit)", row.explicit));
+                    }
+                    if row.trigger > 0 {
+                        kinds.push(format!("{}× (trigger)", row.trigger));
+                    }
+                    if row.paths > 0 {
+                        kinds.push(format!("{}× (paths)", row.paths));
+                    }
+                    if !kinds.is_empty() {
+                        line.push_str(&format!(" · {}", kinds.join(", ")));
+                    }
+                    line.push_str(&format!(
+                        " · last used {}",
+                        super::local_compact(row.last_used_ms, &now)
+                    ));
+                }
+                None => line.push_str(" · never attached"),
+            }
+            if !info.triggers.is_empty() {
+                line.push_str(&format!(" · triggers: {}", info.triggers.join(", ")));
+            }
+            if !info.paths.is_empty() {
+                line.push_str(&format!(" · paths: {}", info.paths.join(", ")));
+            }
+            if !skill.source_copy {
+                line.push_str(" · no source copy");
+            }
+            lines.push(line);
+        }
+        lines.push(format!(
+            "standing: ~{} tok advertised · {}KiB body",
+            total_tokens,
+            total_bytes.div_ceil(1024)
+        ));
+        Outcome::Reply(lines.join("\n"))
+    })
 }

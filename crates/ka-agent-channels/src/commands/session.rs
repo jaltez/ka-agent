@@ -443,32 +443,126 @@ pub(super) fn run_steer<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_queue<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        if ctx.args == "clear" {
-            return match ctx.runtime.clear_queue(&ctx.principal) {
-                Ok(0) => Outcome::Reply("the queue is empty".into()),
-                Ok(n) => Outcome::Reply(format!("cleared {n} queued message(s)")),
+        let args = ctx.args.trim();
+        if args.is_empty() || args == "clear" {
+            if args == "clear" {
+                return match ctx.runtime.clear_queue(&ctx.principal) {
+                    Ok(0) => Outcome::Reply("the queue is empty".into()),
+                    Ok(n) => Outcome::Reply(format!("cleared {n} queued message(s)")),
+                    Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+                };
+            }
+            return match ctx.runtime.queued(&ctx.principal) {
+                Ok(items) if items.is_empty() => Outcome::Reply("the queue is empty".into()),
+                Ok(items) => Outcome::Reply(render_queue(&items)),
                 Err(e) => Outcome::Reply(format!("! [queue] {e}")),
             };
         }
-        match ctx.runtime.queued(&ctx.principal) {
-            Ok(items) if items.is_empty() => Outcome::Reply("the queue is empty".into()),
-            Ok(items) => {
-                let mut out = format!("{} queued:\n", items.len());
-                for (i, (id, source, text)) in items.iter().enumerate() {
-                    let head: String = text.chars().take(80).collect();
-                    out.push_str(&format!(
-                        "  #{} [{}] {} · {}\n",
-                        i + 1,
-                        source,
-                        ka_agent_core::ids::short_id(id),
-                        head
-                    ));
+        // `rm <n> · edit <n> <text> · top <n> · up|down <n> · now <n>`: the
+        // position is resolved against `queued()` here, so every surface
+        // speaks `#n` while the runtime works with ids.
+        let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        let rest = rest.trim();
+        let runtime = ctx.runtime;
+        let who = &ctx.principal;
+        match sub {
+            "rm" | "remove" => {
+                if rest.is_empty() {
+                    return Outcome::Reply("usage: /queue rm <n>".into());
                 }
-                Outcome::Reply(out.trim_end().to_string())
+                match runtime.remove_queued(rest, who) {
+                    Ok(true) => Outcome::Reply("removed".into()),
+                    Ok(false) => Outcome::Reply("! [queue] no queued message matches".into()),
+                    Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+                }
             }
-            Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+            "edit" => match rest.split_once(char::is_whitespace) {
+                None => Outcome::Reply("usage: /queue edit <n> <text>".into()),
+                Some((n, text)) => match runtime.edit_queued(n, text.trim(), who) {
+                    Ok(true) => Outcome::Reply("edited".into()),
+                    Ok(false) => Outcome::Reply("! [queue] no queued message matches".into()),
+                    Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+                },
+            },
+            "top" => queue_move_reply(ctx, rest, 1).await,
+            "up" | "down" => {
+                // One step up/down from the item's current position.
+                match queue_position(runtime, who, rest) {
+                    Ok(pos) => {
+                        let len = runtime.queued(who).map(|q| q.len()).unwrap_or(0);
+                        let to = if sub == "up" {
+                            pos.saturating_sub(1).max(1)
+                        } else {
+                            (pos + 1).min(len)
+                        };
+                        queue_move_reply(ctx, rest, to).await
+                    }
+                    Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+                }
+            }
+            "now" => match runtime.send_queued_now(rest, who).await {
+                Ok(Some(text)) => {
+                    let head: String = text.chars().take(60).collect();
+                    Outcome::Reply(format!("⏭ promoted — starting now: {head}"))
+                }
+                Ok(None) => Outcome::Reply("! [queue] no queued message matches".into()),
+                Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+            },
+            _ => Outcome::Reply(
+                "usage: /queue [clear|rm <n>|edit <n> <text>|top <n>|up <n>|down <n>|now <n>]"
+                    .into(),
+            ),
         }
     })
+}
+
+/// The shared `/queue` listing.
+fn render_queue(items: &[(String, String, String)]) -> String {
+    let mut out = format!("{} queued:\n", items.len());
+    for (i, (id, source, text)) in items.iter().enumerate() {
+        let head: String = text.chars().take(80).collect();
+        out.push_str(&format!(
+            "  #{} [{}] {} · {}\n",
+            i + 1,
+            source,
+            ka_agent_core::ids::short_id(id),
+            head
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// Resolve `/queue`'s 1-based position (or an id prefix) to `#n`.
+fn queue_position(
+    runtime: &Runtime,
+    who: &ka_agent_core::Principal,
+    key: &str,
+) -> Result<usize, String> {
+    let items = runtime.queued(who).map_err(|e| format!("! [queue] {e}"))?;
+    let key = key.trim();
+    if let Ok(n) = key.parse::<usize>() {
+        if n == 0 || n > items.len() {
+            return Err(format!("! [queue] no queued message #{key}"));
+        }
+        return Ok(n);
+    }
+    items
+        .iter()
+        .position(|(id, _, _)| ka_agent_core::ids::id_matches(id, key))
+        .map(|i| i + 1)
+        .ok_or_else(|| format!("! [queue] no queued message matches {key:?}"))
+}
+
+/// `top|up|down <n>`: move and reply with the refreshed list.
+async fn queue_move_reply(ctx: Ctx<'_>, key: &str, to: usize) -> Outcome {
+    match ctx.runtime.reorder_queued(key, to, &ctx.principal) {
+        Ok(true) => match ctx.runtime.queued(&ctx.principal) {
+            Ok(items) => Outcome::Reply(render_queue(&items)),
+            Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+        },
+        Ok(false) => Outcome::Reply("! [queue] no queued message matches".into()),
+        Err(e) => Outcome::Reply(format!("! [queue] {e}")),
+    }
 }
 
 pub(super) fn run_tools<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
@@ -497,5 +591,175 @@ pub(super) fn run_tools<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             out.push_str(&format!("\n{server}: {}", list.join(", ")));
         }
         Outcome::Reply(out)
+    })
+}
+
+/// The slots `/preset` offers.
+const PRESET_SLOTS: u8 = 3;
+
+/// `/preset` — numbered model+mode+effort slots: `/preset` lists them,
+/// `/preset save <1-3>` captures the live triple, `/preset <n>` applies a
+/// slot through the existing setters (model ACLs and role mode ceilings
+/// are inherited — a preset can never lift either).
+pub(super) fn run_preset<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let runtime = ctx.runtime;
+        let who = &ctx.principal;
+        let store = runtime.store();
+        let rest = ctx.args.trim();
+        if rest.is_empty() {
+            let saved = store.list_presets(&who.username).unwrap_or_default();
+            let mut lines = vec!["presets:".to_string()];
+            for slot in 1..=PRESET_SLOTS {
+                let line = match saved.iter().find(|p| p.slot == slot) {
+                    Some(p) => format!(
+                        "{}. {} · mode {} · effort {}",
+                        slot,
+                        p.model.as_deref().unwrap_or("(config model)"),
+                        p.mode.as_deref().unwrap_or("(profile default)"),
+                        p.effort.as_deref().unwrap_or("(model default)"),
+                    ),
+                    None => format!("{slot}. (empty)"),
+                };
+                lines.push(line);
+            }
+            lines.push("/preset save <1-3> captures the current model+mode+effort · /preset <n> applies one".into());
+            return Outcome::Reply(lines.join("\n"));
+        }
+        let (sub, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let rest = rest.trim();
+        let slot = match rest.parse::<u8>() {
+            Ok(n) if (1..=PRESET_SLOTS).contains(&n) => n,
+            _ => {
+                return Outcome::Reply(format!(
+                    "usage: /preset | /preset <1-{PRESET_SLOTS}> | /preset save <1-{PRESET_SLOTS}>"
+                ));
+            }
+        };
+        if sub == "save" {
+            let model = runtime.model_for(who, false);
+            let mode = runtime.effective_mode_for(&who.username);
+            let effort = runtime.effort(who);
+            match store.save_preset(
+                &who.username,
+                slot,
+                model.as_deref(),
+                Some(mode.as_str()),
+                effort.as_deref(),
+            ) {
+                Ok(()) => Outcome::Reply(format!(
+                    "preset {slot} saved: {} · mode {mode} · effort {}",
+                    model.as_deref().unwrap_or("(config model)"),
+                    effort.as_deref().unwrap_or("model default"),
+                )),
+                Err(e) => Outcome::Reply(format!("! [preset] {e}")),
+            }
+        } else {
+            let Some(p) = store.preset(&who.username, slot).unwrap_or(None) else {
+                return Outcome::Reply(format!(
+                    "! [preset] slot {slot} is empty — /preset save {slot} captures the current settings"
+                ));
+            };
+            // Apply through the existing setters: each enforces its own
+            // policy (model ACL, role mode ceiling), so the reply names
+            // the same refusal `/model` or `/mode` would give.
+            let mut steps: Vec<String> = Vec::new();
+            if let Some(sel) = &p.model {
+                match runtime.set_model(sel, who).await {
+                    Ok(id) => steps.push(format!("model → {id}")),
+                    Err(e) => return Outcome::Reply(format!("! [preset] model: {e}")),
+                }
+            }
+            if let Some(mode) = &p.mode {
+                match runtime.set_mode(mode, ctx.source, who).await {
+                    Ok(m) => steps.push(format!("mode → {m}")),
+                    Err(e) => return Outcome::Reply(format!("! [preset] mode: {e}")),
+                }
+            }
+            if let Some(level) = &p.effort {
+                match runtime.set_effort(level, who).await {
+                    Ok(reply) => steps.push(reply),
+                    Err(e) => return Outcome::Reply(format!("! [preset] effort: {e}")),
+                }
+            }
+            if steps.is_empty() {
+                steps.push("nothing to apply (the slot holds no overrides)".into());
+            }
+            Outcome::Reply(format!("preset {slot} → {}", steps.join(" · ")))
+        }
+    })
+}
+
+/// `/archive` — hide this session from the lists without touching its
+/// transcript: `/archive` archives the caller's live session, `/archive
+/// list` shows archived ones, `/archive undo <id-prefix>` restores.
+pub(super) fn run_archive<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let runtime = ctx.runtime;
+        let who = &ctx.principal;
+        let store = runtime.store();
+        let rest = ctx.args.trim();
+        if rest.is_empty() {
+            // The caller's live session: one command, no prompt.
+            let report = match runtime.status_report_for(who) {
+                Ok(r) => r,
+                Err(e) => return Outcome::Reply(format!("! [archive] {e}")),
+            };
+            let sid = ka_agent_core::SessionId(report.session_id.clone());
+            return match store.set_session_archived(&sid, true) {
+                Ok(()) => Outcome::Reply(format!(
+                    "🗄 session {} archived — hidden from the lists, its transcript is kept. /new starts a fresh session; /archive undo {} restores",
+                    short_id(sid.as_str()),
+                    short_id(sid.as_str()),
+                )),
+                Err(e) => Outcome::Reply(format!("! [archive] {e}")),
+            };
+        }
+        let (sub, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let rest = rest.trim();
+        match sub {
+            "list" => {
+                let mine = store
+                    .sessions_for_user(&who.username)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s.archived)
+                    .collect::<Vec<_>>();
+                if mine.is_empty() {
+                    return Outcome::Reply("no archived sessions".into());
+                }
+                let mut out = format!("{} archived:\n", mine.len());
+                for s in &mine {
+                    out.push_str(&format!(
+                        "  {} · updated {}\n",
+                        short_id(s.id.as_str()),
+                        ka_agent_core::when::describe(s.updated_ms, &runtime.now_zoned()),
+                    ));
+                }
+                Outcome::Reply(out.trim_end().to_string())
+            }
+            "undo" => {
+                if rest.is_empty() {
+                    return Outcome::Reply("usage: /archive undo <id-prefix>".into());
+                }
+                let Some(s) = store.find_session_by_prefix(rest).unwrap_or(None) else {
+                    return Outcome::Reply(format!("! [archive] no session matches {rest:?}"));
+                };
+                // Another user's session id prefix is refused.
+                if s.username != who.username {
+                    return Outcome::Reply("! [archive] no session of yours matches".into());
+                }
+                match store.set_session_archived(&s.id, false) {
+                    Ok(()) => Outcome::Reply(format!(
+                        "session {} restored to the lists",
+                        short_id(s.id.as_str())
+                    )),
+                    Err(e) => Outcome::Reply(format!("! [archive] {e}")),
+                }
+            }
+            _ => {
+                Outcome::Reply("usage: /archive | /archive list | /archive undo <id-prefix>".into())
+            }
+        }
     })
 }

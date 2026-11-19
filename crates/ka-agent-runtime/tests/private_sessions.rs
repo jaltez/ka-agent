@@ -388,7 +388,11 @@ async fn boot_sweep_destroys_ended_private_remnants() {
         store.next_queued(&private.id).unwrap().is_none(),
         "the dead private queued text is swept at boot"
     );
-    assert_eq!(rt.session_id_for(&op()).unwrap(), normal.id, "the normal session resumed");
+    assert_eq!(
+        rt.session_id_for(&op()).unwrap(),
+        normal.id,
+        "the normal session resumed"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

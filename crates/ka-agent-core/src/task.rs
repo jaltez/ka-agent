@@ -183,6 +183,25 @@ impl<'de> Deserialize<'de> for CronMode {
     }
 }
 
+/// The days an anchored recurrence fires on, from the persisted fields
+/// (`month_day` wins; empty weekdays = every day). Shared by
+/// [`CronSpec::day_rule`] and [`TriggerSpec::day_rule`].
+fn day_rule_of(month_day: Option<u8>, weekdays: &[u8]) -> crate::when::DayRule {
+    use crate::when::DayRule;
+    if let Some(d) = month_day {
+        return DayRule::MonthDay(d);
+    }
+    let days: Vec<jiff::civil::Weekday> = weekdays
+        .iter()
+        .filter_map(|w| jiff::civil::Weekday::from_monday_zero_offset(*w as i8).ok())
+        .collect();
+    if days.is_empty() {
+        DayRule::Daily
+    } else {
+        DayRule::Weekdays(days)
+    }
+}
+
 /// One generalized cron entry (M11), persisted as the `payload` of a
 /// `kind = "cron"` task row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,20 +256,7 @@ impl CronSpec {
 
     /// The days an anchored (`at_local`) recurrence fires on.
     pub fn day_rule(&self) -> crate::when::DayRule {
-        use crate::when::DayRule;
-        if let Some(d) = self.month_day {
-            return DayRule::MonthDay(d);
-        }
-        let days: Vec<jiff::civil::Weekday> = self
-            .weekdays
-            .iter()
-            .filter_map(|w| jiff::civil::Weekday::from_monday_zero_offset(*w as i8).ok())
-            .collect();
-        if days.is_empty() {
-            DayRule::Daily
-        } else {
-            DayRule::Weekdays(days)
-        }
+        day_rule_of(self.month_day, &self.weekdays)
     }
 
     /// Store a [`crate::when::DayRule`] in the spec's fields.
@@ -325,6 +331,153 @@ impl CronSpec {
     /// Parse a task-row payload; `None` on malformed or foreign JSON.
     pub fn from_payload(payload: &str) -> Option<Self> {
         serde_json::from_str(payload).ok()
+    }
+}
+
+/// What fires an inbound trigger (ADR-0005): a clock schedule or a webhook
+/// delivery. Exactly two kinds — GitHub-label triggers are webhook events,
+/// so one ingress lane plus the payload filter covers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerKind {
+    /// Fires on its recurrence (the `when.rs` grammar, like a cron).
+    Schedule,
+    /// Fires when an accepted, non-duplicate delivery arms it.
+    Webhook,
+}
+
+/// One inbound trigger (C2/B14, ADR-0005), persisted as the `payload` of a
+/// `kind = "trigger"` task row beside the cron entries. Fires run as the
+/// creator (role re-resolved from the user row at fire time) and submit
+/// into the pinned lineage session, never the creator's live chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerSpec {
+    pub kind: TriggerKind,
+    /// The prompt template. For a webhook delivery the normalized body is
+    /// appended, fenced in an `<event-payload>` envelope.
+    pub text: String,
+    /// Who created it: "operator", "kagent", ... (provenance only; the
+    /// fired turn's identity is `username`/`role` below).
+    pub source: String,
+    /// The lineage session this trigger always fires into (pinned at
+    /// creation; the session row carries username/role).
+    pub session_id: String,
+    /// The creator's role snapshot; the fire re-resolves the live role
+    /// from the user row (`None`/absent = admin, so old payloads load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The creator's user (`None`/absent = the operator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Exact hand names this job may use; re-clamped to the role's
+    /// effective toolset at every fire (config changes only narrow).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Consecutive failed fires; at [`TriggerSpec::ERROR_STRIKES`] the
+    /// task pauses as `interrupted` with one Error notice. A success
+    /// resets it.
+    #[serde(default)]
+    pub error_streak: u32,
+    // --- schedule kind ---
+    /// Fixed interval between fires in ms (`None` = one-shot / armed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence_ms: Option<i64>,
+    /// Anchored local wall-clock time ("HH:MM"), operator zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_local: Option<String>,
+    /// With `at_local`: only these weekdays (0 = Monday); empty = daily.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weekdays: Vec<u8>,
+    /// With `at_local`: this day of month (1–31, clamped to month end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month_day: Option<u8>,
+    /// Zero-token shell gate (schedule triggers): exit non-zero skips the
+    /// occurrence, exit 0 appends the output as context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    // --- webhook kind ---
+    /// Hook path prefix under `/api/hook/` (the route is
+    /// `/api/hook/<hook_path>`; unique across triggers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_path: Option<String>,
+    /// The per-trigger `secret:` ref name. `None` = `trigger.<hook_path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// Regex over the normalized body: match → fire, no match → the lane
+    /// answers `filtered` without arming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Body cap in bytes; `None` = 16 KiB. Clamped to 64 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+    /// Stage 3: run the cheap preflight gate (ephemeral readonly worker,
+    /// scratch engine-home, no tools) before spending the real turn.
+    #[serde(default)]
+    pub preflight: bool,
+}
+
+impl TriggerSpec {
+    /// Consecutive failures that pause the trigger (ADR-0005 §8).
+    pub const ERROR_STRIKES: u32 = 3;
+
+    /// The default body cap (16 KiB) and the hard ceiling (64 KiB).
+    pub const DEFAULT_BODY_BYTES: usize = 16 * 1024;
+    pub const MAX_BODY_BYTES: usize = 64 * 1024;
+
+    /// Serialize to the task-row payload (plain JSON, one line).
+    ///
+    /// Infallible for this plain struct (strings + integers); the scoped
+    /// allow covers the workspace's `expect_used` gate.
+    #[allow(clippy::expect_used)]
+    pub fn to_payload(&self) -> String {
+        serde_json::to_string(self).expect("TriggerSpec always serializes")
+    }
+
+    /// Parse a task-row payload; `None` on malformed or foreign JSON.
+    pub fn from_payload(payload: &str) -> Option<Self> {
+        serde_json::from_str(payload).ok()
+    }
+
+    /// The effective body cap: the per-trigger choice clamped into
+    /// [`Self::DEFAULT_BODY_BYTES`]..=[`Self::MAX_BODY_BYTES`] (a 0 or
+    /// absurd value degrades to the default, never to zero).
+    pub fn body_cap(&self) -> usize {
+        match self.max_body_bytes {
+            Some(n) if n >= Self::DEFAULT_BODY_BYTES => n.min(Self::MAX_BODY_BYTES),
+            _ => Self::DEFAULT_BODY_BYTES,
+        }
+    }
+
+    /// The days an anchored (`at_local`) recurrence fires on.
+    pub fn day_rule(&self) -> crate::when::DayRule {
+        day_rule_of(self.month_day, &self.weekdays)
+    }
+
+    /// A schedule trigger from a cron-shaped recurrence: the `when.rs`
+    /// grammar (`CronSpec::from_words`) stays the one parser; the schedule
+    /// fields carry over, the cron-only fields do not. `session_id` is
+    /// pinned by the caller (the runtime creates the lineage session).
+    pub fn from_schedule(cron: CronSpec, session_id: String) -> Self {
+        Self {
+            kind: TriggerKind::Schedule,
+            text: cron.text,
+            source: cron.source,
+            session_id,
+            role: cron.role,
+            username: cron.username,
+            tools: cron.tools,
+            error_streak: 0,
+            recurrence_ms: cron.recurrence_ms,
+            at_local: cron.at_local,
+            weekdays: cron.weekdays,
+            month_day: cron.month_day,
+            gate: cron.gate,
+            hook_path: None,
+            secret: None,
+            filter: None,
+            max_body_bytes: None,
+            preflight: false,
+        }
     }
 }
 
@@ -436,5 +589,137 @@ mod cron_tests {
         assert_eq!(CronSpec::from_payload(""), None);
         assert_eq!(CronSpec::from_payload("not json"), None);
         assert_eq!(CronSpec::from_payload(r#"{"text":"x"}"#), None);
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn webhook_spec() -> TriggerSpec {
+        TriggerSpec {
+            kind: TriggerKind::Webhook,
+            text: "triage the delivery".into(),
+            source: "operator".into(),
+            session_id: "sess_x".into(),
+            role: Some("member".into()),
+            username: Some("member".into()),
+            tools: vec!["read".into()],
+            error_streak: 0,
+            recurrence_ms: None,
+            at_local: None,
+            weekdays: Vec::new(),
+            month_day: None,
+            gate: None,
+            hook_path: Some("github/label".into()),
+            secret: None,
+            filter: Some(r#""action":\s*"opened""#.into()),
+            max_body_bytes: None,
+            preflight: false,
+        }
+    }
+
+    #[test]
+    fn triggerspec_payload_roundtrip_and_old_payloads_load() {
+        let spec = webhook_spec();
+        let payload = spec.to_payload();
+        assert!(payload.contains(r#""kind":"webhook""#), "{payload}");
+        assert_eq!(TriggerSpec::from_payload(&payload), Some(spec));
+
+        // Absent optional fields default: an old or minimal payload loads
+        // as an admin-owned trigger with no narrowing and no cap.
+        let minimal = TriggerSpec::from_payload(
+            r#"{"kind":"schedule","text":"ping","source":"operator","session_id":"sess_x"}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.kind, TriggerKind::Schedule);
+        assert!(minimal.role.is_none());
+        assert!(minimal.username.is_none());
+        assert!(minimal.tools.is_empty());
+        assert_eq!(minimal.error_streak, 0);
+        assert!(!minimal.preflight);
+    }
+
+    #[test]
+    fn triggerspec_body_cap_clamps() {
+        let mut spec = webhook_spec();
+        assert_eq!(spec.body_cap(), TriggerSpec::DEFAULT_BODY_BYTES);
+        spec.max_body_bytes = Some(TriggerSpec::MAX_BODY_BYTES);
+        assert_eq!(spec.body_cap(), TriggerSpec::MAX_BODY_BYTES);
+        // The ceiling holds even for a hand-crafted payload.
+        spec.max_body_bytes = Some(1 << 20);
+        assert_eq!(spec.body_cap(), TriggerSpec::MAX_BODY_BYTES);
+        // A zero cap degrades to the default, never to zero.
+        spec.max_body_bytes = Some(0);
+        assert_eq!(spec.body_cap(), TriggerSpec::DEFAULT_BODY_BYTES);
+    }
+
+    #[test]
+    fn triggerspec_day_rule_mirrors_cron() {
+        let mut spec = webhook_spec();
+        spec.kind = TriggerKind::Schedule;
+        spec.at_local = Some("09:00".into());
+        spec.weekdays = vec![0, 4];
+        let cron_days = spec.day_rule();
+        let mut cron = CronSpec {
+            text: String::new(),
+            source: String::new(),
+            recurrence_ms: Some(86_400_000),
+            mode: CronMode::Agent,
+            at_local: Some("09:00".into()),
+            weekdays: vec![0, 4],
+            month_day: None,
+            gate: None,
+            role: None,
+            username: None,
+            tools: Vec::new(),
+        };
+        assert_eq!(cron_days, cron.day_rule());
+        cron.month_day = Some(7);
+        spec.month_day = Some(7);
+        spec.weekdays.clear();
+        assert_eq!(spec.day_rule(), cron.day_rule());
+    }
+
+    #[test]
+    fn triggerspec_from_schedule_carries_the_recurrence() {
+        let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);
+        let (cron, first_at) = CronSpec::from_words(
+            &["every", "day", "at", "09:00", "check CI"],
+            "operator",
+            &now,
+        )
+        .unwrap();
+        let spec = TriggerSpec::from_schedule(cron, "sess_x".into());
+        assert_eq!(spec.kind, TriggerKind::Schedule);
+        assert_eq!(spec.text, "check CI");
+        assert!(spec.recurrence_ms.is_some());
+        assert!(first_at > now.timestamp().as_millisecond());
+        assert!(spec.hook_path.is_none());
+        assert_eq!(spec.session_id, "sess_x");
+    }
+
+    #[test]
+    fn triggerspec_payload_rejects_malformed() {
+        assert_eq!(TriggerSpec::from_payload(""), None);
+        assert_eq!(TriggerSpec::from_payload("not json"), None);
+        // A cron payload is foreign JSON: fields are missing, kind is not.
+        assert_eq!(TriggerSpec::from_payload(r#"{"text":"x"}"#), None);
+        let cron = CronSpec {
+            text: "x".into(),
+            source: "operator".into(),
+            recurrence_ms: None,
+            mode: CronMode::Agent,
+            at_local: None,
+            weekdays: Vec::new(),
+            month_day: None,
+            gate: None,
+            role: None,
+            username: None,
+            tools: Vec::new(),
+        };
+        assert_eq!(TriggerSpec::from_payload(&cron.to_payload()), None);
     }
 }

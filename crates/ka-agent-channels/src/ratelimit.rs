@@ -53,12 +53,7 @@ impl RateLimiter {
 
     /// Parse a 429/limited response's headers into a deadline for `key`.
     /// `headers` are lowercase names; returns the applied deadline.
-    pub fn apply_headers(
-        &self,
-        key: &str,
-        headers: &[(&str, String)],
-        now_ms: i64,
-    ) -> Option<i64> {
+    pub fn apply_headers(&self, key: &str, headers: &[(&str, String)], now_ms: i64) -> Option<i64> {
         let get = |name: &str| {
             headers
                 .iter()
@@ -68,24 +63,26 @@ impl RateLimiter {
         let mut until = None;
         // Slack: Retry-After in whole seconds.
         if let Some(v) = get("retry-after")
-            && let Ok(secs) = v.trim().parse::<f64>() {
-                until = Some(now_ms + (secs.max(0.0) * 1000.0) as i64);
-            }
+            && let Ok(secs) = v.trim().parse::<f64>()
+        {
+            until = Some(now_ms + (secs.max(0.0) * 1000.0) as i64);
+        }
         // Discord: X-RateLimit-Reset is an epoch second; Remaining 0 means
         // this bucket is exhausted.
         if let Some(reset) = get("x-ratelimit-reset")
-            && let Ok(epoch) = reset.trim().parse::<f64>() {
-                let reset_ms = (epoch * 1000.0) as i64;
-                // Only an exhausted bucket defers: a bucket with capacity
-                // left answers immediately even though its window resets
-                // later.
-                let exhausted = get("x-ratelimit-remaining")
-                    .and_then(|v| v.trim().parse::<i64>().ok())
-                    .is_some_and(|r| r <= 0);
-                if exhausted {
-                    until = Some(until.map_or(reset_ms, |u: i64| u.max(reset_ms)));
-                }
+            && let Ok(epoch) = reset.trim().parse::<f64>()
+        {
+            let reset_ms = (epoch * 1000.0) as i64;
+            // Only an exhausted bucket defers: a bucket with capacity
+            // left answers immediately even though its window resets
+            // later.
+            let exhausted = get("x-ratelimit-remaining")
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|r| r <= 0);
+            if exhausted {
+                until = Some(until.map_or(reset_ms, |u: i64| u.max(reset_ms)));
             }
+        }
         if let Some(until) = until {
             self.defer_until(key, until);
         }

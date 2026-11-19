@@ -101,7 +101,13 @@ impl Store {
     }
 
     /// Persist a connector's resume cursor.
-    pub fn set_kb_source_cursor(&self, kb: &str, kind: &str, target: &str, cursor: &str) -> Result<()> {
+    pub fn set_kb_source_cursor(
+        &self,
+        kb: &str,
+        kind: &str,
+        target: &str,
+        cursor: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE kb_sources SET cursor = ?4 WHERE kb_name = ?1 AND kind = ?2 AND target = ?3",
@@ -115,10 +121,9 @@ impl Store {
     pub fn kb_prune_absent(&self, kb: &str, seen: &[String]) -> Result<usize> {
         let mut removed = 0;
         for doc in self.kb_list_docs(kb)? {
-            if !seen.contains(&doc.path)
-                && self.kb_remove_doc(kb, &doc.path)? {
-                    removed += 1;
-                }
+            if !seen.contains(&doc.path) && self.kb_remove_doc(kb, &doc.path)? {
+                removed += 1;
+            }
         }
         Ok(removed)
     }
@@ -156,18 +161,22 @@ mod tests {
             Some("cur-1")
         );
         // An unknown KB or kind is refused.
-        assert!(store
-            .put_kb_source(&KbSourceRow {
-                kb_name: "nope".into(),
-                ..src.clone()
-            })
-            .is_err());
-        assert!(store
-            .put_kb_source(&KbSourceRow {
-                kind: "s3".into(),
-                ..src.clone()
-            })
-            .is_err());
+        assert!(
+            store
+                .put_kb_source(&KbSourceRow {
+                    kb_name: "nope".into(),
+                    ..src.clone()
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .put_kb_source(&KbSourceRow {
+                    kind: "s3".into(),
+                    ..src.clone()
+                })
+                .is_err()
+        );
         // Prune removes docs the source no longer reports.
         store
             .kb_upsert_doc("docs", "a.md", "A", "x", "h1", "dropbox", 1)

@@ -28,10 +28,13 @@ mod intents;
 mod kb_sources;
 mod kbs;
 mod outbox;
+mod plans;
+mod presets;
 mod queue;
 mod retention;
 mod rules;
 mod sessions;
+mod skill_usage;
 mod tasks;
 pub use tasks::task_username;
 mod turn_sources;
@@ -45,7 +48,9 @@ pub use checkpoints::CheckpointRow;
 pub use groups::{GroupRow, model_allowed, model_matches};
 pub use kb_sources::KbSourceRow;
 pub use kbs::{KbDocInfo, KbHit, KbRow};
+pub use plans::{PlanRow, PlanStatus};
 pub use retention::PruneReport;
+pub use skill_usage::SkillUsage;
 pub use turn_sources::{StagedSource, TurnSourceRow};
 pub use turns::EpisodeFilter;
 pub use users::{UserRow, user_for_role, valid_username};
@@ -117,6 +122,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v12.sql"),
     include_str!("schema_v13.sql"),
     include_str!("schema_v14.sql"),
+    include_str!("schema_v15.sql"),
+    include_str!("schema_v16.sql"),
+    include_str!("schema_v17.sql"),
+    include_str!("schema_v18.sql"),
+    include_str!("schema_v19.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
@@ -380,12 +390,12 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         created_ms: r.get(5)?,
         updated_ms: r.get(6)?,
         private: r.get::<_, i64>(7)? != 0,
+        archived: r.get::<_, i64>(10)? != 0,
     })
 }
 
 /// The column list every session read uses (order is `row_to_session`'s).
-const SESSION_COLS: &str =
-    "id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role, username";
+const SESSION_COLS: &str = "id, workspace, strand_id, strand_path, status, created_ms, updated_ms, private, role, username, archived";
 
 fn row_to_turn(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
     Ok(Turn {

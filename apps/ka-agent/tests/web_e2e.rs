@@ -229,7 +229,11 @@ fn member_realm_is_chat_only() {
     );
     wait_web(port, Duration::from_secs(30));
     let resp = redeem(port, &code, "ana", "longpassword");
-    assert_eq!(resp.status, 303, "invite redemption redirects: {}", resp.body);
+    assert_eq!(
+        resp.status, 303,
+        "invite redemption redirects: {}",
+        resp.body
+    );
     let set = resp.header("set-cookie").expect("Set-Cookie on invite");
     assert!(set.contains("HttpOnly"), "cookie not HttpOnly: {set}");
     assert!(set.contains("SameSite=Strict"), "cookie not Strict: {set}");
@@ -260,13 +264,7 @@ fn member_realm_is_chat_only() {
     // A chat post routes as `web:ana`, so the role gates apply server-side.
     // `/model` is a member command now (filtered by the group allowlist;
     // this account has no groups, so the full catalog lists).
-    let resp = request(
-        port,
-        "POST",
-        "/chat/send",
-        Some(&cookie),
-        "text=%2Fmodel",
-    );
+    let resp = request(port, "POST", "/chat/send", Some(&cookie), "text=%2Fmodel");
     assert_eq!(resp.status, 200);
     assert!(!resp.body.contains("not available"), "{}", resp.body);
     assert!(resp.body.contains("/model"), "{}", resp.body);
@@ -708,7 +706,13 @@ fn admin_pages_cover_the_cli_surface() {
     assert_eq!(group.status, 200, "{}", group.body);
     let groups = request(port, "GET", "/groups", Some(&admin), "");
     assert!(groups.body.contains("dev"), "{}", groups.body);
-    let minted = request(port, "POST", "/users/invite", Some(&admin), "role=member&groups=dev");
+    let minted = request(
+        port,
+        "POST",
+        "/users/invite",
+        Some(&admin),
+        "role=member&groups=dev",
+    );
     assert_eq!(minted.status, 200, "{}", minted.body);
     assert!(
         minted.body.contains("valid 24 h") || minted.body.contains("Invite code"),
@@ -760,14 +764,7 @@ fn request(port: u16, method: &str, path: &str, cookie: Option<&str>, body: &str
     // The panel's own JS submits every form with this header; the raw
     // `request_h` is what proves a POST without it is refused.
     if method == "POST" {
-        request_h(
-            port,
-            method,
-            path,
-            cookie,
-            body,
-            &[("X-Ka-Agent", "1")],
-        )
+        request_h(port, method, path, cookie, body, &[("X-Ka-Agent", "1")])
     } else {
         request_h(port, method, path, cookie, body, &[])
     }
@@ -841,6 +838,7 @@ fn seed_session(store: &ka_agent_store::Store, id: &str, workspace: &std::path::
             username: ka_agent_core::OPERATOR_USER.to_string(),
             role: ka_agent_core::ADMIN_ROLE.to_string(),
             private: false,
+            archived: false,
             created_ms: ka_agent_core::now_ms(),
             updated_ms: ka_agent_core::now_ms(),
         })
@@ -2105,7 +2103,11 @@ fn usage_page_splits_spend_per_model() {
         "csv content type"
     );
     assert!(csv.body.starts_with("day,user,model,turns,tokens,cost_usd"));
-    assert!(csv.body.contains("anthropic/claude-sonnet-4-5"), "{}", csv.body);
+    assert!(
+        csv.body.contains("anthropic/claude-sonnet-4-5"),
+        "{}",
+        csv.body
+    );
     assert!(csv.body.contains("operator"), "{}", csv.body);
     daemon.child.kill().ok();
     daemon.child.wait().ok();
@@ -2265,6 +2267,326 @@ fn events_stream_carries_the_final_chunk() {
         stream.contains("\"ev\":\"turn_finished\""),
         "the turn settles: {stream}"
     );
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Webhook triggers (ADR-0005): the hook lane, its ordering against the
+// shared bearer gate, dedupe by event id, and the caps/filter.
+// ---------------------------------------------------------------------------
+
+/// Seed one webhook trigger (plus its lineage session) into the store
+/// before the daemon boots, and drop its per-trigger secret file when
+/// `secret` is given. Returns (lineage session id, task id).
+fn seed_webhook_trigger(
+    root: &std::path::Path,
+    hook: &str,
+    secret: Option<&str>,
+    filter: Option<&str>,
+    preflight: bool,
+) -> (String, String) {
+    let data = root.join("data");
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    let session = ka_agent_core::Session::new_for_user(
+        root.join("ws"),
+        ka_agent_core::OPERATOR_USER,
+        ka_agent_core::ADMIN_ROLE,
+    );
+    store.insert_session(&session).unwrap();
+    let spec = ka_agent_core::TriggerSpec {
+        kind: ka_agent_core::TriggerKind::Webhook,
+        text: "triage the CI event".into(),
+        source: "operator".into(),
+        session_id: session.id.0.clone(),
+        role: None,
+        username: None,
+        tools: Vec::new(),
+        error_streak: 0,
+        recurrence_ms: None,
+        at_local: None,
+        weekdays: Vec::new(),
+        month_day: None,
+        gate: None,
+        hook_path: Some(hook.into()),
+        secret: None,
+        filter: filter.map(str::to_string),
+        max_body_bytes: None,
+        preflight,
+    };
+    let mut task = ka_agent_core::Task::new(format!("hook {hook}"), "trigger", false);
+    task.session = Some(session.id.clone());
+    task.payload = Some(spec.to_payload());
+    store.insert_task(&task).unwrap();
+    drop(store);
+    if let Some(secret) = secret {
+        let dir = data.join("secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The lane's default ref flattens path separators (a secret ref
+        // is a flat `secrets/` filename).
+        let flat = hook.replace(['/', ':'], "-");
+        let path = dir.join(format!("trigger.{flat}"));
+        std::fs::write(&path, format!("{secret}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    (session.id.0, task.id.0)
+}
+
+/// POST one hook delivery with arbitrary headers.
+fn hook_post(port: u16, hook: &str, headers: &[(&str, &str)], body: &str) -> Http {
+    request_h(
+        port,
+        "POST",
+        &format!("/api/hook/{hook}"),
+        None,
+        body,
+        headers,
+    )
+}
+
+fn lineage_turns(daemon: &Daemon, lineage: &str) -> i64 {
+    let conn = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM turns WHERE session = ?1",
+        rusqlite::params![lineage],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn lineage_queue(daemon: &Daemon, lineage: &str) -> i64 {
+    let conn = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM queue WHERE session = ?1",
+        rusqlite::params![lineage],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn wait_for_turns(daemon: &Daemon, lineage: &str, want: i64) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while lineage_turns(daemon, lineage) < want {
+        assert!(
+            Instant::now() < deadline,
+            "lineage {lineage} never reached {want} turns (has {})",
+            lineage_turns(daemon, lineage)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Same `X-Event-ID` twice → one armed fire, second answer is `dup`.
+#[test]
+fn webhook_dedupes_by_event_id_and_queues_one_turn() {
+    let root = temp_root("hook-dedupe");
+    let (lineage, _task) = seed_webhook_trigger(&root, "ci/ping", Some("s3cret"), None, false);
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+
+    let body = r#"{"status":"passed","id":"run-42"}"#;
+    let first = hook_post(
+        port,
+        "ci/ping",
+        &[("Authorization", "Bearer s3cret"), ("X-Event-ID", "run-42")],
+        body,
+    );
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert!(first.body.contains("\"queued\":true"), "{}", first.body);
+    let second = hook_post(
+        port,
+        "ci/ping",
+        &[("Authorization", "Bearer s3cret"), ("X-Event-ID", "run-42")],
+        body,
+    );
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert!(second.body.contains("\"dup\":true"), "{}", second.body);
+
+    // At-least-once above the dedupe: exactly one turn lands on the
+    // lineage session, carrying the fenced payload.
+    wait_for_turns(&daemon, &lineage, 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(lineage_turns(&daemon, &lineage), 1, "no second fire");
+    let conn = rusqlite::Connection::open(daemon.data.join("state.db")).unwrap();
+    let text: String = conn
+        .query_row(
+            "SELECT inbound_text FROM turns WHERE session = ?1",
+            rusqlite::params![lineage],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(text.contains("<event-payload>"), "{text}");
+    assert!(text.contains("passed"), "{text}");
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The trigger's secret is unconfigured → 404 even with the global token
+/// present (and the global token itself still works on /api/notify, so
+/// the 404 is the hook lane's verdict, not a broken token).
+#[test]
+fn webhook_without_secret_is_404() {
+    let root = temp_root("hook-nosecret");
+    let data = root.join("data");
+    std::fs::create_dir_all(data.join("secrets")).unwrap();
+    std::fs::write(data.join("secrets/web.api_token"), "global-token\n").unwrap();
+    // The trigger's secret ref is left unresolved: `None` writes no
+    // secret file, so the lane sees the hook as off.
+    let (_lineage, _task) = seed_webhook_trigger(&root, "ci/missing", None, None, false);
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+
+    let hook = hook_post(
+        port,
+        "ci/missing",
+        &[
+            ("Authorization", "Bearer global-token"),
+            ("X-Event-ID", "e1"),
+        ],
+        "{}",
+    );
+    assert_eq!(hook.status, 404, "{}", hook.body);
+    let notify = request_h(
+        port,
+        "POST",
+        "/api/notify",
+        None,
+        r#"{"text":"hi"}"#,
+        &[("Authorization", "Bearer global-token")],
+    );
+    assert_eq!(
+        notify.status, 200,
+        "the global token itself works: {}",
+        notify.body
+    );
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// No `web.api_token` configured at all: the hook lane still queues with
+/// the per-trigger secret; the shared token is not the hook lane's auth
+/// (presented but wrong per-trigger secret → 401, unknown path → 404),
+/// and the bearer lane itself stays off.
+#[test]
+fn webhook_lane_ignores_the_global_bearer_gate() {
+    let root = temp_root("hook-ordering");
+    let (lineage, _task) =
+        seed_webhook_trigger(&root, "ci/order", Some("hook-secret"), None, false);
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+
+    // (a) valid per-trigger secret, no global token anywhere → queued.
+    let ok = hook_post(
+        port,
+        "ci/order",
+        &[
+            ("Authorization", "Bearer hook-secret"),
+            ("X-Event-ID", "ord-1"),
+        ],
+        r#"{"status":"passed"}"#,
+    );
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    assert!(ok.body.contains("\"queued\":true"), "{}", ok.body);
+    // The bearer lane is off (404) while the hook lane just worked.
+    let notify = request_h(
+        port,
+        "POST",
+        "/api/notify",
+        None,
+        r#"{"text":"hi"}"#,
+        &[("Authorization", "Bearer whatever")],
+    );
+    assert_eq!(notify.status, 404, "{}", notify.body);
+    // (b) a global-shaped bearer presented with a WRONG per-trigger
+    // secret → 401, never accepted as the global token.
+    let wrong = hook_post(
+        port,
+        "ci/order",
+        &[
+            ("Authorization", "Bearer whatever"),
+            ("X-Event-ID", "ord-2"),
+        ],
+        "{}",
+    );
+    assert_eq!(wrong.status, 401, "{}", wrong.body);
+    // (c) no auth at all → 401.
+    let anon = hook_post(port, "ci/order", &[("X-Event-ID", "ord-3")], "{}");
+    assert_eq!(anon.status, 401, "{}", anon.body);
+    // (d) an unknown hook path → 404, regardless of any bearer.
+    let unknown = hook_post(
+        port,
+        "ci/nope",
+        &[
+            ("Authorization", "Bearer hook-secret"),
+            ("X-Event-ID", "ord-4"),
+        ],
+        "{}",
+    );
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+    // Exactly one of the four deliveries (the first) queues a fire.
+    wait_for_turns(&daemon, &lineage, 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(lineage_turns(&daemon, &lineage), 1);
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Oversized bodies are 413; a body the filter does not match is
+/// `200 {"ok":true,"filtered":true}` with no fire.
+#[test]
+fn webhook_rejects_oversized_and_unfiltered_bodies() {
+    let root = temp_root("hook-caps");
+    let (lineage, _task) = seed_webhook_trigger(
+        &root,
+        "ci/caps",
+        Some("s3cret"),
+        Some(r#""status":"failed""#),
+        false,
+    );
+    let port = free_port();
+    let mut daemon = spawn_daemon(&root, port);
+    wait_web(port, Duration::from_secs(30));
+
+    let oversized = format!(r#"{{"pad":"{}"}}"#, "x".repeat(17 * 1024));
+    let big = hook_post(
+        port,
+        "ci/caps",
+        &[("Authorization", "Bearer s3cret"), ("X-Event-ID", "cap-1")],
+        &oversized,
+    );
+    assert_eq!(big.status, 413, "{}", big.body);
+    let filtered = hook_post(
+        port,
+        "ci/caps",
+        &[("Authorization", "Bearer s3cret"), ("X-Event-ID", "cap-2")],
+        r#"{"status":"passed"}"#,
+    );
+    assert_eq!(filtered.status, 200, "{}", filtered.body);
+    assert!(
+        filtered.body.contains("\"filtered\":true"),
+        "{}",
+        filtered.body
+    );
+    // Neither delivery armed a fire: no queue item, no turn.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(lineage_queue(&daemon, &lineage), 0, "no queued event");
+    assert_eq!(lineage_turns(&daemon, &lineage), 0, "no fire");
+
     daemon.child.kill().ok();
     daemon.child.wait().ok();
     let _ = std::fs::remove_dir_all(&root);

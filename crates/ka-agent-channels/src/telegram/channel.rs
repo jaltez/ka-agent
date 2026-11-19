@@ -637,9 +637,7 @@ impl TelegramChannel {
                 return;
             }
             if let Err(e) = self.runtime.ensure_user_state(&who) {
-                let _ = client
-                    .send_message(chat_id, &format!("{e}"), None)
-                    .await;
+                let _ = client.send_message(chat_id, &format!("{e}"), None).await;
                 return;
             }
             self.send_picker(&client, chat_id, cmd, surface, uid).await;
@@ -671,8 +669,7 @@ impl TelegramChannel {
                     crate::refs::expand(&self.store, &self.runtime.workspace_for(&who), &who, text)
                         .await;
                 crate::refs::stage_sources(&self.store, &source, &refs);
-                if let Err(e) = self.runtime.handle_message(&text, &source).await
-                {
+                if let Err(e) = self.runtime.handle_message(&text, &source).await {
                     eprintln!("telegram: handle_message: {e}");
                 }
             }
@@ -1027,6 +1024,18 @@ impl TelegramChannel {
                 Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
             };
         }
+        // `qu:<short12>` — promote one queued message to the head (the
+        // `/queue` ↑): the card re-renders with the reordered list.
+        if let Some(rest) = data.strip_prefix("qu:") {
+            return match self.runtime.promote_queued(rest, &who) {
+                Ok(true) => match self.queue_card(&who) {
+                    Some((text, markup)) => CallbackReply::page(text, markup),
+                    None => CallbackReply::settle("", "the queue is empty".into()),
+                },
+                Ok(false) => CallbackReply::toast("not queued (already turned)"),
+                Err(e) => CallbackReply::toast(&toast_cap(&e.to_string())),
+            };
+        }
         // `qclr` — the `/queue` card's Clear all row.
         if data == "qclr" {
             return match self.runtime.clear_queue(&who) {
@@ -1324,8 +1333,8 @@ impl TelegramChannel {
         ))
     }
 
-    /// The `/queue` card: one line per queued message, a ✕ per row
-    /// (`qx:<short12>`) and a Clear all row.
+    /// The `/queue` card: one line per queued message, a ✕ and an `↑`
+    /// (promote, `qu:<short12>`) per row, and a Clear all row.
     fn queue_card(&self, who: &ka_agent_core::Principal) -> Option<(String, Value)> {
         let items = self.runtime.queued(who).ok()?;
         if items.is_empty() {
@@ -1335,7 +1344,10 @@ impl TelegramChannel {
         let mut rows = Vec::new();
         for (i, (id, source, text)) in items.iter().take(10).enumerate() {
             lines.push(format!("#{} [{}] {}", i + 1, source, trunc_chars(text, 80)));
-            rows.push(vec![kb_button("✕", &format!("qx:{}", short_id(id, 12)))]);
+            rows.push(vec![
+                kb_button("✕", &format!("qx:{}", short_id(id, 12))),
+                kb_button("↑", &format!("qu:{}", short_id(id, 12))),
+            ]);
         }
         if items.len() > 10 {
             lines.push(format!(
@@ -1353,11 +1365,7 @@ impl TelegramChannel {
     /// One page of the `/forget` card: eight remembered facts per page
     /// (`[short] first-80`), a ✖ per row (`fx:<short>`), `fp:<off>`
     /// paging.
-    fn forget_card(
-        &self,
-        off: usize,
-        who: &ka_agent_core::Principal,
-    ) -> Option<(String, Value)> {
+    fn forget_card(&self, off: usize, who: &ka_agent_core::Principal) -> Option<(String, Value)> {
         let entries = self.runtime.memory_entries(who).ok()?;
         if entries.is_empty() {
             return None;
@@ -1451,11 +1459,7 @@ impl TelegramChannel {
     /// One page of the `/history` card: the `run_history` line format,
     /// `hp:<off>` paging and a ▸ detail row per turn
     /// (`hv:<off>:<short>`).
-    fn history_card(
-        &self,
-        off: usize,
-        who: &ka_agent_core::Principal,
-    ) -> Option<(String, Value)> {
+    fn history_card(&self, off: usize, who: &ka_agent_core::Principal) -> Option<(String, Value)> {
         let who = who.clone();
         let turns = self.runtime.recent_turns(6, off, &who).ok()?;
         if turns.is_empty() {

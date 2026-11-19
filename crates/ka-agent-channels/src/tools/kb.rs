@@ -43,8 +43,8 @@ pub(crate) fn search<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         // A shared agent's knowledge joins the turn, still intersected with
         // what the user may read. Per-user key: global rows cross users once
         // turns run in parallel.
-        if let Some(agent) = super::turnctx(ctx, "agent")
-            .and_then(|name| ctx.store.get_agent(&name).ok().flatten())
+        if let Some(agent) =
+            super::turnctx(ctx, "agent").and_then(|name| ctx.store.get_agent(&name).ok().flatten())
         {
             for kb in agent.kbs {
                 if effective.contains(&kb) {
@@ -76,10 +76,7 @@ pub(crate) fn search<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             .kb_search(&scope, query, LIMIT)
             .map_err(|e| format!("kb search: {e}"))?;
         if hits.is_empty() {
-            return Ok(format!(
-                "no matches for {query:?} in {}",
-                scope.join(", ")
-            ));
+            return Ok(format!("no matches for {query:?} in {}", scope.join(", ")));
         }
         // Provenance: one row per cited document, with the KB's groups.
         // The actor's own current turn (per-user key: global rows cross
@@ -89,12 +86,9 @@ pub(crate) fn search<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         for h in &hits {
             let groups = ctx.store.kb_access(&h.kb_name).unwrap_or_default();
             if !turn.is_empty() {
-                let _ = ctx.store.record_turn_source(
-                    &turn,
-                    "kb",
-                    &h.citation(),
-                    &groups,
-                );
+                let _ = ctx
+                    .store
+                    .record_turn_source(&turn, "kb", &h.citation(), &groups);
             }
             let snippet = ka_agent_core::truncate_at_char(&h.snippet, SNIPPET_CHARS);
             out.push_str(&format!(

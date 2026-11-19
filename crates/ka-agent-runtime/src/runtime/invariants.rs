@@ -15,8 +15,7 @@ use super::{Shared, UserHandle};
 use crate::event::AgentEvent;
 
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    cfg!(debug_assertions)
-        || std::env::var_os("KA_CHECK_INVARIANTS").is_some_and(|v| v != "0")
+    cfg!(debug_assertions) || std::env::var_os("KA_CHECK_INVARIANTS").is_some_and(|v| v != "0")
 });
 
 pub(super) fn enabled() -> bool {
@@ -45,9 +44,7 @@ pub(super) struct Snap {
 pub(super) fn violations(s: &Snap) -> Vec<&'static str> {
     let mut out = Vec::new();
     if s.turn.is_some_and(|t| t.is_terminal()) && s.asks > 0 {
-        out.push(
-            "terminal turn with pending asks (orphan ask — the 2026-11-17 wedge)",
-        );
+        out.push("terminal turn with pending asks (orphan ask — the 2026-11-17 wedge)");
     }
     if matches!(
         s.status,
@@ -146,7 +143,11 @@ mod tests {
 
     #[test]
     fn the_2026_11_17_wedge_is_a_violation() {
-        let s = snap(SessionStatus::AwaitingApproval, 1, Some(TurnStatus::Aborted));
+        let s = snap(
+            SessionStatus::AwaitingApproval,
+            1,
+            Some(TurnStatus::Aborted),
+        );
         assert_eq!(
             violations(&s),
             vec!["terminal turn with pending asks (orphan ask — the 2026-11-17 wedge)"]
@@ -159,7 +160,11 @@ mod tests {
         let s = snap(SessionStatus::Idle, 0, Some(TurnStatus::Done));
         assert!(violations(&s).is_empty());
         // A live ask on a running turn is the machine working as designed.
-        let s = snap(SessionStatus::AwaitingApproval, 1, Some(TurnStatus::Running));
+        let s = snap(
+            SessionStatus::AwaitingApproval,
+            1,
+            Some(TurnStatus::Running),
+        );
         assert!(violations(&s).is_empty());
     }
 
@@ -170,6 +175,8 @@ mod tests {
         assert!(violations(&s).contains(&"busy session without a live worker"));
         let mut s = snap(SessionStatus::Idle, 0, Some(TurnStatus::Done));
         s.sent_empty_chunks = 1;
-        assert!(violations(&s).contains(&"outbox chunk delivered empty (the 2026-11-16 silent family)"));
+        assert!(
+            violations(&s).contains(&"outbox chunk delivered empty (the 2026-11-16 silent family)")
+        );
     }
 }

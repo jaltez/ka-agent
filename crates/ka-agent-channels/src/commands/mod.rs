@@ -11,6 +11,7 @@
 mod approvals;
 mod memory;
 mod misc;
+mod plans;
 mod rules;
 mod schedule;
 mod session;
@@ -263,6 +264,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         run: schedule::run_calendar,
     },
     CommandSpec {
+        name: "plan",
+        args: "draft <goal>|list|show <id>|set <id> <markdown>|approve <id>|run <id>|stop <id>",
+        summary: "editable plan artifact: approve arms its Verify shell command; run executes with bounded repairs",
+        example: "/plan draft migrate the blog to mdx",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: plans::run_plan,
+    },
+    CommandSpec {
         name: "skills",
         args: "",
         summary: "enabled skills",
@@ -281,6 +292,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         reach: Reach::Everywhere,
         run: skills::run_skill,
+    },
+    CommandSpec {
+        name: "skill-doctor",
+        args: "",
+        summary: "skills: context cost and attach counts",
+        example: "/skill-doctor",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: skills::run_skill_doctor,
     },
     CommandSpec {
         name: "approvals",
@@ -374,9 +395,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "queue",
-        args: "[clear]",
-        summary: "list or clear messages waiting for the next turn",
-        example: "/queue",
+        args: "[clear|rm <n>|edit <n> <text>|top <n>|up <n>|down <n>|now <n>]",
+        summary: "list the queued messages, or reorder/edit/remove/jump one",
+        example: "/queue now 2",
         telegram: false,
         aliases: &[],
         reach: Reach::Everywhere,
@@ -391,6 +412,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         reach: Reach::Everywhere,
         run: session::run_tools,
+    },
+    CommandSpec {
+        name: "preset",
+        args: "[<1-3>|save <1-3>]",
+        summary: "numbered model+mode+effort slots — save the current triple, apply one with one command",
+        example: "/preset save 1",
+        telegram: false,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_preset,
+    },
+    CommandSpec {
+        name: "archive",
+        args: "[list|undo <id-prefix>]",
+        summary: "hide this session from the lists (transcript kept), list archived ones, or restore one",
+        example: "/archive undo sess_19a3",
+        telegram: false,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_archive,
     },
     CommandSpec {
         name: "keys",

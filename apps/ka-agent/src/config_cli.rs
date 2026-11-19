@@ -17,7 +17,7 @@ pub enum ConfigCommand {
     Get { key: String },
     Set { key: String, value: String },
     Unset { key: String },
-    Schema { json: bool },
+    Schema { json: bool, json_schema: bool },
     Edit,
 }
 
@@ -302,14 +302,25 @@ pub fn config(command: ConfigCommand, config: PathBuf) -> std::process::ExitCode
                 }
             }
         }
-        ConfigCommand::Schema { json } => schema(json),
+        ConfigCommand::Schema { json, json_schema } => schema(json, json_schema),
         ConfigCommand::Edit => edit(&config),
     }
 }
 
-/// `config schema`: one row per registered key, or the registry as JSON.
-fn schema(json: bool) -> std::process::ExitCode {
+/// `config schema`: one row per registered key, or the registry as JSON
+/// (`--json`), or the published editor schema (`--json-schema`).
+fn schema(json: bool, json_schema: bool) -> std::process::ExitCode {
     use ka_agent_core::config_keys::{Apply, KEYS, Kind};
+    if json_schema {
+        // A16: the same document as docs/schema/ka-agent.schema.json;
+        // `scripts/gen-schema.sh` regenerates the committed copy.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ka_agent_core::DaemonConfig::json_schema())
+                .unwrap_or_default()
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     if json {
         let rows: Vec<serde_json::Value> = KEYS
             .iter()
@@ -379,7 +390,7 @@ fn edit(config: &Path) -> std::process::ExitCode {
             }
         }
         let text = std::fs::read_to_string(&tmp).unwrap_or_default();
-        match toml::from_str::<ka_agent_core::DaemonConfig>(&text).map_err(|e| {
+        match ka_agent_core::DaemonConfig::parse_toml(&text).map_err(|e| {
             ka_agent_core::ConfigError::Parse {
                 path: tmp.clone(),
                 message: e.to_string(),
@@ -388,7 +399,7 @@ fn edit(config: &Path) -> std::process::ExitCode {
             Ok(_) => {
                 let old = std::fs::read_to_string(config)
                     .ok()
-                    .and_then(|t| toml::from_str::<ka_agent_core::DaemonConfig>(&t).ok());
+                    .and_then(|t| ka_agent_core::DaemonConfig::parse_toml(&t).ok());
                 let doc = ka_agent_core::config_file::read_doc(&tmp).and_then(|d| {
                     let new = ka_agent_core::config_file::write_doc(config, &d)?;
                     Ok((d, new))

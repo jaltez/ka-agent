@@ -115,7 +115,10 @@ impl Store {
     pub fn delete_agent(&self, name: &str) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM agent_access WHERE agent_name = ?1", params![name])?;
+        tx.execute(
+            "DELETE FROM agent_access WHERE agent_name = ?1",
+            params![name],
+        )?;
         let changed = tx.execute("DELETE FROM agents WHERE name = ?1", params![name])?;
         tx.commit()?;
         Ok(changed == 1)
@@ -137,7 +140,10 @@ impl Store {
         // The ≥1-owner invariant lives in `owner_username` (always a real
         // user): group grants add viewers/editors, never displace the owner.
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM agent_access WHERE agent_name = ?1", params![name])?;
+        tx.execute(
+            "DELETE FROM agent_access WHERE agent_name = ?1",
+            params![name],
+        )?;
         for grant in grants {
             if !matches!(grant.level.as_str(), "viewer" | "editor" | "owner") {
                 return Err(StoreError::Refused(format!(
@@ -275,20 +281,28 @@ mod tests {
         assert_eq!(store.get_agent("reviewer").unwrap().unwrap(), agent);
         // The owner has owner access by definition; a non-member nothing.
         assert_eq!(
-            store.agent_level("reviewer", "ana", "member").unwrap().as_deref(),
+            store
+                .agent_level("reviewer", "ana", "member")
+                .unwrap()
+                .as_deref(),
             Some("owner")
         );
-        assert_eq!(store.agent_level("reviewer", "bob", "member").unwrap(), None);
+        assert_eq!(
+            store.agent_level("reviewer", "bob", "member").unwrap(),
+            None
+        );
         // An unknown access level is refused.
-        assert!(store
-            .set_agent_access(
-                "reviewer",
-                &[AgentAccess {
-                    group_name: "dev".into(),
-                    level: "superuser".into()
-                }]
-            )
-            .is_err());
+        assert!(
+            store
+                .set_agent_access(
+                    "reviewer",
+                    &[AgentAccess {
+                        group_name: "dev".into(),
+                        level: "superuser".into()
+                    }]
+                )
+                .is_err()
+        );
         store
             .set_agent_access(
                 "reviewer",
@@ -300,22 +314,34 @@ mod tests {
             .unwrap();
         store.add_user_group("bob", "dev").unwrap();
         assert_eq!(
-            store.agent_level("reviewer", "bob", "member").unwrap().as_deref(),
+            store
+                .agent_level("reviewer", "bob", "member")
+                .unwrap()
+                .as_deref(),
             Some("editor")
         );
         assert_eq!(store.agents_for_user("bob", "member").unwrap().len(), 1);
         assert_eq!(store.agents_for_user("moe", "member").unwrap().len(), 0);
         // Admin sees everything as owner.
         assert_eq!(
-            store.agent_level("reviewer", "operator", "admin").unwrap().as_deref(),
+            store
+                .agent_level("reviewer", "operator", "admin")
+                .unwrap()
+                .as_deref(),
             Some("owner")
         );
         // Transfer keeps the new owner an owner; an unknown user is refused.
         assert!(store.transfer_agent("reviewer", "nobody").is_err());
         store.transfer_agent("reviewer", "bob").unwrap();
-        assert_eq!(store.get_agent("reviewer").unwrap().unwrap().owner_username, "bob");
         assert_eq!(
-            store.agent_level("reviewer", "bob", "member").unwrap().as_deref(),
+            store.get_agent("reviewer").unwrap().unwrap().owner_username,
+            "bob"
+        );
+        assert_eq!(
+            store
+                .agent_level("reviewer", "bob", "member")
+                .unwrap()
+                .as_deref(),
             Some("owner")
         );
         assert!(store.delete_agent("reviewer").unwrap());

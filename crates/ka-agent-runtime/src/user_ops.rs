@@ -51,7 +51,9 @@ pub fn export_user(paths: &Paths, username: &str) -> Result<std::path::PathBuf, 
             .append_dir_all(tree, &dir)
             .map_err(|e| format!("archive {tree}: {e}"))?;
     }
-    builder.finish().map_err(|e| format!("finish archive: {e}"))?;
+    builder
+        .finish()
+        .map_err(|e| format!("finish archive: {e}"))?;
     Ok(archive)
 }
 
@@ -87,17 +89,14 @@ pub fn latest_export(paths: &Paths, username: &str) -> Option<std::path::PathBuf
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| {
-                    // Exact username match: the timestamp tail must be all
-                    // digits, or `ana` would match `ana-2`'s exports.
-                    n.strip_prefix(&prefix)
-                        .is_some_and(|tail| {
-                            tail.strip_suffix(".tar")
-                                .is_some_and(|t| !t.is_empty() && t.chars().all(char::is_numeric))
-                        })
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                // Exact username match: the timestamp tail must be all
+                // digits, or `ana` would match `ana-2`'s exports.
+                n.strip_prefix(&prefix).is_some_and(|tail| {
+                    tail.strip_suffix(".tar")
+                        .is_some_and(|t| !t.is_empty() && t.chars().all(char::is_numeric))
                 })
+            })
         })
         .collect();
     hits.sort();
@@ -121,7 +120,10 @@ mod tests {
 
         let archive = export_user(&paths, "ana").unwrap();
         assert!(archive.exists());
-        assert_eq!(latest_export(&paths, "ana").as_deref(), Some(archive.as_path()));
+        assert_eq!(
+            latest_export(&paths, "ana").as_deref(),
+            Some(archive.as_path())
+        );
         // The archive carries the note.
         let text = std::fs::read(&archive).unwrap();
         assert!(text.windows(5).any(|w| w == b"plan."), "tar names the note");

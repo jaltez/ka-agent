@@ -14,6 +14,7 @@ pub fn tool_label(tool: &str, detail: &str) -> String {
         "write" | "edit" => format!("editing {}", file_name(detail)),
         "bash" => "running a command".into(),
         "pathfinder" | "delegate" => "delegating research".into(),
+        "scout" | "kagent__scout" => "scouting (read-only)".into(),
         "kagent__memory_propose" => "noting a memory".into(),
         "kagent__remind" => "setting a reminder".into(),
         "kagent__send_file" => "sending a file".into(),
@@ -77,6 +78,8 @@ mod tests {
         assert_eq!(tool_label("bash", "cargo build"), "running a command");
         assert_eq!(tool_label("pathfinder", "x"), "delegating research");
         assert_eq!(tool_label("delegate", "x"), "delegating research");
+        assert_eq!(tool_label("scout", "x"), "scouting (read-only)");
+        assert_eq!(tool_label("kagent__scout", "x"), "scouting (read-only)");
         assert_eq!(
             tool_label("kagent__history_search", "x"),
             "checking our history"

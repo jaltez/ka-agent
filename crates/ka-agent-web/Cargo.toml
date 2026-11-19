@@ -22,6 +22,8 @@ sha2 = { workspace = true }
 password-hash = { workspace = true }
 jiff = { workspace = true }
 rand_core = { workspace = true }
+# The webhook trigger payload filter (ADR-0005 §6: regex match → fire).
+regex = "1"
 
 [dev-dependencies]
 reqwest = { workspace = true }

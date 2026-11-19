@@ -8,10 +8,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 /// One recorded Web API call.
@@ -272,7 +272,11 @@ where
         st.outbound.drain(..).collect()
     };
     // The socket says hello first, like Slack's own.
-    if sink.send(Message::Text(json!({"type": "hello"}).to_string().into())).await.is_err() {
+    if sink
+        .send(Message::Text(json!({"type": "hello"}).to_string().into()))
+        .await
+        .is_err()
+    {
         return Ok(());
     }
     for frame in pending {
@@ -338,7 +342,9 @@ fn api_response(method: &str, body: &Value, state: &Arc<Mutex<State>>) -> Value 
     match method {
         "apps.connections.open" => json!({"ok": true, "url": st.socket_url.clone()}),
         "auth.test" => json!({"ok": true, "user_id": "UBOT", "team_id": "T1"}),
-        "chat.postMessage" => json!({"ok": true, "ts": "1700000000.000100", "channel": body["channel"]}),
+        "chat.postMessage" => {
+            json!({"ok": true, "ts": "1700000000.000100", "channel": body["channel"]})
+        }
         "chat.update" => json!({"ok": true, "ts": body["ts"]}),
         "chat.postEphemeral" => json!({"ok": true}),
         "files.info" => json!({"ok": true, "file": {"id": body["file"], "size": 4,

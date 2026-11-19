@@ -94,6 +94,7 @@ bearer-token `/api/*` group requires a valid session cookie.
 | GET | `/events` | the SSE stream (one `data:` frame per sequenced bus envelope; `id:` carries the `seq` so a reconnect with `Last-Event-ID` replays exactly the gap) |
 | POST | `/api/notify` | `{"text"}` → a notice on every surface. **Bearer-only**: `Authorization: Bearer <web.api_token>`; `404` while no token is configured, `401` for a wrong one; 16 KiB bodies, 30 req/min |
 | POST | `/api/ask` | `{"text","background","wait"}` → queues a turn (`api` / `api-bg` source); with `wait:true` the reply is held until the turn settles (300 s cap) and carries `{"ok","queued","reply","stop"}`; same bearer auth as `/api/notify` |
+| POST | `/api/hook/<trigger>` | webhook ingress (ADR-0005): the trigger's **own** per-trigger secret is the only auth (`Authorization: Bearer <secret>`; `404` while it is unconfigured, `401` for a wrong one — the shared `web.api_token` plays no part here); body cap 16 KiB default / 64 KiB per-trigger (`413`), optional regex filter (no match → `200 {"ok":true,"filtered":true}`), dedupe by `X-Event-ID`/`event.id` (replay → `200 {"ok":true,"dup":true}`); acceptance arms the trigger → `200 {"ok":true,"queued":true}` |
 | GET | `/login` · `/invite` | the account forms (password, or invite code + password) |
 | POST | `/login` · `/invite` | sign in / redeem an invite and create the account; sets the session cookie |
 | GET | `/users` | accounts: create (invite), disable/enable, reset password, export, purge, groups, role, quota |

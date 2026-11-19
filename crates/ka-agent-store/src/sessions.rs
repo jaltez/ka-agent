@@ -88,11 +88,22 @@ impl Store {
         .ok_or_else(|| StoreError::NotFound(format!("session {}", id)))
     }
 
-    /// Most recently updated sessions first.
-    pub fn list_recent_sessions(&self, limit: usize) -> Result<Vec<Session>> {
+    /// Most recently updated sessions first. Archived rows (`/archive`)
+    /// stay hidden unless `include_archived` — transcripts and turns are
+    /// never touched by archiving, only the listings change.
+    pub fn list_recent_sessions(
+        &self,
+        limit: usize,
+        include_archived: bool,
+    ) -> Result<Vec<Session>> {
         let conn = self.lock();
+        let filter = if include_archived {
+            ""
+        } else {
+            "WHERE archived = 0"
+        };
         let mut stmt = conn.prepare(&format!(
-            "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_ms DESC LIMIT ?1"
+            "SELECT {SESSION_COLS} FROM sessions {filter} ORDER BY updated_ms DESC LIMIT ?1"
         ))?;
         let rows = stmt.query_map(params![limit as i64], row_to_session)?;
         collect_rows(rows)
@@ -161,6 +172,21 @@ impl Store {
                 workspace.to_string_lossy(),
                 ka_agent_core::now_ms()
             ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("session {}", id)));
+        }
+        Ok(())
+    }
+
+    /// Archive (`/archive`) or restore (`/archive undo`) a session:
+    /// only the `archived` flag flips — the transcript, turns, usage and
+    /// strand rows are untouched.
+    pub fn set_session_archived(&self, id: &SessionId, archived: bool) -> Result<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE sessions SET archived = ?2, updated_ms = ?3 WHERE id = ?1",
+            params![id.as_str(), archived as i64, ka_agent_core::now_ms()],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(format!("session {}", id)));
@@ -248,7 +274,7 @@ mod tests {
             .unwrap();
         let got = store.get_session(&s.id).unwrap();
         assert_eq!(got.strand_id.as_deref(), Some("str-1"));
-        assert_eq!(store.list_recent_sessions(10).unwrap().len(), 1);
+        assert_eq!(store.list_recent_sessions(10, false).unwrap().len(), 1);
     }
 
     #[test]
@@ -323,6 +349,31 @@ mod tests {
         );
         assert!(store.latest_session_for_user("nobody").unwrap().is_none());
         // The unfiltered listing still sees both.
-        assert_eq!(store.list_recent_sessions(10).unwrap().len(), 2);
+        assert_eq!(store.list_recent_sessions(10, false).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn archive_hides_from_lists_but_keeps_the_row() {
+        let store = Store::open_in_memory().unwrap();
+        let s = session();
+        store.insert_session(&s).unwrap();
+
+        store.set_session_archived(&s.id, true).unwrap();
+        assert!(store.get_session(&s.id).unwrap().archived);
+        // Hidden from the default listing, visible with include_archived.
+        assert!(store.list_recent_sessions(10, false).unwrap().is_empty());
+        assert_eq!(store.list_recent_sessions(10, true).unwrap().len(), 1);
+
+        // Undo restores it.
+        store.set_session_archived(&s.id, false).unwrap();
+        assert!(!store.get_session(&s.id).unwrap().archived);
+        assert_eq!(store.list_recent_sessions(10, false).unwrap().len(), 1);
+
+        // Unknown id is a NotFound, not a silent no-op.
+        assert!(
+            store
+                .set_session_archived(&SessionId::generate(), true)
+                .is_err()
+        );
     }
 }

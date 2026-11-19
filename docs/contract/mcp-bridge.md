@@ -41,6 +41,19 @@ daemon).
 | `kagent__notes_search` | read | Case-insensitive substring search across the turn role's notes (`<data>/notes/*.md` for admin, `<data>/roles/<r>/notes/*.md` for a role). Max 20 hits. |
 | `kagent__notes_append` | local write | Append a line to the turn role's `<name>.md` note. Name: `[a-z0-9-]{1,64}`. |
 | `kagent__notes_read` | read | Read a note file of the turn role (truncated at 8 KB). |
+| `kagent__scout` | spawn | Run one read-only research child on a single question (`scout{question}`). The child opens a fresh strand in the caller user's partition, runs in `readonly` mode with the role's toolset ∩ `read, glob, grep, web_search, web_fetch` (empty stays an empty allowlist, never "everything"), sees the question plus a context line and no parent transcript, and dies with the call. Its answer returns under `--- scout summary (read-only child, non-authoritative — verify before acting) ---`, capped at `scout.max_summary_chars`. Disabled unless `[scout] enabled = true`. |
+
+## Effects and auto-allow
+
+A tool's `Effect` decides the approval profile the daemon computes at
+start: `Read`, `Propose` and `LocalWrite` never ask; `Spawn`, `Schedule`
+and `ExternalWrite` always ask in `ask` mode and are absent from the
+auto-allow profile (an existing allow-rule can cover them, exactly like
+`cron_manage`). `Spawn` exists because starting another engine worker
+spends a model turn and a worker-pool slot — `kagent__scout` is never
+folded in with reads. A scout child's own asks are answered deny
+immediately (fail closed, one `approval.decide` audit row each): it may
+never widen the permissions its parent gave it.
 
 ## Protocol (ka-side)
 

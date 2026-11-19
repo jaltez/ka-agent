@@ -780,3 +780,367 @@ fn bridge_history_tools_find_and_show_past_turns() {
     assert!(line(4).contains("nothing found"), "{}", line(4));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A16: `config schema` (rows) and `--json` are a published contract —
+/// the format and the field set must not drift.
+#[test]
+fn config_schema_rows_and_json_stay_stable() {
+    use ka_agent_core::config_keys::{Apply, KEYS, Kind};
+
+    let root = temp_root("schema-golden");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let out = ka(&data).args(["config", "schema"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), KEYS.len(), "one row per registered key");
+    // A literal first row: the separator/shape is the contract the
+    // `unknown key` hint points operators at.
+    assert_eq!(
+        lines[0],
+        "workspace · string · default ~/.ka-agent/profiles/default/workspace · applies restart · the single directory every engine session runs in"
+    );
+    for (line, spec) in lines.iter().zip(KEYS) {
+        let kind = match spec.kind {
+            Kind::Int { min, max } => format!("int {min}..={max}"),
+            Kind::Float { min } => format!("float ≥ {min}"),
+            Kind::Enum(vals) => format!("enum {}", vals.join("|")),
+            other => other.label().to_string(),
+        };
+        let expected = format!(
+            "{} · {} · default {} · applies {} · {}",
+            spec.path,
+            kind,
+            spec.default,
+            spec.apply.label(),
+            spec.doc
+        );
+        assert_eq!(*line, expected);
+        let _ = Apply::Live;
+    }
+
+    let out = ka(&data)
+        .args(["config", "schema", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows.len(), KEYS.len());
+    assert_eq!(
+        rows[0],
+        serde_json::json!({
+            "path": "workspace",
+            "type": "string",
+            "default": "~/.ka-agent/profiles/default/workspace",
+            "applies": "restart",
+            "web": false,
+            "doc": "the single directory every engine session runs in",
+        })
+    );
+    for (row, spec) in rows.iter().zip(KEYS) {
+        assert_eq!(row["path"], spec.path);
+        assert_eq!(row["type"], spec.kind.label());
+        assert_eq!(row["default"], spec.default);
+        assert_eq!(row["applies"], spec.apply.label());
+        assert_eq!(row["web"], spec.web);
+        assert_eq!(row["doc"], spec.doc);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A16: `--json-schema` emits the published editor schema — it validates a
+/// fully-populated fixture, rejects an unknown key, and matches the
+/// committed copy (`scripts/gen-schema.sh`).
+#[test]
+fn config_json_schema_validates_a_fixture_and_rejects_unknown() {
+    let root = temp_root("schema-json");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let out = ka(&data)
+        .args(["config", "schema", "--json-schema"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(schema.get("$schema").is_some(), "draft declaration");
+    assert_eq!(schema["additionalProperties"], false, "strict root");
+
+    let fixture = schema_sample(&schema, &schema, 0);
+    assert!(
+        schema_check(&schema, &schema, &fixture, "config").is_ok(),
+        "fully-populated fixture must validate: {:?}",
+        schema_check(&schema, &schema, &fixture, "config")
+    );
+    let mut unknown = fixture.clone();
+    unknown["definitely_not_a_key"] = serde_json::json!("x");
+    assert!(
+        schema_check(&schema, &schema, &unknown, "config").is_err(),
+        "an unknown key must be rejected"
+    );
+
+    let committed: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/schema/ka-agent.schema.json")).unwrap();
+    assert_eq!(
+        committed, schema,
+        "docs/schema/ka-agent.schema.json is stale — run scripts/gen-schema.sh"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Follow `$ref`s into `$defs` (schemars emits nested structs there).
+fn schema_node<'a>(
+    root: &'a serde_json::Value,
+    mut node: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    for _ in 0..32 {
+        let Some(name) = node
+            .get("$ref")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.strip_prefix("#/$defs/"))
+        else {
+            break;
+        };
+        let Some(next) = root.get("$defs").and_then(|d| d.get(name)) else {
+            break;
+        };
+        node = next;
+    }
+    node
+}
+
+/// A deliberately small JSON-Schema checker: enough for the config model
+/// (objects, strict unknown keys, required fields, scalar types, enums and
+/// `anyOf` for `Option<T>`).
+fn schema_check(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    at: &str,
+) -> Result<(), String> {
+    let s = schema_node(root, schema);
+    if let Some(branches) = s.get("anyOf").and_then(|a| a.as_array()) {
+        let mut last = format!("{at}: no anyOf branch matched");
+        for branch in branches {
+            match schema_check(root, branch, value, at) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
+        return Err(last);
+    }
+    if let Some(vals) = s.get("enum").and_then(|e| e.as_array())
+        && !vals.contains(value)
+    {
+        return Err(format!("{at}: not one of the allowed values"));
+    }
+    if s.get("properties").is_some() || s.get("type").and_then(|t| t.as_str()) == Some("object") {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| format!("{at}: expected object"))?;
+        if let Some(required) = s.get("required").and_then(|r| r.as_array()) {
+            for name in required {
+                let name = name.as_str().unwrap_or_default();
+                if !obj.contains_key(name) {
+                    return Err(format!("{at}: missing required `{name}`"));
+                }
+            }
+        }
+        let props = s.get("properties").and_then(|p| p.as_object());
+        let deny = s.get("additionalProperties") == Some(&serde_json::Value::Bool(false));
+        for (key, child) in obj {
+            match props.and_then(|p| p.get(key)) {
+                Some(sub) => schema_check(root, sub, child, &format!("{at}.{key}"))?,
+                None if deny => return Err(format!("{at}: unknown key `{key}`")),
+                None => {}
+            }
+        }
+        return Ok(());
+    }
+    let ok = match s.get("type").and_then(|t| t.as_str()) {
+        Some("string") => value.is_string(),
+        Some("integer") => value.is_i64() || value.is_u64(),
+        Some("number") => value.is_number(),
+        Some("boolean") => value.is_boolean(),
+        Some("array") => value.is_array(),
+        Some("null") => value.is_null(),
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{at}: wrong type (wanted {:?})", s.get("type")))
+    }
+}
+
+/// One value per property, recursively: a "fully populated" fixture.
+fn schema_sample(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    depth: usize,
+) -> serde_json::Value {
+    let s = schema_node(root, schema);
+    if let Some(branches) = s.get("anyOf").and_then(|a| a.as_array()) {
+        if let Some(branch) = branches
+            .iter()
+            .find(|b| schema_node(root, b).get("type").and_then(|t| t.as_str()) != Some("null"))
+        {
+            return schema_sample(root, branch, depth);
+        }
+        return serde_json::Value::Null;
+    }
+    if let Some(vals) = s.get("enum").and_then(|e| e.as_array()) {
+        return vals.first().cloned().unwrap_or(serde_json::Value::Null);
+    }
+    if depth > 8 {
+        return serde_json::Value::Null;
+    }
+    match s.get("type").and_then(|t| t.as_str()) {
+        Some("object") => {
+            let mut map = serde_json::Map::new();
+            if let Some(props) = s.get("properties").and_then(|p| p.as_object()) {
+                for (key, sub) in props {
+                    map.insert(key.clone(), schema_sample(root, sub, depth + 1));
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        Some("array") => serde_json::Value::Array(Vec::new()),
+        Some("string") => serde_json::json!("sample"),
+        Some("integer") => serde_json::json!(0),
+        Some("number") => serde_json::json!(0.0),
+        Some("boolean") => serde_json::Value::Bool(false),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// B19: `doctor --bundle` writes doctor lines, the config (secret refs
+/// opaque), the live status, the daemon prompt layers and recent turns —
+/// and no turn text for a private session.
+#[test]
+fn doctor_bundle_carries_state_and_skips_private_text() {
+    let root = temp_root("bundle");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let cfg = root.join("ka-agent.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#""$schema" = "https://example.invalid/ka-agent.schema.json"
+workspace = {:?}
+mode = "ask"
+turn_grace_secs = 5
+
+[telegram]
+enabled = false
+token_secret = "telegram.bot_token"
+
+[[mcp]]
+name = "demo"
+command = "demo-mcp"
+
+[mcp.env]
+TOKEN = "secret:demo.token"
+"#,
+            ws.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    let normal = ka_agent_core::Session::new(ws.clone());
+    store.insert_session(&normal).unwrap();
+    let turn = ka_agent_core::Turn::new(normal.id.clone(), "BUNDLE-VISIBLE-TURN".into());
+    store.insert_turn(&turn).unwrap();
+    let mut private = ka_agent_core::Session::new(ws.clone());
+    private.private = true;
+    store.insert_session(&private).unwrap();
+    let private_turn = ka_agent_core::Turn::new(private.id.clone(), "PRIVATE-TURN-TEXT".into());
+    store.insert_turn(&private_turn).unwrap();
+    drop(store);
+
+    let _host = start_host(&data, &cfg);
+    let bundle = root.join("bundle.json");
+    let out = ka(&data)
+        .arg("doctor")
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--bundle")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("review it before sharing"),
+        "privacy warning: {stdout}"
+    );
+    assert!(!stdout.contains("invalid config"), "config loads: {stdout}");
+    assert!(bundle.exists(), "bundle written: {stdout}");
+
+    let text = std::fs::read_to_string(&bundle).unwrap();
+    assert!(
+        !text.contains("PRIVATE-TURN-TEXT"),
+        "private turn text leaked into the bundle"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        doc["doctor"]["checks"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "doctor lines: {doc}"
+    );
+    assert_eq!(doc["config"]["mcp"][0]["env"]["TOKEN"], "secret:demo.token");
+    assert_eq!(
+        doc["config"]["telegram"]["token_secret"],
+        "telegram.bot_token"
+    );
+    assert!(
+        doc["status"]["mode"].is_string(),
+        "live status report: {:?}",
+        doc["status"]
+    );
+    let identity = doc["prompt"]["compiled_identity"].as_str().unwrap_or("");
+    assert!(
+        identity.contains("resident personal assistant"),
+        "compiled identity: {identity}"
+    );
+    assert!(
+        doc["prompt"]["label"]
+            .as_str()
+            .unwrap_or("")
+            .contains("engine assembles the final prompt"),
+        "prompt label: {}",
+        doc["prompt"]["label"]
+    );
+
+    let sessions = doc["sessions"].as_array().unwrap();
+    let normal_row = sessions
+        .iter()
+        .find(|s| s["id"] == normal.id.as_str())
+        .expect("normal session in the bundle");
+    let turn_texts: Vec<&str> = normal_row["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["inbound_text"].as_str())
+        .collect();
+    assert!(
+        turn_texts.contains(&"BUNDLE-VISIBLE-TURN"),
+        "visible turn: {turn_texts:?}"
+    );
+    let private_row = sessions
+        .iter()
+        .find(|s| s["id"] == private.id.as_str())
+        .expect("private session metadata in the bundle");
+    assert_eq!(private_row["private"], true);
+    assert_eq!(
+        private_row["turns"].as_array().map(Vec::len),
+        Some(0),
+        "private session carries no turns"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

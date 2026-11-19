@@ -136,7 +136,10 @@ impl SlackChannel {
         // runs under the channel role: no personal memory or grants leak
         // into it. DMs are the user's own private session.
         let (principal, raw_text) = if is_dm {
-            (own.clone(), event["text"].as_str().unwrap_or("").to_string())
+            (
+                own.clone(),
+                event["text"].as_str().unwrap_or("").to_string(),
+            )
         } else {
             if kind != "app_mention" {
                 return;
@@ -183,7 +186,11 @@ impl SlackChannel {
         )
         .await;
         crate::refs::stage_sources(&self.store, &source, &refs);
-        if let Err(e) = self.runtime.handle_message_as(&text, &source, &principal).await {
+        if let Err(e) = self
+            .runtime
+            .handle_message_as(&text, &source, &principal)
+            .await
+        {
             eprintln!("slack: submit: {e}");
         }
     }
@@ -197,10 +204,7 @@ impl SlackChannel {
         let user = payload["user"]["id"].as_str().unwrap_or("");
         let channel = payload["channel"]["id"].as_str().unwrap_or("");
         let message_ts = payload["message"]["ts"].as_str().unwrap_or("");
-        let Some(action) = payload["actions"]
-            .as_array()
-            .and_then(|a| a.first())
-        else {
+        let Some(action) = payload["actions"].as_array().and_then(|a| a.first()) else {
             return;
         };
         let action_id = action["action_id"].as_str().unwrap_or("");
@@ -218,7 +222,11 @@ impl SlackChannel {
         let source = format!("slack:{team}:{user}");
         match self.runtime.decide(&approval, decision, &source).await {
             Ok(()) => {
-                let label = if is_approve { "✅ approved" } else { "❌ denied" };
+                let label = if is_approve {
+                    "✅ approved"
+                } else {
+                    "❌ denied"
+                };
                 let blocks = json!([{
                     "type": "section",
                     "text": {"type": "mrkdwn", "text": label}
@@ -288,7 +296,13 @@ impl SlackChannel {
         std::fs::create_dir_all(&dir).ok()?;
         let safe = name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
         std::fs::write(dir.join(&safe), &bytes).ok()?;
         Some(format!("attachments/{safe}"))

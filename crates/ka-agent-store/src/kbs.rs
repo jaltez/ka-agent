@@ -116,9 +116,8 @@ impl Store {
 
     pub fn kb_access(&self, kb: &str) -> Result<Vec<String>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT group_name FROM kb_access WHERE kb_name = ?1 ORDER BY group_name",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT group_name FROM kb_access WHERE kb_name = ?1 ORDER BY group_name")?;
         let rows = stmt.query_map(params![kb], |r| r.get::<_, String>(0))?;
         collect_rows(rows)
     }
@@ -137,10 +136,7 @@ impl Store {
                 )
              ORDER BY name",
         )?;
-        let rows = stmt.query_map(
-            params![username, role],
-            |r| r.get::<_, String>(0),
-        )?;
+        let rows = stmt.query_map(params![username, role], |r| r.get::<_, String>(0))?;
         collect_rows(rows)
     }
 
@@ -217,7 +213,10 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        tx.execute("DELETE FROM kb_docs_fts WHERE kb_name = ?1 AND path = ?2", params![kb, path])?;
+        tx.execute(
+            "DELETE FROM kb_docs_fts WHERE kb_name = ?1 AND path = ?2",
+            params![kb, path],
+        )?;
         tx.execute(
             "INSERT INTO kb_docs(kb_name, path, title, content, mtime_ms, sha256, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -237,7 +236,10 @@ impl Store {
     pub fn kb_remove_doc(&self, kb: &str, path: &str) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM kb_docs_fts WHERE kb_name = ?1 AND path = ?2", params![kb, path])?;
+        tx.execute(
+            "DELETE FROM kb_docs_fts WHERE kb_name = ?1 AND path = ?2",
+            params![kb, path],
+        )?;
         let changed = tx.execute(
             "DELETE FROM kb_docs WHERE kb_name = ?1 AND path = ?2",
             params![kb, path],
@@ -335,7 +337,10 @@ mod tests {
 
         // A member of ops reads the handbook only.
         store.set_user_groups("ana", &["ops".into()]).unwrap();
-        assert_eq!(store.kb_effective("ana", "member").unwrap(), vec!["handbook"]);
+        assert_eq!(
+            store.kb_effective("ana", "member").unwrap(),
+            vec!["handbook"]
+        );
         assert!(store.kb_can_read("handbook", "ana", "member").unwrap());
         assert!(!store.kb_can_read("secret", "ana", "member").unwrap());
         assert!(!store.kb_can_read("missing", "ana", "member").unwrap());
@@ -359,13 +364,29 @@ mod tests {
         store.create_kb("docs", "Docs", "operator").unwrap();
         assert!(
             store
-                .kb_upsert_doc("docs", "a.md", "Alpha", "the quick brown fox", "h1", "upload", 1)
+                .kb_upsert_doc(
+                    "docs",
+                    "a.md",
+                    "Alpha",
+                    "the quick brown fox",
+                    "h1",
+                    "upload",
+                    1
+                )
                 .unwrap()
         );
         // Same path replaces: not a second document, FTS not duplicated.
         assert!(
             !store
-                .kb_upsert_doc("docs", "a.md", "Alpha", "a slow green turtle", "h2", "upload", 2)
+                .kb_upsert_doc(
+                    "docs",
+                    "a.md",
+                    "Alpha",
+                    "a slow green turtle",
+                    "h2",
+                    "upload",
+                    2
+                )
                 .unwrap()
         );
         assert_eq!(store.kb_doc_count("docs").unwrap(), 1);
@@ -402,6 +423,11 @@ mod tests {
         );
         assert!(store.kb_remove_doc("docs", "a.md").unwrap());
         assert!(!store.kb_remove_doc("docs", "a.md").unwrap());
-        assert!(store.kb_search(&["docs".to_string()], "green", 8).unwrap().is_empty());
+        assert!(
+            store
+                .kb_search(&["docs".to_string()], "green", 8)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -198,12 +198,13 @@ async fn dms_answer_and_bots_are_ignored() {
     stack.fake.wait_socket().await;
     stack.fake.send_message(dm_message("U1", "hello"));
     wait_for("the DM reply", || {
-        stack
-            .fake
-            .calls("POST")
-            .iter()
-            .any(|c| c.path.contains("/channels/D1/messages")
-                && c.body["content"].as_str().unwrap_or("").contains("ok from the engine"))
+        stack.fake.calls("POST").iter().any(|c| {
+            c.path.contains("/channels/D1/messages")
+                && c.body["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("ok from the engine")
+        })
     })
     .await;
     let post = stack.fake.calls("POST")[0].clone();
@@ -243,7 +244,13 @@ async fn guild_needs_a_mention_and_uses_the_channel_account() {
         .unwrap()
         .expect("the channel account has its own session");
     assert_eq!(session.role, "channel");
-    assert!(stack.store.latest_session_for_user("ana").unwrap().is_none());
+    assert!(
+        stack
+            .store
+            .latest_session_for_user("ana")
+            .unwrap()
+            .is_none()
+    );
     stop(&mut stack).await;
 }
 
@@ -259,7 +266,10 @@ async fn unknown_guild_is_ignored_and_audited() {
         stack
             .store
             .recent_audit(10)
-            .map(|rows| rows.iter().any(|r| r.action == "discord.unauthorized_guild"))
+            .map(|rows| {
+                rows.iter()
+                    .any(|r| r.action == "discord.unauthorized_guild")
+            })
             .unwrap_or(false)
     })
     .await;
@@ -273,7 +283,12 @@ async fn interaction_is_refused_for_another_user() {
     stack.fake.wait_socket().await;
     let ana = Principal::new("ana", "member");
     stack.runtime.ensure_user_state(&ana).unwrap();
-    let sid = stack.store.latest_session_for_user("ana").unwrap().unwrap().id;
+    let sid = stack
+        .store
+        .latest_session_for_user("ana")
+        .unwrap()
+        .unwrap()
+        .id;
     let approval = ka_agent_core::Approval::new(
         sid,
         ka_agent_core::TurnId::generate(),

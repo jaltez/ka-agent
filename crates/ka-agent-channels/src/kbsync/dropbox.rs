@@ -26,11 +26,17 @@ pub async fn sync(
     // The first run lists the whole folder; later runs consume the delta.
     let (mut path, mut body) = match &cursor {
         Some(c) => (
-            format!("{}/2/files/list_folder/continue", endpoints.dropbox.trim_end_matches('/')),
+            format!(
+                "{}/2/files/list_folder/continue",
+                endpoints.dropbox.trim_end_matches('/')
+            ),
             json!({"cursor": c}),
         ),
         None => (
-            format!("{}/2/files/list_folder", endpoints.dropbox.trim_end_matches('/')),
+            format!(
+                "{}/2/files/list_folder",
+                endpoints.dropbox.trim_end_matches('/')
+            ),
             json!({"path": src.target, "recursive": true, "include_deleted": true}),
         ),
     };
@@ -46,13 +52,19 @@ pub async fn sync(
         if !resp.status().is_success() {
             return Err(format!("dropbox list: HTTP {}", resp.status()));
         }
-        let value: Value = resp.json().await.map_err(|e| format!("dropbox list: {e}"))?;
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("dropbox list: {e}"))?;
         entries.extend(value["entries"].as_array().cloned().unwrap_or_default());
         cursor = value["cursor"].as_str().map(str::to_string);
         if value["has_more"].as_bool() != Some(true) || entries.len() >= MAX_DOCS {
             break;
         }
-        path = format!("{}/2/files/list_folder/continue", endpoints.dropbox.trim_end_matches('/'));
+        path = format!(
+            "{}/2/files/list_folder/continue",
+            endpoints.dropbox.trim_end_matches('/')
+        );
         body = json!({"cursor": cursor.clone().unwrap_or_default()});
     }
     let mut seen: Vec<String> = Vec::new();
@@ -83,17 +95,20 @@ pub async fn sync(
                 endpoints.dropbox_content.trim_end_matches('/')
             ))
             .bearer_auth(&token)
-            .header(
-                "Dropbox-API-Arg",
-                json!({"path": display}).to_string(),
-            )
+            .header("Dropbox-API-Arg", json!({"path": display}).to_string())
             .send()
             .await
             .map_err(|e| format!("dropbox download: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("dropbox download {display}: HTTP {}", resp.status()));
+            return Err(format!(
+                "dropbox download {display}: HTTP {}",
+                resp.status()
+            ));
         }
-        let bytes = resp.bytes().await.map_err(|e| format!("dropbox download: {e}"))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("dropbox download: {e}"))?;
         if bytes.len() > super::MAX_BYTES {
             continue;
         }

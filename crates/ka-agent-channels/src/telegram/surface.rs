@@ -738,8 +738,8 @@ impl Surface for TelegramSurface {
                         // restart. No row (private session): there was
                         // nothing to mark; the loss window is the one
                         // between the runtime's handoff and this send.
-                        if let Err(e) =
-                            store.mark_chunk_failed(&ka_agent_core::TurnId(turn.clone()), chunk_index)
+                        if let Err(e) = store
+                            .mark_chunk_failed(&ka_agent_core::TurnId(turn.clone()), chunk_index)
                         {
                             eprintln!("telegram: fail chunk {turn}/{}: {e}", chunk_index + 1);
                         }

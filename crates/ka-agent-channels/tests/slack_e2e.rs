@@ -208,11 +208,12 @@ async fn dms_answer_and_echoes_are_ignored() {
                "text": "hello", "ts": "1.1"}),
     ));
     wait_for("the DM reply", || {
-        stack
-            .fake
-            .calls("chat.postMessage")
-            .iter()
-            .any(|c| c.body["text"].as_str().unwrap_or("").contains("ok from the engine"))
+        stack.fake.calls("chat.postMessage").iter().any(|c| {
+            c.body["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("ok from the engine")
+        })
     })
     .await;
     let post = stack.fake.calls("chat.postMessage")[0].clone();
@@ -239,7 +240,10 @@ async fn dms_answer_and_echoes_are_ignored() {
         .unwrap()
         .pop()
         .expect("a turn");
-    assert_eq!(turn.inbound_text.lines().last().unwrap_or("").trim(), "hello");
+    assert_eq!(
+        turn.inbound_text.lines().last().unwrap_or("").trim(),
+        "hello"
+    );
     stop(&mut stack).await;
 }
 
@@ -273,7 +277,11 @@ async fn channel_needs_a_mention_and_replies_in_thread() {
     // The turn ran as a per-channel surface account under the channel role:
     // ana's own session and partition stay untouched.
     assert!(
-        stack.store.latest_session_for_user("ana").unwrap().is_none(),
+        stack
+            .store
+            .latest_session_for_user("ana")
+            .unwrap()
+            .is_none(),
         "a shared-channel turn must not open the person's own session"
     );
     let surface_user = ka_agent_channels::slack::surface_username("slack", "T1", "C1");
@@ -304,7 +312,10 @@ async fn unknown_workspace_is_ignored_and_audited() {
         stack
             .store
             .recent_audit(10)
-            .map(|rows| rows.iter().any(|r| r.action == "slack.unauthorized_workspace"))
+            .map(|rows| {
+                rows.iter()
+                    .any(|r| r.action == "slack.unauthorized_workspace")
+            })
             .unwrap_or(false)
     })
     .await;
@@ -319,7 +330,12 @@ async fn approval_buttons_decide_only_for_the_acting_user() {
     // ana needs a session before an approval can reference it.
     let ana = Principal::new("ana", "member");
     stack.runtime.ensure_user_state(&ana).unwrap();
-    let sid = stack.store.latest_session_for_user("ana").unwrap().unwrap().id;
+    let sid = stack
+        .store
+        .latest_session_for_user("ana")
+        .unwrap()
+        .unwrap()
+        .id;
     let approval = ka_agent_core::Approval::new(
         sid,
         ka_agent_core::TurnId::generate(),
@@ -355,11 +371,7 @@ async fn approval_buttons_decide_only_for_the_acting_user() {
         "{refused:?}"
     );
     assert_eq!(
-        stack
-            .store
-            .get_approval(&approval.id)
-            .unwrap()
-            .status,
+        stack.store.get_approval(&approval.id).unwrap().status,
         ka_agent_core::ApprovalStatus::Pending
     );
     // ana clicks approve: the engine has no live ask behind this seeded row,

@@ -107,7 +107,9 @@ fn role(name: &str, commands: &[&str]) -> RoleSpec {
 fn member_role() -> RoleSpec {
     role(
         "member",
-        &["status", "help", "mode", "skills", "history", "memory", "cron"],
+        &[
+            "status", "help", "mode", "skills", "history", "memory", "cron",
+        ],
     )
 }
 
@@ -241,7 +243,9 @@ async fn identities_resolve_to_users_with_their_own_sessions() {
     );
     // The member's workspace is their partition, not the profile's.
     assert!(
-        member_session.workspace.starts_with(stack.root.join("users/member")),
+        member_session
+            .workspace
+            .starts_with(stack.root.join("users/member")),
         "{:?}",
         member_session.workspace
     );
@@ -352,8 +356,7 @@ async fn member_file_refs_cannot_reach_the_operator_workspace() {
         turn.inbound_text
     );
     assert!(
-        turn.inbound_text.contains("not found")
-            || turn.inbound_text.contains("[ref @secret.md"),
+        turn.inbound_text.contains("not found") || turn.inbound_text.contains("[ref @secret.md"),
         "{}",
         turn.inbound_text
     );
@@ -375,7 +378,11 @@ async fn memory_lands_in_the_proposing_users_root() {
     // The operator reviews every subject's, and the proposal still lands in
     // the proposer's root.
     assert_eq!(
-        stack.runtime.pending_candidates_for(&operator()).unwrap().len(),
+        stack
+            .runtime
+            .pending_candidates_for(&operator())
+            .unwrap()
+            .len(),
         1
     );
     assert!(
@@ -411,10 +418,7 @@ async fn memory_lands_in_the_proposing_users_root() {
 #[tokio::test(flavor = "multi_thread")]
 async fn knowledge_is_gated_by_group() {
     let mut stack = spawn_stack("kb", vec![member_role()]);
-    stack
-        .store
-        .upsert_group("dev", &[], None)
-        .unwrap();
+    stack.store.upsert_group("dev", &[], None).unwrap();
     stack
         .store
         .create_kb("docs", "Docs", ka_agent_core::OPERATOR_USER)
@@ -482,12 +486,7 @@ async fn knowledge_is_gated_by_group() {
 /// The card a turn raises (seeded through the store: this test binary hosts
 /// no `__mcp` bridge, so a real engine ask cannot be scripted here; the
 /// classification itself is unit-tested in `runtime::policy`).
-fn seed_ask(
-    stack: &Stack,
-    who: &Principal,
-    escalated: bool,
-    ask: &str,
-) -> ka_agent_core::Approval {
+fn seed_ask(stack: &Stack, who: &Principal, escalated: bool, ask: &str) -> ka_agent_core::Approval {
     let session = stack
         .store
         .latest_session_for_user(&who.username)
@@ -529,11 +528,7 @@ async fn self_scope_approvals_are_the_users_own() {
     // Another user cannot decide it.
     let err = stack
         .runtime
-        .decide(
-            approval.id.as_str(),
-            ApprovalDecision::Allow,
-            "telegram:43",
-        )
+        .decide(approval.id.as_str(), ApprovalDecision::Allow, "telegram:43")
         .await
         .unwrap_err()
         .to_string();
@@ -542,11 +537,7 @@ async fn self_scope_approvals_are_the_users_own() {
     // acting user's decision is refused as unknown (not as authorization).
     let err = stack
         .runtime
-        .decide(
-            approval.id.as_str(),
-            ApprovalDecision::Allow,
-            "telegram:77",
-        )
+        .decide(approval.id.as_str(), ApprovalDecision::Allow, "telegram:77")
         .await
         .unwrap_err()
         .to_string();
@@ -554,11 +545,7 @@ async fn self_scope_approvals_are_the_users_own() {
     // Authorization is what changed: the admin reaches the engine check too.
     let err = stack
         .runtime
-        .decide(
-            approval.id.as_str(),
-            ApprovalDecision::Allow,
-            "telegram:42",
-        )
+        .decide(approval.id.as_str(), ApprovalDecision::Allow, "telegram:42")
         .await
         .unwrap_err()
         .to_string();
@@ -593,11 +580,7 @@ async fn escalated_cards_belong_to_the_admin() {
     );
     let err = stack
         .runtime
-        .decide(
-            approval.id.as_str(),
-            ApprovalDecision::Allow,
-            "telegram:77",
-        )
+        .decide(approval.id.as_str(), ApprovalDecision::Allow, "telegram:77")
         .await
         .unwrap_err()
         .to_string();
@@ -641,7 +624,10 @@ async fn disabling_a_user_pauses_everything() {
     stack.store.set_user_disabled("member", true).unwrap();
     stack.store.delete_web_sessions_for("member").unwrap();
     for task in stack.store.cron_tasks_for_user("member").unwrap() {
-        stack.store.set_task_status(&task.id, "interrupted").unwrap();
+        stack
+            .store
+            .set_task_status(&task.id, "interrupted")
+            .unwrap();
     }
     // Inbound is refused: no reply, one audit row.
     stack.server.push_text_message(1, 700, 77, "are you there?");
@@ -664,7 +650,13 @@ async fn disabling_a_user_pauses_everything() {
         stack.store.identity_principal("telegram", "77").unwrap(),
         None
     );
-    assert!(stack.store.web_session_user("hash-of-a-token", ka_agent_core::now_ms()).unwrap().is_none());
+    assert!(
+        stack
+            .store
+            .web_session_user("hash-of-a-token", ka_agent_core::now_ms())
+            .unwrap()
+            .is_none()
+    );
     let paused = stack.store.cron_tasks_for_user("member").unwrap();
     assert_eq!(paused.len(), 1, "the job stays visible as paused");
     assert_eq!(paused[0].status, ka_agent_core::TaskStatus::Interrupted);
@@ -680,6 +672,12 @@ async fn disabling_a_user_pauses_everything() {
     );
     // Re-enabling restores resolution.
     stack.store.set_user_disabled("member", false).unwrap();
-    assert!(stack.store.identity_principal("telegram", "77").unwrap().is_some());
+    assert!(
+        stack
+            .store
+            .identity_principal("telegram", "77")
+            .unwrap()
+            .is_some()
+    );
     stop(&mut stack).await;
 }

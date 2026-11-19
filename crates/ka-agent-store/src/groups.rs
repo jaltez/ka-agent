@@ -89,9 +89,15 @@ impl Store {
     pub fn delete_group(&self, name: &str) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM users_groups WHERE group_name = ?1", params![name])?;
+        tx.execute(
+            "DELETE FROM users_groups WHERE group_name = ?1",
+            params![name],
+        )?;
         tx.execute("DELETE FROM kb_access WHERE group_name = ?1", params![name])?;
-        tx.execute("DELETE FROM agent_access WHERE group_name = ?1", params![name])?;
+        tx.execute(
+            "DELETE FROM agent_access WHERE group_name = ?1",
+            params![name],
+        )?;
         let changed = tx.execute("DELETE FROM groups WHERE name = ?1", params![name])?;
         tx.commit()?;
         Ok(changed == 1)
@@ -101,7 +107,10 @@ impl Store {
     pub fn set_user_groups(&self, username: &str, groups: &[String]) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM users_groups WHERE username = ?1", params![username])?;
+        tx.execute(
+            "DELETE FROM users_groups WHERE username = ?1",
+            params![username],
+        )?;
         for group in groups {
             tx.execute(
                 "INSERT OR IGNORE INTO users_groups(username, group_name) VALUES (?1, ?2)",
@@ -143,9 +152,8 @@ impl Store {
     /// A group's members, alphabetical.
     pub fn group_members(&self, group: &str) -> Result<Vec<String>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT username FROM users_groups WHERE group_name = ?1 ORDER BY username",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT username FROM users_groups WHERE group_name = ?1 ORDER BY username")?;
         let rows = stmt.query_map(params![group], |r| r.get::<_, String>(0))?;
         collect_rows(rows)
     }
@@ -272,7 +280,9 @@ mod tests {
         store
             .upsert_group("dev", &["anthropic/*".into()], Some("anthropic/claude"))
             .unwrap();
-        store.upsert_group("ops", &["openai/*".into()], None).unwrap();
+        store
+            .upsert_group("ops", &["openai/*".into()], None)
+            .unwrap();
         store.upsert_group("all", &[], None).unwrap();
         assert_eq!(store.list_groups().unwrap().len(), 3);
         assert_eq!(
@@ -294,10 +304,15 @@ mod tests {
                 })
                 .unwrap();
         }
-        store.set_user_groups("ana", &["dev".into(), "ops".into()]).unwrap();
+        store
+            .set_user_groups("ana", &["dev".into(), "ops".into()])
+            .unwrap();
         assert_eq!(store.groups_of("ana").unwrap(), vec!["dev", "ops"]);
         let (allow, dflt) = store.model_policy_for("ana").unwrap();
-        assert_eq!(allow, vec!["anthropic/*".to_string(), "openai/*".to_string()]);
+        assert_eq!(
+            allow,
+            vec!["anthropic/*".to_string(), "openai/*".to_string()]
+        );
         assert_eq!(dflt.as_deref(), Some("anthropic/claude"));
 
         // Any unrestricted group (or no group) means every catalog model.

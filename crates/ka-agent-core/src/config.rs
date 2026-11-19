@@ -23,7 +23,7 @@ pub enum Error {
     Edit(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerRestart {
     /// First backoff after a worker crash.
@@ -51,7 +51,7 @@ impl Default for WorkerRestart {
 /// `silent_secs` after the last engine event a "still working" notice
 /// goes out (once per turn); `abort_secs` after the last event the turn
 /// is aborted like `/stop`. `0` disables either stage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct TurnWatchdog {
     /// Seconds of engine silence before the "still working" notice.
@@ -69,7 +69,7 @@ impl Default for TurnWatchdog {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Budgets {
     /// Daily USD cap across sessions (ka usage accounting).
@@ -79,7 +79,7 @@ pub struct Budgets {
     pub daily_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Ka {
     /// Optional ka engine layer (ka's own strict `ka.toml` format), validated
@@ -90,7 +90,7 @@ pub struct Ka {
 /// The profile-wide engine feature baseline (`[tools]`): subtractive specs
 /// in the engine's own `[features] disable` grammar. Every worker spawns
 /// with them (the admin role included); a role may narrow further.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tools {
     /// Engine feature specs disabled for every worker.
@@ -100,7 +100,7 @@ pub struct Tools {
 
 /// One role (`[[role]]`): a linked identity's slice of the instance.
 /// `admin` is implicit (terminal, web panel, CLI) and cannot be defined.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct RoleSpec {
     /// `[a-z0-9-]{1,32}`, unique, never `admin`.
@@ -199,7 +199,7 @@ pub fn valid_role_name(s: &str) -> bool {
 }
 
 /// One operator hook (`[[hooks]]`, plan 2.7).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct HookSpec {
     /// The event to react to: an agent event (`message_received`,
@@ -244,7 +244,7 @@ pub const ENGINE_HOOK_EVENTS: &[&str] = &[
 ];
 
 /// The Matrix channel (Phase 6): strict `[matrix]` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct MatrixSettings {
     pub enabled: bool,
@@ -256,7 +256,7 @@ pub struct MatrixSettings {
     pub token_secret: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Telegram {
     /// Enable the Telegram channel in the daemon.
@@ -298,7 +298,7 @@ impl Telegram {
 
 /// The Slack workspace app (`[slack]`): one app install serves the whole
 /// workspace, so the daemon must be the single process answering it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct SlackSettings {
     pub enabled: bool,
@@ -324,7 +324,7 @@ impl SlackSettings {
 }
 
 /// The Discord bot (`[discord]`): gateway WebSocket, guild allowlist.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct DiscordSettings {
     pub enabled: bool,
@@ -344,7 +344,7 @@ impl DiscordSettings {
 }
 
 /// Workplace-channel policy (`[channels]`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Channels {
     /// The role a shared-channel turn runs as (never a user's own memory or
@@ -365,7 +365,7 @@ impl Default for Channels {
 }
 
 /// The local web control panel: strict `[web]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Web {
     /// Serve the web UI.
@@ -391,7 +391,7 @@ impl Default for Web {
 }
 
 /// The calendar digest: strict `[calendar]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Calendar {
     /// Local clock time (operator zone) of the daily digest, `HH:MM`.
@@ -407,7 +407,7 @@ impl Default for Calendar {
 }
 
 /// Web search for the engine's `web_search` tool: strict `[search]`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Search {
     /// `tavily` | `brave` | `bing`.
@@ -427,7 +427,7 @@ impl Search {
 }
 
 /// Approval tuning: strict `[approvals]`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Approvals {
     /// Let the engine's fast model auto-allow unmistakably safe commands
@@ -435,7 +435,7 @@ pub struct Approvals {
     pub auto_review: bool,
 }
 /// One `[[grants.path]]` entry's reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
     /// Writable without asking (the engine's sandbox allowlist plus
@@ -472,7 +472,7 @@ impl<'de> Deserialize<'de> for Access {
 }
 
 /// One per-directory grant (`[[grants.path]]`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PathGrant {
     /// Absolute directory the grant covers.
@@ -483,7 +483,7 @@ pub struct PathGrant {
 
 /// Operator grants (`[grants]`): what the engine may do without an
 /// approval card — pre-approved directories, installs, or everything.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Grants {
     /// App/package installs (`sudo apt-get install`, `npm i -g`,
@@ -520,7 +520,7 @@ impl Default for Grants {
 }
 
 /// Proactive-message manners: strict `[notify]`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Notify {
     /// `"22:00-07:00"`: scheduled prompts (crons, the briefing) that fall
@@ -554,7 +554,7 @@ impl Notify {
 
 /// Voice-note transcription: strict `[voice]`. OpenAI-compatible
 /// `/audio/transcriptions` — OpenAI, Groq, or a local Whisper server.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Voice {
     /// `openai` | `groq` | `local`.
@@ -600,7 +600,7 @@ impl Voice {
 /// One operator-declared MCP server (`[[mcp]]`). Values written
 /// `secret:<name>` in `env`/`headers` resolve from the secret store when the
 /// worker starts, so tokens never live in the config file.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
     /// Tool prefix: tools appear to the model as `<name>.<tool>`.
@@ -636,7 +636,7 @@ impl McpServer {
 
 /// Engine supervision (`[runtime]`): how many workers may run at once and
 /// whether each one is wrapped in the engine bubblewrap profile (ADR-0003).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct RuntimeSettings {
     /// Live engine workers at once (1..=64). Over the cap an idle worker is
@@ -660,7 +660,7 @@ impl Default for RuntimeSettings {
 /// Agent commit attribution (`[git]`, A14): the identity any git the
 /// engine's shell tool runs commits under. `None` keeps today's behavior
 /// (no env pinned); a set field pulls its per-username default.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Git {
     /// Author/committer name; default `ka-agent (<username>)`.
@@ -671,7 +671,7 @@ pub struct Git {
 
 /// Retention knobs (D12): 0 = keep forever, the default (an internal tool
 /// keeps everything unless an organization asks otherwise).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Retention {
     /// Delete turns (and their search rows) older than this many days.
@@ -680,7 +680,7 @@ pub struct Retention {
     pub attachments_days: u32,
 }
 /// Memory extraction gating (`[memory]`, B15c).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Memory {
     /// Recorded turns a session needs before `memory_propose` is allowed
@@ -698,7 +698,7 @@ impl Default for Memory {
 
 /// Shadow-git checkpoints (`[checkpoint]`, v4 B1): the safety net under
 /// approved writes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Checkpoint {
     /// Snapshot the workspace before every approved write. `false` turns
@@ -718,7 +718,34 @@ impl Default for Checkpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Read-only research children (`[scout]`, v4 F13/C1 slice).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Scout {
+    /// Offer `kagent__scout` to the model at all.
+    pub enabled: bool,
+    /// Children allowed to run at once (the rest queue; over the queue a
+    /// spawn answers busy).
+    pub max_concurrent: u32,
+    /// Per-child deadline in seconds — kept under the `__mcp` relay's
+    /// 120 s IPC read timeout.
+    pub timeout_secs: u64,
+    /// Cap on the summary returned to the parent (chars).
+    pub max_summary_chars: usize,
+}
+
+impl Default for Scout {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent: 2,
+            timeout_secs: 90,
+            max_summary_chars: 6000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonConfig {
     /// The single workspace directory every engine runs in (MVP). The
@@ -743,6 +770,11 @@ pub struct DaemonConfig {
     /// A message that arrives mid-turn: `steer` (default, rides the
     /// running reply) or `queue` (durable, next turn).
     pub busy_messages: String,
+    /// Bare interrupt keywords (`stop`, `wait`, …): `on` (default) aborts
+    /// the running turn when such a short message arrives mid-cycle and
+    /// makes it the next one; `off` keeps the plain `busy_messages`
+    /// behavior.
+    pub interrupts: String,
     /// `ask` (default) | `accept_edits` | `allow` | `readonly`. The old
     /// names (`guarded`, `free`, `plan`, `accept-edits`) are accepted
     /// forever and normalized at load ([`normalize_mode`]).
@@ -813,6 +845,9 @@ pub struct DaemonConfig {
     /// Shadow-git checkpoints (`[checkpoint]`).
     #[serde(default)]
     pub checkpoint: Checkpoint,
+    /// Read-only research children (`[scout]`).
+    #[serde(default)]
+    pub scout: Scout,
 }
 
 impl Default for DaemonConfig {
@@ -825,6 +860,7 @@ impl Default for DaemonConfig {
             background_model: None,
             sandbox: "auto".to_string(),
             busy_messages: "steer".to_string(),
+            interrupts: "on".to_string(),
             mode: "ask".to_string(),
             approval_ttl_secs: 900,
             turn_grace_secs: 10,
@@ -856,6 +892,7 @@ impl Default for DaemonConfig {
             hooks: Vec::new(),
             memory: Memory::default(),
             checkpoint: Checkpoint::default(),
+            scout: Scout::default(),
         }
     }
 }
@@ -901,20 +938,68 @@ fn unknown_mode(mode: &str) -> String {
     )
 }
 
+/// The editor hint published configs carry (`"$schema" = "…"`). It is
+/// not a daemon setting: `load`/`parse_toml` drop it before the strict
+/// `deny_unknown_fields` parse so editors can autocomplete without the
+/// daemon refusing the file.
+const EDITOR_SCHEMA_KEY: &str = "$schema";
+
+fn strip_editor_schema(text: &str) -> std::borrow::Cow<'_, str> {
+    let Ok(mut doc) = toml::from_str::<toml::Value>(text) else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let Some(table) = doc.as_table_mut() else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    if table.remove(EDITOR_SCHEMA_KEY).is_none() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    match toml::to_string(&doc) {
+        Ok(clean) => std::borrow::Cow::Owned(clean),
+        Err(_) => std::borrow::Cow::Borrowed(text),
+    }
+}
+
 impl DaemonConfig {
+    /// Parse config text, tolerating the editor-only `"$schema"` key.
+    pub fn parse_toml(text: &str) -> Result<Self, toml::de::Error> {
+        let clean = strip_editor_schema(text);
+        toml::from_str(clean.as_ref())
+    }
+
+    /// The published JSON Schema (`docs/schema/ka-agent.schema.json`):
+    /// derived from the serde model, so every field's doc comment and
+    /// `deny_unknown_fields` reaches the editor. `"$schema"` itself is
+    /// declared so a file carrying the hint validates in the editor too.
+    pub fn json_schema() -> serde_json::Value {
+        let mut schema = serde_json::to_value(schemars::schema_for!(DaemonConfig))
+            .unwrap_or(serde_json::Value::Null);
+        if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            props.insert(
+                EDITOR_SCHEMA_KEY.to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Editor hint: the URL of this schema. Ignored by the daemon.",
+                }),
+            );
+        }
+        schema
+    }
+
     /// Load and validate. `~` expands against `$HOME`.
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        let cfg: Self = toml::from_str(&text).map_err(|e| Error::Parse {
+        let clean = strip_editor_schema(&text);
+        let cfg: Self = toml::from_str(clean.as_ref()).map_err(|e| Error::Parse {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
         // A config that pins nothing gets the ACTIVE profile's workspace —
         // profiles must never share one by accident of the default value.
-        let has_workspace = toml::from_str::<toml::Value>(&text)
+        let has_workspace = toml::from_str::<toml::Value>(clean.as_ref())
             .ok()
             .and_then(|v| v.get("workspace").cloned())
             .is_some();
@@ -996,6 +1081,12 @@ impl DaemonConfig {
             return Err(Error::Validate(format!(
                 "unknown busy_messages {:?} (steer|queue)",
                 self.busy_messages
+            )));
+        }
+        if !matches!(self.interrupts.as_str(), "on" | "off") {
+            return Err(Error::Validate(format!(
+                "unknown interrupts {:?} (on|off)",
+                self.interrupts
             )));
         }
         if self.approval_ttl_secs == 0 || self.approval_ttl_secs > 86_400 {
@@ -1520,6 +1611,74 @@ mod tests {
         let p = dir.join("ka-agent.toml");
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    /// Follow `$ref`s into `$defs` (schemars emits nested structs there).
+    fn resolve<'a>(
+        root: &'a serde_json::Value,
+        mut node: &'a serde_json::Value,
+    ) -> &'a serde_json::Value {
+        for _ in 0..16 {
+            if let Some(name) = node
+                .get("$ref")
+                .and_then(|r| r.as_str())
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+            {
+                let Some(next) = root.get("$defs").and_then(|d| d.get(name)) else {
+                    break;
+                };
+                node = next;
+                continue;
+            }
+            // `Option<T>` renders as `anyOf [T, null]`.
+            if node.get("properties").is_none()
+                && let Some(next) = node.get("anyOf").and_then(|a| a.as_array()).and_then(|a| {
+                    a.iter()
+                        .find(|b| b.get("$ref").is_some() || b.get("properties").is_some())
+                })
+            {
+                node = next;
+                continue;
+            }
+            break;
+        }
+        node
+    }
+
+    /// A16: the schema kills typos at typing time, so it must cover every
+    /// key the registry advertises — a registered key missing from the
+    /// derived schema is drift and fails here.
+    #[test]
+    fn every_registered_key_appears_in_the_derived_schema() {
+        let schema = DaemonConfig::json_schema();
+        for spec in crate::config_keys::KEYS {
+            let mut node = resolve(&schema, &schema);
+            for segment in spec.path.split('.') {
+                let next = resolve(&schema, node)
+                    .get("properties")
+                    .and_then(|props| props.get(segment));
+                let Some(next) = next else {
+                    panic!(
+                        "registered key `{}` is missing from the JSON schema \
+                         (no property `{segment}`)",
+                        spec.path
+                    );
+                };
+                node = next;
+            }
+        }
+    }
+
+    #[test]
+    fn editor_schema_key_is_tolerated_and_unknown_keys_still_fail() {
+        let p = write_tmp(
+            "editor-schema",
+            "\"$schema\" = \"https://json.schemastore.org/ka-agent.json\"\nmode = \"ask\"\n",
+        );
+        let cfg = DaemonConfig::load(&p).unwrap();
+        assert_eq!(cfg.mode, "ask");
+        // The strict parse is unchanged: a real typo is still an error.
+        assert!(DaemonConfig::parse_toml("modee = \"ask\"").is_err());
     }
 
     #[test]

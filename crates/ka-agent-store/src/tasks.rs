@@ -305,22 +305,77 @@ impl Store {
         let rows = stmt.query_map(params![limit as i64], row_to_run)?;
         collect_rows(rows)
     }
+
+    /// Live trigger tasks (queued, running or paused), armed first. A
+    /// webhook trigger sits `queued` with no schedule while it waits for a
+    /// delivery; terminal rows are history, not triggers.
+    pub fn trigger_tasks(&self) -> Result<Vec<ka_agent_core::Task>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, title, kind, status, read_only, scheduled_at_ms, payload, created_ms, updated_ms
+             FROM tasks
+             WHERE kind = 'trigger' AND status IN ('queued','running','interrupted')
+             ORDER BY scheduled_at_ms",
+        )?;
+        let rows = stmt.query_map([], row_to_task)?;
+        collect_rows(rows)
+    }
+
+    /// Reserve a webhook event id (ADR-0005 §5): `Ok(true)` = first
+    /// sighting, the delivery proceeds; `Ok(false)` = replay, the lane
+    /// answers `dup` and arms nothing.
+    pub fn record_trigger_event(&self, event_id: &str, trigger_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO trigger_events(event_id, trigger_id, seen_ms) VALUES (?1, ?2, ?3)",
+            params![event_id, trigger_id, ka_agent_core::now_ms()],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Park a fired webhook trigger: back to `queued` with no schedule
+    /// (it waits for the next delivery to arm it again). Conditional on
+    /// `running`, so an operator's cancel/pause wins the race.
+    pub fn park_trigger(&self, id: &ka_agent_core::TaskId) -> Result<bool> {
+        let conn = self.lock();
+        let parked = conn.execute(
+            "UPDATE tasks SET status = 'queued', scheduled_at_ms = NULL, updated_ms = ?2
+             WHERE id = ?1 AND status = 'running'",
+            params![id.as_str(), ka_agent_core::now_ms()],
+        )?;
+        Ok(parked > 0)
+    }
 }
 
-/// The user a task belongs to: a cron's creator (payload `username`, else
-/// its role mapped through the user rule), reminders always the operator.
+/// The user a task belongs to: a cron's or trigger's creator (payload
+/// `username`, else its role mapped through the user rule), reminders
+/// always the operator.
 pub fn task_username(t: &ka_agent_core::Task) -> String {
-    if t.kind != "cron" {
-        return ka_agent_core::OPERATOR_USER.to_string();
+    match t.kind.as_str() {
+        "cron" => t
+            .payload
+            .as_deref()
+            .and_then(ka_agent_core::CronSpec::from_payload)
+            .map(|c| match c.username {
+                Some(u) => u,
+                None => {
+                    crate::user_for_role(c.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE))
+                }
+            })
+            .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string()),
+        "trigger" => t
+            .payload
+            .as_deref()
+            .and_then(ka_agent_core::TriggerSpec::from_payload)
+            .map(|s| match s.username {
+                Some(u) => u,
+                None => {
+                    crate::user_for_role(s.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE))
+                }
+            })
+            .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string()),
+        _ => ka_agent_core::OPERATOR_USER.to_string(),
     }
-    t.payload
-        .as_deref()
-        .and_then(ka_agent_core::CronSpec::from_payload)
-        .map(|c| match c.username {
-            Some(u) => u,
-            None => crate::user_for_role(c.role.as_deref().unwrap_or(ka_agent_core::ADMIN_ROLE)),
-        })
-        .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string())
 }
 
 #[cfg(test)]
@@ -362,5 +417,59 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].tokens, Some(50));
+    }
+
+    #[test]
+    fn trigger_events_dedupe_by_event_id() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.record_trigger_event("ev-1", "task_1").unwrap());
+        // Same event id, same or different trigger: a replay, not a new
+        // delivery.
+        assert!(!store.record_trigger_event("ev-1", "task_1").unwrap());
+        assert!(!store.record_trigger_event("ev-1", "task_2").unwrap());
+        assert!(store.record_trigger_event("ev-2", "task_1").unwrap());
+    }
+
+    #[test]
+    fn trigger_task_rows_and_username() {
+        let store = Store::open_in_memory().unwrap();
+        let mut task = ka_agent_core::Task::new("hook github/label".into(), "trigger", false);
+        task.payload = Some(
+            ka_agent_core::TriggerSpec {
+                kind: ka_agent_core::TriggerKind::Webhook,
+                text: "triage".into(),
+                source: "operator".into(),
+                session_id: "sess_x".into(),
+                role: Some("member".into()),
+                username: Some("member".into()),
+                tools: Vec::new(),
+                error_streak: 0,
+                recurrence_ms: None,
+                at_local: None,
+                weekdays: Vec::new(),
+                month_day: None,
+                gate: None,
+                hook_path: Some("github/label".into()),
+                secret: None,
+                filter: None,
+                max_body_bytes: None,
+                preflight: false,
+            }
+            .to_payload(),
+        );
+        store.insert_task(&task).unwrap();
+        // The creator rides the username column (rbac.md's trigger row).
+        assert_eq!(super::task_username(&task), "member");
+        assert_eq!(store.trigger_tasks().unwrap().len(), 1);
+        // Park is conditional: a running row parks back to queued with no
+        // schedule; a queued row is untouched (it parks nothing).
+        store.claim_task(&task.id).unwrap();
+        assert!(store.park_trigger(&task.id).unwrap());
+        let back = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(back.status, ka_agent_core::TaskStatus::Queued);
+        assert!(back.scheduled_at_ms.is_none());
+        // A cancelled trigger is never resurrected by a park.
+        store.set_task_status(&task.id, "cancelled").unwrap();
+        assert!(!store.park_trigger(&task.id).unwrap());
     }
 }

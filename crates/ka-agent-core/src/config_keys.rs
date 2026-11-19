@@ -132,6 +132,14 @@ pub static KEYS: &[KeySpec] = &[
         doc: "a message that arrives mid-turn: steer into the reply, or queue for the next turn",
     },
     KeySpec {
+        path: "interrupts",
+        kind: Kind::Enum(&["on", "off"]),
+        default: "on",
+        apply: Apply::Live,
+        web: true,
+        doc: "a bare short interrupt word (\"stop\", \"wait\", …) mid-turn: abort the cycle and make it the next turn (off = plain busy_messages behavior)",
+    },
+    KeySpec {
         path: "mode",
         kind: Kind::Enum(&["ask", "accept_edits", "allow", "readonly"]),
         default: "ask",
@@ -687,6 +695,41 @@ pub static KEYS: &[KeySpec] = &[
         apply: Apply::Live,
         web: true,
         doc: "how long checkpoint rows and their shadow repos live (destructive pruning)",
+    },
+    KeySpec {
+        path: "scout.enabled",
+        kind: Kind::Bool,
+        default: "false",
+        apply: Apply::Worker,
+        web: true,
+        doc: "offer kagent__scout (a read-only research child) to the model",
+    },
+    KeySpec {
+        path: "scout.max_concurrent",
+        kind: Kind::Int { min: 1, max: 8 },
+        default: "2",
+        apply: Apply::Live,
+        web: true,
+        doc: "scout children allowed to run at once (the rest queue, then busy)",
+    },
+    KeySpec {
+        path: "scout.timeout_secs",
+        kind: Kind::Int { min: 10, max: 119 },
+        default: "90",
+        apply: Apply::Live,
+        web: true,
+        doc: "per-child deadline (kept under the __mcp relay's 120 s read timeout)",
+    },
+    KeySpec {
+        path: "scout.max_summary_chars",
+        kind: Kind::Int {
+            min: 500,
+            max: 60000,
+        },
+        default: "6000",
+        apply: Apply::Live,
+        web: true,
+        doc: "cap on the summary a scout returns to its parent",
     },
 ];
 

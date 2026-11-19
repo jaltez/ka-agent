@@ -2462,6 +2462,72 @@ async fn queue_picker_removes_one_item() {
     stop(&mut stack).await;
 }
 
+/// `/queue` renders a card whose `↑` promotes one queued message: the card
+/// re-renders with the reordered list and the store's head is the promoted
+/// item (`qu:` callback, beside `queue_picker_removes_one_item`).
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_card_promotes_one_item() {
+    let mut stack = spawn_channel(vec![42], "tok-qup").await;
+    let sid = stack.runtime.session_id_for(&op()).unwrap();
+    let first = ka_agent_core::QueueItem::new(sid.clone(), "first queued".into(), "telegram:42");
+    let mut second =
+        ka_agent_core::QueueItem::new(sid.clone(), "second queued".into(), "telegram:42");
+    second.enqueued_ms += 10; // deterministic order regardless of clock granularity
+    stack.store.enqueue(&first).unwrap();
+    stack.store.enqueue(&second).unwrap();
+    stack.server.push_text_message(1, 7, 42, "/queue");
+    let card = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("second queued"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("queue card sent");
+    // Each row is a [✕ `qx:…`, ↑ `qu:…`] pair; take row 2's promote button.
+    let rows = card.body["reply_markup"]["inline_keyboard"]
+        .as_array()
+        .unwrap();
+    let up = rows[1]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["callback_data"].as_str())
+        .find(|d| d.starts_with("qu:"))
+        .expect("no promote (qu:) button")
+        .to_string();
+    assert!(up.len() <= 64, "callback data cap");
+    stack.server.push_callback(2, 7, 42, &up);
+    // The card re-renders with the promoted item first.
+    let edited = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "editMessageText"
+                    && c.body["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("second queued"))
+            },
+            Duration::from_secs(10),
+        )
+        .expect("card did not re-render with the reordered list");
+    let text = edited.body["text"].as_str().unwrap();
+    let first_pos = text.find("first queued").expect("first line kept");
+    let second_pos = text.find("second queued").expect("promoted line kept");
+    assert!(
+        second_pos < first_pos,
+        "the promoted item must list first: {text}"
+    );
+    // And the store's head is the promoted item (the next drain submits it).
+    let next = stack.store.next_queued(&sid).unwrap().unwrap();
+    assert_eq!(next.text, "second queued");
+    stop(&mut stack).await;
+}
+
 /// `/forget` renders the remembered facts with a ✖ that forgets one.
 #[tokio::test(flavor = "multi_thread")]
 async fn forget_picker_forgets_one_memory() {
@@ -2562,7 +2628,12 @@ async fn a_refused_final_chunk_marks_the_outbox_row_failed() {
             "the answer".into(),
         ))
         .unwrap();
-    let surface = TelegramSurface::new(base, "tok-fail".to_string(), Some(7), Some(Arc::clone(&store)));
+    let surface = TelegramSurface::new(
+        base,
+        "tok-fail".to_string(),
+        Some(7),
+        Some(Arc::clone(&store)),
+    );
     surface.emit(&env(
         1,
         AgentEvent::TurnStarted {

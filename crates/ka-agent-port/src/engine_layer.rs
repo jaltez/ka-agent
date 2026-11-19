@@ -248,9 +248,7 @@ pub fn compose_for_role(
             let allowed = match (&m.roles, role_name) {
                 (None, _) => true,
                 (Some(roles), Some(name)) => roles.iter().any(|r| r == name),
-                (Some(roles), None) => roles
-                    .iter()
-                    .any(|r| r == ka_agent_core::ADMIN_ROLE),
+                (Some(roles), None) => roles.iter().any(|r| r == ka_agent_core::ADMIN_ROLE),
             };
             if !allowed {
                 continue;

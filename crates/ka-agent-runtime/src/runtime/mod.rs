@@ -39,6 +39,7 @@ mod memory;
 mod policy;
 mod roles;
 mod scheduler;
+mod scout;
 mod worker;
 
 use config::publish_timezone;
@@ -161,6 +162,10 @@ pub(super) struct UserState {
     /// exact): asked again, they are answered without a card. Cleared by
     /// `/new`.
     session_allow: std::collections::HashSet<String>,
+    /// Skills parked by a `paths:` touch in the running turn: the next
+    /// conversational submit attaches them (single-writer: never
+    /// mid-cycle) and writes their once-per-conversation marker.
+    paths_pending: std::collections::BTreeSet<String>,
     live: Option<Live>,
     budget: BudgetState,
     /// Timestamps (ms) of recent worker crashes, for the crash-loop breaker.
@@ -168,6 +173,9 @@ pub(super) struct UserState {
     restart_attempt: u32,
     /// This user's reasoning effort (`/effort`; cleared by `/new`).
     effort: Option<String>,
+    /// When the engine last hit a retryable rate limit (ms since epoch):
+    /// surfaced in `StatusReport`, cleared at the next settled turn.
+    throttled_since_ms: Option<i64>,
     /// Last time this user did anything: the LRU order the worker cap's
     /// idle eviction uses.
     last_active_ms: i64,
@@ -259,6 +267,12 @@ struct Shared {
     /// Exact tool names that never ask (the app computes this from the
     /// tool registry and sets it at host start).
     auto_allow: Mutex<Vec<String>>,
+    /// Live scout children (v4 F13): they hold a pool slot without a
+    /// `users` entry, so the worker cap sums them here.
+    scouts_live: Mutex<usize>,
+    /// The scout concurrency queue (`[scout] max_concurrent`), rebuilt when
+    /// the configured width changes.
+    scout_sem: Mutex<Option<(usize, Arc<tokio::sync::Semaphore>)>>,
     /// Per-channel poll health, set by the channel tasks: a dead phone
     /// link must show in `status`, not only in the journal (F8).
     channel_health: Mutex<HashMap<String, crate::status::ChannelHealth>>,
@@ -509,11 +523,13 @@ impl Runtime {
             session_model: None,
             agent: None,
             session_allow: std::collections::HashSet::new(),
+            paths_pending: std::collections::BTreeSet::new(),
             live: None,
             budget,
             crashes: Vec::new(),
             restart_attempt: 0,
             effort: None,
+            throttled_since_ms: None,
             last_active_ms: ka_agent_core::now_ms(),
         };
         let mut users = HashMap::new();
@@ -545,6 +561,8 @@ impl Runtime {
                 persona_mtime: Mutex::new(None),
                 started_ms: ka_agent_core::now_ms(),
                 auto_allow: Mutex::new(Vec::new()),
+                scouts_live: Mutex::new(0),
+                scout_sem: Mutex::new(None),
                 channel_health: Mutex::new(HashMap::new()),
                 live_model: Mutex::new(None),
                 update_available: Mutex::new(None),
@@ -643,7 +661,7 @@ impl Runtime {
     ) -> Result<crate::status::StatusReport, Error> {
         let cfg = self.cfg();
         let st = self.ensure_user(who)?;
-        let (sid, status, strand, worker_running, budget, crashes, private, role) = {
+        let (sid, status, strand, worker_running, budget, crashes, private, role, throttled) = {
             let g = st.lock();
             (
                 g.session.id.clone(),
@@ -654,6 +672,7 @@ impl Runtime {
                 g.crashes.len(),
                 g.session.private,
                 g.role.clone(),
+                g.throttled_since_ms,
             )
         };
         let (limit_usd, limit_tokens) = self.budget_caps_for(&who.username, &role);
@@ -683,6 +702,7 @@ impl Runtime {
             awake_since_ms: self.sh.started_ms,
             status: format!("{status:?}"),
             private,
+            throttled_since_ms: throttled,
             strand_id: strand,
             model: cfg.model.clone(),
             mode: self.effective_mode_for(&who.username),
@@ -879,6 +899,7 @@ impl Runtime {
             // "Allow for this session", the session mode and effort end
             // with it.
             g.session_allow.clear();
+            g.paths_pending.clear();
             g.session_mode = None;
             g.effort = None;
             let superseded = g.session.private.then(|| g.session.id.clone());

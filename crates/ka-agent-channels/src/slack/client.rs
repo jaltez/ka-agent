@@ -46,10 +46,17 @@ impl SlackClient {
         let headers: Vec<(String, String)> = resp
             .headers()
             .iter()
-            .map(|(k, v)| (k.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                )
+            })
             .collect();
-        let header_refs: Vec<(&str, String)> =
-            headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let header_refs: Vec<(&str, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
         if status.as_u16() == 429 {
             self.limiter
                 .apply_headers(&key, &header_refs, ka_agent_core::now_ms());
@@ -101,7 +108,12 @@ impl SlackClient {
     }
 
     /// `chat.postEphemeral`: answer only the person who clicked.
-    pub async fn post_ephemeral(&self, channel: &str, user: &str, text: &str) -> Result<Value, String> {
+    pub async fn post_ephemeral(
+        &self,
+        channel: &str,
+        user: &str,
+        text: &str,
+    ) -> Result<Value, String> {
         self.call(
             "chat.postEphemeral",
             json!({"channel": channel, "user": user, "text": text}),
@@ -190,7 +202,10 @@ impl SlackClient {
         bytes: &[u8],
     ) -> Result<Value, String> {
         let info = self
-            .call("files.getUploadURLExternal", json!({"filename": filename, "length": bytes.len()}))
+            .call(
+                "files.getUploadURLExternal",
+                json!({"filename": filename, "length": bytes.len()}),
+            )
             .await?;
         let upload_url = info["upload_url"]
             .as_str()

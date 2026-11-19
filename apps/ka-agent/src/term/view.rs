@@ -31,6 +31,8 @@ pub struct View {
     pub mode: String,
     /// Private (incognito) conversation — `🕶 private` in the status line.
     pub private: bool,
+    /// The engine is rate-limited and retrying in-engine — `⏳ rate-limited`.
+    pub throttled: bool,
     pub focused: bool,
     pub verbose: bool,
     pub width: usize,
@@ -77,6 +79,7 @@ impl View {
             session: String::new(),
             mode: "ask".into(),
             private: false,
+            throttled: false,
             focused: true,
             verbose: false,
             width,
@@ -110,6 +113,9 @@ impl View {
         }
         if let Some(pct) = self.context_pct {
             parts.push(format!("ctx {pct}%"));
+        }
+        if self.throttled {
+            parts.push("⏳ rate-limited".into());
         }
         match (self.spent_today, self.daily_cap) {
             (spent, Some(cap)) => parts.push(format!("${spent:.2}/{cap:.2}")),
@@ -453,6 +459,7 @@ pub fn absorb(view: &mut View, ev: &AgentEvent, thinking: bool) -> Vec<String> {
         // the privacy marker must not wait for the next Settings event.
         AgentEvent::Hello { report } => {
             view.private = report.private;
+            view.throttled = report.throttled_since_ms.is_some();
         }
         // A router reply (every `/command`) renders like an answer.
         AgentEvent::Reply { text } => {
@@ -729,6 +736,53 @@ mod tests {
                 false
             ),
             vec![crate::term::paint::dim("· cron cron2 → ok")]
+        );
+    }
+
+    /// A6: the rate-limit throttle shows in the status line while set.
+    #[test]
+    fn throttled_shows_the_rate_limit_badge() {
+        let mut v = View::new("Ka".into(), 200);
+        assert!(!v.status_line().contains("rate-limited"));
+        v.throttled = true;
+        assert!(
+            v.status_line().contains("⏳ rate-limited"),
+            "{}",
+            v.status_line()
+        );
+        // Cleared on the next settled turn's Hello.
+        let report = Box::new(ka_agent_runtime::StatusReport {
+            session_id: "sess_t-00-00000000".into(),
+            persona: "Ka".into(),
+            awake_since_ms: 0,
+            status: "Idle".into(),
+            strand_id: None,
+            model: Some("zai/glm-5.3".into()),
+            mode: "ask".into(),
+            worker_running: true,
+            idle_timeout_secs: 900,
+            spent_usd: 0.0,
+            spent_tokens: 0,
+            limit_usd: None,
+            limit_tokens: None,
+            queue: 0,
+            pending_approvals: 0,
+            crashes: 0,
+            next_task: None,
+            timezone: "UTC".into(),
+            capabilities: Default::default(),
+            memory: None,
+            live_model: None,
+            update_available: None,
+            channels: Vec::new(),
+            private: false,
+            throttled_since_ms: None,
+        });
+        absorb(&mut v, &AgentEvent::Hello { report }, false);
+        assert!(
+            !v.status_line().contains("rate-limited"),
+            "{}",
+            v.status_line()
         );
     }
 

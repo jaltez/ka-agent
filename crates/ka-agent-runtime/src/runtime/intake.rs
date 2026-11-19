@@ -1,6 +1,7 @@
 // Inbound handling per user: principal resolution, preflight, submit, the
 // durable queue, retry and stop. Split from runtime.rs (moves only).
 use super::events::is_scheduled;
+use super::scheduler::record_trigger_run;
 use super::worker::rt_on_engine_closed;
 use super::*;
 use ka_agent_core::Principal;
@@ -26,6 +27,133 @@ fn publish_turn_context(store: &Store, source: &str, who: &Principal) {
     let _ = store.meta_set(ka_agent_core::layout::TURN_USER_META_KEY, &who.username);
 }
 
+/// A per-turn override (`/skill` allowed_tools, a cron's tool list) can
+/// only narrow the role's toolset, never widen it.
+fn narrow_tools(
+    role_allow: Option<Vec<String>>,
+    tool_override: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match tool_override {
+        Some(tools) => Some(match role_allow {
+            Some(allow) => tools.into_iter().filter(|t| allow.contains(t)).collect(),
+            None => tools,
+        }),
+        None => role_allow,
+    }
+}
+
+/// What one submit attaches beyond its explicit list: the trigger/paths
+/// skills and the per-kind names `/skill-doctor` counts.
+#[derive(Default)]
+struct SkillAttach {
+    /// Names to put on the wire (explicit + trigger + paths, deduped).
+    attach: Vec<String>,
+    explicit: Vec<String>,
+    trigger: Vec<String>,
+    paths: Vec<String>,
+}
+
+/// Resolve the skills a submission fires. Trigger matching and paths
+/// attachment are conversational only: cron/briefing turns are exempt (a
+/// pending paths skill waits for the next human turn).
+fn plan_skill_attach(
+    sh: &Shared,
+    who: &Principal,
+    st: &UserHandle,
+    sid: &str,
+    text: &str,
+    explicit_names: Option<&[String]>,
+    conversational: bool,
+) -> SkillAttach {
+    let mut out = SkillAttach::default();
+    if !conversational {
+        return out;
+    }
+    let resolved = crate::skills::Skills::new(&sh.paths.user_engine_home(&who.username)).resolved();
+    let hits = crate::skills::matched_triggers(text, &resolved);
+    let mut names: Vec<String> = Vec::new();
+    if let Some(explicit) = explicit_names {
+        names.extend(explicit.iter().cloned());
+    }
+    for hit in &hits {
+        if !names.contains(hit) {
+            names.push(hit.clone());
+        }
+    }
+    names.truncate(3);
+    out.attach = names;
+    out.trigger = hits
+        .into_iter()
+        .filter(|hit| out.attach.contains(hit))
+        .collect();
+    if let Some(explicit) = explicit_names {
+        out.explicit = explicit
+            .iter()
+            .filter(|name| out.attach.contains(name))
+            .cloned()
+            .collect();
+    }
+    // A paths touch parks a name until the next submit; the marker is
+    // written only when the skill actually attaches, so a restart between
+    // touch and attach forgets the touch without burning the marker.
+    let pending: Vec<String> = st.lock().paths_pending.iter().cloned().collect();
+    let mut keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for name in pending {
+        let still_offered = resolved.iter().any(|skill| skill.info.name == name);
+        if !still_offered || crate::skills::path_marked(&sh.store, sid, &name) {
+            continue;
+        }
+        keep.insert(name.clone());
+        if !out.attach.contains(&name) {
+            out.attach.push(name.clone());
+        }
+        out.paths.push(name);
+    }
+    if keep.len() != st.lock().paths_pending.len() {
+        st.lock().paths_pending = keep;
+    }
+    out
+}
+
+/// Persist the attach counts (`/skill-doctor`) and the paths markers.
+/// Called only after the submit handshake succeeded: nothing counted that
+/// the engine never saw.
+fn record_skill_attach(
+    sh: &Shared,
+    who: &Principal,
+    st: &UserHandle,
+    sid: &str,
+    attach: &SkillAttach,
+) {
+    let mut rows: std::collections::BTreeMap<String, (bool, bool, bool)> =
+        std::collections::BTreeMap::new();
+    for name in &attach.explicit {
+        rows.entry(name.clone()).or_default().0 = true;
+    }
+    for name in &attach.trigger {
+        rows.entry(name.clone()).or_default().1 = true;
+    }
+    for name in &attach.paths {
+        rows.entry(name.clone()).or_default().2 = true;
+    }
+    for (name, (explicit, trigger, paths)) in rows {
+        let _ = sh
+            .store
+            .bump_skill_usage(&who.username, &name, explicit, trigger, paths);
+        if paths {
+            let _ = sh
+                .store
+                .meta_set(&crate::skills::path_marker_key(sid, &name), "1");
+        }
+    }
+    if !attach.paths.is_empty() {
+        let mut g = st.lock();
+        for name in &attach.paths {
+            g.paths_pending.remove(name);
+        }
+    }
+}
+
 /// The per-turn context line the model sees first: local clock, weekday,
 /// zone and channel; scheduled turns name their origin. `turns.inbound_text`
 /// and the FTS index keep the raw text.
@@ -47,13 +175,15 @@ fn ctx_line(now: &jiff::Zoned, source: &str) -> String {
         jiff::civil::Weekday::Sunday => "Sun",
     };
     // console -> terminal; "-bg" background asks speak as their channel;
-    // a cron:<id> source names the task in `scheduled`.
+    // a cron:<id> or trigger:<id> source names the task in `scheduled`.
     let (via, scheduled) = if let Some(rest) = source.strip_prefix("cron:") {
         ("cron", Some(format!("cron:{rest}")))
     } else if source == "cron" {
         ("cron", Some("cron".to_string()))
     } else if source == "briefing" {
         ("briefing", Some("briefing".to_string()))
+    } else if let Some(rest) = source.strip_prefix("trigger:") {
+        ("trigger", Some(format!("trigger:{rest}")))
     } else {
         let bare = source.strip_suffix("-bg").unwrap_or(source);
         let bare = bare.split(':').next().unwrap_or(bare);
@@ -67,6 +197,88 @@ fn ctx_line(now: &jiff::Zoned, source: &str) -> String {
         "<ctx now=\"{}\" day=\"{day}\" tz=\"{tz}\" via=\"{via}\"{scheduled}/>",
         now.strftime("%Y-%m-%dT%H:%M:%S%:z")
     )
+}
+
+/// The trigger fire's run row: what the turn did, with the turn's own
+/// usage (the `runs`-per-fire rule the cron arm follows).
+fn record_trigger_run_finished(
+    store: &Store,
+    task_id: &ka_agent_core::TaskId,
+    stop: &str,
+    cost_usd: f64,
+    tokens: u64,
+    started_ms: i64,
+) {
+    let _ = store.insert_run(&ka_agent_store::RunRow {
+        id: ka_agent_core::RunId::generate(),
+        kind: "trigger".into(),
+        ref_id: Some(task_id.as_str().to_string()),
+        status: if stop == "done" || stop == "length" {
+            "fired"
+        } else {
+            "failed"
+        }
+        .into(),
+        stop: Some(stop.to_string()),
+        error_class: None,
+        error_message: None,
+        cost_usd: Some(cost_usd),
+        tokens: Some(tokens),
+        started_ms,
+        ended_ms: Some(ka_agent_core::now_ms()),
+    });
+}
+
+/// Index the trigger turn into the episode FTS (user + assistant rows),
+/// so the lineage session is searchable and `@turn:`-addressable like a
+/// chat transcript.
+fn index_trigger_episode(
+    sh: &Arc<Shared>,
+    sid: &ka_agent_core::SessionId,
+    inbound: &str,
+    answer: &str,
+) {
+    let turns = sh
+        .store
+        .latest_turns_for_session(sid, 1, 0)
+        .unwrap_or_default();
+    let Some(turn) = turns.last() else {
+        return;
+    };
+    let tid = turn.id.clone();
+    if !inbound.trim().is_empty() {
+        sh.store.index_episode(sid, &tid, "user", inbound).ok();
+    }
+    if !answer.trim().is_empty() {
+        sh.store.index_episode(sid, &tid, "assistant", answer).ok();
+    }
+}
+
+/// The bare interrupt words that abort a running turn (A3, Goose's
+/// heuristic): `stop halt cease quit end abort cancel wait hold pause`.
+/// The medium words (`no`, `wrong`, `actually`, `nevermind`, …) are
+/// deliberately NOT acted on — a mid-cycle correction rides the steer
+/// path (`busy_messages = "steer"`).
+const INTERRUPT_WORDS: &[&str] = &[
+    "stop", "halt", "cease", "quit", "end", "abort", "cancel", "wait", "hold", "pause",
+];
+
+/// The pure matcher (unit-tested): a trimmed message of at most 20 chars
+/// that is exactly one interrupt word — case-insensitive — plus optional
+/// trailing punctuation. Anything longer or wordier is an ordinary
+/// message: by construction the benign shorts ("ok", "thanks", "hm")
+/// never match.
+fn is_bare_interrupt(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > 20 {
+        return false;
+    }
+    let bare = trimmed.trim_end_matches(['.', '!', '?', '…', ';', ':']);
+    if bare.is_empty() {
+        return false;
+    }
+    let lower = bare.to_lowercase();
+    INTERRUPT_WORDS.contains(&lower.as_str())
 }
 
 /// Submit the next queued message of one user, if any. Returns true when a
@@ -166,6 +378,17 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
             live.thought_tail.clear();
         }
     }
+    // Queued items stay plain text; triggers and parked paths fire at
+    // drain time, just like a direct submit (scheduled fires are exempt).
+    let attach = plan_skill_attach(
+        sh,
+        who,
+        st,
+        sid.as_str(),
+        &item.text,
+        None,
+        !is_scheduled(Some(item.source.as_str())),
+    );
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
     let allowed_tools = Runtime { sh: Arc::clone(sh) }.role_toolset(&who.role);
     // B15b: a scheduled turn runs against the automation compile (machine
@@ -184,10 +407,17 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
         });
     }
     match port
-        .submit_full(wire, Vec::new(), Vec::new(), model, allowed_tools)
+        .submit_full(
+            wire,
+            Vec::new(),
+            attach.attach.clone(),
+            model,
+            allowed_tools,
+        )
         .await
     {
         Ok(()) => {
+            record_skill_attach(sh, who, st, sid.as_str(), &attach);
             turn.transition(TurnStatus::Running)
                 .map_err(|t| illegal_turn(turn.status, t))
                 .ok();
@@ -347,6 +577,426 @@ impl Runtime {
         self.handle_message_inner(text, source, who, tools).await
     }
 
+    /// A trigger fire (ADR-0005): one ephemeral worker bound to the
+    /// trigger's pinned lineage session — never the creator's live chat, so
+    /// automation noise stays out of human conversation. The caller (the
+    /// scheduler's `trigger` arm) has claimed the task row and checked the
+    /// in-flight cap; this owns the turn row, the run row, the error
+    /// streak and the requeue, exactly one fire at a time.
+    pub(super) async fn handle_trigger_message(
+        &self,
+        task: ka_agent_core::Task,
+        spec: ka_agent_core::TriggerSpec,
+        who: Principal,
+        lineage_sid: ka_agent_core::SessionId,
+        delivered: Option<ka_agent_core::QueueItem>,
+        gate_output: String,
+    ) {
+        let source = crate::runtime::scheduler::trigger_source(&task);
+        let text = delivered
+            .as_ref()
+            .map(|item| item.text.clone())
+            .unwrap_or_else(|| spec.text.clone());
+        // The one line of chat-shaped context the model sees (its clock,
+        // its channel); scheduled turns name their origin.
+        let mut wire = format!("{}\n{}", context_line(&self.sh, &source), text,);
+        if !gate_output.trim().is_empty() {
+            wire = format!(
+                "{wire}\n<gate-output>\n{}\n</gate-output>",
+                gate_output.trim_end()
+            );
+        }
+        let started_ms = ka_agent_core::now_ms();
+        // Model under the creator's policy (the background chain, like the
+        // drain path): a named policy refusal is a failed fire, never a
+        // silent fallback to a wider model.
+        let cfg = self.cfg();
+        let configured = cfg.background_model.clone().or_else(|| cfg.model.clone());
+        let model = match model_under_policy(&self.sh.store, &who.username, configured.as_deref()) {
+            Ok(model) => model,
+            Err(why) => {
+                self.sh.emit(AgentEvent::Error {
+                    class: "trigger".into(),
+                    retryable: retryable_class("trigger"),
+                    message: format!("{}: {source}: {why}", task.id.as_str()),
+                });
+                record_trigger_run(&self.sh.store, &task.id, "failed", Some(&why));
+                self.settle_trigger(&task, &spec, false).await;
+                return;
+            }
+        };
+        // Tool narrowing: the cron rule — an empty `spec.tools` means the
+        // trigger never asked to narrow; otherwise the clamp is the
+        // allowlist even when it removed every tool. The clamp uses the
+        // fire-time role (the caller re-resolved it).
+        let allowed_tools =
+            (!spec.tools.is_empty()).then(|| self.clamp_cron_tools(&who.role, &spec.tools));
+        // Pool discipline: a fully busy pool skips this occurrence (the
+        // queued event survives; the next arm delivers it).
+        {
+            let _spawn = self.sh.spawn_lock.lock().await;
+            if self.live_worker_count() >= self.max_workers() {
+                let why = format!(
+                    "all {} engine workers busy — the fire waits for the next arm",
+                    self.max_workers()
+                );
+                record_trigger_run(&self.sh.store, &task.id, "skipped", Some(&why));
+                self.requeue_trigger(&task, &spec);
+                return;
+            }
+        }
+        match self
+            .run_trigger_turn(
+                &task,
+                &who,
+                &lineage_sid,
+                delivered.as_ref(),
+                &text,
+                &wire,
+                model,
+                allowed_tools,
+                started_ms,
+            )
+            .await
+        {
+            Ok((stop, cost_usd, tokens, answer)) => {
+                record_trigger_run_finished(
+                    &self.sh.store,
+                    &task.id,
+                    &stop,
+                    cost_usd,
+                    tokens,
+                    started_ms,
+                );
+                // FTS transcript: the lineage session stays addressable
+                // (`@turn:`/`@session:`), exactly like a chat turn.
+                index_trigger_episode(&self.sh, &lineage_sid, &text, &answer);
+                self.settle_trigger(&task, &spec, true).await;
+            }
+            Err(why) => {
+                record_trigger_run(&self.sh.store, &task.id, "failed", Some(&why));
+                self.settle_trigger(&task, &spec, false).await;
+            }
+        }
+    }
+
+    /// The trigger's post-fire bookkeeping: reset the error streak on
+    /// success (and requeue), or count the failure — at
+    /// [`TriggerSpec::ERROR_STRIKES`] consecutive failures the trigger
+    /// pauses as `interrupted` with exactly one Error notice (ADR-0005
+    /// §8); run history is never deleted.
+    async fn settle_trigger(
+        &self,
+        task: &ka_agent_core::Task,
+        spec: &ka_agent_core::TriggerSpec,
+        ok: bool,
+    ) {
+        let mut spec = spec.clone();
+        if ok {
+            spec.error_streak = 0;
+            let _ = self
+                .sh
+                .store
+                .update_task_payload(&task.id, &spec.to_payload());
+            match spec.kind {
+                ka_agent_core::TriggerKind::Schedule => {
+                    let recurring = spec.recurrence_ms.is_some_and(|rec| rec > 0);
+                    if recurring {
+                        let now_zoned = jiff::Timestamp::now().to_zoned(self.cfg().time_zone());
+                        match crate::runtime::scheduler::trigger_next_after(
+                            &spec,
+                            spec.recurrence_ms.unwrap_or(0),
+                            &now_zoned,
+                        ) {
+                            Some(next) => {
+                                let _ = self.sh.store.rearm_task(&task.id, next);
+                            }
+                            None => {
+                                let _ = self.sh.store.settle_task(&task.id, "failed");
+                            }
+                        }
+                    } else {
+                        let _ = self.sh.store.settle_task(&task.id, "succeeded");
+                    }
+                }
+                ka_agent_core::TriggerKind::Webhook => {
+                    let _ = self.sh.store.park_trigger(&task.id);
+                }
+            }
+            return;
+        }
+        spec.error_streak = spec.error_streak.saturating_add(1);
+        let strikes = spec.error_streak;
+        let _ = self
+            .sh
+            .store
+            .update_task_payload(&task.id, &spec.to_payload());
+        if strikes >= ka_agent_core::TriggerSpec::ERROR_STRIKES
+            && self
+                .sh
+                .store
+                .settle_task(&task.id, "interrupted")
+                .unwrap_or(false)
+        {
+            self.sh.emit(AgentEvent::Error {
+                class: "trigger".into(),
+                retryable: false,
+                message: format!(
+                    "trigger '{}' paused after {strikes} consecutive failed fires — \
+                     `ka-agent cron resume {}` re-arms it",
+                    spec.text,
+                    ka_agent_core::ids::short_id(task.id.as_str())
+                ),
+            });
+            return;
+        }
+        // Still below the strike line: keep the trigger working. A failed
+        // one-shot settles failed (the cron rule); recurring schedules
+        // re-arm; webhooks park for the next delivery.
+        let recurring = spec.kind == ka_agent_core::TriggerKind::Schedule
+            && spec.recurrence_ms.is_some_and(|rec| rec > 0);
+        if recurring {
+            let now_zoned = jiff::Timestamp::now().to_zoned(self.cfg().time_zone());
+            match crate::runtime::scheduler::trigger_next_after(
+                &spec,
+                spec.recurrence_ms.unwrap_or(0),
+                &now_zoned,
+            ) {
+                Some(next) => {
+                    let _ = self.sh.store.rearm_task(&task.id, next);
+                }
+                None => {
+                    let _ = self.sh.store.settle_task(&task.id, "failed");
+                }
+            }
+        } else if spec.kind == ka_agent_core::TriggerKind::Webhook {
+            let _ = self.sh.store.park_trigger(&task.id);
+        } else {
+            let _ = self.sh.store.settle_task(&task.id, "failed");
+        }
+    }
+
+    /// Open one worker on the lineage session, submit, drive the events to
+    /// completion, and record the turn row. Returns `(stop, cost, tokens,
+    /// answer)` on a settled cycle, or the operator-facing failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_trigger_turn(
+        &self,
+        task: &ka_agent_core::Task,
+        who: &Principal,
+        lineage_sid: &ka_agent_core::SessionId,
+        delivered: Option<&ka_agent_core::QueueItem>,
+        inbound: &str,
+        wire: &str,
+        model: Option<String>,
+        allowed_tools: Option<Vec<String>>,
+        started_ms: i64,
+    ) -> Result<(String, f64, u64, String), String> {
+        // Foreign-key order: the lineage session row is created with the
+        // trigger; a hand-crafted payload pointing at an unknown session
+        // gets one reconstructed here (workspace only — the strand binds
+        // on first fire).
+        if self.sh.store.get_session(lineage_sid).is_err() {
+            let mut session = ka_agent_core::Session::new_for_user(
+                self.workspace_for_user(&who.username, &who.role),
+                &who.username,
+                &who.role,
+            );
+            session.id = lineage_sid.clone();
+            session.created_ms = started_ms;
+            session.updated_ms = started_ms;
+            self.sh
+                .store
+                .insert_session(&session)
+                .map_err(|e| format!("lineage session: {e}"))?;
+        }
+        // The creator's partitioning (HOME, data root, grants, keys) with
+        // the lineage strand: continuity across fires, nothing of the
+        // live chat.
+        let cfg = self.cfg();
+        let state = self.ensure_user(who).map_err(|e| e.to_string())?;
+        let (mut req, _parent_session, _private) = self
+            .prepare_open(who, &state, &cfg)
+            .map_err(|e| e.to_string())?;
+        let lineage = self
+            .sh
+            .store
+            .get_session(lineage_sid)
+            .map_err(|e| e.to_string())?;
+        req.workspace = lineage.workspace.clone();
+        req.strand = match (&lineage.strand_path, lineage.strand_id.as_ref()) {
+            (Some(p), Some(_)) if p.exists() => ka_agent_port::StrandSelector::Path(p.clone()),
+            _ => ka_agent_port::StrandSelector::New,
+        };
+        // The turn is durable before the submit handshake, exactly like the
+        // drain path (gap G8): a crash leaves a recorded interruption.
+        let mut turn = Turn::new(lineage_sid.clone(), inbound.to_string());
+        turn.model = model.clone();
+        self.sh
+            .store
+            .insert_turn(&turn)
+            .map_err(|e| e.to_string())?;
+        if let Some(item) = delivered {
+            let _ = self.sh.store.mark_turned(&item.id, &turn.id);
+        }
+        let port = self.sh.port.open(req).await.map_err(|e| e.to_string())?;
+        if let Err(e) = port
+            .submit_full(
+                wire.to_string(),
+                Vec::new(),
+                Vec::new(),
+                model,
+                allowed_tools,
+            )
+            .await
+        {
+            port.kill().await;
+            let _ = turn.transition(ka_agent_core::TurnStatus::Interrupted);
+            self.sh.store.update_turn(&turn).ok();
+            return Err(format!("submit: {e}"));
+        }
+        turn.transition(ka_agent_core::TurnStatus::Submitted)
+            .map_err(|t| format!("illegal turn state {t:?}"))?;
+        self.sh.store.update_turn(&turn).ok();
+        turn.transition(ka_agent_core::TurnStatus::Running)
+            .map_err(|t| format!("illegal turn state {t:?}"))?;
+        self.sh.store.update_turn(&turn).ok();
+
+        // Drive the cycle: the watchdog applies the same silence rules as a
+        // chat turn (`turn_watchdog`); asks are denied fail-closed (an
+        // automation never widens its permissions).
+        let abort_secs = cfg.turn_watchdog.abort_secs;
+        let mut rx = port.take_events();
+        let mut answer = String::new();
+        let mut stop = String::new();
+        let mut cost_usd = 0.0f64;
+        let mut tokens = 0u64;
+        let mut engine_error: Option<String> = None;
+        let mut closed = false;
+        let mut last_activity = std::time::Instant::now();
+        loop {
+            let wait = if abort_secs > 0 {
+                std::time::Duration::from_millis(1000)
+            } else {
+                std::time::Duration::from_secs(3600)
+            };
+            let ev = tokio::select! {
+                ev = rx.recv() => ev,
+                _ = tokio::time::sleep(wait) => {
+                    if abort_secs > 0
+                        && last_activity.elapsed()
+                            >= std::time::Duration::from_secs(u64::from(abort_secs))
+                    {
+                        port.kill().await;
+                        closed = true;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match ev {
+                Some(PortEvent::DeltaText(delta)) => {
+                    answer.push_str(&delta);
+                    last_activity = std::time::Instant::now();
+                }
+                Some(PortEvent::Bootstrap {
+                    strand_id,
+                    strand_path,
+                    ..
+                }) => {
+                    // Session lineage: bind the strand so the next fire
+                    // resumes this transcript.
+                    if let (Some(id), Some(p)) = (strand_id.as_deref(), strand_path.as_deref()) {
+                        let _ = self
+                            .sh
+                            .store
+                            .set_strand(lineage_sid, id, std::path::Path::new(p));
+                    }
+                    last_activity = std::time::Instant::now();
+                }
+                Some(PortEvent::Ask {
+                    ask_id, question, ..
+                }) => {
+                    port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                        .await
+                        .ok();
+                    let mut rec = AuditRecord::new(
+                        "runtime",
+                        audit_actions::APPROVAL_DECIDE,
+                        task.id.as_str(),
+                        Some(format!(
+                            "deny: a trigger turn may not ask ({})",
+                            question.chars().take(120).collect::<String>()
+                        )),
+                    )
+                    .with_user(&who.username)
+                    .with_role(&who.role);
+                    let _ = self.sh.store.append_audit(&mut rec);
+                    last_activity = std::time::Instant::now();
+                }
+                Some(PortEvent::TurnFinished {
+                    stop: word,
+                    cost_usd: cost,
+                    tokens: count,
+                }) => {
+                    stop = word;
+                    cost_usd = cost;
+                    tokens = count;
+                    last_activity = std::time::Instant::now();
+                }
+                Some(PortEvent::Idle) => break,
+                Some(PortEvent::EngineClosed) => {
+                    closed = true;
+                    break;
+                }
+                Some(PortEvent::EngineError { class, message, .. }) => {
+                    engine_error = Some(format!("({class}) {message}"));
+                    last_activity = std::time::Instant::now();
+                }
+                Some(_) => {}
+                None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        // Settle the turn from what actually came back (the engine may
+        // report a failed optional component and still finish cleanly).
+        let settled = stop == "done" || stop == "length";
+        let next_status = if closed && stop.is_empty() {
+            ka_agent_core::TurnStatus::Interrupted
+        } else {
+            match stop.as_str() {
+                "done" | "length" => ka_agent_core::TurnStatus::Done,
+                "aborted" => ka_agent_core::TurnStatus::Aborted,
+                _ => ka_agent_core::TurnStatus::Error,
+            }
+        };
+        turn.cost_usd = cost_usd;
+        turn.tokens = tokens;
+        if !settled {
+            turn.error_class = Some("trigger".into());
+            turn.error_message = engine_error.clone();
+        }
+        turn.transition(next_status)
+            .map_err(|t| format!("illegal turn state {t:?}"))?;
+        self.sh.store.update_turn(&turn).ok();
+        if settled {
+            port.close().await.ok();
+            Ok((stop, cost_usd, tokens, answer))
+        } else {
+            port.kill().await;
+            let why = if stop.is_empty() {
+                engine_error.unwrap_or_else(|| "engine closed before finishing".to_string())
+            } else if stop == "aborted" {
+                "aborted".to_string()
+            } else {
+                engine_error.unwrap_or_else(|| format!("engine reported {stop}"))
+            };
+            Err(why)
+        }
+    }
+
     async fn handle_message_inner(
         &self,
         text: &str,
@@ -449,10 +1099,33 @@ impl Runtime {
         if !submit_now {
             match self.session_status_for(who) {
                 SessionStatus::Running => {
+                    let live = self.live_port_for(who);
+                    // A3: a bare interrupt word ("stop", "wait", …) aborts
+                    // the live cycle and the word itself becomes the next
+                    // turn (the `/stop` abort shape; the drain submits it
+                    // at the turn boundary). `interrupts = "off"` keeps the
+                    // steer/queue split below untouched.
+                    if self.cfg().interrupts == "on"
+                        && live.is_some()
+                        && is_bare_interrupt(text)
+                        && self.abort_live_cycle(st).await
+                    {
+                        self.sh.emit_from(
+                            AgentEvent::Notice {
+                                text: "⏹ stopped — your message is next".into(),
+                            },
+                            Some(source),
+                        );
+                        let sid = st.lock().session.id.clone();
+                        let item = QueueItem::new(sid, text.to_string(), source);
+                        self.sh.store.enqueue_front(&item)?;
+                        let n = self.sh.store.queue_len(&st.lock().session.id)?;
+                        self.sh.emit(AgentEvent::Queue { depth: n as u32 });
+                        return Ok(());
+                    }
                     // `busy_messages = "steer"`: an operator message lands in
                     // the running reply at the next tool-batch boundary.
                     // Scheduled turns stay uninterrupted.
-                    let live = self.live_port_for(who);
                     let running = self.current_turn_source_for(who);
                     let steerable = self.cfg().busy_messages == "steer"
                         && live.is_some()
@@ -547,7 +1220,7 @@ impl Runtime {
             return Ok(());
         }
         match self
-            .submit_text_with(text, Vec::new(), Some(source), who, tool_override)
+            .submit_text_with(text, Vec::new(), Some(source), who, tool_override, false)
             .await
         {
             Ok(()) => Ok(()),
@@ -586,6 +1259,15 @@ impl Runtime {
         if text.trim().is_empty() {
             return Err(Error::Refused("usage: /skill <name> <text>".into()));
         }
+        // Turn-scoped tools from the operator's source copy (the engine
+        // copy is stripped). Never widens: `submit_text_with` intersects
+        // this with the role's toolset.
+        let tool_override = skills
+            .resolved()
+            .into_iter()
+            .find(|skill| skill.info.name == name)
+            .map(|skill| skill.info.allowed_tools)
+            .filter(|tools| !tools.is_empty());
         {
             let mut g = st.lock();
             if g.session.status != SessionStatus::Idle {
@@ -606,7 +1288,14 @@ impl Runtime {
             self.persist_session_status(&who.username, &sid, status);
         }
         match self
-            .submit_text_with(text, vec![name.to_string()], Some(source), who, None)
+            .submit_text_with(
+                text,
+                vec![name.to_string()],
+                Some(source),
+                who,
+                tool_override,
+                true,
+            )
             .await
         {
             Ok(()) => Ok(()),
@@ -693,6 +1382,7 @@ impl Runtime {
         source: Option<&str>,
         who: &Principal,
         tool_override: Option<Vec<String>>,
+        explicit_skill: bool,
     ) -> Result<(), Error> {
         let st = self.ensure_user(who)?;
         // The bridge reads the turn's source, user and role from the store
@@ -787,7 +1477,7 @@ impl Runtime {
         });
         // A private conversation records usage only: the row carries no text.
         let mut turn = Turn::new(
-            sid,
+            sid.clone(),
             if private {
                 String::new()
             } else {
@@ -837,7 +1527,23 @@ impl Runtime {
             ),
             None => (String::new(), Vec::new(), None),
         };
+        // Trigger hits and the paths skills parked by this conversation.
+        // Explicit `/skill` names stay in front of the 3-skill cap.
+        let attach = plan_skill_attach(
+            &self.sh,
+            who,
+            &st,
+            sid.as_str(),
+            text,
+            explicit_skill.then_some(skills_extra.as_slice()),
+            !is_scheduled(source),
+        );
         skills.extend(skills_extra);
+        for name in &attach.attach {
+            if !skills.contains(name) {
+                skills.push(name.clone());
+            }
+        }
         let model = match agent_model {
             Some(m) => {
                 let (allow, _) = self
@@ -876,13 +1582,7 @@ impl Runtime {
         // The per-turn allowlist: the role's toolset, narrowed by a cron's
         // own list (never widened).
         let role_allow = self.role_toolset(&who.role);
-        let allowed_tools = match tool_override {
-            Some(tools) => Some(match role_allow {
-                Some(allow) => tools.into_iter().filter(|t| allow.contains(t)).collect(),
-                None => tools,
-            }),
-            None => role_allow,
-        };
+        let allowed_tools = narrow_tools(role_allow, tool_override);
         // B15b: a scheduled turn runs against the automation compile
         // (machine facts only); every exit of this bracket restores the
         // full one — Ok at TurnFinished/Idle (and immediately below for
@@ -899,7 +1599,7 @@ impl Runtime {
             .submit_full(wire, Vec::new(), skills, model, allowed_tools)
             .await
         {
-            Ok(()) => {}
+            Ok(()) => record_skill_attach(&self.sh, who, &st, sid.as_str(), &attach),
             Err(PortError::EngineClosed) => {
                 turn.transition(TurnStatus::Interrupted)
                     .map_err(|t| illegal_turn(turn.status, t))?;
@@ -944,6 +1644,54 @@ impl Runtime {
             .map_err(|t| illegal_turn(turn.status, t))?;
         self.sh.store.update_turn(&turn)?;
         Ok(())
+    }
+
+    /// `/stop`'s abort shape without its notices: flip a live cycle to
+    /// `Stopping`, send `port.abort()`, and arm the grace escalation on
+    /// the *turn* (a successful abort leaves the worker attached). `true`
+    /// when an abort was sent. Shared by `/stop`, the interrupt keywords
+    /// and `/queue now` (single-writer: none of them submits a mid-cycle
+    /// prompt — the next cycle is simply the next `drain_queue` head).
+    pub(super) async fn abort_live_cycle(&self, st: &UserHandle) -> bool {
+        let port = {
+            let mut g = st.lock();
+            let status = g.session.status;
+            let live_port = g.live.as_ref().map(|l| Arc::clone(&l.port));
+            match (status, live_port) {
+                (SessionStatus::Running | SessionStatus::AwaitingApproval, Some(p)) => {
+                    // The edge is legal by construction (same lock scope).
+                    if g.session.transition(SessionStatus::Stopping).is_ok() {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        let Some(port) = port else {
+            return false;
+        };
+        port.abort().await.ok();
+        let grace = Duration::from_secs(self.cfg().turn_grace_secs);
+        // Escalate on the *turn*, not the process (SEED.md §3.8).
+        let sh = Arc::clone(&self.sh);
+        let st = st.clone();
+        let turn = { st.lock().live.as_ref().and_then(|l| l.current_turn.clone()) };
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let turn_still_open = turn
+                .as_ref()
+                .and_then(|t| sh.store.get_turn(t).ok().flatten())
+                .is_some_and(|t| !t.status.is_terminal());
+            if turn_still_open && !port.is_closed() {
+                if let Some(live) = st.lock().live.as_mut() {
+                    live.deliberate_close = true;
+                }
+                port.kill().await;
+            }
+        });
+        true
     }
 
     /// `/stop`: abort; escalate to SIGKILL after the configured grace
@@ -1011,6 +1759,12 @@ impl Runtime {
     pub fn skills_enabled(&self, who: &Principal) -> Vec<crate::skills::SkillInfo> {
         crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username)).enabled()
     }
+
+    /// The firing view (`/skill-doctor`): enabled names joined with the
+    /// operator library's triggers/paths/allowed_tools.
+    pub fn skills_resolved(&self, who: &Principal) -> Vec<crate::skills::ResolvedSkill> {
+        crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username)).resolved()
+    }
 }
 
 #[cfg(test)]
@@ -1020,6 +1774,22 @@ mod tests {
 
     fn now() -> jiff::Zoned {
         "2026-07-14T23:14:05+02:00[Europe/Madrid]".parse().unwrap()
+    }
+
+    #[test]
+    fn skill_tools_never_widen() {
+        let role = Some(vec!["read".to_string()]);
+        let skill = Some(vec!["read".to_string(), "bash".to_string()]);
+        // A skill asking for bash cannot widen a role that only gets read.
+        assert_eq!(narrow_tools(role.clone(), skill), role);
+        // No role allowlist (admin) accepts the skill's list as written.
+        assert_eq!(
+            narrow_tools(None, Some(vec!["read".to_string(), "bash".to_string()])),
+            Some(vec!["read".to_string(), "bash".to_string()])
+        );
+        // No override keeps the role toolset untouched.
+        assert_eq!(narrow_tools(role.clone(), None), role);
+        assert_eq!(narrow_tools(None, None), None);
     }
 
     #[test]
@@ -1045,6 +1815,47 @@ mod tests {
         assert!(brief.contains("via=\"briefing\""), "{brief}");
         assert!(brief.contains("scheduled=\"briefing\""), "{brief}");
         assert!(!ctx_line(&now(), "console").contains("scheduled="));
+    }
+
+    #[test]
+    fn bare_interrupt_words_match_alone_only() {
+        // Every high word, any case, trailing punctuation tolerated.
+        for word in [
+            "stop", "halt", "cease", "quit", "end", "abort", "cancel", "wait", "hold", "pause",
+        ] {
+            assert!(is_bare_interrupt(word), "{word}");
+            let loud = format!("{}!", word.to_uppercase());
+            assert!(is_bare_interrupt(&loud), "{loud}");
+            assert!(is_bare_interrupt(&format!(" {word}. ")), "'{word}.'");
+            assert!(is_bare_interrupt(&format!("{word}?")), "{word}?");
+        }
+        // Benign shorts never match — the medium words ride the steer path.
+        for benign in [
+            "ok",
+            "ok.",
+            "thanks",
+            "hm",
+            "no",
+            "wrong",
+            "actually",
+            "nevermind",
+            "go on",
+        ] {
+            assert!(!is_bare_interrupt(benign), "{benign}");
+        }
+        // Exactly one word: sentences — even short ones — do not match.
+        assert!(!is_bare_interrupt("stop now"));
+        assert!(!is_bare_interrupt("please stop"));
+        // The 20-char cap: a long sentence with an interrupt word is a
+        // message, not an interrupt.
+        assert!(!is_bare_interrupt("wait for the green build"));
+        assert!(!is_bare_interrupt(""));
+        assert!(!is_bare_interrupt("   "));
+        assert!(!is_bare_interrupt("?!"));
+        // The ≤20-char cap: anything longer is an ordinary message even
+        // when it is a single word-shaped run.
+        let long_word = format!("sto{}p", "o".repeat(18)); // 22 chars
+        assert!(!is_bare_interrupt(&long_word));
     }
 
     #[test]

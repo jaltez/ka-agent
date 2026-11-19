@@ -143,7 +143,10 @@ impl Host {
             let Some(scfg) = ka_agent_channels::slack::SlackConfig::from_config(&cfg, &secrets)
                 .map_err(|e| format!("ka-agent: {e}"))?
             else {
-                return Err("ka-agent: slack.enabled is set but the Slack config could not be resolved".into());
+                return Err(
+                    "ka-agent: slack.enabled is set but the Slack config could not be resolved"
+                        .into(),
+                );
             };
             let parts = ka_agent_channels::slack::SlackParts::new(&scfg);
             Some((scfg, parts))
@@ -153,11 +156,13 @@ impl Host {
         // Discord: same shape (surface first, connector after the runtime).
         let discord_parts = if opts.channels && cfg.discord.enabled {
             let secrets = paths.root().join("secrets");
-            let Some(dcfg) =
-                ka_agent_channels::discord::DiscordConfig::from_config(&cfg, &secrets)
-                    .map_err(|e| format!("ka-agent: {e}"))?
+            let Some(dcfg) = ka_agent_channels::discord::DiscordConfig::from_config(&cfg, &secrets)
+                .map_err(|e| format!("ka-agent: {e}"))?
             else {
-                return Err("ka-agent: discord.enabled is set but the Discord config could not be resolved".into());
+                return Err(
+                    "ka-agent: discord.enabled is set but the Discord config could not be resolved"
+                        .into(),
+                );
             };
             let parts = ka_agent_channels::discord::DiscordParts::new(&dcfg);
             Some((dcfg, parts))

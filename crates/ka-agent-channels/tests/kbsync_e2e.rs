@@ -60,7 +60,10 @@ impl FakeHttp {
                         .to_string();
                     let length = text
                         .lines()
-                        .find_map(|l| l.strip_prefix("Content-Length: ").or_else(|| l.strip_prefix("content-length: ")))
+                        .find_map(|l| {
+                            l.strip_prefix("Content-Length: ")
+                                .or_else(|| l.strip_prefix("content-length: "))
+                        })
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(0);
                     let mut body = head[head_len..].to_vec();
@@ -77,15 +80,14 @@ impl FakeHttp {
                     // Dropbox's download endpoint keys off Dropbox-API-Arg.
                     let api_arg = text
                         .lines()
-                        .find_map(|l| l.strip_prefix("dropbox-api-arg: ").or_else(|| l.strip_prefix("Dropbox-API-Arg: ")))
+                        .find_map(|l| {
+                            l.strip_prefix("dropbox-api-arg: ")
+                                .or_else(|| l.strip_prefix("Dropbox-API-Arg: "))
+                        })
                         .unwrap_or("");
                     // The vendor paths carry query strings; routes are
                     // registered without them.
-                    let lookup_path = path
-                        .split('?')
-                        .next()
-                        .unwrap_or(&path)
-                        .to_string();
+                    let lookup_path = path.split('?').next().unwrap_or(&path).to_string();
                     let key = if api_arg.is_empty() {
                         lookup_path.clone()
                     } else {
@@ -123,10 +125,7 @@ impl FakeHttp {
     }
 
     fn route(&self, path: &str, body: Value) {
-        self.routes
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), body);
+        self.routes.lock().unwrap().insert(path.to_string(), body);
     }
 
     fn file(&self, path: &str, bytes: &[u8]) {
@@ -285,7 +284,15 @@ async fn git_indexes_a_repository_and_drops_removed_files() {
     };
     git(&["init", "-q"]);
     git(&["add", "."]);
-    git(&["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init"]);
+    git(&[
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
     let store = Store::open(&dir.join("state.db")).unwrap();
     store
         .create_kb("docs", "Docs", ka_agent_core::OPERATOR_USER)
@@ -312,7 +319,15 @@ async fn git_indexes_a_repository_and_drops_removed_files() {
     // Removing a file from the repository removes its document.
     std::fs::remove_file(repo.join("notes.txt")).unwrap();
     git(&["add", "-A"]);
-    git(&["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "drop"]);
+    git(&[
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "drop",
+    ]);
     let report = kbsync::sync_with(&store, &src, &dir, &Endpoints::default())
         .await
         .unwrap();

@@ -127,11 +127,7 @@ pub fn users(_runtime: &Runtime, store: &Store, msg: Option<&str>) -> Response {
     for u in &users {
         let mut memberships = String::new();
         for g in &group_names {
-            let checked = if store
-                .groups_of(&u.username)
-                .unwrap_or_default()
-                .contains(g)
-            {
+            let checked = if store.groups_of(&u.username).unwrap_or_default().contains(g) {
                 " checked"
             } else {
                 ""
@@ -194,7 +190,13 @@ pub fn users(_runtime: &Runtime, store: &Store, msg: Option<&str>) -> Response {
     }
     let _group_options: String = group_names
         .iter()
-        .map(|g| format!("<label class=small><input type=checkbox name=group value=\"{}\"> {}</label> ", escape_html(g), escape_html(g)))
+        .map(|g| {
+            format!(
+                "<label class=small><input type=checkbox name=group value=\"{}\"> {}</label> ",
+                escape_html(g),
+                escape_html(g)
+            )
+        })
         .collect();
     let flash_line = msg.map(|m| flash("ok", m)).unwrap_or_default();
     let invites = store.list_invites().unwrap_or_default();
@@ -276,7 +278,11 @@ pub fn users_invite(store: &Store, body: &[u8]) -> Response {
              <p class=small muted>Link a channel identity afterwards: <code>ka-agent identity link telegram &lt;id&gt;</code></p>\
              <p><a href=\"/users\">back to users</a></p></div>",
             escape_html(role),
-            escape_html(&if groups.is_empty() { "none".to_string() } else { groups.join(", ") }),
+            escape_html(&if groups.is_empty() {
+                "none".to_string()
+            } else {
+                groups.join(", ")
+            }),
             escape_html(&code),
         ),
     )
@@ -338,7 +344,11 @@ pub fn users_state(store: &Store, body: &[u8], disable: bool) -> Response {
     } else {
         let _ = store.set_user_disabled(username, false);
     }
-    let action = if disable { "user.disable" } else { "user.enable" };
+    let action = if disable {
+        "user.disable"
+    } else {
+        "user.enable"
+    };
     let mut rec = ka_agent_core::AuditRecord::new("web", action, username, None)
         .with_role(&user.role)
         .with_user(ka_agent_core::OPERATOR_USER);
@@ -458,7 +468,12 @@ pub fn groups(store: &Store) -> Response {
             .list_kbs()
             .unwrap_or_default()
             .into_iter()
-            .filter(|k| store.kb_access(&k.name).unwrap_or_default().contains(&g.name))
+            .filter(|k| {
+                store
+                    .kb_access(&k.name)
+                    .unwrap_or_default()
+                    .contains(&g.name)
+            })
             .map(|k| k.name)
             .collect();
         rows.push_str(&format!(
@@ -508,7 +523,10 @@ pub fn groups_save(store: &Store, body: &[u8]) -> Response {
             "Groups",
             "",
             "/groups",
-            flash("bad", "group name: lowercase letters, digits, dot, dash or underscore"),
+            flash(
+                "bad",
+                "group name: lowercase letters, digits, dot, dash or underscore",
+            ),
         );
     }
     let allow = form.list("models_allow");
@@ -602,7 +620,12 @@ pub fn kb_create(store: &Store, body: &[u8], who: &ka_agent_core::Principal) -> 
     let form = Form::parse(body);
     let name = form.get("name").trim().to_ascii_lowercase();
     if !ka_agent_store::valid_username(&name) {
-        return admin_page("Knowledge", "", "/kb", flash("bad", "kb name: lowercase word"));
+        return admin_page(
+            "Knowledge",
+            "",
+            "/kb",
+            flash("bad", "kb name: lowercase word"),
+        );
     }
     let display = form.get("display_name").trim();
     let display = if display.is_empty() { &name } else { display };
@@ -610,9 +633,19 @@ pub fn kb_create(store: &Store, body: &[u8], who: &ka_agent_core::Principal) -> 
         Ok(true) => {
             let groups = form.list("groups");
             let _ = store.set_kb_access(&name, &groups);
-            admin_page("Knowledge", "", "/kb", flash("ok", "knowledge base created"))
+            admin_page(
+                "Knowledge",
+                "",
+                "/kb",
+                flash("ok", "knowledge base created"),
+            )
         }
-        Ok(false) => admin_page("Knowledge", "", "/kb", flash("bad", "that KB already exists")),
+        Ok(false) => admin_page(
+            "Knowledge",
+            "",
+            "/kb",
+            flash("bad", "that KB already exists"),
+        ),
         Err(e) => admin_page("Knowledge", "", "/kb", flash("bad", &e.to_string())),
     }
 }
@@ -633,7 +666,12 @@ pub fn kb_rm(store: &Store, body: &[u8]) -> Response {
     let path = form.get("path").trim();
     if path.is_empty() {
         let _ = store.delete_kb(kb);
-        admin_page("Knowledge", "", "/kb", flash("ok", "knowledge base deleted"))
+        admin_page(
+            "Knowledge",
+            "",
+            "/kb",
+            flash("ok", "knowledge base deleted"),
+        )
     } else {
         let _ = store.kb_remove_doc(kb, path);
         admin_page("Knowledge", "", "/kb", flash("ok", "document removed"))
@@ -658,12 +696,19 @@ pub fn kb_upload(
                     "Knowledge",
                     "",
                     "/kb",
-                    flash("bad", "the document is not UTF-8 text (PDF/binary is not supported yet)"),
+                    flash(
+                        "bad",
+                        "the document is not UTF-8 text (PDF/binary is not supported yet)",
+                    ),
                 );
             };
             (text, name.trim(), raw_title.unwrap_or(name).trim())
         }
-        _ => (form.get("content"), form.get("path").trim(), form.get("title").trim()),
+        _ => (
+            form.get("content"),
+            form.get("path").trim(),
+            form.get("title").trim(),
+        ),
     };
     if content.trim().is_empty() {
         return admin_page(
@@ -674,10 +719,20 @@ pub fn kb_upload(
         );
     }
     if path.is_empty() {
-        return admin_page("Knowledge", "", "/kb", flash("bad", "a document needs a path"));
+        return admin_page(
+            "Knowledge",
+            "",
+            "/kb",
+            flash("bad", "a document needs a path"),
+        );
     }
     if content.len() > 10 * 1024 * 1024 {
-        return admin_page("Knowledge", "", "/kb", flash("bad", "document exceeds 10 MiB"));
+        return admin_page(
+            "Knowledge",
+            "",
+            "/kb",
+            flash("bad", "document exceeds 10 MiB"),
+        );
     }
     let digest = crate::sha256_hex(content);
     let title = if title.is_empty() { path } else { title };
@@ -697,7 +752,9 @@ pub fn kb_upload(
 
 /// `GET /agents`: the shared agents this user can see, with their level.
 pub fn agents(store: &Store, who: &ka_agent_core::Principal) -> Response {
-    let views = store.agents_for_user(&who.username, &who.role).unwrap_or_default();
+    let views = store
+        .agents_for_user(&who.username, &who.role)
+        .unwrap_or_default();
     let mut cards = String::new();
     for view in &views {
         let a = &view.agent;
@@ -782,7 +839,12 @@ pub fn agents_create(store: &Store, body: &[u8], who: &ka_agent_core::Principal)
     let form = Form::parse(body);
     let name = form.get("name").trim().to_ascii_lowercase();
     if !ka_agent_store::valid_username(&name) {
-        return admin_page("Shared agents", "", "/agents", flash("bad", "agent name: lowercase word"));
+        return admin_page(
+            "Shared agents",
+            "",
+            "/agents",
+            flash("bad", "agent name: lowercase word"),
+        );
     }
     let agent = ka_agent_store::AgentRow {
         name: name.clone(),
@@ -822,17 +884,37 @@ pub fn agents_create(store: &Store, body: &[u8], who: &ka_agent_core::Principal)
 pub fn agents_save(store: &Store, body: &[u8], who: &ka_agent_core::Principal) -> Response {
     let form = Form::parse(body);
     let name = form.get("name").trim();
-    let Some(level) = store.agent_level(name, &who.username, &who.role).ok().flatten() else {
-        return admin_page("Shared agents", "", "/agents", flash("bad", "no access to that agent"));
+    let Some(level) = store
+        .agent_level(name, &who.username, &who.role)
+        .ok()
+        .flatten()
+    else {
+        return admin_page(
+            "Shared agents",
+            "",
+            "/agents",
+            flash("bad", "no access to that agent"),
+        );
     };
     if level == "viewer" {
-        return admin_page("Shared agents", "", "/agents", flash("bad", "viewers cannot edit an agent"));
+        return admin_page(
+            "Shared agents",
+            "",
+            "/agents",
+            flash("bad", "viewers cannot edit an agent"),
+        );
     }
     let Some(mut agent) = store.get_agent(name).ok().flatten() else {
-        return admin_page("Shared agents", "", "/agents", flash("bad", "no such agent"));
+        return admin_page(
+            "Shared agents",
+            "",
+            "/agents",
+            flash("bad", "no such agent"),
+        );
     };
     agent.persona = form.get("persona").trim().to_string();
-    agent.model = (!form.get("model").trim().is_empty()).then(|| form.get("model").trim().to_string());
+    agent.model =
+        (!form.get("model").trim().is_empty()).then(|| form.get("model").trim().to_string());
     agent.skills = form.list("skills");
     agent.kbs = form.list("kbs");
     match store.update_agent(&agent) {
@@ -846,9 +928,17 @@ pub fn agents_save(store: &Store, body: &[u8], who: &ka_agent_core::Principal) -
 pub fn agents_rm(store: &Store, body: &[u8], who: &ka_agent_core::Principal) -> Response {
     let form = Form::parse(body);
     let name = form.get("name").trim();
-    let level = store.agent_level(name, &who.username, &who.role).ok().flatten();
+    let level = store
+        .agent_level(name, &who.username, &who.role)
+        .ok()
+        .flatten();
     if level.as_deref() != Some("owner") {
-        return admin_page("Shared agents", "", "/agents", flash("bad", "only an owner can delete an agent"));
+        return admin_page(
+            "Shared agents",
+            "",
+            "/agents",
+            flash("bad", "only an owner can delete an agent"),
+        );
     }
     let _ = store.delete_agent(name);
     admin_page("Shared agents", "", "/agents", flash("ok", "agent deleted"))
