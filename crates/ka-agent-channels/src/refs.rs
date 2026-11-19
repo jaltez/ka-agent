@@ -4,8 +4,13 @@
 //! in `turns.inbound_text` (auditable, searchable via FTS).
 //!
 //! Forms: `@<path>` (workspace-relative or absolute, file or directory),
-//! `@turn:<id-prefix>` / `@t:<id-prefix>`, `@http(s)://…` (grant- and
-//! SSRF-guarded exactly like the `http_get` tool).
+//! `@turn:<id-prefix>` / `@t:<id-prefix>`, `@session:<id-prefix>` /
+//! `@s:<id-prefix>`, `@http(s)://…` (grant- and SSRF-guarded exactly like
+//! the `http_get` tool).
+//!
+//! `@turn:` and `@session:` honor rbac.md's History row: a non-admin caller
+//! only ever expands their own partition's ids; anything else renders the
+//! same `not found` marker (no existence leak).
 //!
 //! Failed references render as visible `[ref …]` markers — never a silent
 //! drop. Total expansion budget: 24 000 chars.
@@ -106,7 +111,13 @@ async fn expand_word(
         .strip_prefix("@turn:")
         .or_else(|| word.strip_prefix("@t:"))
     {
-        return (turn_ref(store, prefix, word), None);
+        return (turn_ref(store, who, prefix, word), None);
+    }
+    if let Some(prefix) = word
+        .strip_prefix("@session:")
+        .or_else(|| word.strip_prefix("@s:"))
+    {
+        return (session_ref(store, who, prefix, word), None);
     }
     if word.starts_with("@http://") || word.starts_with("@https://") {
         return (url_ref(store, word).await, None);
@@ -206,19 +217,67 @@ fn list_dir(dir: &Path, prefix: &str, depth: usize, count: &mut usize, out: &mut
     }
 }
 
-/// `@turn:<prefix>`: the turn's inbound text and its recorded answer.
-fn turn_ref(store: &Store, prefix: &str, token: &str) -> String {
-    match store.find_turn_by_prefix(prefix) {
-        Ok(Some(turn)) => {
+/// `@turn:<prefix>`: the turn's inbound text and its recorded answer. The
+/// caller's partition only (rbac.md's History row): another user's turn
+/// resolves to the same `not found` marker as a missing one.
+fn turn_ref(store: &Store, who: &ka_agent_core::Principal, prefix: &str, token: &str) -> String {
+    let turn = match store.find_turn_by_prefix(prefix) {
+        Ok(Some(t)) => t,
+        _ => return format!("[ref {token}: not found]"),
+    };
+    let owner = store.turn_username(&turn.id).ok().flatten();
+    if !who.is_admin() && owner.as_deref() != Some(who.username.as_str()) {
+        return format!("[ref {token}: not found]");
+    }
+    let answer = store
+        .chunks_for_turn(&turn.id)
+        .map(|chunks| chunks.iter().map(|c| c.text.as_str()).collect::<String>())
+        .unwrap_or_default();
+    let answer = ka_agent_core::truncate_at_char(&answer, REF_ITEM_MAX);
+    format!("--- {token} ---\n> {}\n{answer}", turn.inbound_text)
+}
+
+/// `@session:<prefix>`: a conversation of the caller's own partition —
+/// header (short id, owner, creation date, turn count) plus the last three
+/// exchanges, each citing its turn id so `@turn:` follow-ups work. The
+/// whole expansion is capped at `REF_ITEM_MAX` chars like any one item.
+fn session_ref(store: &Store, who: &ka_agent_core::Principal, prefix: &str, token: &str) -> String {
+    let session = match store.find_session_by_prefix(prefix) {
+        Ok(Some(s)) => s,
+        _ => return format!("[ref {token}: not found]"),
+    };
+    if !who.is_admin() && session.username != who.username {
+        return format!("[ref {token}: not found]");
+    }
+    let count = store.count_turns_for_session(&session.id).unwrap_or(0);
+    let created = jiff::Timestamp::from_millisecond(session.created_ms)
+        .map(|ts| {
+            ts.to_zoned(jiff::tz::TimeZone::UTC)
+                .strftime("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|_| session.created_ms.to_string());
+    let mut out = format!(
+        "--- {token} ---\nsession {} · {username} · created {created} · {count} turns\n",
+        ka_agent_core::ids::short_id(session.id.as_str()),
+        username = session.username,
+    );
+    if let Ok(turns) = store.latest_turns_for_session(&session.id, 3, 0) {
+        for turn in turns.iter().rev() {
             let answer = store
                 .chunks_for_turn(&turn.id)
                 .map(|chunks| chunks.iter().map(|c| c.text.as_str()).collect::<String>())
                 .unwrap_or_default();
-            let answer = ka_agent_core::truncate_at_char(&answer, REF_ITEM_MAX);
-            format!("--- {token} ---\n> {}\n{answer}", turn.inbound_text)
+            let tail = format!(
+                "> {}\n{}\n(turn {})\n",
+                turn.inbound_text,
+                ka_agent_core::truncate_at_char(&answer, REF_ITEM_MAX / 3),
+                ka_agent_core::ids::short_id(turn.id.as_str())
+            );
+            out.push_str(&tail);
         }
-        _ => format!("[ref {token}: not found]"),
     }
+    (ka_agent_core::truncate_at_char(&out, REF_ITEM_MAX)).to_string()
 }
 
 /// `@http(s)://…`: the `http_get` tool's grant and SSRF rules, applied to a
@@ -479,6 +538,106 @@ mod tests {
             out.chars().count()
         );
         assert!(out.contains("[refs truncated]"), "budget marker missing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn turn_refs_of_another_user_are_not_found() {
+        let root = temp_root("turn-partition");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = store_at(&root.join("data"));
+        let session = Session::new_for_user(ws.clone(), "alice", "member");
+        store.insert_session(&session).unwrap();
+        let turn = Turn::new(session.id, "secreto de alice".into());
+        store.insert_turn(&turn).unwrap();
+        let prefix = ka_agent_core::ids::short_id(turn.id.as_str()).to_string();
+        // bob (non-admin) sees the same marker as a missing turn: no
+        // existence leak, no content.
+        let bob = ka_agent_core::Principal::new("bob", "member");
+        let out = expand(&store, &ws, &bob, &format!("@turn:{prefix}"))
+            .await
+            .0;
+        assert_eq!(out, format!("[ref @turn:{prefix}: not found]"));
+        // the operator's history view keeps seeing everything.
+        let admin = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            &format!("@turn:{prefix}"),
+        )
+        .await
+        .0;
+        assert!(admin.contains("secreto de alice"), "{admin}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_ref_pulls_last_exchanges_and_cites_turn_ids() {
+        let root = temp_root("session-ref");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = store_at(&root.join("data"));
+        let session = Session::new(ws.clone());
+        store.insert_session(&session).unwrap();
+        for (q, a) in [("primera", "uno"), ("segunda", "dos")] {
+            let mut turn = Turn::new(session.id.clone(), q.into());
+            store.insert_turn(&turn).unwrap();
+            turn.transition(TurnStatus::Submitted).unwrap();
+            store.update_turn(&turn).unwrap();
+            turn.transition(TurnStatus::Running).unwrap();
+            store.update_turn(&turn).unwrap();
+            turn.transition(TurnStatus::Done).unwrap();
+            store.update_turn(&turn).unwrap();
+            store
+                .push_chunk(&OutboxChunk {
+                    turn: turn.id.clone(),
+                    chunk_index: 0,
+                    text: a.into(),
+                    status: OutboxStatus::Queued,
+                    channel_message_id: None,
+                    created_ms: 0,
+                })
+                .unwrap();
+        }
+        let prefix = ka_agent_core::ids::short_id(session.id.as_str());
+        let out = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            &format!("@session:{prefix}"),
+        )
+        .await
+        .0;
+        assert!(out.contains(&format!("--- @session:{prefix} ---")), "{out}");
+        assert!(out.contains("2 turns"), "{out}");
+        assert!(out.contains("> primera"), "{out}");
+        assert!(out.contains("> segunda"), "{out}");
+        assert!(out.contains("(turn "), "{out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_ref_of_another_user_is_not_found() {
+        let root = temp_root("session-partition");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = store_at(&root.join("data"));
+        let session = Session::new_for_user(ws.clone(), "alice", "member");
+        store.insert_session(&session).unwrap();
+        let prefix = ka_agent_core::ids::short_id(session.id.as_str()).to_string();
+        let bob = ka_agent_core::Principal::new("bob", "member");
+        let out = expand(&store, &ws, &bob, &format!("@s:{prefix}")).await.0;
+        assert_eq!(out, format!("[ref @s:{prefix}: not found]"));
+        let admin = expand(
+            &store,
+            &ws,
+            &ka_agent_core::Principal::operator(),
+            &format!("@s:{prefix}"),
+        )
+        .await
+        .0;
+        assert!(admin.contains(&format!("--- @s:{prefix} ---")), "{admin}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

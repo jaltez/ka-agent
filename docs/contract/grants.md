@@ -155,3 +155,46 @@ same rules hold (absolute, unique, `allow | ask | deny`), and the
 `__guard` hook enforces the role's list for that role's worker only.
 Role roots are also write-protected from every other role (and from the
 admin), so a granted dir never widens into another subject's tree.
+
+## Durable allow-rules (v4 B7)
+
+`/y <id> always` settles an engine ask Allow and persists a **rule** — the
+absence of a future card for matching asks, never a grant (the engine's
+permission gate, path grants and role ceilings all still apply upstream).
+
+- **Shapes** (`grant_rules.kind`): `command` (a provably-plain bash prefix —
+  `cargo test` also answers `cargo test --color never`, never
+  `cargo test && …`), `call_key` (a byte-identical bash command — the
+  compound landing shape, because the engine decorates permission questions
+  with volatile context that makes question text unstable between identical
+  asks), `tool` (one tool hand name; never `bash`), `ask_key` (the exact
+  question+detail pair — the no-call-context fallback). The ladder in
+  `RuleShape::for_ask` always picks the narrowest derivable shape.
+- **Fail-closed creation**: a shape must pass `validate()` and its own
+  generated cases (`passes_cases()`) before anything is stored; a failing
+  rule is refused with nothing written.
+- **Evaluation ordering**: rules are consulted in the `PortEvent::Ask` arm
+  **after** D9 routing and the `awaiting` transition, and only when
+  `awaiting && !escalated` — a rule answers exactly the asks the acting
+  user themselves decides. Escalated, over-quota and orphan asks never see
+  a rule; orphan asks keep their deny.
+- **Mode scoping** (B8): a rule fires iff `mode_rank(current) <=
+  mode_rank(rule.mode)` — the creation mode and more permissive ones only.
+  Role ceilings compose through the session's effective mode. This closes
+  gap G12: durable "always" lives here, and the engine's own `always`
+  answer (which writes `.ka/ka.toml`) is never sent — every settle answers
+  `Allow` (choice 0).
+- **Single settle site**: every allow-class settle — operator `/y`, the
+  session-allow set, a rule — routes through `Runtime::answer_allow`
+  (answer → settle row → labeled audit → session back to Running), so one
+  place observes them all.
+- **Partitioning**: rules are subject-partitioned (the asking user's
+  partition, even when the admin approves a member's card); `/rules` shows
+  the caller's own (the admin: all), `/rules rm` removes own-only (admin:
+  any). Terminal and web only — a phone `/y <id> always` is refused with
+  the same wording as `session`.
+- **Store**: loaded fresh at every ask (never cached, the MCP-bridge rule).
+  Audit: `rule.add`, `rule.rm`, and each rule settle as
+  `approval.decide` with label `Allow (rule <id>)`. CLI:
+  `ka-agent grant rule check <cmd>` (dry-run, grants nothing) · `list` ·
+  `rm <id>`.

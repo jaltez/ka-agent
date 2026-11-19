@@ -7,6 +7,42 @@ use super::*;
 #[allow(dead_code)]
 pub type UserUsageRow = (i64, f64, u64, Option<String>, String);
 
+use rusqlite::params_from_iter;
+
+/// Leading-position `/history` filters (B17 power-user half): bound SQL
+/// predicates on the `turns` join — filter values never enter the FTS
+/// MATCH expression.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpisodeFilter {
+    pub model: Option<String>,
+    /// Inclusive lower bound on `turns.created_ms`.
+    pub after_ms: Option<i64>,
+    /// One of the turn statuses (`queued`, `done`, `error`, …).
+    pub status: Option<String>,
+}
+
+/// The `AND t.… = ?N` predicates for an [`EpisodeFilter`], binding into
+/// `binds` (all TEXT; the integer comparison casts at the column).
+fn filter_preds(filter: &EpisodeFilter, binds: &mut Vec<String>) -> String {
+    let mut sql = String::new();
+    if let Some(model) = &filter.model {
+        binds.push(model.clone());
+        sql.push_str(&format!(" AND t.model = ?{}", binds.len()));
+    }
+    if let Some(after) = filter.after_ms {
+        binds.push(after.to_string());
+        sql.push_str(&format!(
+            " AND t.created_ms >= CAST(?{} AS INTEGER)",
+            binds.len()
+        ));
+    }
+    if let Some(status) = &filter.status {
+        binds.push(status.clone());
+        sql.push_str(&format!(" AND t.status = ?{}", binds.len()));
+    }
+    sql
+}
+
 impl Store {
     /// Persist a brand-new turn (status `queued`, gap G8 mitigation).
     pub fn insert_turn(&self, t: &Turn) -> Result<()> {
@@ -141,6 +177,17 @@ impl Store {
         Ok(out)
     }
 
+    /// Number of turns recorded for one session — the `@session:` header.
+    pub fn count_turns_for_session(&self, session: &SessionId) -> Result<i64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE session = ?1",
+            params![session.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// One turn by id, if it exists.
     pub fn get_turn(&self, id: &TurnId) -> Result<Option<Turn>> {
         let conn = self.lock();
@@ -241,20 +288,37 @@ impl Store {
     /// input stays one token, so an exact phrase is still searchable.
     /// Returns hits with a snippet around the match.
     pub fn search_episodes(&self, query: &str, limit: usize) -> Result<Vec<EpisodeHit>> {
+        self.search_episodes_filtered(query, limit, &EpisodeFilter::default())
+    }
+
+    /// [`search_episodes`](Self::search_episodes) with an
+    /// [`EpisodeFilter`] applied to the `turns` join. Under a filter the
+    /// LEFT JOIN is effectively inner: episodes whose turn row was pruned
+    /// drop out silently (accepted).
+    pub fn search_episodes_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &EpisodeFilter,
+    ) -> Result<Vec<EpisodeHit>> {
         let match_expr = fts_and_query(query);
         if match_expr.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
+        let mut binds = vec![match_expr];
+        let preds = filter_preds(filter, &mut binds);
+        let sql = format!(
             "SELECT f.session, f.turn, f.role,
                     snippet(episodes_fts, 3, '[', ']', '…', 12), t.created_ms
-             FROM episodes_fts f
-             LEFT JOIN turns t ON t.id = f.turn
-             WHERE episodes_fts MATCH ?1
-             ORDER BY rank LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![match_expr, limit as i64], |r| {
+             FROM episodes_fts f LEFT JOIN turns t ON t.id = f.turn
+             WHERE episodes_fts MATCH ?1 {preds}
+             ORDER BY rank LIMIT ?{}",
+            binds.len() + 1,
+        );
+        binds.push(limit.to_string());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(binds.iter()), |r| {
             Ok(EpisodeHit {
                 session: r.get(0)?,
                 turn: r.get(1)?,
@@ -331,21 +395,38 @@ impl Store {
         limit: usize,
         username: &str,
     ) -> Result<Vec<EpisodeHit>> {
+        self.search_episodes_for_user_filtered(query, limit, username, &EpisodeFilter::default())
+    }
+
+    /// [`search_episodes_for_user`](Self::search_episodes_for_user) with
+    /// an [`EpisodeFilter`] on the `turns` join.
+    pub fn search_episodes_for_user_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        username: &str,
+        filter: &EpisodeFilter,
+    ) -> Result<Vec<EpisodeHit>> {
         let match_expr = fts_and_query(query);
         if match_expr.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
+        let mut binds = vec![match_expr, username.to_string()];
+        let preds = filter_preds(filter, &mut binds);
+        let sql = format!(
             "SELECT f.session, f.turn, f.role,
                     snippet(episodes_fts, 3, '[', ']', '…', 12), t.created_ms
-             FROM episodes_fts f
-             LEFT JOIN turns t ON t.id = f.turn
+             FROM episodes_fts f LEFT JOIN turns t ON t.id = f.turn
              WHERE episodes_fts MATCH ?1
-               AND f.session IN (SELECT id FROM sessions WHERE username = ?3)
-             ORDER BY rank LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![match_expr, limit as i64, username], |r| {
+               AND f.session IN (SELECT id FROM sessions WHERE username = ?2)
+               {preds}
+             ORDER BY rank LIMIT ?{}",
+            binds.len() + 1,
+        );
+        binds.push(limit.to_string());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(binds.iter()), |r| {
             Ok(EpisodeHit {
                 session: r.get(0)?,
                 turn: r.get(1)?,
@@ -381,6 +462,61 @@ impl Store {
         )
         .optional()
         .map_err(StoreError::from)
+    }
+
+    /// `updated_ms` of the user's newest turn that ended in a
+    /// rate-limit error — the `memory_propose` cooldown clock (B15c);
+    /// `None` when there is none.
+    pub fn last_rate_limit_at(&self, username: &str) -> Result<Option<i64>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT t.updated_ms FROM turns t JOIN sessions s ON s.id = t.session
+             WHERE s.username = ?1 AND t.error_class = 'rate_limit'
+             ORDER BY t.updated_ms DESC LIMIT 1",
+            params![username],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
+    }
+
+    /// Newest-first turn listing under an [`EpisodeFilter`] with no FTS
+    /// text (`/history status:error`): the same bound predicates as the
+    /// filtered search, `None` username = every user (the admin split).
+    pub fn list_turns_filtered(
+        &self,
+        filter: &EpisodeFilter,
+        username: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EpisodeHit>> {
+        let mut binds = Vec::new();
+        let mut sql = String::from(
+            "SELECT t.id, substr(COALESCE(t.inbound_text, ''), 1, 100),
+                    t.created_ms, s.id, s.role
+             FROM turns t JOIN sessions s ON s.id = t.session WHERE 1=1",
+        );
+        if let Some(username) = username {
+            binds.push(username.to_string());
+            sql.push_str(&format!(" AND s.username = ?{}", binds.len()));
+        }
+        sql.push_str(&filter_preds(filter, &mut binds));
+        sql.push_str(&format!(
+            " ORDER BY t.created_ms DESC LIMIT ?{}",
+            binds.len() + 1
+        ));
+        binds.push(limit.to_string());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(binds.iter()), |r| {
+            Ok(EpisodeHit {
+                session: r.get(3)?,
+                turn: r.get(0)?,
+                role: r.get(4)?,
+                snippet: r.get(1)?,
+                at_ms: r.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
     }
 
     /// Remove a session's episodes (strand reset / purge).
@@ -599,5 +735,149 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].3.as_deref(), Some("anthropic/claude-sonnet-4-5"));
         assert_eq!(rows[1].3.as_deref(), Some("google/gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn last_rate_limit_at_is_per_user() {
+        let store = Store::open_in_memory().unwrap();
+        let mut s1 = session();
+        s1.username = "alice".into();
+        let mut s2 = session();
+        s2.username = "bob".into();
+        store.insert_session(&s1).unwrap();
+        store.insert_session(&s2).unwrap();
+        let mut err = Turn::new(s1.id.clone(), "hit the cap".into());
+        err.status = TurnStatus::Error;
+        err.error_class = Some("rate_limit".into());
+        err.updated_ms = 5_000;
+        let mut other = Turn::new(s2.id.clone(), "different user".into());
+        other.status = TurnStatus::Error;
+        other.error_class = Some("rate_limit".into());
+        other.updated_ms = 9_000;
+        let mut plain = Turn::new(s1.id.clone(), "ordinary".into());
+        plain.status = TurnStatus::Done;
+        plain.updated_ms = 8_000;
+        store.insert_turn(&err).unwrap();
+        store.insert_turn(&other).unwrap();
+        store.insert_turn(&plain).unwrap();
+
+        assert_eq!(store.last_rate_limit_at("alice").unwrap(), Some(5_000));
+        assert_eq!(store.last_rate_limit_at("bob").unwrap(), Some(9_000));
+        assert_eq!(store.last_rate_limit_at("carol").unwrap(), None);
+    }
+
+    #[test]
+    fn episode_filters_bind_model_after_status() {
+        let store = Store::open_in_memory().unwrap();
+        let mut s_alice = session();
+        s_alice.username = "alice".into();
+        let mut s_bob = session();
+        s_bob.username = "bob".into();
+        store.insert_session(&s_alice).unwrap();
+        store.insert_session(&s_bob).unwrap();
+
+        let mut old = Turn::new(s_alice.id.clone(), "deploy the flaky mutex".into());
+        old.model = Some("zai/glm-5.3".into());
+        old.created_ms = 1_000;
+        old.status = TurnStatus::Done;
+        let mut err = Turn::new(s_alice.id.clone(), "flaky mutex again".into());
+        err.model = Some("zai/glm-5.3".into());
+        err.created_ms = 9_000;
+        err.status = TurnStatus::Error;
+        let mut bob = Turn::new(s_bob.id.clone(), "flaky mutex elsewhere".into());
+        bob.model = Some("anthropic/claude-sonnet-4-5".into());
+        bob.created_ms = 9_000;
+        bob.status = TurnStatus::Done;
+        for t in [&old, &err, &bob] {
+            store.insert_turn(t).unwrap();
+            store
+                .index_episode(&s_of(t), &t.id, "user", &t.inbound_text)
+                .unwrap();
+        }
+
+        let all = |f: &EpisodeFilter| {
+            store
+                .search_episodes_filtered("mutex", 10, f)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(all(&EpisodeFilter::default()), 3);
+        assert_eq!(
+            all(&EpisodeFilter {
+                model: Some("zai/glm-5.3".into()),
+                ..EpisodeFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            all(&EpisodeFilter {
+                model: Some("zai/glm-5.3".into()),
+                after_ms: Some(5_000),
+                ..EpisodeFilter::default()
+            }),
+            1
+        );
+        assert_eq!(
+            all(&EpisodeFilter {
+                status: Some("error".into()),
+                ..EpisodeFilter::default()
+            }),
+            1
+        );
+        // The user split still fences a filtered search.
+        assert_eq!(
+            store
+                .search_episodes_for_user_filtered(
+                    "mutex",
+                    10,
+                    "alice",
+                    &EpisodeFilter {
+                        status: Some("error".into()),
+                        ..EpisodeFilter::default()
+                    }
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_episodes_for_user_filtered(
+                    "mutex",
+                    10,
+                    "alice",
+                    &EpisodeFilter {
+                        model: Some("anthropic/claude-sonnet-4-5".into()),
+                        ..EpisodeFilter::default()
+                    }
+                )
+                .unwrap()
+                .len(),
+            0,
+            "a filtered search never returns another user's hits"
+        );
+
+        // No-FTS listing: the caller's own turns, newest first.
+        let listed = store
+            .list_turns_filtered(&EpisodeFilter::default(), Some("alice"), 10)
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].snippet, "flaky mutex again");
+        let errs = store
+            .list_turns_filtered(
+                &EpisodeFilter {
+                    status: Some("error".into()),
+                    ..EpisodeFilter::default()
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].snippet, "flaky mutex again");
+    }
+
+    fn s_of(t: &Turn) -> SessionId {
+        t.session.clone()
     }
 }

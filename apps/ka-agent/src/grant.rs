@@ -88,6 +88,9 @@ pub fn grant_action(action: GrantAction) -> std::process::ExitCode {
                 }
             }
         }
+        // Durable allow-rules (v4 B7): dry-run, list, remove — the CLI
+        // twin of chat's `/rules`.
+        GrantAction::Rule { action } => return rule_action(&store, action),
         // Handled before the store was opened; unreachable in practice.
         GrantAction::Path { .. } => {}
     }
@@ -96,6 +99,63 @@ pub fn grant_action(action: GrantAction) -> std::process::ExitCode {
 fn fail(msg: impl std::fmt::Display) -> std::process::ExitCode {
     eprintln!("ka-agent: {msg}");
     std::process::ExitCode::FAILURE
+}
+
+/// `ka-agent grant rule check|list|rm` (v4 B7): the operator's CLI view
+/// of the durable allow-rules. `check` grants nothing — it prints which
+/// rule (if any) would answer a fresh bash ask carrying this command.
+fn rule_action(store: &Store, action: crate::cli::RuleAction) -> std::process::ExitCode {
+    use ka_agent_core::rules::plain_command;
+    match action {
+        crate::cli::RuleAction::Check { command } => {
+            let cmd = command.trim();
+            if !plain_command(cmd) {
+                println!(
+                    "no command rule can match: {cmd:?} is not provably plain \
+                     (contains ; | & $ ( ) < > ` or newline) — only the exact ask can be allowed"
+                );
+                return std::process::ExitCode::SUCCESS;
+            }
+            let rules = match store.rules_for_subject(ka_agent_core::OPERATOR_USER) {
+                Ok(r) => r,
+                Err(e) => return fail(e),
+            };
+            let hit = rules.into_iter().find(|r| {
+                r.shape
+                    .matches(&format!("run `{cmd}`?"), None, Some(("bash", cmd)))
+            });
+            match hit {
+                Some(r) => println!(
+                    "rule {} ({} · mode {}) would answer it — no card",
+                    r.id,
+                    r.shape.label(),
+                    r.mode
+                ),
+                None => println!("no rule matches — the ask still raises a card"),
+            }
+        }
+        crate::cli::RuleAction::List => match store.all_rules() {
+            Ok(rules) if rules.is_empty() => println!("no durable rules"),
+            Ok(rules) => {
+                for r in rules {
+                    println!(
+                        "{} · {} · {} · {}",
+                        r.id,
+                        r.subject,
+                        r.shape.label(),
+                        r.mode
+                    );
+                }
+            }
+            Err(e) => return fail(e),
+        },
+        crate::cli::RuleAction::Rm { id } => match store.remove_rule_any(&id) {
+            Ok(true) => println!("removed rule {id}"),
+            Ok(false) => println!("no rule matches {id}"),
+            Err(e) => return fail(e),
+        },
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// `dir` with `~` expanded, refused when it is not absolute — the same

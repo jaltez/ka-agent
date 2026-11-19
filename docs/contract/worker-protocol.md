@@ -27,6 +27,9 @@ Direction: D→W (daemon to worker, written to the worker's stdin), W→D
 | `SetModel` — set model selector | `{"op":"set_model","selector":"openai/gpt-5.2"}` |
 | `SetMode` — set permission mode | `{"op":"set_mode","mode":"readonly"}` |
 | `SetName` — title the session | `{"op":"set_name","name":"CI flake hunt"}` |
+| `SetEffort` — set effort level | `{"op":"set_effort","level":"high"}` |
+| `Steer` — queue text into the live cycle (the engine drains it at turn/tool boundaries; settles into the queue when unconsumed) | `{"op":"steer","text":"also update the README"}` |
+| `UndoFile` — revert the engine's last file edit | `{"op":"undo_file"}` |
 | `Compact` — compact the strand | `{"op":"compact"}` |
 | `Close` — close the engine and exit cleanly | `{"op":"close"}` |
 

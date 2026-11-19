@@ -90,7 +90,37 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                     Ok(rows) if rows.is_empty() => "no pending candidates".to_string(),
                     Ok(rows) => rows
                         .into_iter()
-                        .map(|c| format!("[{}] ({}) {}", short_id(c.id.as_str()), c.source, c.text))
+                        .map(|c| {
+                            let preview = runtime.candidate_preview(&c);
+                            match preview {
+                                Ok((diff, before, after)) => {
+                                    let lands_after = match diff.after_id.as_deref() {
+                                        Some(id) => format!(", after [{}]", short_id(id)),
+                                        None => " (file empty)".to_string(),
+                                    };
+                                    let trunc = if after.truncated {
+                                        "; budget would truncate"
+                                    } else {
+                                        ""
+                                    };
+                                    format!(
+                                        "[{}] ({}) → {}{}\n  + {}\n  compiled {}B of {}B (now {}B{})",
+                                        short_id(c.id.as_str()),
+                                        c.source,
+                                        diff.file,
+                                        lands_after,
+                                        diff.text,
+                                        after.total_bytes,
+                                        after.budget_bytes,
+                                        before,
+                                        trunc,
+                                    )
+                                }
+                                Err(_) => {
+                                    format!("[{}] ({}) {}", short_id(c.id.as_str()), c.source, c.text)
+                                }
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join("\n"),
                     Err(e) => format!("! [memory] {e}"),
@@ -176,7 +206,67 @@ pub(super) fn run_history<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                 Err(e) => format!("! [history] {e}"),
             }
         } else {
-            match runtime.history_search(rest, 5, &ctx.principal) {
+            // Leading-position filters (B17): `model:`, `after:` (date in
+            // the profile tz) and `status:` — a token that is not a valid
+            // filter, or one mid-query, stays ordinary searchable text.
+            let mut rest = rest;
+            let mut filter = ka_agent_store::EpisodeFilter::default();
+            let mut any_filter = false;
+            while let Some(tok) = rest.split_whitespace().next() {
+                let stripped = rest.strip_prefix(tok).unwrap_or("").trim_start();
+                let applied = if let Some(v) = tok.strip_prefix("model:")
+                    && !v.is_empty()
+                {
+                    filter.model = Some(v.to_string());
+                    true
+                } else if let Some(v) = tok.strip_prefix("status:")
+                    && matches!(
+                        v,
+                        "queued"
+                            | "submitted"
+                            | "running"
+                            | "done"
+                            | "error"
+                            | "aborted"
+                            | "interrupted"
+                            | "killed"
+                    )
+                {
+                    filter.status = Some(v.to_string());
+                    true
+                } else if let Some(v) = tok.strip_prefix("after:")
+                    && let Ok(day) = v.parse::<jiff::civil::Date>()
+                {
+                    let tz = runtime.now_zoned();
+                    let start = day
+                        .at(0, 0, 0, 0)
+                        .to_zoned(tz.time_zone().clone())
+                        .ok()
+                        .map(|z| z.timestamp().as_millisecond());
+                    match start {
+                        Some(ms) => {
+                            filter.after_ms = Some(ms);
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if !applied {
+                    break;
+                }
+                any_filter = true;
+                rest = stripped;
+            }
+            let hits = if !any_filter {
+                runtime.history_search(rest, 5, &ctx.principal)
+            } else if rest.is_empty() {
+                runtime.history_list_filtered(&filter, 5, &ctx.principal)
+            } else {
+                runtime.history_search_filtered(rest, 5, &filter, &ctx.principal)
+            };
+            match hits {
                 Ok(hits) if hits.is_empty() => format!("no history matches {rest:?}"),
                 Ok(hits) => {
                     let now = runtime.now_zoned();

@@ -167,30 +167,123 @@ impl Runtime {
             ApprovalDecision::Allow | ApprovalDecision::Always => ApprovalStatus::Approved,
             ApprovalDecision::Deny => ApprovalStatus::Denied,
         };
-        port.answer(ask_id.clone(), decision.ka_choice()).await?;
-        self.sh
-            .store
-            .decide_approval(&id, status, ka_agent_core::now_ms())?;
-        self.audit_for(
+        if status == ApprovalStatus::Denied {
+            port.answer(ask_id.clone(), decision.ka_choice()).await?;
+            self.sh
+                .store
+                .decide_approval(&id, status, ka_agent_core::now_ms())?;
+            self.audit_for(
+                &who,
+                audit_actions::APPROVAL_DECIDE,
+                approval_id,
+                Some(format!("{decision:?}")),
+            )?;
+            self.sh.emit(AgentEvent::ApprovalSettled {
+                id: approval_id.to_string(),
+                status: format!("{status:?}"),
+            });
+            let mut g = st.lock();
+            if let Some(live) = g.live.as_mut() {
+                live.pending_asks.remove(&id);
+            }
+            if g.session.status == SessionStatus::AwaitingApproval {
+                let from = g.session.status;
+                g.session
+                    .transition(SessionStatus::Running)
+                    .map_err(|t| illegal_session(from, t))?;
+            }
+            return Ok(());
+        }
+        // The one Allow settle site: every allow-class path — an operator
+        // `/y`, the session-allow set, a durable rule — settles through
+        // [`Runtime::answer_allow`] and nowhere else.
+        self.answer_allow(
+            &st,
             &who,
+            Some((&row, status)),
+            ask_id,
+            &format!("{decision:?}"),
+            source,
+        )
+        .await
+    }
+
+    /// The single Allow settle site (v4 B7): answer the ask Allow, settle
+    /// the approval row when there is one, audit with a caller label, and
+    /// return the session to Running. `approval` is `None` for asks
+    /// answered before any card existed (the session-allow set), and the
+    /// label names the path (`Allow`, `Allow (session)`, `Allow (rule …)`)
+    /// in the audit row.
+    pub(super) async fn answer_allow(
+        &self,
+        st: &UserHandle,
+        who: &Principal,
+        approval: Option<(&Approval, ApprovalStatus)>,
+        ask_id: String,
+        label: &str,
+        source: &str,
+    ) -> Result<(), Error> {
+        let approval_id = approval
+            .map(|(row, _)| row.id.to_string())
+            .unwrap_or_else(|| ask_id.clone());
+        let port = st.lock().live.as_ref().map(|l| Arc::clone(&l.port));
+        let Some(port) = port else {
+            return Err(Error::UnknownApproval(approval_id));
+        };
+        // B1: the checkpoint net — snapshot the workspace before the
+        // write this Allow releases. The engine is blocked on the ask,
+        // so the workspace is quiescent and the snapshot cannot race
+        // it. A failed snapshot never vetoes the write.
+        {
+            let (session, turn) = {
+                let g = st.lock();
+                let turn = approval
+                    .map(|(row, _)| row.turn.clone())
+                    .or_else(|| g.live.as_ref().and_then(|l| l.current_turn.clone()))
+                    .unwrap_or_else(TurnId::generate);
+                (g.session.clone(), turn)
+            };
+            self.checkpoint_before_allow(who, &session, &turn, approval.map(|(row, _)| row));
+        }
+        // Everything settles BEFORE the engine is released: `port.answer`
+        // unblocks the worker at once, and the very next event can be the
+        // cycle's next ask — it must find the session already back in
+        // Running (the orphan-ask deny of the 2026-11 wedge would
+        // otherwise eat it). On an answer error the row is settled but
+        // the engine ask expires into its own deny (fail closed).
+        let id = ApprovalId(approval_id.clone());
+        if let Some((row, status)) = approval {
+            self.sh
+                .store
+                .decide_approval(&row.id, status, ka_agent_core::now_ms())?;
+            self.sh.emit(AgentEvent::ApprovalSettled {
+                id: row.id.to_string(),
+                status: format!("{status:?}"),
+            });
+        }
+        let mut rec = AuditRecord::new(
+            source,
             audit_actions::APPROVAL_DECIDE,
-            approval_id,
-            Some(format!("{decision:?}")),
-        )?;
-        self.sh.emit(AgentEvent::ApprovalSettled {
-            id: approval_id.to_string(),
-            status: format!("{status:?}"),
-        });
-        let mut g = st.lock();
-        if let Some(live) = g.live.as_mut() {
-            live.pending_asks.remove(&id);
+            &approval_id,
+            Some(label.to_string()),
+        )
+        .with_role(&who.role)
+        .with_user(&who.username);
+        self.sh.store.append_audit(&mut rec)?;
+        {
+            let mut g = st.lock();
+            if let Some(live) = g.live.as_mut() {
+                live.pending_asks.remove(&id);
+            }
+            if g.session.status == SessionStatus::AwaitingApproval {
+                let from = g.session.status;
+                g.session
+                    .transition(SessionStatus::Running)
+                    .map_err(|t| illegal_session(from, t))?;
+            }
         }
-        if g.session.status == SessionStatus::AwaitingApproval {
-            let from = g.session.status;
-            g.session
-                .transition(SessionStatus::Running)
-                .map_err(|t| illegal_session(from, t))?;
-        }
+        port.answer(ask_id, ApprovalDecision::Allow.ka_choice())
+            .await?;
         Ok(())
     }
 
@@ -216,6 +309,122 @@ impl Runtime {
         }
         self.decide(approval_id, ApprovalDecision::Allow, source)
             .await
+    }
+
+    /// `/y <id> always` (v4 B7/B8): settle this ask Allow and persist a
+    /// durable rule that answers matching future asks without a card —
+    /// in the ACTING user's partition, scoped to the creation mode and
+    /// looser. Terminal and web only — the caller enforces the surface.
+    /// Returns the rule text for the reply.
+    pub async fn decide_always(&self, approval_id: &str, source: &str) -> Result<String, Error> {
+        let who = self
+            .principal_for_source(source)
+            .ok_or_else(|| Error::Refused("unlinked sender".into()))?;
+        let row = self
+            .sh
+            .store
+            .get_approval(&ApprovalId(approval_id.to_string()))
+            .map_err(|_| Error::UnknownApproval(approval_id.to_string()))?;
+        if let Err(reason) = self.may_decide(&row, &who) {
+            return Err(Error::Refused(format!(
+                "approvals are decided by the admin role ({reason})"
+            )));
+        }
+        if row.escalated {
+            return Err(Error::Refused(
+                "escalated cards stay the operator's call — a rule must be self-scope".into(),
+            ));
+        }
+        let ApprovalKind::KaAsk {
+            question, detail, ..
+        } = &row.kind
+        else {
+            return Err(Error::Refused("only engine asks can become rules".into()));
+        };
+        // The rule lands in the asking user's partition (a member's card an
+        // admin approved still writes the member's rule, never the
+        // admin's), and carries the asking user's effective mode.
+        let subject = row.username.clone().unwrap_or_else(|| who.username.clone());
+        let last_call = self.ask_last_call(&row);
+        let shape = ka_agent_core::rules::RuleShape::for_ask(
+            question,
+            detail.as_deref(),
+            last_call.as_ref().map(|(t, d)| (t.as_str(), d.as_str())),
+        );
+        shape.validate().map_err(Error::Refused)?;
+        let mode = self.effective_mode_for(&subject);
+        let rule = ka_agent_core::rules::Rule {
+            id: ka_agent_core::RuleId::generate().0,
+            subject,
+            shape: shape.clone(),
+            mode: mode.clone(),
+            from_approval: Some(approval_id.to_string()),
+            created_ms: ka_agent_core::now_ms(),
+        };
+        if !rule.passes_cases() {
+            return Err(Error::Refused(
+                "the rule's own test cases failed — nothing stored".into(),
+            ));
+        }
+        let label = rule.shape.label();
+        self.sh.store.insert_rule(&rule)?;
+        self.audit_for(
+            &who,
+            audit_actions::RULE_ADD,
+            &rule.id,
+            Some(format!("from approval {approval_id}: {label}")),
+        )?;
+        self.decide(approval_id, ApprovalDecision::Allow, source)
+            .await?;
+        Ok(format!(
+            "rule added — {label} · fires in {mode} and more permissive modes"
+        ))
+    }
+
+    /// The engine's last (tool, argument summary) call on the asking
+    /// user's live worker — the shape ladder's input.
+    fn ask_last_call(&self, approval: &Approval) -> Option<(String, String)> {
+        let asking = approval
+            .username
+            .clone()
+            .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string());
+        self.user_handle(&asking)
+            .and_then(|st| st.lock().live.as_ref().and_then(|l| l.last_call.clone()))
+    }
+
+    /// `/rules`: the caller's own durable rules; the admin sees (and may
+    /// remove) every subject's.
+    pub fn rules_list(&self, who: &Principal) -> Result<Vec<ka_agent_core::rules::Rule>, Error> {
+        let rules = if who.is_admin() {
+            self.sh.store.all_rules()?
+        } else {
+            self.sh.store.rules_for_subject(&who.username)?
+        };
+        Ok(rules)
+    }
+
+    /// `/rules rm <id>`: a user removes only their own rules; the admin
+    /// may remove any. Audited.
+    pub async fn rule_remove(
+        &self,
+        id: &str,
+        who: &Principal,
+        source: &str,
+    ) -> Result<bool, Error> {
+        let removed = if who.is_admin() {
+            self.sh.store.remove_rule_any(id)?
+        } else {
+            self.sh.store.remove_rule(&who.username, id)?
+        };
+        if removed {
+            self.audit_for(
+                who,
+                audit_actions::RULE_RM,
+                id,
+                Some(format!("by {source}")),
+            )?;
+        }
+        Ok(removed)
     }
 
     /// Decide the most recent pending approval of the caller's own session

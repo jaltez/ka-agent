@@ -26,6 +26,19 @@ operator accepts stable-memory writes.
   replaced by a one-line omission marker. The result is written to
   `<engine-home>/.config/ka/MEMORY.md` (ka's user-tier memory, re-read per
   prompt — validation §5: no worker restart needed).
+- **Automation variant** (B15b): turns a schedule started (`cron`,
+  `cron:<id>`, `briefing` sources) run against an `Automation`-scope
+  compile that keeps only the machine facts (`environment.md` +
+  `conventions.md`) — profile, preferences, projects and facts are
+  dropped, so crons neither read nor feed on personal memory. The daemon
+  installs it right before the scheduled submit and restores the full
+  compile at every exit of that bracket: the cycle's terminal points
+  (`turn_finished` before any drain, `idle` before any drain,
+  engine-closed) and the Err arms of both bracketed submit paths (a
+  submit failure marks the turn `interrupted` and no port event ever
+  arrives). Limits: only daemon death inside a scheduled span leaves the
+  lean compile until the next boot or memory change — degraded answers,
+  never a leak; two processes refreshing mid-span race benignly.
 - **Commands** (shared router: console, Telegram, Matrix):
   - `/remember <fact>` — explicit operator acceptance, appends to facts.md,
     recompiles, commits.
@@ -50,6 +63,26 @@ operator accepts stable-memory writes.
   (2) acceptance of a candidate via `/memory accept` — or the web review
   inbox (`POST /memory/edit` stages, `POST /memory/candidate` decides), the
   same runtime paths as the console commands.
+- **Review shows the exact delta** (B15a): `/memory review` renders each
+  pending candidate as a bullet diff — target file, the `+ <text>` line,
+  the entry it lands after — plus the dry-run compile impact
+  (`compiled NB of BB`, and whether the budget would then truncate).
+  The web review inbox rides the same accept path unchanged.
+- **Accept is screen → apply → rollback** (B15a): accepting re-runs
+  `screen_proposal` on the stored text (rules may have tightened since
+  filing — a candidate that fails today's screen is refused), then
+  snapshots the target file, applies, recompiles and commits; any failure
+  (git missing, compile error) restores the snapshot byte-for-byte,
+  recompiles and refuses — memory never lands half-applied.
+- **Refusals at the `memory_propose` gate**: private conversations (row
+  above); **scheduled sources** (cron/briefing turns cannot propose
+  memory at all); and the three quota/warm-up gates (B15c) — the user's
+  budget verdict is `Warn` (≥80% of a cap) or `Exceeded`, their newest
+  `rate_limit` turn is less than 30 minutes old, or their live session
+  has fewer than `[memory] extraction_min_turns` recorded turns (default
+  5, `0` = off).
+- **Removal/edit proposals are a NON-GOAL**: a poisoned removal is a
+  §4-shaped deletion vector; `/forget` stays the only removal path.
 - **Private conversations** (`/new private`) write nothing: `memory_propose`
   and `skill_propose` are refused for the session's turns, `/remember`,
   `notes_append` and every scheduling path (`/remind`, `/cron`, the
@@ -79,8 +112,15 @@ operator accepts stable-memory writes.
   `final_text` is the concatenated outbox chunks.
 - **Commands**:
   - `/history <query>` — FTS5 search, top 5 results with turn id + snippet.
-  - `/history show <turn_id>` — the stored exchange: `> {inbound}` +
-    `{answer}` from the turn row + outbox chunks.
+    Leading-position filters (B17): `model:<id>`, `after:<YYYY-MM-DD>`
+    (parsed in the profile timezone) and `status:<queued|submitted|
+    running|done|error|aborted|interrupted|killed>` — applied as bound
+    SQL predicates on the `turns` join, never as FTS MATCH syntax; a
+    filter token mid-query stays ordinary searchable text. With a filter
+    but no text (`/history status:error`), the command lists newest-first
+    turns under the same predicates, the caller's own (every user's for
+    the admin). Under a filter, episodes whose turn row was pruned drop
+    out (the join turns inner) — accepted.
 
 ## What does NOT auto-update memory
 

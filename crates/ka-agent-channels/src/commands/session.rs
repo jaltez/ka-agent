@@ -68,6 +68,31 @@ pub(super) fn run_retry<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     })
 }
 
+/// `/rewind [n]`: list this session's shadow-git checkpoints (newest
+/// first) or restore one. Code only — the reply carries the original
+/// question and inbound text so the operator can re-propose.
+pub(super) fn run_rewind<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let arg = ctx.args.trim();
+        let n = if arg.is_empty() {
+            None
+        } else {
+            match arg.parse::<usize>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    return Outcome::Reply(
+                        "usage: /rewind [n] — n is a number from the list".into(),
+                    );
+                }
+            }
+        };
+        match ctx.runtime.rewind(&ctx.principal, n).await {
+            Ok(text) => Outcome::Reply(text),
+            Err(e) => Outcome::Reply(format!("! [rewind] {e}")),
+        }
+    })
+}
+
 /// The modes `/mode` offers, in pick order (`/mode <n>` resolves here).
 pub const MODES: &[(&str, &str)] = &[
     ("ask", "asks before acting"),

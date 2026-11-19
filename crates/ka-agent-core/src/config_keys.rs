@@ -279,6 +279,22 @@ pub static KEYS: &[KeySpec] = &[
         doc: "delete attachment files older than this many days; 0 keeps forever",
     },
     KeySpec {
+        path: "git.name",
+        kind: Kind::Str,
+        default: "unset (ka-agent (<username>))",
+        apply: Apply::Worker,
+        web: true,
+        doc: "git author/committer name for agent commits (per-user default: ka-agent (<username>)); unset keeps today's behavior",
+    },
+    KeySpec {
+        path: "git.email",
+        kind: Kind::Str,
+        default: "unset (<username>@ka-agent.local)",
+        apply: Apply::Worker,
+        web: true,
+        doc: "git author/committer email for agent commits (per-user default: <username>@ka-agent.local); unset keeps today's behavior",
+    },
+    KeySpec {
         path: "runtime.max_workers",
         kind: Kind::Int { min: 1, max: 64 },
         default: "8",
@@ -647,6 +663,30 @@ pub static KEYS: &[KeySpec] = &[
         apply: Apply::Worker,
         web: false,
         doc: "roles for linked identities ([[role]]: name, mode, allow/disable, workspace, budget, commands, grants)",
+    },
+    KeySpec {
+        path: "memory.extraction_min_turns",
+        kind: Kind::Int { min: 0, max: 1000 },
+        default: "5",
+        apply: Apply::Live,
+        web: true,
+        doc: "recorded turns a session needs before memory_propose is allowed (warm-up gate; 0 = off)",
+    },
+    KeySpec {
+        path: "checkpoint.enabled",
+        kind: Kind::Bool,
+        default: "true",
+        apply: Apply::Live,
+        web: true,
+        doc: "snapshot the workspace before every approved write (the /rewind safety net)",
+    },
+    KeySpec {
+        path: "checkpoint.keep_days",
+        kind: Kind::Int { min: 1, max: 3650 },
+        default: "30",
+        apply: Apply::Live,
+        web: true,
+        doc: "how long checkpoint rows and their shadow repos live (destructive pruning)",
     },
 ];
 

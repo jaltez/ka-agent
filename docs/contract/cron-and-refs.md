@@ -19,6 +19,12 @@ A cron job is a `kind = 'cron'` task whose `payload` is a `CronSpec`:
 
 - `agent` jobs submit `text` to the engine as a prompt when they fire (a
   normal turn: budget, approvals and audit all apply).
+- A cron job runs the `text` snapshotted at creation; daemon upgrades
+  never rewrite what an existing job asks the model. The daily briefing
+  (`source = "briefing"`) bakes its full prompt into `text` when enabled
+  and only time-derived `briefing_context` is added at fire time; legacy
+  placeholder payloads were snapshotted once at boot (B13, logged one
+  line).
 - `no_agent` jobs dispatch to a runtime-registered handler by `kind`
   (today: `calendar`). No engine, no LLM. A missing handler or a failing
   handler marks the job `failed` — visible on the surface, never re-armed.
@@ -71,6 +77,7 @@ word starting with `@`:
 | `@<path>` | file content (8 000-char cap, read is byte-bounded at the source), workspace-relative or absolute |
 | `@<dir>` | shallow listing (depth 2, 50 entries, dirs get `/`) |
 | `@turn:<prefix>` / `@t:<prefix>` | that turn's question and answer |
+| `@session:<prefix>` / `@s:<prefix>` | that conversation's header (short id, owner, created date, turn count) plus its last three exchanges, each citing its turn id |
 | `@https://…` | the URL body, under the `http_get` grant + SSRF rules |
 
 The expansion replaces the token **before** `handle_message`, so it is
@@ -79,6 +86,11 @@ Failures are visible markers (`[ref @x: not found]`,
 `[ref @url refused: no grant …]`), never a dropped message. Total
 expansion budget: 24 000 chars, then `… [refs truncated]`. Words like
 `bob@example.com` are not references (only a leading `@` counts).
+
+`@turn:` and `@session:` honor `rbac.md`'s History row: a non-admin caller
+only ever resolves ids of their own partition — another user's turn or
+session renders the same `[ref …: not found]` marker as a missing one (no
+existence leak); the operator's history view keeps seeing everything.
 
 ## AGENTS.md
 

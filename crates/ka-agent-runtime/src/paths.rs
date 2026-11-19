@@ -145,6 +145,13 @@ impl Paths {
         self.user_root(username).join("workspace")
     }
 
+    /// The user's checkpoint shadow repos (v4 B1): a daemon-owned slot
+    /// beside the workspace, deliberately NOT `user_ka_data` (the engine's
+    /// `KA_DATA_DIR`).
+    pub fn user_checkpoints(&self, username: &str) -> PathBuf {
+        self.user_root(username).join("checkpoints")
+    }
+
     /// Create one user's tree, 0700 like the rest. Idempotent; the operator
     /// is the profile root already covered by [`Self::ensure_dirs`].
     pub fn ensure_user_dirs(&self, username: &str) -> std::io::Result<()> {
@@ -155,6 +162,7 @@ impl Paths {
             self.user_root(username),
             self.user_memory(username),
             self.user_workspace(username),
+            self.user_checkpoints(username),
             self.user_notes(username),
             self.user_attachments(username),
             self.user_ka_data(username),

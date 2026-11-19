@@ -315,6 +315,15 @@ pub fn doctor(config: PathBuf, online: bool, json: bool, fix: bool) -> std::proc
                 _ => rep.info(&line),
             }
         }
+        // Durable allow-rules (v4 B7): the count beside the grants lines.
+        if paths.state_db().exists()
+            && let Ok(store) = ka_agent_store::Store::open(&paths.state_db())
+            && let Ok(n) = store.count_rules()
+            && n > 0
+        {
+            let line = format!("rules: {n} durable allow-rule(s) — /rules lists them");
+            rep.info(&line);
+        }
     }
 
     // git (memory backing is a git repo).

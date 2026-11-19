@@ -166,6 +166,21 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
     }
     let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
     let allowed_tools = Runtime { sh: Arc::clone(sh) }.role_toolset(&who.role);
+    // B15b: a scheduled turn runs against the automation compile (machine
+    // facts only); every exit of this bracket restores the full one — the
+    // Ok path at TurnFinished/Idle, the Err path right here (the turn is
+    // marked interrupted and no port event will ever arrive).
+    let scheduled = is_scheduled(Some(item.source.as_str()));
+    if scheduled
+        && let Err(e) =
+            (Runtime { sh: Arc::clone(sh) }).install_automation_memory_for(&who.username)
+    {
+        sh.emit(AgentEvent::Error {
+            class: "internal".into(),
+            retryable: retryable_class("internal"),
+            message: format!("automation memory compile: {e}"),
+        });
+    }
     match port
         .submit_full(wire, Vec::new(), Vec::new(), model, allowed_tools)
         .await
@@ -182,6 +197,16 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
                 .map_err(|t| illegal_turn(turn.status, t))
                 .ok();
             sh.store.update_turn(&turn).ok();
+            if scheduled
+                && let Err(e) =
+                    (Runtime { sh: Arc::clone(sh) }).refresh_compiled_memory_for(&who.username)
+            {
+                sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    retryable: retryable_class("internal"),
+                    message: format!("memory restore: {e}"),
+                });
+            }
             false
         }
     }
@@ -868,6 +893,18 @@ impl Runtime {
             }),
             None => role_allow,
         };
+        // B15b: a scheduled turn runs against the automation compile
+        // (machine facts only); every exit of this bracket restores the
+        // full one — Ok at TurnFinished/Idle (and immediately below for
+        // a fast scripted finish), Err right in the arms.
+        let scheduled = is_scheduled(source);
+        if scheduled && let Err(e) = self.install_automation_memory_for(&who.username) {
+            self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                retryable: retryable_class("internal"),
+                message: format!("automation memory compile: {e}"),
+            });
+        }
         match port
             .submit_full(wire, Vec::new(), skills, model, allowed_tools)
             .await
@@ -878,9 +915,25 @@ impl Runtime {
                     .map_err(|t| illegal_turn(turn.status, t))?;
                 self.sh.store.update_turn(&turn)?;
                 rt_on_engine_closed(&self.sh, &st, port).await;
+                if scheduled && let Err(e) = self.refresh_compiled_memory_for(&who.username) {
+                    self.sh.emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        retryable: retryable_class("internal"),
+                        message: format!("memory restore: {e}"),
+                    });
+                }
                 return Ok(());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                if scheduled && let Err(why) = self.refresh_compiled_memory_for(&who.username) {
+                    self.sh.emit(AgentEvent::Error {
+                        class: "internal".into(),
+                        retryable: retryable_class("internal"),
+                        message: format!("memory restore: {why}"),
+                    });
+                }
+                return Err(e.into());
+            }
         }
         // The engine may have finished the turn already (fast scripted
         // speaker): its record is then terminal.
@@ -892,6 +945,9 @@ impl Runtime {
             .flatten()
             .is_some_and(|t| t.status.is_terminal())
         {
+            if scheduled {
+                self.refresh_compiled_memory_for(&who.username).ok();
+            }
             return Ok(());
         }
         turn.transition(TurnStatus::Running)

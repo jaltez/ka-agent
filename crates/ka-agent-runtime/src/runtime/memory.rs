@@ -168,24 +168,35 @@ impl Runtime {
         }) else {
             return Ok(false);
         };
-        // The proposal names its target file (facts by default).
-        let file = match row.file.as_deref() {
-            None | Some("facts") => ka_agent_memory::MemoryFile::Facts,
-            Some("preferences") => ka_agent_memory::MemoryFile::Preferences,
-            Some("environment") => ka_agent_memory::MemoryFile::Environment,
-            Some("profile") => ka_agent_memory::MemoryFile::Profile,
-            Some(other) => {
-                return Err(Error::Refused(format!(
-                    "candidate names an unknown memory file {other:?}"
-                )));
-            }
-        };
+        // Screening rules may have tightened since the candidate was
+        // filed: re-run the screen on the stored text before anything
+        // moves (B15a).
+        ka_agent_memory::screen_proposal(&row.text).map_err(Error::Refused)?;
+        let file = Self::memory_file_of(row.file.as_deref())?;
         // The proposal lands in the memory root of the user whose turn
         // proposed it, never the decider's by accident.
         let memory = self.memory_store(&row.username)?;
-        let mem_id = memory.add(file, &row.text, &row.source, None)?;
-        self.refresh_compiled_memory_for(&row.username)?;
-        memory.commit(&format!("memory: accept {mem_id} (candidate)"))?;
+        // Screen → apply → rollback on any failure: the operator's
+        // memory never lands half-applied (B15a).
+        let snapshot = memory.snapshot_file(&file)?;
+        let applied: Result<String, Error> = (|| {
+            let mem_id = memory
+                .add(file.clone(), &row.text, &row.source, None)
+                .map_err(Error::Memory)?;
+            self.refresh_compiled_memory_for(&row.username)?;
+            memory
+                .commit(&format!("memory: accept {mem_id} (candidate)"))
+                .map_err(Error::Memory)?;
+            Ok(mem_id)
+        })();
+        let mem_id = match applied {
+            Ok(id) => id,
+            Err(e) => {
+                memory.restore_file(&file, snapshot)?;
+                self.refresh_compiled_memory_for(&row.username)?;
+                return Err(e);
+            }
+        };
         self.sh.store.set_candidate_status(&row.id, "accepted")?;
         self.audit_for(
             who,
@@ -231,11 +242,48 @@ impl Runtime {
         limit: usize,
         who: &Principal,
     ) -> Result<Vec<ka_agent_store::EpisodeHit>, Error> {
+        self.history_search_filtered(query, limit, &ka_agent_store::EpisodeFilter::default(), who)
+    }
+
+    /// [`history_search`](Self::history_search) with the leading-position
+    /// `/history` filters (`model:`/`after:`/`status:`) applied as bound
+    /// SQL predicates on the `turns` join.
+    pub fn history_search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &ka_agent_store::EpisodeFilter,
+        who: &Principal,
+    ) -> Result<Vec<ka_agent_store::EpisodeHit>, Error> {
         Ok(if who.is_admin() {
-            self.sh.store.search_episodes(query, limit)?
+            self.sh
+                .store
+                .search_episodes_filtered(query, limit, filter)?
         } else {
             self.sh.store.search_episodes_for_user(query, limit, &who.username)?
+            self.sh
+                .store
+                .search_episodes_for_user_filtered(query, limit, &who.username, filter)?
         })
+    }
+
+    /// `/history` with filters but no search text: newest-first turn
+    /// listing, the caller's own turns (every user's for the admin).
+    pub fn history_list_filtered(
+        &self,
+        filter: &ka_agent_store::EpisodeFilter,
+        limit: usize,
+        who: &Principal,
+    ) -> Result<Vec<ka_agent_store::EpisodeHit>, Error> {
+        let scope = (!who.is_admin()).then_some(who.username.as_str());
+        Ok(self.sh.store.list_turns_filtered(filter, scope, limit)?)
+    }
+
+    /// Recorded turns in the user's live session — the `memory_propose`
+    /// warm-up gate (B15c); `None` before their first message.
+    pub fn session_turn_count_for(&self, username: &str) -> Option<i64> {
+        let sid = self.user_handle(username)?.lock().session.id.clone();
+        self.sh.store.count_turns_for_session(&sid).ok()
     }
 
     /// `/history show <turn|prefix>`: the stored exchange. The id may be the
@@ -283,6 +331,57 @@ impl Runtime {
             &memory_preamble(&self.cfg()),
         )?;
         Ok(())
+    }
+
+    /// Install the automation compile (machine facts only, B15b) for a
+    /// scheduled turn — the lean variant the daemon swaps in before a
+    /// cron/briefing submit and swaps out at every cycle exit.
+    pub(super) fn install_automation_memory_for(&self, username: &str) -> Result<(), Error> {
+        let memory = self.memory_store(username)?;
+        memory.install_compiled_scoped(
+            &self.sh.paths.user_engine_home(username).join(".config/ka"),
+            ka_agent_memory::DEFAULT_BUDGET_BYTES,
+            &memory_preamble(&self.cfg()),
+            ka_agent_memory::CompileScope::Automation,
+        )?;
+        Ok(())
+    }
+
+    /// The memory file a candidate names (`facts` by default).
+    fn memory_file_of(name: Option<&str>) -> Result<ka_agent_memory::MemoryFile, Error> {
+        Ok(match name {
+            None | Some("facts") => ka_agent_memory::MemoryFile::Facts,
+            Some("preferences") => ka_agent_memory::MemoryFile::Preferences,
+            Some("environment") => ka_agent_memory::MemoryFile::Environment,
+            Some("profile") => ka_agent_memory::MemoryFile::Profile,
+            Some(other) => {
+                return Err(Error::Refused(format!(
+                    "candidate names an unknown memory file {other:?}"
+                )));
+            }
+        })
+    }
+
+    /// The bullet diff + dry-run compile impact one pending candidate
+    /// would have if accepted now (B15a): what `/memory review` renders.
+    /// Returns the preview, the byte total today, and the report after.
+    pub fn candidate_preview(
+        &self,
+        row: &ka_agent_store::CandidateRow,
+    ) -> Result<
+        (
+            ka_agent_memory::DiffPreview,
+            usize,
+            ka_agent_memory::CompileReport,
+        ),
+        Error,
+    > {
+        let file = Self::memory_file_of(row.file.as_deref())?;
+        let memory = self.memory_store(&row.username)?;
+        let before = memory.compile(ka_agent_memory::DEFAULT_BUDGET_BYTES)?;
+        let (preview, after) =
+            memory.dry_run_add(file, &row.text, ka_agent_memory::DEFAULT_BUDGET_BYTES)?;
+        Ok((preview, before.total_bytes, after))
     }
 
     /// Offer each new `memory_propose` candidate to its user once (the bridge

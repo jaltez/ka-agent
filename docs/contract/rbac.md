@@ -71,7 +71,7 @@ channel until an identity is linked.
 
 | Layer | Store | Partition |
 | --- | --- | --- |
-| user | `users`, `users_groups`, `groups` | `<data>/users/<username>/{memory,notes,attachments,engine-*,ka,workspace}` |
+| user | `users`, `users_groups`, `groups` | `<data>/users/<username>/{checkpoints,memory,notes,attachments,engine-*,ka,workspace}` |
 | session | `sessions.username` | one conversation per user, adopted at first message |
 | identity | `identities.username` | any number of channel identities per user |
 | audit | `audit.username` (beside the hash chain) | per-user views |
@@ -145,7 +145,7 @@ default_role = "member"             # role an auto-provisioned user gets
 | Memory | disjoint user roots; accepted candidates land in the proposing user's root | n/a (routing) |
 | Notes | `turn.username` store key → `<data>/users/<u>/notes` | absent key = admin (in-flight turn) |
 | History | FTS/`/history` scoped to the user's sessions | other users' turns are invisible |
-| Approvals | self-scope cards go to the acting user's surfaces and their decision; shared-resource, over-quota and `escalate` hits go to the admin queue; a foreign decision is refused and audited (D9) | `approvals are decided by the admin role` |
+| Approvals | self-scope cards go to the acting user's surfaces and their decision; shared-resource, over-quota and `escalate` hits go to the admin queue; a foreign decision is refused and audited (D9); durable rules (`/y <id> always`) answer only non-escalated self-scope asks of the rule's own subject, after D9 routing, within the creation mode and looser (grants.md §Durable allow-rules) | `approvals are decided by the admin role` |
 | Re-auth | every approved intent re-resolves the actor at execute time: disabled user, removed role or withdrawn grant ⇒ deny + `approval.stale` | the external write never happens |
 | Models | the user's groups' `models_allow` union; a non-allowed model is refused by name | named refusal |
 | KBs | KBs whose `kb_access` intersects the user's groups, plus owned, plus all for admin; `kagent__kb_search`, `@kb:` refs and the web KB route share the check | `no knowledge base matches` |

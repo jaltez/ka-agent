@@ -19,6 +19,7 @@ pub mod markdown;
 pub mod outbox;
 pub mod principal;
 pub mod queue;
+pub mod rules;
 pub mod secret;
 pub mod session;
 pub mod task;
@@ -34,7 +35,7 @@ pub use config::{
     Channels, DiscordSettings, Retention, RoleSpec, RuntimeSettings, Search, SlackSettings, Tools, TurnWatchdog, Voice, Web, WorkerRestart,
     valid_feature_spec, valid_role_name,
 };
-pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RunId, SessionId, TaskId, TurnId};
+pub use ids::{ApprovalId, IntentId, MemoryId, QueueId, RuleId, RunId, SessionId, TaskId, TurnId};
 pub use outbox::{OutboxChunk, OutboxStatus, truncate_at_char};
 pub use principal::Principal;
 pub use queue::QueueItem;

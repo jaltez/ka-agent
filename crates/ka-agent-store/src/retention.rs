@@ -18,15 +18,21 @@ pub struct PruneReport {
     pub queue: usize,
     pub outbox: usize,
     pub tasks: usize,
+    /// Checkpoint rows deleted by the checkpoint window (B1; the shadow
+    /// repos follow via `checkpoint_dir_keys` at the scheduler).
+    pub checkpoints: usize,
 }
 
 const RUNS_DAYS: i64 = 90;
 const APPROVALS_DAYS: i64 = 90;
 const INTENTS_DAYS: i64 = 90;
 const CANDIDATES_DAYS: i64 = 90;
+const TASKS_DAYS: i64 = 90;
 const QUEUE_DAYS: i64 = 30;
 const OUTBOX_DAYS: i64 = 30;
-const TASKS_DAYS: i64 = 90;
+/// Gemini's documented default; `checkpoint.keep_days` takes over when
+/// its config key lands (core-owned `config_keys.rs`).
+const CHECKPOINTS_DAYS: u32 = 30;
 
 impl Store {
     /// Delete terminal rows older than the retention windows. One
@@ -38,6 +44,27 @@ impl Store {
 
     /// The same, with an explicit turns window in days (0 = never).
     pub fn prune_with(&self, now_ms: i64, turns_days: u32) -> Result<PruneReport, StoreError> {
+        self.prune_all(now_ms, turns_days, CHECKPOINTS_DAYS)
+    }
+
+    /// The full pass with the checkpoint window from
+    /// `[checkpoint] keep_days` (B1); the plain [`prune_with`](Self::prune_with)
+    /// keeps the documented default for every existing caller.
+    pub fn prune_with_checkpoints(
+        &self,
+        now_ms: i64,
+        turns_days: u32,
+        checkpoints_days: u32,
+    ) -> Result<PruneReport, StoreError> {
+        self.prune_all(now_ms, turns_days, checkpoints_days)
+    }
+
+    fn prune_all(
+        &self,
+        now_ms: i64,
+        turns_days: u32,
+        checkpoints_days: u32,
+    ) -> Result<PruneReport, StoreError> {
         let day = 86_400_000i64;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -104,6 +131,11 @@ impl Store {
                 "DELETE FROM tasks WHERE kind = 'reminder' \
                  AND status IN ('succeeded','failed','cancelled','missed') AND updated_ms < ?",
                 now_ms - TASKS_DAYS * day,
+            )?,
+            checkpoints: exec(
+                &tx,
+                "DELETE FROM checkpoints WHERE created_ms < ?",
+                now_ms - (checkpoints_days as i64) * day,
             )?,
         };
         tx.commit()?;
@@ -244,6 +276,18 @@ mod tests {
                 .unwrap();
         }
 
+        // checkpoints: one past the 30-day window, one fresh
+        for (id, created) in [("ckpt-old", old), ("ckpt-new", fresh)] {
+            store
+                .lock()
+                .execute(
+                    "INSERT INTO checkpoints(id, session, turn, username, sha, created_ms)
+                     VALUES (?1, ?2, 'turn', 'operator', 'sha', ?3)",
+                    rusqlite::params![id, s, created],
+                )
+                .unwrap();
+        }
+
         let report = store.prune(now).unwrap();
         assert_eq!(report.runs, 1);
         assert_eq!(report.approvals, 1, "{report:?}");
@@ -252,6 +296,7 @@ mod tests {
         assert_eq!(report.queue, 1);
         assert_eq!(report.outbox, 1);
         assert_eq!(report.tasks, 1, "{report:?}");
+        assert_eq!(report.checkpoints, 1, "{report:?}");
 
         let count = |table: &str, cond: &str| -> i64 {
             store
@@ -273,5 +318,6 @@ mod tests {
         assert_eq!(count("tasks", "id = 'task-pend'"), 1);
         // never pruned: turns, sessions, audit, identities, crons
         assert_eq!(count("sessions", &format!("id = '{s}'")), 1);
+        assert_eq!(count("checkpoints", "id = 'ckpt-new'"), 1);
     }
 }

@@ -590,3 +590,105 @@ fn full_access_advisory_off_silences_status_and_doctor() {
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
+/// v4 B7 — `/y always` on a plain bash command lands a Command rule; the
+/// second identical call inside the same turn never raises a card (the
+/// rule answers it) and the command really runs both times.
+#[test]
+fn always_command_rule_stops_second_ask() {
+    let root = temp_root("rule1");
+    let target = root.join("ws/one");
+    let cmd = format!("touch {}/one", root.join("ws").display());
+    let sc = scenario_file(
+        &root,
+        "rule1.json",
+        &format!(
+            r#"{{ "steps": [
+                {{"call": {{"tool": "bash", "args": {{"command": "{cmd}"}}}}}},
+                {{"call": {{"tool": "bash", "args": {{"command": "{cmd}"}}}}}},
+                {{"text": "done both"}}
+            ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }}"#
+        ),
+    );
+    let mut chat = spawn(&root, &sc, "ask", "");
+    let tap = Tap::connect(&root);
+    let from = tap.mark();
+    chat.send("go");
+    // First call raises exactly one card.
+    tap.expect_from("\"ev\":\"approval\"", from, Duration::from_secs(60));
+    chat.send("/y always");
+    chat.expect("rule added", Duration::from_secs(120));
+    // The second identical call is answered by the rule: the ✓ note, no
+    // second approval envelope, the turn finishes, and the command's
+    // side effect happened (the allow was real, not a suppressed card).
+    tap.expect_from("✓ rule", from, Duration::from_secs(120));
+    tap.expect_from("\"ev\":\"turn_finished\"", from, Duration::from_secs(60));
+    assert_eq!(tap.count_from("\"ev\":\"approval\"", from), 1);
+    chat.expect("done both", Duration::from_secs(30));
+    assert!(target.exists());
+    // /rules lists it; the CLI dry-run names it.
+    chat.send("/rules");
+    chat.expect("durable rules", Duration::from_secs(30));
+    chat.send("/quit");
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("grant")
+        .arg("rule")
+        .arg("check")
+        .arg(&cmd)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("would answer it"), "{text}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// v4 B7 — a compound bash command never becomes a Command (or bash-wide)
+/// rule: `/y always` lands the byte-exact ask rule, the identical second
+/// call auto-allows through it, and `grant rule check` names the compound
+/// honestly.
+#[test]
+fn compound_command_lands_an_exact_ask_rule() {
+    let root = temp_root("rule2");
+    let cmd = format!(
+        "echo a > {}/c.out && echo b >> {}/c.out",
+        root.display(),
+        root.display()
+    );
+    let sc = scenario_file(
+        &root,
+        "rule2.json",
+        &format!(
+            r#"{{ "steps": [
+                {{"call": {{"tool": "bash", "args": {{"command": "{cmd}"}}}}}},
+                {{"call": {{"tool": "bash", "args": {{"command": "{cmd}"}}}}}},
+                {{"text": "compounded"}}
+            ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }}"#
+        ),
+    );
+    let mut chat = spawn(&root, &sc, "ask", "");
+    let tap = Tap::connect(&root);
+    let from = tap.mark();
+    chat.send("go");
+    tap.expect_from("\"ev\":\"approval\"", from, Duration::from_secs(60));
+    chat.send("/y always");
+    // The reply names the honest shape: the exact ask, not a prefix.
+    chat.expect("exact command", Duration::from_secs(120));
+    // The byte-identical second call auto-allows via the ask rule; a
+    // mutated variant would card again (unit-pinned in core).
+    tap.expect_from("✓ rule", from, Duration::from_secs(120));
+    tap.expect_from("\"ev\":\"turn_finished\"", from, Duration::from_secs(60));
+    assert_eq!(tap.count_from("\"ev\":\"approval\"", from), 1);
+    chat.expect("compounded", Duration::from_secs(30));
+    chat.send("/quit");
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .arg("grant")
+        .arg("rule")
+        .arg("check")
+        .arg(&cmd)
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not provably plain"), "{text}");
+    std::fs::remove_dir_all(&root).ok();
+}

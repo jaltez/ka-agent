@@ -472,11 +472,13 @@ impl Runtime {
                     let ok = match &spec.mode {
                         ka_agent_core::CronMode::Agent => {
                             let (prompt, label) = if spec.source == crate::briefing::SOURCE {
+                                // B13: the creation-time snapshot, not the
+                                // live constant — only the context (time
+                                // data, not instructions) is fire-time.
                                 (
-                                    format!(
-                                        "{}\n\n{}",
-                                        crate::briefing::PROMPT,
-                                        self.briefing_context(&fire_principal)
+                                    crate::briefing::fire_prompt(
+                                        &spec,
+                                        &self.briefing_context(&fire_principal),
                                     ),
                                     "☀ daily briefing".to_string(),
                                 )
@@ -696,6 +698,21 @@ impl Runtime {
     /// recomputes the deadline immediately; engine-side `cron_manage`
     /// writes the store from another process and waits at most `every`.
     pub async fn run_maintenance(&self, every: Duration) {
+        // Boot pass (B13): snapshot the current briefing prompt into
+        // legacy placeholder payloads once; a no-op from then on.
+        match crate::briefing::snapshot_legacy_prompts(&self.sh.store) {
+            Ok(0) => {}
+            Ok(n) => self.sh.emit(AgentEvent::Notice {
+                text: format!(
+                    "cron: snapshotted the creation-time prompt into {n} legacy briefing job(s)"
+                ),
+            }),
+            Err(e) => self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                retryable: retryable_class("internal"),
+                message: format!("briefing snapshot migration: {e}"),
+            }),
+        }
         loop {
             if let Err(e) = self.expire_approvals().await {
                 self.sh.emit(AgentEvent::Error {
@@ -811,6 +828,10 @@ impl Runtime {
             Ok(report) => {
                 let _ = self.sh.store.meta_set("prune.last_ms", &now.to_string());
                 let attachments = self.prune_attachments(cfg.retention.attachments_days, now);
+                // B1: checkpoint rows went with the store pass above;
+                // their shadow repos follow (a session whose rows are
+                // all gone loses its repo).
+                let checkpoint_repos = self.prune_checkpoint_repos();
                 let pruned = report.turns
                     + report.runs
                     + attachments
@@ -819,7 +840,9 @@ impl Runtime {
                     + report.memory_candidates
                     + report.queue
                     + report.outbox
-                    + report.tasks;
+                    + report.tasks
+                    + report.checkpoints
+                    + checkpoint_repos;
                 if pruned > 0 {
                     self.sh.emit(AgentEvent::Notice {
                         text: format!(
@@ -836,6 +859,46 @@ impl Runtime {
                 });
             }
         }
+    }
+
+    /// Remove checkpoint repo directories whose sessions no longer have
+    /// any checkpoint rows (the retention pass deleted them). The
+    /// operator's repos sit at the profile root; every other user's
+    /// under `users/<name>/checkpoints`.
+    fn prune_checkpoint_repos(&self) -> usize {
+        let live: std::collections::HashSet<String> = self
+            .sh
+            .store
+            .checkpoint_dir_keys()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut roots = vec![(
+            ka_agent_core::OPERATOR_USER.to_string(),
+            self.sh.paths.user_checkpoints(ka_agent_core::OPERATOR_USER),
+        )];
+        if let Ok(rd) = std::fs::read_dir(self.sh.paths.users_root()) {
+            for entry in rd.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    roots.push((name.to_string(), entry.path().join("checkpoints")));
+                }
+            }
+        }
+        let mut removed = 0;
+        for (user, cp) in roots {
+            let Ok(rd) = std::fs::read_dir(&cp) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !live.contains(&format!("{user}/{name}"))
+                    && std::fs::remove_dir_all(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// What the briefing prompt needs and the model cannot see: today's

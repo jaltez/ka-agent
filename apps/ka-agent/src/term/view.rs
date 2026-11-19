@@ -200,6 +200,16 @@ impl View {
         ops
     }
 
+    /// The Ctrl-L visual clear as drawing commands: wipe the whole screen,
+    /// home the cursor, then the full live-area repaint from row 0 (the
+    /// cursor is already home, so no `Up` is needed). Purely visual — the
+    /// caller touches no session or queue state.
+    pub fn clear_screen_ops(&self, editor: &Editor) -> Vec<super::paint::Op> {
+        let mut ops = vec![super::paint::Op::ClearScreen];
+        ops.extend(self.redraw_ops(editor, 0));
+        ops
+    }
+
     /// Rows between the live area's first row and the cursor: the editor
     /// rows above the cursor's row plus the activity and status rows, so
     /// the next redraw starts at the top.

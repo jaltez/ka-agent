@@ -15,7 +15,7 @@ use ka_agent_core::Principal;
 pub const FINAL_CHUNK_MAX: usize = 3800;
 
 /// Is this turn one a schedule started (cron / briefing)?
-fn is_scheduled(source: Option<&str>) -> bool {
+pub(crate) fn is_scheduled(source: Option<&str>) -> bool {
     source.is_some_and(|s| s == "cron" || s.starts_with("cron:") || s == "briefing")
 }
 
@@ -431,27 +431,32 @@ pub(super) async fn drive(
                 let question = readable_question(&question, last_call.as_ref());
                 // Allowed for this session already: answer at once, no card
                 // (still audited).
-                let key = session_allow_key(&question, detail.as_deref());
+                let ask_detail = detail.clone();
+                let key = session_allow_key(&question, ask_detail.as_deref());
                 let pre_allowed = st.lock().session_allow.contains(&key);
                 if pre_allowed {
-                    let port = st.lock().live.as_ref().map(|l| Arc::clone(&l.port));
-                    if let Some(port) = port {
-                        let _ = port
-                            .answer(ask_id.clone(), ApprovalDecision::Allow.ka_choice())
-                            .await;
+                    // The one Allow settle site (B7): the session-allow
+                    // set answers before any card exists — `answer_allow`
+                    // with no approval row.
+                    let rt = Runtime {
+                        sh: Arc::clone(&sh),
+                    };
+                    if rt
+                        .answer_allow(
+                            &st,
+                            &who,
+                            None,
+                            ask_id.clone(),
+                            "Allow (session)",
+                            "operator",
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        emit(AgentEvent::Note {
+                            text: format!("✓ allowed for this session: {question}"),
+                        });
                     }
-                    let mut rec = AuditRecord::new(
-                        "operator",
-                        audit_actions::APPROVAL_DECIDE,
-                        &ask_id,
-                        Some("Allow (session)".into()),
-                    )
-                    .with_role(&who.role)
-                    .with_user(&who.username);
-                    let _ = sh.store.append_audit(&mut rec);
-                    emit(AgentEvent::Note {
-                        text: format!("✓ allowed for this session: {question}"),
-                    });
                     continue;
                 }
                 let kind = ApprovalKind::KaAsk {
@@ -517,6 +522,52 @@ pub(super) async fn drive(
                     (awaiting, port)
                 };
                 if awaiting {
+                    // Durable rules (v4 B7): evaluated AFTER D9 routing and
+                    // the awaiting transition, and only on non-escalated
+                    // asks — a rule answers exactly the asks the acting
+                    // user themselves decides, never the admin queue's.
+                    if !escalated {
+                        let rt = Runtime {
+                            sh: Arc::clone(&sh),
+                        };
+                        let mode = rt.effective_mode_for(&who.username);
+                        let hit = sh
+                            .store
+                            .rules_for_subject(&who.username)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|r| {
+                                ka_agent_core::config::mode_rank(&mode)
+                                    .zip(ka_agent_core::config::mode_rank(&r.mode))
+                                    .is_some_and(|(cur, born)| cur <= born)
+                                    && r.shape.matches(
+                                        &question,
+                                        ask_detail.as_deref(),
+                                        last_call.as_ref().map(|(t, d)| (t.as_str(), d.as_str())),
+                                    )
+                            });
+                        if let Some(rule) = hit {
+                            let label = format!("Allow (rule {})", rule.id);
+                            let note = format!("✓ rule {}: {question}", rule.shape.label());
+                            let ask = approval_ask_id(&approval);
+                            if rt
+                                .answer_allow(
+                                    &st,
+                                    &who,
+                                    Some((&approval, ApprovalStatus::Approved)),
+                                    ask,
+                                    &label,
+                                    "runtime",
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                rt_persist_status(&sh, &st);
+                                emit(AgentEvent::Note { text: note });
+                                continue;
+                            }
+                        }
+                    }
                     rt_persist_status(&sh, &st);
                     if let Some(card) = card {
                         if escalated {

@@ -511,13 +511,14 @@ fn resolve_submission(text: &str, pending: Option<&PendingCard>) -> (String, boo
         return (text.to_string(), false);
     };
     match bare {
-        "y" | "n" | "s" => {
+        "y" | "n" | "s" | "a" => {
             let line = match (bare, kind.as_str()) {
                 ("y", "memory") => format!("/memory accept {id}"),
                 ("n", "memory") => format!("/memory reject {id}"),
                 ("y", "skill") => format!("/skills accept {id}"),
                 ("n", "skill") => format!("/skills reject {id}"),
                 ("s", _) => format!("/y {id} session"),
+                ("a", "approval") => format!("/y {id} always"),
                 (verb, _) => format!("/{verb} {id}"),
             };
             (line, true)

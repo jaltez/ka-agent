@@ -29,6 +29,7 @@ use crate::paths::Paths;
 use crate::surface::Surface;
 
 mod approvals;
+mod checkpoint;
 mod config;
 mod events;
 mod identity;

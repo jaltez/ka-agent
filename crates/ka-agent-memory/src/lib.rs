@@ -64,6 +64,27 @@ pub struct CompileReport {
     pub truncated: bool,
 }
 
+/// Which files a compilation includes. `Full` is the operator compile;
+/// `Automation` keeps only the machine facts (`environment` +
+/// `conventions`) for scheduled turns, so crons and briefings never read
+/// or feed on personal memory (B15b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileScope {
+    Full,
+    Automation,
+}
+
+/// The bullet-level preview of one not-yet-applied [`MemoryStore::add`]
+/// (B15a): the target file, the exact line that would be appended, and
+/// the entry it lands after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPreview {
+    pub file: String,
+    pub text: String,
+    /// Id of the last entry of the target file (`None` when it is empty).
+    pub after_id: Option<String>,
+}
+
 /// The well-known memory files (SEED.md §4.2). The persona is NOT one of
 /// them: it is free-form instructions compiled into IDENTITY.md, never
 /// into MEMORY.md (see [`persona`]).
@@ -215,7 +236,7 @@ impl MemoryStore {
 
     /// Delete the bullet + provenance comment for `id`. `Ok(false)` when unknown.
     pub fn remove(&self, id: &str) -> Result<bool, Error> {
-        for rel in self.scan_files()? {
+        for rel in self.scan_files(CompileScope::Full)? {
             let path = self.root.join(&rel);
             let content = std::fs::read_to_string(&path)?;
             let mut out = String::new();
@@ -251,7 +272,7 @@ impl MemoryStore {
     /// Parse all entries across all files (priority order).
     pub fn entries(&self) -> Result<Vec<Entry>, Error> {
         let mut out = Vec::new();
-        for rel in self.scan_files()? {
+        for rel in self.scan_files(CompileScope::Full)? {
             let content = std::fs::read_to_string(self.root.join(&rel))?;
             let mut bullet: Option<String> = None;
             for line in content.lines() {
@@ -275,14 +296,14 @@ impl MemoryStore {
 
     /// Compile and mirror to `<root>/MEMORY.md`.
     pub fn compile(&self, budget_bytes: usize) -> Result<CompileReport, Error> {
-        let (report, text) = self.compile_inner(budget_bytes, "")?;
+        let (report, text) = self.compile_inner(budget_bytes, "", CompileScope::Full)?;
         std::fs::write(self.root.join("MEMORY.md"), &text)?;
         Ok(report)
     }
 
     /// Compile without writing anything (tests, dry runs).
     pub fn compiled_text(&self, budget_bytes: usize) -> Result<String, Error> {
-        Ok(self.compile_inner(budget_bytes, "")?.1)
+        Ok(self.compile_inner(budget_bytes, "", CompileScope::Full)?.1)
     }
 
     /// Compile and install to `<engine_config_ka_dir>/MEMORY.md`, creating the dir.
@@ -294,7 +315,23 @@ impl MemoryStore {
         budget_bytes: usize,
         preamble: &str,
     ) -> Result<CompileReport, Error> {
-        let (report, text) = self.compile_inner(budget_bytes, preamble)?;
+        let (report, text) = self.compile_inner(budget_bytes, preamble, CompileScope::Full)?;
+        std::fs::create_dir_all(engine_config_ka_dir)?;
+        std::fs::write(engine_config_ka_dir.join("MEMORY.md"), &text)?;
+        Ok(report)
+    }
+
+    /// [`install_compiled`](Self::install_compiled) under an explicit
+    /// [`CompileScope`] — the automation variant scheduled turns run
+    /// under (B15b).
+    pub fn install_compiled_scoped(
+        &self,
+        engine_config_ka_dir: &Path,
+        budget_bytes: usize,
+        preamble: &str,
+        scope: CompileScope,
+    ) -> Result<CompileReport, Error> {
+        let (report, text) = self.compile_inner(budget_bytes, preamble, scope)?;
         std::fs::create_dir_all(engine_config_ka_dir)?;
         std::fs::write(engine_config_ka_dir.join("MEMORY.md"), &text)?;
         Ok(report)
@@ -330,6 +367,7 @@ impl MemoryStore {
         &self,
         budget_bytes: usize,
         preamble: &str,
+        scope: CompileScope,
     ) -> Result<(CompileReport, String), Error> {
         let preamble = preamble.trim();
         let head = if preamble.is_empty() {
@@ -344,7 +382,7 @@ impl MemoryStore {
             bullets: Vec<String>,
         }
         let mut secs = Vec::new();
-        for rel in self.scan_files()? {
+        for rel in self.scan_files(scope)? {
             let content = std::fs::read_to_string(self.root.join(&rel))?;
             let title = MemoryFile::from_rel(&rel)
                 .map(|m| m.title())
@@ -446,8 +484,9 @@ impl MemoryStore {
         ))
     }
 
-    /// Existing memory files in priority order (SEED.md §4.4).
-    fn scan_files(&self) -> Result<Vec<String>, Error> {
+    /// Existing memory files in priority order (SEED.md §4.4), narrowed
+    /// to machine facts under `Automation`.
+    fn scan_files(&self, scope: CompileScope) -> Result<Vec<String>, Error> {
         let mut rels = vec![
             "profile.md".to_string(),
             "preferences.md".to_string(),
@@ -465,10 +504,85 @@ impl MemoryStore {
         projects.sort();
         rels.extend(projects);
         rels.push("facts.md".to_string());
+        let rels = match scope {
+            CompileScope::Full => rels,
+            // Machine facts only: no profile, preferences, projects or
+            // facts — a scheduled turn reads (and can echo back) nothing
+            // personal.
+            CompileScope::Automation => rels
+                .into_iter()
+                .filter(|r| r == "environment.md" || r == "conventions.md")
+                .collect(),
+        };
         Ok(rels
             .into_iter()
             .filter(|r| self.root.join(r).exists())
             .collect())
+    }
+
+    /// The exact bytes of one well-known file (`None` before it exists) —
+    /// the snapshot accept rolls back to (B15a).
+    pub fn snapshot_file(&self, file: &MemoryFile) -> Result<Option<Vec<u8>>, Error> {
+        let path = self.root.join(file.path());
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read(&path)?))
+    }
+
+    /// Put a file back to its [`snapshot_file`](Self::snapshot_file)
+    /// state; `None` removes it (it did not exist).
+    pub fn restore_file(&self, file: &MemoryFile, snapshot: Option<Vec<u8>>) -> Result<(), Error> {
+        let path = self.root.join(file.path());
+        match snapshot {
+            Some(bytes) => std::fs::write(&path, bytes)?,
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Dry-run one `add`: apply it exactly as [`add`](Self::add) would,
+    /// compile under `budget` without writing anything derived, then
+    /// restore the file byte-for-byte. Returns the bullet preview and the
+    /// compile report an accept would produce (B15a).
+    pub fn dry_run_add(
+        &self,
+        file: MemoryFile,
+        text: &str,
+        budget_bytes: usize,
+    ) -> Result<(DiffPreview, CompileReport), Error> {
+        if let MemoryFile::Project(slug) = &file
+            && !valid_slug(slug)
+        {
+            return Err(Error::BadSlug(slug.clone()));
+        }
+        let after_id = self
+            .entries()?
+            .into_iter()
+            .rev()
+            .find(|e| e.file == file.name())
+            .map(|e| e.id);
+        let snapshot = self.snapshot_file(&file)?;
+        let outcome = self.add(file.clone(), text, "dry-run", None).and_then(|_| {
+            self.compile_inner(budget_bytes, "", CompileScope::Full)
+                .map(|(report, _)| report)
+        });
+        // A dry run must never leave the bullet behind — restore first,
+        // then report whichever side failed.
+        self.restore_file(&file, snapshot)?;
+        let report = outcome?;
+        Ok((
+            DiffPreview {
+                file: file.name(),
+                text: text.to_string(),
+                after_id,
+            },
+            report,
+        ))
     }
 
     fn git(root: &Path, args: &[&str]) -> Result<String, Error> {
@@ -1015,6 +1129,78 @@ mod undo_tests {
         let text = store.compiled_text(4096).unwrap();
         assert!(text.contains("likes tea"), "{text}");
         assert!(!text.contains("hates coffee"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod b15_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ka-mem-b15-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn automation_scope_drops_personal_files() {
+        let root = tmp_root("scope");
+        let store = MemoryStore::open(&root).unwrap();
+        store
+            .add(MemoryFile::Profile, "name is Ada", "operator", None)
+            .unwrap();
+        store
+            .add(MemoryFile::Facts, "likes tea", "operator", None)
+            .unwrap();
+        store
+            .add(
+                MemoryFile::Environment,
+                "laptop has 32 GB",
+                "operator",
+                None,
+            )
+            .unwrap();
+        let full = store.compiled_text(DEFAULT_BUDGET_BYTES).unwrap();
+        assert!(full.contains("name is Ada"));
+        assert!(full.contains("likes tea"));
+        assert!(full.contains("laptop has 32 GB"));
+        let automation = store
+            .compile_inner(DEFAULT_BUDGET_BYTES, "", CompileScope::Automation)
+            .unwrap()
+            .1;
+        assert!(automation.contains("laptop has 32 GB"), "{automation}");
+        assert!(!automation.contains("name is Ada"), "{automation}");
+        assert!(!automation.contains("likes tea"), "{automation}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dry_run_previews_and_restores() {
+        let root = tmp_root("dry");
+        let store = MemoryStore::open(&root).unwrap();
+        let first = store
+            .add(MemoryFile::Facts, "likes tea", "operator", None)
+            .unwrap();
+        let file = MemoryFile::Facts;
+        let before = store.snapshot_file(&file).unwrap();
+        let (preview, report) = store
+            .dry_run_add(file.clone(), "likes coffee", DEFAULT_BUDGET_BYTES)
+            .unwrap();
+        assert_eq!(preview.file, "facts.md");
+        assert_eq!(preview.text, "likes coffee");
+        assert_eq!(preview.after_id.as_deref(), Some(first.as_str()));
+        assert!(report.total_bytes > 0);
+        // Byte-identical: the dry run left nothing behind.
+        assert_eq!(store.snapshot_file(&file).unwrap(), before);
+        assert!(
+            store
+                .entries()
+                .unwrap()
+                .iter()
+                .all(|e| e.text != "likes coffee")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

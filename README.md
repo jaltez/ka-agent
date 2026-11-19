@@ -398,7 +398,7 @@ sandbox). `docs/contract/` is one behavior contract per subsystem; `doctor`
 embeds their hash so support can compare builds.
 
 **The ka pin.** The `ka-*` engine crates are pinned to one ka-harness git
-revision, `193ad5d` (the `v0.4.1` line noted in `Cargo.toml`), which
+revision, `247e99e` (the `v0.7.0+` line noted in `Cargo.toml`), which
 `doctor` reports as `KA_PIN`. Upgrades are deliberate: bump the revision
 in every `ka-*` dependency together, keep the contract suite green
 (SEED §11.3); `scripts/check-ka-deps.sh` fails CI if any one of those

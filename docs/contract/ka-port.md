@@ -40,13 +40,17 @@ to what they send over the worker protocol (`worker-protocol.md`):
 | `set_mode` | `set_mode` | Set permission mode; persists a `Change` record to the strand. |
 | `set_model` | `set_model` | Set model selector; persists a `Change` record to the strand. |
 | `set_name` | `set_name` | Name the session (title). |
+| `set_effort` | `set_effort` | Set effort level; persists a `Change` record to the strand. |
+| `steer` | `steer` | Queue text into the **live** cycle — the engine drains it at turn/tool boundaries and settles unconsumed steers into the session queue (`busy_messages = "steer"` default; not a second `submit`, so the single-writer rule holds). |
+| `undo_file` | `undo_file` | Ask the engine to revert its last file edit. |
 | `compact` | `compact` | Compact the strand into a digest (offered on `overflow`). |
 | `close` | session drop | Close the engine and release the strand. |
 
 ## 2. Allowed command subset and the trust invariant
 
 **[Requirement]** Ka Agent forwards only these Ka `Command`s: `prompt`,
-`answer`, `abort`, `set_mode`, `set_model`, `set_name`, `compact`.
+`answer`, `abort`, `set_mode`, `set_model`, `set_name`, `set_effort`,
+`steer`, `undo_file`, `compact`.
 
 Everything else in Ka's `Command` enum is engine-internal or local-only, and
 **is NEVER forwarded**:
@@ -117,10 +121,15 @@ V-06b — HTTP 200, no events for the dropped prompt). Ka Agent therefore:
   going terminal is what proves the cycle is over, so the status never
   depends on catching a transient `idle`: that event remains the delivery
   boundary (flush, episodic index, queue drain), and it never drains the
-  queue into a live cycle (`PortError::Busy` is a dropped prompt).
+  queue into a live cycle (a mid-cycle `prompt` is dropped by the engine —
+  hence the runtime owns the queue and `drain_queue` is the only submitter;
+  steering uses `steer`, not `submit`).
 
-`submit` while a cycle is live is a caller bug: the port returns
-`PortError::Busy` and never sends the command.
+`submit` while a cycle is live is a caller bug: the port layer never sends
+it — `drain_queue` is the only submitter, so the situation cannot arise by
+construction. (The refusal is runtime-owned; there is no `PortError::Busy`
+variant — the enum is `Spawn/Io/Protocol/Closed/EngineClosed`,
+`crates/ka-agent-port/src/port/mod.rs:30-50`.)
 
 ## 5. Asks: TTL and deny-on-expiry
 

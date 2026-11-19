@@ -228,8 +228,11 @@ impl Terminal {
                 }
                 Key::Ctrl('y') => self.editor.yank(),
                 Key::Ctrl('l') => {
-                    // Clear the screen, keep the live area.
-                    print!("\x1b[2J\x1b[H");
+                    // True visual clear: wipe the screen and repaint the
+                    // live area (session state untouched — `/new` stays
+                    // the only context-wiping path).
+                    self.clear_visual();
+                    continue;
                 }
                 Key::Ctrl('o') => {
                     self.view.verbose = !self.view.verbose;
@@ -299,6 +302,17 @@ impl Terminal {
     fn announce(&mut self, text: &str) {
         self.begin_permanent();
         println!("{}", paint::dim(&format!("· {text}")));
+    }
+
+    /// Ctrl-L: wipe the whole screen and repaint the live area from the
+    /// home row, inside the sync wrapper. Only drawing state changes
+    /// (`cursor_up`); no session, history, or queue state is touched.
+    fn clear_visual(&mut self) {
+        self.completions.clear();
+        self.completion_start = None;
+        let ops = self.view.clear_screen_ops(&self.editor);
+        paint::emit(&ops);
+        self.cursor_up = self.view.cursor_up(&self.editor, 0);
     }
 
     /// Tab: complete the current word. A single match inserts; several
@@ -637,5 +651,36 @@ mod tests {
             Key::Interrupt
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A9: Ctrl-L is a true visual clear — the handler's op list starts
+    /// with `Op::ClearScreen` followed by exactly the ops `redraw_ops`
+    /// yields for the live view (activity + status + draft, sync-wrapped),
+    /// and the ANSI render wipes the screen before the repaint. The ops
+    /// builder takes only `(&View, &Editor)`, so no session, history, or
+    /// queue state is reachable from the Ctrl-L path.
+    #[test]
+    fn ctrl_l_clears_screen_then_repaints_live_area() {
+        let mut view = view::View::new("Ka".into(), 80);
+        view.model = "zai/glm-5.3".into();
+        view.running = true;
+        view.activity = "running a command".into();
+        let mut editor = Editor::default();
+        editor.insert_str("draft");
+
+        let ops = view.clear_screen_ops(&editor);
+        let mut expected = vec![paint::Op::ClearScreen];
+        expected.extend(view.redraw_ops(&editor, 0));
+        assert_eq!(ops, expected);
+
+        let ansi = paint::to_ansi(&ops);
+        assert!(ansi.starts_with("\x1b[2J\x1b[H\x1b[?2026h"), "{ansi:?}");
+        assert!(ansi.contains("running a command"), "{ansi:?}");
+        assert!(ansi.contains("\x1b[1m»\x1b[0m draft"), "{ansi:?}");
+        assert!(ansi.ends_with("\x1b[?2026l"), "{ansi:?}");
+
+        // The repaint matches a fresh draw (cursor_up 0), so the cursor-up
+        // bookkeeping restarts from a painted screen, not a blank one.
+        assert_eq!(view.cursor_up(&editor, 0), 2);
     }
 }

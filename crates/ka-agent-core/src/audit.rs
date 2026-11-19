@@ -81,6 +81,10 @@ pub mod actions {
     pub const IDENTITY_UNLINK: &str = "identity.unlink";
     pub const IDENTITY_PAIR: &str = "identity.pair";
     pub const IDENTITY_ROLE: &str = "identity.role";
+    /// A durable allow-rule was stored (`/y <id> always`, v4 B7).
+    pub const RULE_ADD: &str = "rule.add";
+    /// A durable allow-rule was removed (`/rules rm <id>`).
+    pub const RULE_RM: &str = "rule.rm";
 }
 
 #[cfg(test)]

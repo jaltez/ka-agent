@@ -286,6 +286,9 @@ impl Runtime {
                     allow,
                     hard: full || mode == "allow",
                 },
+                // Agent commit attribution (A14): per-username, only
+                // when the operator configured `[git]`.
+                git: git_identity(cfg, &who.username),
             };
             let user_layer = cfg
                 .engine_layer_path()
@@ -616,6 +619,23 @@ fn provision_user_env(paths: &crate::paths::Paths, username: &str) {
     }
 }
 
+/// The agent's git identity for `username` (A14): configured name/email
+/// win, an unset field falls back to its per-username default, and an
+/// unset `[git]` section pins nothing (today's behavior).
+fn git_identity(
+    cfg: &ka_agent_core::config::DaemonConfig,
+    username: &str,
+) -> Option<(String, String)> {
+    let name = cfg.git.name.clone();
+    let email = cfg.git.email.clone();
+    (name.is_some() || email.is_some()).then(|| {
+        (
+            name.unwrap_or_else(|| format!("ka-agent ({username})")),
+            email.unwrap_or_else(|| format!("{username}@ka-agent.local")),
+        )
+    })
+}
+
 /// One user's worker died or was killed: book it against that user only.
 pub(super) async fn rt_on_engine_closed(
     sh: &Arc<Shared>,
@@ -714,4 +734,54 @@ pub(super) async fn rt_on_engine_closed(
     // Another user's message may be waiting for a worker slot: this one
     // just freed capacity.
     Runtime { sh: Arc::clone(sh) }.spawn_drain();
+}
+
+#[cfg(test)]
+mod git_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::git_identity;
+    use ka_agent_core::config::DaemonConfig;
+
+    fn cfg_with(name: Option<&str>, email: Option<&str>) -> DaemonConfig {
+        DaemonConfig {
+            git: ka_agent_core::config::Git {
+                name: name.map(str::to_string),
+                email: email.map(str::to_string),
+            },
+            ..DaemonConfig::default()
+        }
+    }
+
+    #[test]
+    fn unset_git_section_pins_nothing() {
+        assert_eq!(git_identity(&cfg_with(None, None), "alice"), None);
+    }
+
+    #[test]
+    fn configured_fields_win_and_unset_ones_default_per_username() {
+        assert_eq!(
+            git_identity(&cfg_with(Some("Agent Bot"), None), "alice"),
+            Some(("Agent Bot".to_string(), "alice@ka-agent.local".to_string()))
+        );
+        assert_eq!(
+            git_identity(&cfg_with(None, Some("bot@x.test")), "bob"),
+            Some(("ka-agent (bob)".to_string(), "bot@x.test".to_string()))
+        );
+        assert_eq!(
+            git_identity(&cfg_with(Some("A"), Some("a@b")), "carol"),
+            Some(("A".to_string(), "a@b".to_string()))
+        );
+    }
+
+    #[test]
+    fn identity_is_scoped_to_the_workspace_user() {
+        let cfg = cfg_with(None, Some("shared@ka-agent.local"));
+        let (name_a, email_a) = git_identity(&cfg, "alice").unwrap();
+        let (name_b, email_b) = git_identity(&cfg, "bob").unwrap();
+        assert_eq!(name_a, "ka-agent (alice)");
+        assert_eq!(email_a, "shared@ka-agent.local");
+        assert_eq!(name_b, "ka-agent (bob)");
+        assert_eq!(email_b, "shared@ka-agent.local");
+        assert_ne!(name_a, name_b);
+    }
 }

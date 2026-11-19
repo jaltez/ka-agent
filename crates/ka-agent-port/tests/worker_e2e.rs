@@ -41,6 +41,7 @@ impl Env {
             guard_write: Vec::new(),
             guard_read: Vec::new(),
             guard_grants: Default::default(),
+            git: None,
         }
     }
 

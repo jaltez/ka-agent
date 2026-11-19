@@ -128,6 +128,30 @@ impl Store {
         collect_rows(rows).map(|mut v| v.pop())
     }
 
+    /// Most recent session whose id matches `prefix` — `@session:<prefix>`
+    /// references resolve through this. Same matching shape as
+    /// [`find_turn_by_prefix`](crate::Turns::find_turn_by_prefix): the full
+    /// id, a prefix with or without the `sess_` family prefix, or a tail of
+    /// at least 4 characters; newest `updated_ms` wins. Partition checking
+    /// is the caller's (rbac.md's History row).
+    pub fn find_session_by_prefix(&self, prefix: &str) -> Result<Option<Session>> {
+        let conn = self.lock();
+        let session = conn
+            .query_row(
+                &format!(
+                    "SELECT {SESSION_COLS} FROM sessions
+                     WHERE substr(id, 1, length(?1)) = ?1
+                        OR substr(id, 6, length(?1)) = ?1
+                        OR (length(?1) >= 4 AND substr(id, -length(?1)) = ?1)
+                     ORDER BY updated_ms DESC LIMIT 1"
+                ),
+                params![prefix],
+                row_to_session,
+            )
+            .optional()?;
+        Ok(session)
+    }
+
     /// Repoint a session's workspace (the v12 bootstrap migrates legacy
     /// `roles/<r>/workspace` rows to the user partition).
     pub fn set_session_workspace(&self, id: &SessionId, workspace: &Path) -> Result<()> {

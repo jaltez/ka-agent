@@ -54,6 +54,8 @@ string_id!(RunId, "run");
 string_id!(IntentId, "int");
 string_id!(MemoryId, "mem");
 
+string_id!(RuleId, "rule");
+
 /// The operator-facing handle of an id: its last 8 characters. The head of
 /// an id is time-ordered (ids minted seconds apart share it); the tail is
 /// the per-id entropy, so 8 characters of it are unique in practice.

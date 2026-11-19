@@ -39,6 +39,11 @@ pub struct WorkerEnv {
     pub tool_context: Option<String>,
     /// Grant decisions the `__guard` hook enforces or pre-approves.
     pub guard_grants: GuardGrants,
+    /// Git author/committer identity (name, email) pinned into the
+    /// worker's env so any git the engine's shell tool runs commits under
+    /// the agent's, not the operator's, identity. `None` pins nothing
+    /// (today's behavior).
+    pub git: Option<(String, String)>,
 }
 
 /// What the `__guard` hook may pre-approve or deny beyond the protected
@@ -116,6 +121,12 @@ impl WorkerEnv {
         }
         if let Some(user) = &self.tool_context {
             cmd.env("KA_AGENT_TOOLCTX", user);
+        }
+        if let Some((name, email)) = &self.git {
+            cmd.env("GIT_AUTHOR_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_COMMITTER_EMAIL", email);
         }
         // Always sent (all-false by default): the hook's parser treats
         // absence as all-false, so older daemons stay compatible.
@@ -204,6 +215,7 @@ mod tests {
             guard_write: Vec::new(),
             guard_read: Vec::new(),
             guard_grants: GuardGrants::default(),
+            git: None,
         };
         let mut cmd = Command::new("env");
         env.sanitize(&mut cmd);
@@ -276,5 +288,42 @@ mod tests {
         assert_eq!(v["deny"], serde_json::json!(["/srv/nope"]));
         assert_eq!(v["allow"], serde_json::json!(["/srv/ok"]));
         let _ = std::fs::remove_dir_all(&root);
+    }
+    async fn git_env_output(git: Option<(String, String)>) -> String {
+        let env = WorkerEnv {
+            git,
+            ..WorkerEnv::default()
+        };
+        let mut cmd = Command::new("env");
+        env.sanitize(&mut cmd);
+        String::from_utf8_lossy(&cmd.output().await.unwrap().stdout).to_string()
+    }
+
+    #[tokio::test]
+    async fn sanitize_pins_git_identity_when_configured() {
+        let text = git_env_output(Some((
+            "ka-agent (alice)".to_string(),
+            "alice@ka-agent.local".to_string(),
+        )))
+        .await;
+        assert!(
+            text.contains("GIT_AUTHOR_NAME=ka-agent (alice)\n")
+                && text.contains("GIT_AUTHOR_EMAIL=alice@ka-agent.local\n")
+                && text.contains("GIT_COMMITTER_NAME=ka-agent (alice)\n")
+                && text.contains("GIT_COMMITTER_EMAIL=alice@ka-agent.local\n"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitize_leaves_git_env_unchanged_when_unset() {
+        let text = git_env_output(None).await;
+        assert!(
+            !text.contains("GIT_AUTHOR_NAME=")
+                && !text.contains("GIT_AUTHOR_EMAIL=")
+                && !text.contains("GIT_COMMITTER_NAME=")
+                && !text.contains("GIT_COMMITTER_EMAIL="),
+            "{text}"
+        );
     }
 }

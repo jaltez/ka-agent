@@ -25,6 +25,8 @@ pub enum Op {
     Right(usize),
     /// Clear from the cursor to the end of the screen.
     ClearDown,
+    /// Clear the whole screen and home the cursor (`ESC[2J ESC[H`).
+    ClearScreen,
     /// Begin a synchronized update.
     SyncBegin,
     /// End a synchronized update.
@@ -102,6 +104,7 @@ pub fn emit(ops: &[Op]) {
                 Op::Up(n) => out.push_str(&format!("\x1b[{n}A")),
                 Op::Right(n) => out.push_str(&format!("\x1b[{n}C")),
                 Op::ClearDown => out.push_str("\x1b[J"),
+                Op::ClearScreen => out.push_str("\x1b[2J\x1b[H"),
                 Op::SyncBegin => out.push_str("\x1b[?2026h"),
                 Op::SyncEnd => out.push_str("\x1b[?2026l"),
             }
@@ -136,6 +139,13 @@ pub fn emit(ops: &[Op]) {
                 Op::ClearDown => {
                     queue!(stdout, terminal::Clear(terminal::ClearType::FromCursorDown))
                 }
+                Op::ClearScreen => {
+                    queue!(
+                        stdout,
+                        terminal::Clear(terminal::ClearType::All),
+                        cursor::MoveTo(0, 0)
+                    )
+                }
                 Op::SyncBegin => queue!(stdout, terminal::BeginSynchronizedUpdate),
                 Op::SyncEnd => queue!(stdout, terminal::EndSynchronizedUpdate),
             };
@@ -166,6 +176,7 @@ pub fn to_ansi(ops: &[Op]) -> String {
             Op::Up(n) => out.push_str(&format!("\x1b[{n}A")),
             Op::Right(n) => out.push_str(&format!("\x1b[{n}C")),
             Op::ClearDown => out.push_str("\x1b[J"),
+            Op::ClearScreen => out.push_str("\x1b[2J\x1b[H"),
             Op::SyncBegin => out.push_str("\x1b[?2026h"),
             Op::SyncEnd => out.push_str("\x1b[?2026l"),
         }

@@ -659,6 +659,18 @@ impl Default for RuntimeSettings {
     }
 }
 
+/// Agent commit attribution (`[git]`, A14): the identity any git the
+/// engine's shell tool runs commits under. `None` keeps today's behavior
+/// (no env pinned); a set field pulls its per-username default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Git {
+    /// Author/committer name; default `ka-agent (<username>)`.
+    pub name: Option<String>,
+    /// Author/committer email; default `<username>@ka-agent.local`.
+    pub email: Option<String>,
+}
+
 /// Retention knobs (D12): 0 = keep forever, the default (an internal tool
 /// keeps everything unless an organization asks otherwise).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -668,6 +680,44 @@ pub struct Retention {
     pub turns_days: u32,
     /// Delete attachment files older than this many days.
     pub attachments_days: u32,
+}
+/// Memory extraction gating (`[memory]`, B15c).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Memory {
+    /// Recorded turns a session needs before `memory_propose` is allowed
+    /// (the warm-up gate); `0` turns the gate off.
+    pub extraction_min_turns: u32,
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            extraction_min_turns: 5,
+        }
+    }
+}
+
+/// Shadow-git checkpoints (`[checkpoint]`, v4 B1): the safety net under
+/// approved writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Checkpoint {
+    /// Snapshot the workspace before every approved write. `false` turns
+    /// the net off entirely (`/rewind` answers "no checkpoints").
+    pub enabled: bool,
+    /// How long checkpoint rows and their shadow repos live (Gemini's
+    /// documented 30-day default); pruning is destructive.
+    pub keep_days: u32,
+}
+
+impl Default for Checkpoint {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep_days: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -742,6 +792,8 @@ pub struct DaemonConfig {
     /// Engine supervision (`[runtime]`): worker pool size and the engine
     /// sandbox.
     pub runtime: RuntimeSettings,
+    /// Agent commit attribution (`[git]`).
+    pub git: Git,
     /// Data retention (`[retention]`): 0 = keep forever.
     pub retention: Retention,
     /// The Slack workspace app (`[slack]`).
@@ -757,6 +809,12 @@ pub struct DaemonConfig {
     /// Operator hooks ([[hooks]]).
     #[serde(default)]
     pub hooks: Vec<HookSpec>,
+    /// Memory extraction gating (`[memory]`).
+    #[serde(default)]
+    pub memory: Memory,
+    /// Shadow-git checkpoints (`[checkpoint]`).
+    #[serde(default)]
+    pub checkpoint: Checkpoint,
 }
 
 impl Default for DaemonConfig {
@@ -790,6 +848,7 @@ impl Default for DaemonConfig {
             approvals: Approvals::default(),
             grants: Grants::default(),
             tools: Tools::default(),
+            git: Git::default(),
             runtime: RuntimeSettings::default(),
             retention: Retention::default(),
             slack: SlackSettings::default(),
@@ -797,6 +856,8 @@ impl Default for DaemonConfig {
             channels: Channels::default(),
             roles: Vec::new(),
             hooks: Vec::new(),
+            memory: Memory::default(),
+            checkpoint: Checkpoint::default(),
         }
     }
 }
@@ -816,6 +877,21 @@ pub fn normalize_mode(s: &str) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// Strictness rank of a mode word (canonical or legacy): `allow` = 0 <
+/// `accept_edits` = 1 < `ask` = 2 < `readonly` = 3. `None` names no mode.
+/// Shared by `/mode`'s phone rule, role ceilings and durable rules
+/// (a rule fires only in its creation mode and more permissive ones:
+/// `rank(current) <= rank(rule.mode)`).
+pub fn mode_rank(s: &str) -> Option<u8> {
+    Some(match s {
+        "allow" | "free" => 0,
+        "accept_edits" | "accept-edits" => 1,
+        "ask" | "guarded" => 2,
+        "readonly" | "plan" => 3,
+        _ => return None,
+    })
 }
 
 /// The validation error for a mode word that names nothing (neither the

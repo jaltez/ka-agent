@@ -568,6 +568,22 @@ pub(crate) enum GrantAction {
         #[command(subcommand)]
         action: crate::grant::PathGrantAction,
     },
+    /// Durable allow-rules (`/y <id> always` in chat).
+    Rule {
+        #[command(subcommand)]
+        action: RuleAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub(crate) enum RuleAction {
+    /// Dry-run one command against the operator's durable rules: which
+    /// rule would answer it, granting nothing.
+    Check { command: String },
+    /// List durable allow-rules (all subjects).
+    List,
+    /// Remove one rule by id.
+    Rm { id: String },
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]

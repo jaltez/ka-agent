@@ -52,6 +52,42 @@ pub(super) async fn decide(
         ApprovalDecision::Deny
     };
     let mut prefix = args;
+    // `/y [id] always` (v4 B7/B8): settle Allow and persist a durable
+    // rule. Terminal and web only, exactly like `session` — a durable
+    // rule minted from a phone would outlive the glance many times over.
+    let always = allow && (prefix == "always" || prefix.ends_with(" always"));
+    if always {
+        if source.starts_with("telegram:") || source.starts_with("matrix:") {
+            return Outcome::Reply(
+                "always-rules are only offered in the terminal and the web panel".into(),
+            );
+        }
+        prefix = prefix.trim_end_matches("always").trim();
+        let cards = match runtime.pending_approval_cards(principal) {
+            Ok(c) => c,
+            Err(e) => return Outcome::Reply(format!("! [approval] {e}")),
+        };
+        let pick: Vec<_> = if prefix.is_empty() {
+            cards
+                .iter()
+                .max_by_key(|c| c.expires_at_ms)
+                .into_iter()
+                .collect()
+        } else {
+            cards
+                .iter()
+                .filter(|c| id_matches(&c.approval_id, prefix))
+                .collect()
+        };
+        return match pick.as_slice() {
+            [one] => match runtime.decide_always(&one.approval_id, source).await {
+                Ok(text) => Outcome::Reply(text),
+                Err(e) => Outcome::Reply(format!("! [approval] {e}")),
+            },
+            [] => Outcome::Reply("no pending approval".into()),
+            _ => Outcome::Reply("ambiguous approval id — /approvals lists them".into()),
+        };
+    }
     // `/y [id] session`: allow this call and identical ones until
     // /new — terminal and web only (a phone grant would outlive the
     // glance it was given with).

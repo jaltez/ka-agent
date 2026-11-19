@@ -21,6 +21,7 @@ mod agents;
 mod approvals;
 mod audit;
 mod candidates;
+mod checkpoints;
 mod groups;
 mod identities;
 mod intents;
@@ -29,6 +30,7 @@ mod kbs;
 mod outbox;
 mod queue;
 mod retention;
+mod rules;
 mod sessions;
 mod tasks;
 pub use tasks::task_username;
@@ -39,11 +41,13 @@ mod users;
 pub use accounts::{InviteRow, InviteVerdict, WebSessionRow};
 pub use agents::{AgentAccess, AgentRow, AgentView};
 pub use candidates::SkillCandidateRow;
+pub use checkpoints::CheckpointRow;
 pub use groups::{GroupRow, model_allowed, model_matches};
 pub use kb_sources::KbSourceRow;
 pub use kbs::{KbDocInfo, KbHit, KbRow};
 pub use retention::PruneReport;
 pub use turn_sources::{StagedSource, TurnSourceRow};
+pub use turns::EpisodeFilter;
 pub use users::{UserRow, user_for_role, valid_username};
 
 use std::path::Path;
@@ -111,6 +115,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v10.sql"),
     include_str!("schema_v11.sql"),
     include_str!("schema_v12.sql"),
+    include_str!("schema_v13.sql"),
+    include_str!("schema_v14.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).

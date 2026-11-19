@@ -561,17 +561,12 @@ impl Runtime {
         source: &str,
         who: &ka_agent_core::Principal,
     ) -> Result<String, Error> {
-        /// Strictness rank; `None` names no mode. The old spellings stay
-        /// accepted here as a defense in depth — the daemon's config is
-        /// normalized at load, but callers hand in raw operator input.
+        /// Strictness rank; `None` names no mode. Delegates to the shared
+        /// [`mode_rank`](ka_agent_core::config::mode_rank) — durable rules
+        /// (v4 B7) rank modes with the same ladder, and the old spellings
+        /// stay accepted as defense in depth (callers hand in raw input).
         fn strictness(m: &str) -> Option<u8> {
-            Some(match m {
-                "allow" | "free" => 0,
-                "accept_edits" | "accept-edits" => 1,
-                "ask" | "guarded" => 2,
-                "readonly" | "plan" => 3,
-                _ => return None,
-            })
+            ka_agent_core::config::mode_rank(m)
         }
         let mode = mode.trim();
         let Some(canonical) = ka_agent_core::config::normalize_mode(mode) else {
