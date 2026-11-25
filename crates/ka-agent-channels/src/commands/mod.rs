@@ -205,8 +205,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "memory",
-        args: "[files|review|search <q>|log|undo|accept <id>|reject <id>]",
-        summary: "what is remembered, its budget, and search",
+        args: "[files|review|search <q>|index [status|rebuild]|log|undo|accept <id>|reject <id>]",
+        summary: "what is remembered, its budget, search, and the index",
         example: "/memory search deploy",
         telegram: true,
         aliases: &[],

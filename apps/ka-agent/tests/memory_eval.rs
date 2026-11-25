@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ka_agent_memory::{DEFAULT_BUDGET_BYTES, Entry, MemoryFile, MemoryStore};
-use ka_agent_store::{MemoryIndexRow, Store};
+use ka_agent_runtime::runtime::memory_vectors::{cosine_top_k, rrf_fuse};
+use ka_agent_store::{MemoryIndexRow, MemoryVectorRow, Store};
 
 struct Case {
     class: &'static str,
@@ -65,15 +66,78 @@ fn baseline_ids(entries: &[Entry], compiled: &str, query: &str, limit: usize) ->
         .collect()
 }
 
+const FIXTURE_MODEL: &str = "fixture-concepts-v1";
+const FIXTURE_DIM: usize = 15;
+
+/// A deterministic concept fixture, not a real model. It proves the
+/// vector channel and the RRF fusion; model quality remains a separate
+/// manual check.
+const CONCEPTS: &[&[&str]] = &[
+    &[
+        "short",
+        "brief",
+        "concise",
+        "answers",
+        "replies",
+        "respuestas",
+        "breves",
+        "prefiere",
+        "prefers",
+    ],
+    &[
+        "deploy",
+        "deploys",
+        "deployment",
+        "despliegue",
+        "ship",
+        "ships",
+        "release",
+        "branch",
+    ],
+    &["server", "servidor", "vps", "staging"],
+    &["database", "datos", "postgres", "sql", "base"],
+    &["time", "zone", "clock", "zona", "horaria", "cet"],
+    &["command", "cli", "comando", "binary", "name"],
+    &["tests", "test", "ci", "suite", "trigger", "pull"],
+    &["backup", "backups", "snapshots", "bucket", "object"],
+    &["model", "fast", "cheap", "runs"],
+    &["monorepo", "repository", "repo", "layout"],
+    &["logo", "brand", "color", "circle"],
+    &["office", "city", "madrid", "lisbon"],
+    &["secret", "vault", "key", "api"],
+    &["language", "rust", "idioma", "equipo"],
+    &["review", "weekly", "friday"],
+];
+
+fn fixture_embed(text: &str) -> Vec<f32> {
+    let lower = text.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out = vec![0.0f32; FIXTURE_DIM];
+    for (i, words) in CONCEPTS.iter().enumerate() {
+        out[i] = tokens.iter().filter(|t| words.contains(t)).count() as f32;
+    }
+    let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut out {
+            *v /= norm;
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 struct Stats {
     cases: usize,
     base_hits: usize,
     fts_hits: usize,
+    hybrid_hits: usize,
 }
 
 #[test]
-fn phase_a_eval_beats_compiled_memory_on_lexical() {
+fn phase_b1_eval_hybrid_beats_fts() {
     let root = temp_root();
     let memory = MemoryStore::open(&root.join("memory")).unwrap();
     let store = Store::open_in_memory().unwrap();
@@ -358,6 +422,22 @@ fn phase_a_eval_beats_compiled_memory_on_lexical() {
         })
         .collect();
     store.replace_memory_fts_for_user("eval", &rows).unwrap();
+    let vector_rows: Vec<MemoryVectorRow> = entries
+        .iter()
+        .map(|e| MemoryVectorRow {
+            ref_id: e.id.clone(),
+            scope: Some(e.file.clone()),
+            vec: fixture_embed(&e.text),
+            updated_ms: e.accepted_ms,
+        })
+        .collect();
+    store
+        .replace_memory_vectors_for_user("eval", FIXTURE_MODEL, FIXTURE_DIM, &vector_rows)
+        .unwrap();
+    let vector_owned: Vec<(String, Vec<f32>)> = vector_rows
+        .iter()
+        .map(|r| (r.ref_id.clone(), r.vec.clone()))
+        .collect();
     let compiled = memory.compiled_text(DEFAULT_BUDGET_BYTES).unwrap();
 
     let mut stats: BTreeMap<&'static str, Stats> = BTreeMap::new();
@@ -366,10 +446,18 @@ fn phase_a_eval_beats_compiled_memory_on_lexical() {
         let base = baseline_ids(&entries, &compiled, case.query, 5);
         let started = Instant::now();
         let fts = store
-            .search_memory_fts_for_user("eval", case.query, 5)
+            .search_memory_fts_for_user("eval", case.query, 10)
             .unwrap();
+        let query_vec = fixture_embed(case.query);
+        let vector_hits = cosine_top_k(&query_vec, &vector_owned, 10);
+        let fts_list: Vec<String> = fts.iter().map(|h| h.id.clone()).collect();
+        let vector_list: Vec<String> = vector_hits.into_iter().map(|(id, _)| id).collect();
+        let hybrid_ids: Vec<String> = rrf_fuse(&[fts_list, vector_list], 5)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         latencies.push(started.elapsed().as_secs_f64() * 1000.0);
-        let fts_ids: Vec<String> = fts.into_iter().map(|h| h.id).collect();
+        let fts_ids: Vec<String> = fts.into_iter().take(5).map(|h| h.id).collect();
         let entry = stats.entry(case.class).or_default();
         entry.cases += 1;
         match &case.expected {
@@ -380,6 +468,9 @@ fn phase_a_eval_beats_compiled_memory_on_lexical() {
                 if ids.iter().any(|id| fts_ids.contains(id)) {
                     entry.fts_hits += 1;
                 }
+                if ids.iter().any(|id| hybrid_ids.contains(id)) {
+                    entry.hybrid_hits += 1;
+                }
             }
             None => {
                 if base.is_empty() {
@@ -388,36 +479,46 @@ fn phase_a_eval_beats_compiled_memory_on_lexical() {
                 if fts_ids.is_empty() {
                     entry.fts_hits += 1;
                 }
+                if hybrid_ids.is_empty() {
+                    entry.hybrid_hits += 1;
+                }
             }
         }
     }
 
-    println!("\nphase A memory eval (top 5):");
+    println!("\nphase B1 memory eval (top 5, fixture embedder):");
     println!(
-        "{:<14} {:>5} {:>10} {:>8} {:>8}",
-        "class", "cases", "compiled", "fts", "delta"
+        "{:<14} {:>5} {:>10} {:>8} {:>8} {:>8}",
+        "class", "cases", "compiled", "fts", "hybrid", "delta"
     );
     for (class, s) in &stats {
         let base = s.base_hits as f64 / s.cases as f64;
         let fts = s.fts_hits as f64 / s.cases as f64;
+        let hybrid = s.hybrid_hits as f64 / s.cases as f64;
         println!(
-            "{class:<14} {:>5} {:>9.0}% {:>7.0}% {:>+8.0}%",
+            "{class:<14} {:>5} {:>9.0}% {:>7.0}% {:>7.0}% {:>+8.0}%",
             s.cases,
             base * 100.0,
             fts * 100.0,
-            (fts - base) * 100.0
+            hybrid * 100.0,
+            (hybrid - fts) * 100.0
         );
     }
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50 = latencies[latencies.len() / 2];
-    println!("p50 FTS search: {p50:.2} ms\n");
+    println!("p50 hybrid search: {p50:.2} ms (fixture embedder; not model quality)\n");
 
     let lexical = stats.get("lexical").expect("lexical class");
     let lexical_base = lexical.base_hits as f64 / lexical.cases as f64;
     let lexical_fts = lexical.fts_hits as f64 / lexical.cases as f64;
+    let lexical_hybrid = lexical.hybrid_hits as f64 / lexical.cases as f64;
     assert!(
         lexical_fts >= lexical_base + 0.05,
-        "lexical recall must beat the compiled baseline by at least 5 points: {lexical_base:.2} -> {lexical_fts:.2}"
+        "lexical FTS recall must beat the compiled baseline by at least 5 points: {lexical_base:.2} -> {lexical_fts:.2}"
+    );
+    assert!(
+        lexical_hybrid >= lexical_base - 0.01,
+        "lexical hybrid recall must not regress below the compiled baseline: {lexical_base:.2} -> {lexical_hybrid:.2}"
     );
     for (class, s) in &stats {
         if *class == "abstention" {
@@ -425,19 +526,50 @@ fn phase_a_eval_beats_compiled_memory_on_lexical() {
         }
         let base = s.base_hits as f64 / s.cases as f64;
         let fts = s.fts_hits as f64 / s.cases as f64;
+        let hybrid = s.hybrid_hits as f64 / s.cases as f64;
         assert!(
             fts >= base - 0.01,
-            "{class} regressed below the compiled baseline: {base:.2} -> {fts:.2}"
+            "{class} FTS regressed below the compiled baseline: {base:.2} -> {fts:.2}"
+        );
+        assert!(
+            hybrid >= fts - 0.01,
+            "{class} hybrid regressed below FTS: {fts:.2} -> {hybrid:.2}"
+        );
+        assert!(
+            hybrid >= base - 0.01,
+            "{class} hybrid regressed below the compiled baseline: {base:.2} -> {hybrid:.2}"
+        );
+    }
+    for class in ["paraphrase", "multilingual"] {
+        let s = stats.get(class).expect("class");
+        let fts = s.fts_hits as f64 / s.cases as f64;
+        let hybrid = s.hybrid_hits as f64 / s.cases as f64;
+        assert!(
+            hybrid >= fts + 0.05,
+            "{class} hybrid must gain at least 5 points over FTS: {fts:.2} -> {hybrid:.2}"
         );
     }
     let abstention = stats.get("abstention").expect("abstention class");
     let abstention_base = abstention.base_hits as f64 / abstention.cases as f64;
     let abstention_fts = abstention.fts_hits as f64 / abstention.cases as f64;
+    let abstention_hybrid = abstention.hybrid_hits as f64 / abstention.cases as f64;
     assert!(
         abstention_fts >= abstention_base - 0.01,
-        "abstention regressed: {abstention_base:.2} -> {abstention_fts:.2}"
+        "abstention FTS regressed: {abstention_base:.2} -> {abstention_fts:.2}"
     );
-    assert!(p50 < 50.0, "p50 FTS search must stay under 50 ms: {p50:.2}");
+    assert!(
+        abstention_hybrid >= abstention_fts - 0.01,
+        "abstention hybrid regressed: {abstention_fts:.2} -> {abstention_hybrid:.2}"
+    );
+    assert!(
+        p50 < 50.0,
+        "p50 hybrid search must stay under 50 ms: {p50:.2}"
+    );
+    let compiled_est = DEFAULT_BUDGET_BYTES / 5;
+    assert!(
+        compiled_est + 600 <= 2_000,
+        "the 600-token recall budget plus the compiled-memory estimate must fit the 2,000-token cap"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

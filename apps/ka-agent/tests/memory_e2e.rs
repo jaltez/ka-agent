@@ -245,6 +245,16 @@ fn memory_search_finds_a_remembered_fact_and_refuses_in_private() {
     chat.send("/memory search zzz-no-such-fact");
     chat.expect("no memory or history matches", Duration::from_secs(20));
 
+    chat.send("/memory index status");
+    chat.expect("memory index: fts", Duration::from_secs(20));
+    let out = chat.seen();
+    assert!(
+        out.contains("model none"),
+        "status shows the backend:\n{out}"
+    );
+    chat.send("/memory index rebuild");
+    chat.expect("rebuilt · memory index", Duration::from_secs(20));
+
     chat.send("/new private");
     chat.expect("private session", Duration::from_secs(20));
     chat.send("/memory search release");

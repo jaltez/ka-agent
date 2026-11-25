@@ -679,19 +679,89 @@ pub struct Retention {
     /// Delete attachment files older than this many days.
     pub attachments_days: u32,
 }
-/// Memory extraction gating (`[memory]`, B15c).
+/// Memory extraction gating (`[memory]`, B15c) plus phase B1 recall and
+/// embedding settings. Every default keeps today's behavior: no automatic
+/// recall, no embeddings.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Memory {
     /// Recorded turns a session needs before `memory_propose` is allowed
     /// (the warm-up gate); `0` turns the gate off.
     pub extraction_min_turns: u32,
+    /// Hard cap for the per-prompt memory context, including the compiled
+    /// `MEMORY.md` estimate and the recall block.
+    pub max_context_tokens: u32,
+    pub recall: MemoryRecall,
+    pub embeddings: MemoryEmbeddings,
+}
+
+/// Automatic recall block (`[memory.recall]`).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct MemoryRecall {
+    /// Inject the bounded `<recalled_memory>` block into interactive turns.
+    pub enabled: bool,
+    /// Maximum number of items in the block.
+    pub top_k: u32,
+    /// Maximum tokens for the block itself.
+    pub budget_tokens: u32,
+}
+
+impl Default for MemoryRecall {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            top_k: 6,
+            budget_tokens: 600,
+        }
+    }
+}
+
+/// Optional embedding backend (`[memory.embeddings]`). `provider = "none"`
+/// keeps the FTS-only path.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct MemoryEmbeddings {
+    /// `none`, `openai` (any OpenAI-compatible endpoint), `ollama`
+    /// (alias for the compatible endpoint), or `local` (fastembed).
+    pub provider: String,
+    /// Base URL for an HTTP endpoint. `/v1/embeddings` is appended when
+    /// the URL does not already name the embeddings path.
+    pub base_url: Option<String>,
+    /// Model name. For `local`, one of the fastembed model names.
+    pub model: Option<String>,
+    /// Expected dimension; `None` discovers it from the backend.
+    pub dimensions: Option<u32>,
+    /// API key or `secret:<name>` reference. Never a literal secret in
+    /// the config file.
+    pub api_key: Option<String>,
+    /// Per-request timeout for the HTTP backend.
+    pub timeout_secs: u64,
+    /// Texts per embedding request.
+    pub batch_size: u32,
+}
+
+impl Default for MemoryEmbeddings {
+    fn default() -> Self {
+        Self {
+            provider: "none".into(),
+            base_url: None,
+            model: None,
+            dimensions: None,
+            api_key: None,
+            timeout_secs: 20,
+            batch_size: 16,
+        }
+    }
 }
 
 impl Default for Memory {
     fn default() -> Self {
         Self {
             extraction_min_turns: 5,
+            max_context_tokens: 2_000,
+            recall: MemoryRecall::default(),
+            embeddings: MemoryEmbeddings::default(),
         }
     }
 }
@@ -1052,6 +1122,66 @@ impl DaemonConfig {
                     h.on
                 )));
             }
+        }
+        if self.memory.max_context_tokens < 500 || self.memory.max_context_tokens > 8_000 {
+            return Err(Error::Validate(
+                "memory.max_context_tokens must be in 500..=8000".into(),
+            ));
+        }
+        if self.memory.recall.top_k == 0 || self.memory.recall.top_k > 20 {
+            return Err(Error::Validate(
+                "memory.recall.top_k must be in 1..=20".into(),
+            ));
+        }
+        if self.memory.recall.budget_tokens == 0 || self.memory.recall.budget_tokens > 2_000 {
+            return Err(Error::Validate(
+                "memory.recall.budget_tokens must be in 1..=2000".into(),
+            ));
+        }
+        let provider = self.memory.embeddings.provider.as_str();
+        if !matches!(provider, "none" | "openai" | "ollama" | "local") {
+            return Err(Error::Validate(format!(
+                "unknown memory.embeddings.provider {provider:?} (none|openai|ollama|local)"
+            )));
+        }
+        if provider != "none" {
+            if self
+                .memory
+                .embeddings
+                .model
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(Error::Validate(
+                    "memory.embeddings.model is required when the provider is enabled".into(),
+                ));
+            }
+            if matches!(provider, "openai" | "ollama")
+                && self
+                    .memory
+                    .embeddings
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                return Err(Error::Validate(
+                    "memory.embeddings.base_url is required for the HTTP provider".into(),
+                ));
+            }
+        }
+        if self.memory.embeddings.timeout_secs == 0 || self.memory.embeddings.timeout_secs > 300 {
+            return Err(Error::Validate(
+                "memory.embeddings.timeout_secs must be in 1..=300".into(),
+            ));
+        }
+        if self.memory.embeddings.batch_size == 0 || self.memory.embeddings.batch_size > 128 {
+            return Err(Error::Validate(
+                "memory.embeddings.batch_size must be in 1..=128".into(),
+            ));
         }
         if self.runtime.max_workers == 0 || self.runtime.max_workers > 64 {
             return Err(Error::Validate(

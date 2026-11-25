@@ -13,6 +13,7 @@ ka-agent-store = { workspace = true }
 ka-agent-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tokio = { workspace = true }
@@ -20,6 +21,13 @@ thiserror = { workspace = true }
 jiff = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
+fastembed = { version = "7", optional = true, default-features = false, features = ["onnx", "fancy-regex", "hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+
+[features]
+# Optional local embedding backend. Off by default: the HTTP backend
+# needs no model download and the whole index stays FTS-only with
+# `provider = "none"`.
+local-embeddings = ["dep:fastembed"]
 
 [dev-dependencies]
 # Feature-enabled so `ka-port-test-worker` builds for this crate's

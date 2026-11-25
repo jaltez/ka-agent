@@ -167,6 +167,18 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             other => {
                 let (verb, id) = other.split_once(' ').unwrap_or((other, ""));
                 match verb {
+                    "index" => match id.trim() {
+                        "status" => match runtime.memory_index_status_for(&ctx.principal) {
+                            Ok(s) => format_memory_index(&s, ""),
+                            Err(e) => format!("! [memory] {e}"),
+                        },
+                        "rebuild" => match runtime.rebuild_memory_index_for(&ctx.principal) {
+                            Ok(s) => format_memory_index(&s, "rebuilt · "),
+                            Err(e) => format!("! [memory] {e}"),
+                        },
+                        "" => "usage: /memory index [status|rebuild]".to_string(),
+                        _ => "usage: /memory index [status|rebuild]".to_string(),
+                    },
                     "search" => {
                         let query = id.trim();
                         if query.is_empty() {
@@ -216,7 +228,7 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                         Err(e) => format!("! [memory] {e}"),
                     },
                     _ => {
-                        "usage: /memory [files|review|search <q>|log|undo|accept <id>|reject <id>]"
+                        "usage: /memory [files|review|search <q>|index [status|rebuild]|log|undo|accept <id>|reject <id>]"
                             .to_string()
                     }
                 }
@@ -224,6 +236,18 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         };
         Outcome::Reply(reply)
     })
+}
+
+fn format_memory_index(
+    status: &ka_agent_runtime::runtime::memory_vectors::MemoryIndexStatus,
+    prefix: &str,
+) -> String {
+    let state = if status.stale { "stale" } else { "current" };
+    let recall = if status.recall_enabled { "on" } else { "off" };
+    format!(
+        "{prefix}memory index: fts {} · vectors {} · model {} ({}d) · recall {recall} · {state}",
+        status.fts, status.vectors, status.model, status.dim
+    )
 }
 
 pub(super) fn run_history<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {

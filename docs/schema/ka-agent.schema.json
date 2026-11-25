@@ -342,11 +342,124 @@
     },
     "Memory": {
       "additionalProperties": false,
-      "description": "Memory extraction gating (`[memory]`, B15c).",
+      "description": "Memory extraction gating (`[memory]`, B15c) plus phase B1 recall and\nembedding settings. Every default keeps today's behavior: no automatic\nrecall, no embeddings.",
       "properties": {
+        "embeddings": {
+          "$ref": "#/$defs/MemoryEmbeddings",
+          "default": {
+            "api_key": null,
+            "base_url": null,
+            "batch_size": 16,
+            "dimensions": null,
+            "model": null,
+            "provider": "none",
+            "timeout_secs": 20
+          }
+        },
         "extraction_min_turns": {
           "default": 5,
           "description": "Recorded turns a session needs before `memory_propose` is allowed\n(the warm-up gate); `0` turns the gate off.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_context_tokens": {
+          "default": 2000,
+          "description": "Hard cap for the per-prompt memory context, including the compiled\n`MEMORY.md` estimate and the recall block.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recall": {
+          "$ref": "#/$defs/MemoryRecall",
+          "default": {
+            "budget_tokens": 600,
+            "enabled": true,
+            "top_k": 6
+          }
+        }
+      },
+      "type": "object"
+    },
+    "MemoryEmbeddings": {
+      "additionalProperties": false,
+      "description": "Optional embedding backend (`[memory.embeddings]`). `provider = \"none\"`\nkeeps the FTS-only path.",
+      "properties": {
+        "api_key": {
+          "default": null,
+          "description": "API key or `secret:<name>` reference. Never a literal secret in\nthe config file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url": {
+          "default": null,
+          "description": "Base URL for an HTTP endpoint. `/v1/embeddings` is appended when\nthe URL does not already name the embeddings path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "batch_size": {
+          "default": 16,
+          "description": "Texts per embedding request.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dimensions": {
+          "default": null,
+          "description": "Expected dimension; `None` discovers it from the backend.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "description": "Model name. For `local`, one of the fastembed model names.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "default": "none",
+          "description": "`none`, `openai` (any OpenAI-compatible endpoint), `ollama`\n(alias for the compatible endpoint), or `local` (fastembed).",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "default": 20,
+          "description": "Per-request timeout for the HTTP backend.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "MemoryRecall": {
+      "additionalProperties": false,
+      "description": "Automatic recall block (`[memory.recall]`).",
+      "properties": {
+        "budget_tokens": {
+          "default": 600,
+          "description": "Maximum tokens for the block itself.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Inject the bounded `<recalled_memory>` block into interactive turns.",
+          "type": "boolean"
+        },
+        "top_k": {
+          "default": 6,
+          "description": "Maximum number of items in the block.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -932,7 +1045,22 @@
     "memory": {
       "$ref": "#/$defs/Memory",
       "default": {
-        "extraction_min_turns": 5
+        "embeddings": {
+          "api_key": null,
+          "base_url": null,
+          "batch_size": 16,
+          "dimensions": null,
+          "model": null,
+          "provider": "none",
+          "timeout_secs": 20
+        },
+        "extraction_min_turns": 5,
+        "max_context_tokens": 2000,
+        "recall": {
+          "budget_tokens": 600,
+          "enabled": true,
+          "top_k": 6
+        }
       },
       "description": "Memory extraction gating (`[memory]`)."
     },

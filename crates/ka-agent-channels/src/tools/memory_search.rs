@@ -50,7 +50,7 @@ pub(crate) fn run<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         // Fetch a wider window for a kind-specific call: the merged list is
         // memory first, then episodes, so a narrow window would starve the
         // episode side.
-        let window = if kind == "all" { limit } else { limit.max(20) };
+        let window = if kind == "all" { limit } else { limit.max(50) };
         let hits = ctx
             .runtime
             .search_memory_and_episodes(query, window, &who)

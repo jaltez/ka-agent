@@ -45,7 +45,10 @@ operator accepts stable-memory writes.
   - `/forget <id>` — removes the entry, recompiles, commits.
   - `/memory` — report: files, bytes, budget %, truncated flag.
   - `/memory search <query>` — accepted-memory and past-turn search
-    (phase A). Refused in a private conversation.
+    (phase A; hybrid when embeddings are configured). Refused in a
+    private conversation.
+  - `/memory index [status|rebuild]` — FTS/vector counts, model,
+    dimension, staleness, and a rebuild (embeddings optional).
   - `/memory review` — lists pending candidates with **full ids**.
   - `/memory accept <id>` / `/memory reject <id>` — candidate → stable
     memory (or rejected). `<id>` may be the full id or any unique prefix
@@ -158,6 +161,48 @@ operator accepts stable-memory writes.
   compiled-`MEMORY.md` baseline misses truncated bullets while FTS finds
   them. It prints Recall@5 per class and p50 FTS latency; phase A asserts
   the lexical gain and no class regression.
+
+## Recall and embeddings (B1)
+
+- **Defaults**: `memory.recall.enabled = true` (FTS-only until an
+  embedder is configured) and `memory.embeddings.provider = "none"`.
+  The operator can disable recall or enable a backend.
+- **Hybrid retrieval**: `search_memory_and_episodes` runs the memory FTS
+  list, the optional vector list, and the episode FTS list, then fuses
+  them with reciprocal rank fusion (k = 60). `/memory search` and
+  `kagent__memory_search` use the same path. A vector backend or index
+  error degrades to FTS; it never fails the turn.
+- **Vector index**: `memory_vectors` (schema v21) stores one unit-length
+  f32 vector per accepted bullet, per user, with the model id and
+  dimension. The runtime rebuilds it from the Markdown source when the
+  entry fingerprint or model changes. A full per-user exact cosine scan
+  is used; the cache is loaded on first query. The per-user cap is 50k
+  vectors (about 200 MB at 1024 dimensions), after which only the newest
+  entries are indexed. `memory_index_meta` records model, dimension,
+  fingerprint, and timestamp.
+- **Embedding backends**: `openai`/`ollama` post to an OpenAI-compatible
+  `/v1/embeddings` endpoint (`base_url`, `model`, optional
+  `api_key = "secret:<name>"`). `local` uses fastembed behind the
+  `local-embeddings` build feature; the model is downloaded on first use
+  under `<data>/models`. `provider = "none"` is the default and keeps
+  the binary lean.
+- **Recall block**: interactive turns with `[memory.recall] enabled`
+  get a `<recalled_memory source="ka-agent">` prefix. The block is
+  capped at `memory.recall.budget_tokens` (600) and the combined memory
+  context is capped at `memory.max_context_tokens` (2000), measured with
+  a five-bytes-per-token estimate for the compiled `MEMORY.md`. It is
+  skipped in private conversations and for `cron`/`briefing` sources.
+  The text is escaped and labeled data, not instructions.
+- **Status/rebuild**: `/memory index status` reports the FTS and vector
+  counts, model, dimension, recall state, and staleness.
+  `/memory index rebuild` recompiles the FTS mirror and, when an
+  embedder is configured, re-embeds the accepted bullets. `ka-agent user
+  purge` deletes both derived tables with the memory tree.
+- **Eval**: `cargo test -p ka-agent --test memory_eval -- --nocapture`.
+  The B1 fixture embedder is a deterministic concept table, not a real
+  model. It proves the vector channel and RRF fusion on the phase B
+  corpus (paraphrase and multilingual gains, no lexical regression, p50
+  under 50 ms). Real model quality is a separate manual check.
 
 ## What does NOT auto-update memory
 

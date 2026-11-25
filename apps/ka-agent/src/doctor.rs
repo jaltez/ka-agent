@@ -509,6 +509,25 @@ pub fn doctor(
             rep.ok(line);
         }
     }
+    // B1: the derived search/vector index, if this instance has one.
+    if paths.state_db().exists()
+        && let Ok(store) = ka_agent_store::Store::open(&paths.state_db())
+        && let Ok(fts) = store.count_memory_fts_for_user(ka_agent_core::OPERATOR_USER)
+        && let Ok(vectors) = store.count_memory_vectors_for_user(ka_agent_core::OPERATOR_USER)
+    {
+        let provider = cfg
+            .as_ref()
+            .map(|c| c.memory.embeddings.provider.as_str())
+            .unwrap_or("none");
+        let recall = if cfg.as_ref().is_some_and(|c| c.memory.recall.enabled) {
+            "on"
+        } else {
+            "off"
+        };
+        rep.info(&format!(
+            "memory index: fts {fts}, vectors {vectors}, embedder {provider}, recall {recall}"
+        ));
+    }
 
     // A cached update check (refreshed by `ka-agent update [--check]`).
     if let Some((latest, at)) = crate::update_cli::last_check(&paths)

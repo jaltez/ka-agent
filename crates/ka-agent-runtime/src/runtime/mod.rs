@@ -36,6 +36,8 @@ mod identity;
 mod intake;
 mod invariants;
 mod memory;
+pub mod memory_embed;
+pub mod memory_vectors;
 mod policy;
 mod roles;
 mod scheduler;
@@ -223,6 +225,11 @@ struct Shared {
     /// One memory store per user, opened lazily at the user's root
     /// (the operator keeps `<data>/memory`).
     memories: Mutex<HashMap<String, ka_agent_memory::MemoryStore>>,
+    /// Lazy embedding backend, keyed by the config fields that built it.
+    embedder: Mutex<Option<(String, Arc<dyn memory_embed::Embedder>)>>,
+    /// Per-user vectors for the exact scan, loaded from the store on first
+    /// use and invalidated when the index rebuilds.
+    vector_cache: Mutex<HashMap<String, Arc<memory_embed::CachedVectors>>>,
     port: WorkerPort,
     surface: Arc<dyn Surface>,
     /// The envelope sequence (starts at 1): every emitted envelope takes
@@ -294,6 +301,14 @@ struct Shared {
 }
 
 impl Shared {
+    /// Drop one user's cached vectors; the next query reloads them.
+    pub(super) fn clear_vector_cache(&self, username: &str) {
+        self.vector_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(username);
+    }
+
     /// Sequence and fan out one event to the surface.
     pub(super) fn emit(&self, ev: AgentEvent) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -546,6 +561,8 @@ impl Runtime {
                 paths,
                 store,
                 memories: Mutex::new(memories),
+                embedder: Mutex::new(None),
+                vector_cache: Mutex::new(HashMap::new()),
                 port,
                 surface,
                 seq,

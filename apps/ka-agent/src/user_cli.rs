@@ -327,6 +327,9 @@ pub fn user_action(action: UserAction) -> ExitCode {
                     if let Err(e) = store.delete_memory_fts_for_user(&username) {
                         return fail(e);
                     }
+                    if let Err(e) = store.delete_memory_vectors_for_user(&username) {
+                        return fail(e);
+                    }
                     audit("user.purge", &username, Some(removed.join(",")));
                     println!("purged {}: {}", username, removed.join(", "));
                     ExitCode::SUCCESS

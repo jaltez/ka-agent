@@ -43,6 +43,10 @@ terminal_size = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Forward the optional local embedding backend to the runtime.
+local-embeddings = ["ka-agent-runtime/local-embeddings"]
+
 # Windows console support for the inline terminal client (plan 4.4): the
 # safe API for raw mode, key events and console drawing, so the workspace's
 # `unsafe_code = "forbid"` holds. Unix keeps rustix termios.

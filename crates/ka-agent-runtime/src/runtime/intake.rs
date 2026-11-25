@@ -389,7 +389,15 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
         None,
         !is_scheduled(Some(item.source.as_str())),
     );
-    let wire = format!("{}\n{}", context_line(sh, &item.source), item.text);
+    let recall = Runtime { sh: Arc::clone(sh) }
+        .recall_block_for(who, &item.source, &item.text)
+        .unwrap_or_default();
+    let wire = format!(
+        "{}\n{}{}",
+        context_line(sh, &item.source),
+        recall,
+        item.text
+    );
     let allowed_tools = Runtime { sh: Arc::clone(sh) }.role_toolset(&who.role);
     // B15b: a scheduled turn runs against the automation compile (machine
     // facts only); every exit of this bracket restores the full one — the
@@ -599,7 +607,10 @@ impl Runtime {
             .unwrap_or_else(|| spec.text.clone());
         // The one line of chat-shaped context the model sees (its clock,
         // its channel); scheduled turns name their origin.
-        let mut wire = format!("{}\n{}", context_line(&self.sh, &source), text,);
+        let recall = self
+            .recall_block_for(&who, &source, &text)
+            .unwrap_or_default();
+        let mut wire = format!("{}\n{}{}", context_line(&self.sh, &source), recall, text);
         if !gate_output.trim().is_empty() {
             wire = format!(
                 "{wire}\n<gate-output>\n{}\n</gate-output>",
@@ -1568,10 +1579,14 @@ impl Runtime {
             }
             None => model,
         };
+        let recall = self
+            .recall_block_for(who, source.unwrap_or("console"), text)
+            .unwrap_or_default();
         let wire = format!(
-            "{}{}\n{text}",
+            "{}{}\n{}{text}",
             context_line(&self.sh, source.unwrap_or("console")),
-            agent_preamble
+            agent_preamble,
+            recall
         );
         if let Some(a) = &agent {
             let _ = self.sh.store.meta_set(
