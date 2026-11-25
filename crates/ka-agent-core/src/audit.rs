@@ -76,6 +76,7 @@ pub mod actions {
     pub const WORKER_RESTART: &str = "worker.restart";
     pub const MEMORY_ACCEPT: &str = "memory.accept";
     pub const MEMORY_EDIT: &str = "memory.edit";
+    pub const MEMORY_DREAM: &str = "memory.dream";
     pub const BUDGET_PAUSE: &str = "budget.pause";
     pub const IDENTITY_LINK: &str = "identity.link";
     pub const IDENTITY_UNLINK: &str = "identity.unlink";

@@ -693,6 +693,7 @@ pub struct Memory {
     pub max_context_tokens: u32,
     pub recall: MemoryRecall,
     pub embeddings: MemoryEmbeddings,
+    pub dream: MemoryDream,
 }
 
 /// Automatic recall block (`[memory.recall]`).
@@ -741,6 +742,34 @@ pub struct MemoryEmbeddings {
     pub batch_size: u32,
 }
 
+/// Background memory extraction (`[memory.dream]`). Off by default; the
+/// `/memory dream` command runs one pass when enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct MemoryDream {
+    pub enabled: bool,
+    /// A session must be idle this long before it is eligible.
+    pub idle_hours: u64,
+    /// Eligible turns a session needs before extraction runs.
+    pub min_turns: u32,
+    /// Maximum candidates one pass may create.
+    pub max_candidates: u32,
+    /// Child deadline in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for MemoryDream {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_hours: 3,
+            min_turns: 10,
+            max_candidates: 5,
+            timeout_secs: 120,
+        }
+    }
+}
+
 impl Default for MemoryEmbeddings {
     fn default() -> Self {
         Self {
@@ -762,6 +791,7 @@ impl Default for Memory {
             max_context_tokens: 2_000,
             recall: MemoryRecall::default(),
             embeddings: MemoryEmbeddings::default(),
+            dream: MemoryDream::default(),
         }
     }
 }
@@ -1181,6 +1211,26 @@ impl DaemonConfig {
         if self.memory.embeddings.batch_size == 0 || self.memory.embeddings.batch_size > 128 {
             return Err(Error::Validate(
                 "memory.embeddings.batch_size must be in 1..=128".into(),
+            ));
+        }
+        if self.memory.dream.idle_hours > 720 {
+            return Err(Error::Validate(
+                "memory.dream.idle_hours must be 0..=720".into(),
+            ));
+        }
+        if self.memory.dream.min_turns > 1_000 {
+            return Err(Error::Validate(
+                "memory.dream.min_turns must be 0..=1000".into(),
+            ));
+        }
+        if self.memory.dream.max_candidates == 0 || self.memory.dream.max_candidates > 20 {
+            return Err(Error::Validate(
+                "memory.dream.max_candidates must be in 1..=20".into(),
+            ));
+        }
+        if self.memory.dream.timeout_secs < 10 || self.memory.dream.timeout_secs > 600 {
+            return Err(Error::Validate(
+                "memory.dream.timeout_secs must be in 10..=600".into(),
             ));
         }
         if self.runtime.max_workers == 0 || self.runtime.max_workers > 64 {

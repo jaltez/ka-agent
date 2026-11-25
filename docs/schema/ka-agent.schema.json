@@ -344,6 +344,16 @@
       "additionalProperties": false,
       "description": "Memory extraction gating (`[memory]`, B15c) plus phase B1 recall and\nembedding settings. Every default keeps today's behavior: no automatic\nrecall, no embeddings.",
       "properties": {
+        "dream": {
+          "$ref": "#/$defs/MemoryDream",
+          "default": {
+            "enabled": false,
+            "idle_hours": 3,
+            "max_candidates": 5,
+            "min_turns": 10,
+            "timeout_secs": 120
+          }
+        },
         "embeddings": {
           "$ref": "#/$defs/MemoryEmbeddings",
           "default": {
@@ -377,6 +387,45 @@
             "enabled": true,
             "top_k": 6
           }
+        }
+      },
+      "type": "object"
+    },
+    "MemoryDream": {
+      "additionalProperties": false,
+      "description": "Background memory extraction (`[memory.dream]`). Off by default; the\n`/memory dream` command runs one pass when enabled.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "idle_hours": {
+          "default": 3,
+          "description": "A session must be idle this long before it is eligible.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_candidates": {
+          "default": 5,
+          "description": "Maximum candidates one pass may create.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_turns": {
+          "default": 10,
+          "description": "Eligible turns a session needs before extraction runs.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_secs": {
+          "default": 120,
+          "description": "Child deadline in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -1045,6 +1094,13 @@
     "memory": {
       "$ref": "#/$defs/Memory",
       "default": {
+        "dream": {
+          "enabled": false,
+          "idle_hours": 3,
+          "max_candidates": 5,
+          "min_turns": 10,
+          "timeout_secs": 120
+        },
         "embeddings": {
           "api_key": null,
           "base_url": null,

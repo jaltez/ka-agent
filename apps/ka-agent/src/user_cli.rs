@@ -324,10 +324,7 @@ pub fn user_action(action: UserAction) -> ExitCode {
             }
             match user_ops::purge_user(&paths, &username) {
                 Ok(removed) => {
-                    if let Err(e) = store.delete_memory_fts_for_user(&username) {
-                        return fail(e);
-                    }
-                    if let Err(e) = store.delete_memory_vectors_for_user(&username) {
+                    if let Err(e) = store.delete_memory_derived_for_user(&username) {
                         return fail(e);
                     }
                     audit("user.purge", &username, Some(removed.join(",")));

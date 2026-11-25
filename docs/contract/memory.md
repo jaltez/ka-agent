@@ -49,10 +49,15 @@ operator accepts stable-memory writes.
     private conversation.
   - `/memory index [status|rebuild]` — FTS/vector counts, model,
     dimension, staleness, and a rebuild (embeddings optional).
+  - `/memory dream` — one review-gated extraction pass (disabled by
+    default; see "Dream extraction").
   - `/memory review` — lists pending candidates with **full ids**.
   - `/memory accept <id>` / `/memory reject <id>` — candidate → stable
     memory (or rejected). `<id>` may be the full id or any unique prefix
     (`/cron rm` rule); an ambiguous prefix is refused, never guessed.
+    `/memory accept <id> supersede <old>` adds the candidate and removes
+    the named stable entry in one rollback-protected step; git history
+    keeps the old text. Removal stays operator-only.
 - **CLI** (`ka-agent memory …`): `path` prints the memory directory,
   `show [file]` prints one file, `edit [file]` opens `$EDITOR` on it and
   recompiles + git-commits the result (SEED.md §9.1 `ka-agent memory
@@ -203,6 +208,41 @@ operator accepts stable-memory writes.
   model. It proves the vector channel and RRF fusion on the phase B
   corpus (paraphrase and multilingual gains, no lexical regression, p50
   under 50 ms). Real model quality is a separate manual check.
+
+## Dream extraction (B2)
+
+- **Config**: `[memory.dream] enabled` (default `false`), `idle_hours`
+  (3), `min_turns` (10), `max_candidates` (5), `timeout_secs` (120).
+  `/memory dream` runs one pass when enabled; automatic idle scheduling is
+  not wired yet, so the command is the trigger.
+- **Eligibility**: the newest non-private, non-archived session of the
+  caller, idle for at least `idle_hours`, with at least `min_turns`
+  eligible turns. A processed session is remembered in
+  `memory.dream.<user>.<session>`; new turns make it eligible again.
+- **Input**: the daemon assembles up to 8 KB of user messages and
+  assistant final text from the session's turns. Tool output is never
+  included. Scheduled-source turns are excluded through `turn_origins`
+  (schema v22), written on every turn insert, plus the existing
+  `cron`/`cron:<id>`/`briefing` source check.
+- **Child**: a disposable engine worker on a fresh strand in `readonly`
+  mode with an empty `allowed_tools` list (no tools). It sees the compiled
+  memory (under the existing 6 KB budget) and the excerpt, not the store.
+  A child ask is denied fail-closed and audited; the child dies with the
+  pass. A `runs` row (`kind = memory_dream`) and an audit row
+  (`memory.dream`) record the pass.
+- **Output**: lines of the form
+  `FACT: <text> | FILE: facts|preferences|environment|profile |
+  SUPERSEDES: <exact existing bullet or ->`. The daemon screens every
+  fact with `screen_proposal`, drops text over 300 chars, and dedupes
+  against stable memory and pending candidates by keyword Jaccard
+  (`>= 0.8` duplicate; `0.5..0.8` sets an `overlaps:<id>` provenance
+  note). A resolved `SUPERSEDES` becomes `supersedes:<id>`. Candidates
+  are staged only; nothing is auto-accepted.
+- **Review**: `/memory review` shows the provenance line, so an operator
+  can copy the old id into `/memory accept <id> supersede <old>`.
+- **Zero auto-apply** is the contract: dream can only call
+  `add_candidate_for_user`; it cannot accept, forget, or edit stable
+  memory. Removal and supersession require the operator.
 
 ## What does NOT auto-update memory
 

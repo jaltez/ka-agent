@@ -31,6 +31,7 @@ use crate::surface::Surface;
 mod approvals;
 mod checkpoint;
 mod config;
+mod dream;
 mod events;
 mod identity;
 mod intake;

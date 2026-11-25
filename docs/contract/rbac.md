@@ -146,6 +146,7 @@ default_role = "member"             # role an auto-provisioned user gets
 | Memory | disjoint user roots; accepted candidates land in the proposing user's root | n/a (routing) |
 | Notes | `turn.username` store key → `<data>/users/<u>/notes` | absent key = admin (in-flight turn) |
 | History | FTS/`/history` scoped to the user's sessions | other users' turns are invisible |
+| Dream | the child opens through the parent user's `prepare_open` on a fresh strand in `readonly` mode; `Submit.allowed_tools = []` (no tools). It sees the daemon-assembled excerpt and compiled memory, never the store; scheduled-source turns are excluded through `turn_origins` | a child ask is denied fail-closed (audited); a full pool answers busy; the pass stages candidates only, never accepts or removes |
 | Approvals | self-scope cards go to the acting user's surfaces and their decision; shared-resource, over-quota and `escalate` hits go to the admin queue; a foreign decision is refused and audited (D9); durable rules (`/y <id> always`) answer only non-escalated self-scope asks of the rule's own subject, after D9 routing, within the creation mode and looser (grants.md §Durable allow-rules) | `approvals are decided by the admin role` |
 | Re-auth | every approved intent re-resolves the actor at execute time: disabled user, removed role or withdrawn grant ⇒ deny + `approval.stale` | the external write never happens |
 | Models | the user's groups' `models_allow` union; a non-allowed model is refused by name | named refusal |

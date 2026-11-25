@@ -28,6 +28,8 @@ pub enum Error {
     BadSlug(String),
     #[error("invalid valid_until {0:?}: must be YYYY-MM-DD")]
     BadValidUntil(String),
+    #[error("invalid memory path {0:?}")]
+    BadPath(String),
     #[error("git failed: {0}")]
     Git(String),
     #[error("malformed provenance comment: {0}")]
@@ -530,6 +532,35 @@ impl MemoryStore {
         Ok(Some(std::fs::read(&path)?))
     }
 
+    /// Snapshot a file by its relative path (the `Entry.file` form). The
+    /// path is refused if it is absolute or escapes the memory root.
+    pub fn snapshot_rel(&self, rel: &str) -> Result<Option<Vec<u8>>, Error> {
+        let path = self.root.join(safe_rel(rel)?);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read(&path)?))
+    }
+
+    /// Restore a file by its relative path; `None` removes it.
+    pub fn restore_rel(&self, rel: &str, snapshot: Option<Vec<u8>>) -> Result<(), Error> {
+        let path = self.root.join(safe_rel(rel)?);
+        match snapshot {
+            Some(bytes) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, bytes)?;
+            }
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Put a file back to its [`snapshot_file`](Self::snapshot_file)
     /// state; `None` removes it (it did not exist).
     pub fn restore_file(&self, file: &MemoryFile, snapshot: Option<Vec<u8>>) -> Result<(), Error> {
@@ -630,6 +661,18 @@ pub fn keywords(text: &str) -> String {
         }
     }
     out.join(" ")
+}
+
+fn safe_rel(rel: &str) -> Result<&Path, Error> {
+    let path = Path::new(rel);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::BadPath(rel.to_string()));
+    }
+    Ok(path)
 }
 
 fn valid_slug(slug: &str) -> bool {

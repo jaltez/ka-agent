@@ -89,6 +89,11 @@ impl Store {
                 [cutoff],
             )?;
             tx.execute(
+                "DELETE FROM turn_origins WHERE turn_id IN \
+                 (SELECT id FROM turns WHERE status IN ('done','error','aborted','interrupted','killed') AND created_ms < ?1)",
+                [cutoff],
+            )?;
+            tx.execute(
                 "DELETE FROM turns WHERE status IN ('done','error','aborted','interrupted','killed') AND created_ms < ?1",
                 [cutoff],
             )?

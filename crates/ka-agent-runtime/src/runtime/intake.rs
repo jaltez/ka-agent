@@ -345,6 +345,7 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
         });
         return false;
     }
+    let _ = sh.store.set_turn_origin(&turn.id, &item.source);
     let _ = sh.store.meta_set(
         &ka_agent_core::layout::turnctx_key(&who.username, "id"),
         turn.id.as_str(),
@@ -847,6 +848,10 @@ impl Runtime {
             .store
             .insert_turn(&turn)
             .map_err(|e| e.to_string())?;
+        let _ = self
+            .sh
+            .store
+            .set_turn_origin(&turn.id, &crate::runtime::scheduler::trigger_source(task));
         if let Some(item) = delivered {
             let _ = self.sh.store.mark_turned(&item.id, &turn.id);
         }
@@ -1497,6 +1502,10 @@ impl Runtime {
         );
         turn.model = model.clone();
         self.sh.store.insert_turn(&turn)?;
+        let _ = self
+            .sh
+            .store
+            .set_turn_origin(&turn.id, source.unwrap_or("console"));
         let _ = self.sh.store.meta_set(
             &ka_agent_core::layout::turnctx_key(&who.username, "id"),
             turn.id.as_str(),

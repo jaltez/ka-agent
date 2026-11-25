@@ -20,6 +20,21 @@ pub struct MemorySearchHit {
 /// FNV-1a over the accepted entries, used to detect an external edit of
 /// the Markdown source of truth. The mirror is derived state; the hash
 /// only needs to change when the entries change.
+fn memory_index_rows(entries: &[ka_agent_memory::Entry]) -> Vec<ka_agent_store::MemoryIndexRow> {
+    entries
+        .iter()
+        .map(|e| ka_agent_store::MemoryIndexRow {
+            id: e.id.clone(),
+            file: e.file.clone(),
+            text: e.text.clone(),
+            source: e.source.clone(),
+            keywords: ka_agent_memory::keywords(&e.text),
+            accepted_ms: e.accepted_ms,
+            valid_until: e.valid_until.clone(),
+        })
+        .collect()
+}
+
 fn memory_fingerprint(entries: &[ka_agent_memory::Entry]) -> u64 {
     fn feed(h: &mut u64, bytes: &[u8]) {
         for b in bytes {
@@ -78,20 +93,27 @@ impl Runtime {
         {
             return Ok(());
         }
-        let rows: Vec<ka_agent_store::MemoryIndexRow> = entries
-            .iter()
-            .map(|e| ka_agent_store::MemoryIndexRow {
-                id: e.id.clone(),
-                file: e.file.clone(),
-                text: e.text.clone(),
-                source: e.source.clone(),
-                keywords: ka_agent_memory::keywords(&e.text),
-                accepted_ms: e.accepted_ms,
-                valid_until: e.valid_until.clone(),
-            })
-            .collect();
+        let rows = memory_index_rows(&entries);
         self.sh.store.replace_memory_fts_for_user(username, &rows)?;
         self.sh.store.meta_set(&key, &fingerprint)?;
+        Ok(())
+    }
+
+    /// Rebuild the FTS mirror and drop the stale vectors in one store
+    /// transaction. The refresh path after a memory mutation uses this, so
+    /// a forgotten bullet's vector cannot outlive its FTS row. The
+    /// embedding rebuild is scheduled separately on the blocking pool.
+    fn reindex_memory_derived_for(&self, username: &str) -> Result<(), Error> {
+        let (fingerprint, entries) = self.memory_entries_with_fingerprint(username)?;
+        let rows = memory_index_rows(&entries);
+        self.sh
+            .store
+            .replace_memory_derived_for_user(username, &rows)?;
+        self.sh
+            .store
+            .meta_set(&format!("memory.fts.{username}.hash"), &fingerprint)?;
+        self.sh.clear_vector_cache(username);
+        self.spawn_vector_reindex(username);
         Ok(())
     }
 
@@ -475,6 +497,95 @@ impl Runtime {
         Ok(true)
     }
 
+    /// `/memory accept <id> supersede <old>`: operator-authorized
+    /// replacement. The new bullet is added and the old one removed in one
+    /// rollback-protected step; git history keeps the old text. Removal is
+    /// never automatic.
+    pub fn accept_candidate_superseding(
+        &self,
+        id: &str,
+        supersede: &str,
+        who: &Principal,
+    ) -> Result<bool, Error> {
+        let pending = self.pending_candidates_for(who)?;
+        let matches: Vec<_> = pending
+            .iter()
+            .filter(|c| ka_agent_core::ids::id_matches(c.id.as_str(), id))
+            .collect();
+        let row = match matches.as_slice() {
+            [one] => (**one).clone(),
+            [] => return Ok(false),
+            _ => {
+                return Err(Error::Refused(
+                    "ambiguous candidate id: type more of it".into(),
+                ));
+            }
+        };
+        ka_agent_memory::screen_proposal(&row.text).map_err(Error::Refused)?;
+        let memory = self.memory_store(&row.username)?;
+        let entries = memory.entries()?;
+        let old_matches: Vec<_> = entries
+            .iter()
+            .filter(|e| ka_agent_core::ids::id_matches(&e.id, supersede))
+            .collect();
+        let old = match old_matches.as_slice() {
+            [one] => (*one).clone(),
+            [] => {
+                return Err(Error::Refused(format!(
+                    "no stable memory matches {supersede:?}"
+                )));
+            }
+            _ => {
+                return Err(Error::Refused(
+                    "ambiguous supersede id: type more of it".into(),
+                ));
+            }
+        };
+        let target = Self::memory_file_of(row.file.as_deref())?;
+        let target_rel = target.name();
+        let old_rel = old.file.clone();
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert(target_rel.clone(), memory.snapshot_rel(&target_rel)?);
+        if old_rel != target_rel {
+            snapshots.insert(old_rel.clone(), memory.snapshot_rel(&old_rel)?);
+        }
+        let applied: Result<String, Error> = (|| {
+            let new_id = memory
+                .add(target.clone(), &row.text, &row.source, None)
+                .map_err(Error::Memory)?;
+            if !memory.remove(&old.id)? {
+                return Err(Error::Refused("the superseded memory disappeared".into()));
+            }
+            self.refresh_compiled_memory_for(&row.username)?;
+            memory
+                .commit(&format!("memory: accept {new_id} (supersedes {})", old.id))
+                .map_err(Error::Memory)?;
+            Ok(new_id)
+        })();
+        let new_id = match applied {
+            Ok(id) => id,
+            Err(e) => {
+                for (rel, snapshot) in snapshots {
+                    memory.restore_rel(&rel, snapshot)?;
+                }
+                self.refresh_compiled_memory_for(&row.username)?;
+                return Err(e);
+            }
+        };
+        self.sh.store.set_candidate_status(&row.id, "accepted")?;
+        self.audit_for(
+            who,
+            audit_actions::MEMORY_ACCEPT,
+            &new_id,
+            Some(format!(
+                "supersedes {}: {}",
+                old.id,
+                row.text.chars().take(80).collect::<String>()
+            )),
+        )?;
+        Ok(true)
+    }
+
     /// `/memory reject <id>`: the same full-id-or-unique-prefix rule.
     pub fn reject_candidate(&self, id: &str, who: &Principal) -> Result<bool, Error> {
         let pending = self.pending_candidates_for(who)?;
@@ -597,14 +708,7 @@ impl Runtime {
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
             &memory_preamble(&self.cfg()),
         )?;
-        self.ensure_memory_index_for(username)?;
-        // A changed bullet invalidates its vector too. Drop the derived
-        // vectors and the cache; the next recall rebuilds them. This also
-        // makes a forgotten fact's embedding disappear immediately.
-        self.sh.store.delete_memory_vectors_for_user(username)?;
-        self.sh.clear_vector_cache(username);
-        self.spawn_vector_reindex(username);
-        Ok(())
+        self.reindex_memory_derived_for(username)
     }
 
     /// Install the automation compile (machine facts only, B15b) for a

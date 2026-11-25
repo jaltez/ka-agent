@@ -57,12 +57,17 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         // The engine never reads personal memory in a private session.
         // The operator-facing list stays available, but a search is a
         // read surface, so it is off here.
-        if (rest == "search" || rest.starts_with("search "))
-            && runtime.session_private_for(&ctx.principal)
-        {
-            return Outcome::Reply(
-                "this is a private conversation — memory search is off here".into(),
-            );
+        if runtime.session_private_for(&ctx.principal) {
+            if rest == "search" || rest.starts_with("search ") {
+                return Outcome::Reply(
+                    "this is a private conversation — memory search is off here".into(),
+                );
+            }
+            if rest == "dream" || rest.starts_with("dream ") {
+                return Outcome::Reply(
+                    "this is a private conversation — memory dream is off here".into(),
+                );
+            }
         }
         let reply = match rest {
             "log" => match runtime.memory_log(10, &ctx.principal) {
@@ -113,8 +118,13 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                                     } else {
                                         ""
                                     };
+                                    let prov = c
+                                        .provenance
+                                        .as_deref()
+                                        .map(|p| format!("\n  provenance: {p}"))
+                                        .unwrap_or_default();
                                     format!(
-                                        "[{}] ({}) → {}{}\n  + {}\n  compiled {}B of {}B (now {}B{})",
+                                        "[{}] ({}) → {}{}\n  + {}\n  compiled {}B of {}B (now {}B{}){prov}",
                                         short_id(c.id.as_str()),
                                         c.source,
                                         diff.file,
@@ -179,6 +189,28 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                         "" => "usage: /memory index [status|rebuild]".to_string(),
                         _ => "usage: /memory index [status|rebuild]".to_string(),
                     },
+                    "dream" => {
+                        if !runtime.config().memory.dream.enabled {
+                            "dream is disabled ([memory.dream] enabled = false)".to_string()
+                        } else {
+                            match runtime.run_dream_for(&ctx.principal).await {
+                                Ok(report) => match report.session {
+                                    None => {
+                                        "dream: no idle session with enough turns".to_string()
+                                    }
+                                    Some(sid) => format!(
+                                        "dream: {} candidate(s) from {} ({} chars); {} duplicate(s), {} refused",
+                                        report.candidates,
+                                        short_id(&sid),
+                                        report.excerpt_chars,
+                                        report.duplicates,
+                                        report.refused
+                                    ),
+                                },
+                                Err(e) => format!("! [memory] {e}"),
+                            }
+                        }
+                    }
                     "search" => {
                         let query = id.trim();
                         if query.is_empty() {
@@ -217,18 +249,46 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                             }
                         }
                     }
-                    "accept" => match runtime.accept_candidate(id.trim(), &ctx.principal) {
-                        Ok(true) => "accepted into stable memory".to_string(),
-                        Ok(false) => "no such pending candidate".to_string(),
-                        Err(e) => format!("! [memory] {e}"),
-                    },
+                    "accept" => {
+                        let mut parts = id.split_whitespace();
+                        let cand = parts.next().unwrap_or("");
+                        let marker = parts.next();
+                        let old = parts.next();
+                        if marker == Some("supersede") {
+                            match old {
+                                Some(old) => {
+                                    match runtime.accept_candidate_superseding(
+                                        cand,
+                                        old,
+                                        &ctx.principal,
+                                    ) {
+                                        Ok(true) => "accepted into stable memory (superseded)"
+                                            .to_string(),
+                                        Ok(false) => "no such pending candidate".to_string(),
+                                        Err(e) => format!("! [memory] {e}"),
+                                    }
+                                }
+                                None => {
+                                    "usage: /memory accept <id> supersede <old-id>".to_string()
+                                }
+                            }
+                        } else if marker.is_some() {
+                            "usage: /memory accept <id> [supersede <old-id>]".to_string()
+                        } else {
+                            match runtime.accept_candidate(cand, &ctx.principal) {
+                                Ok(true) => "accepted into stable memory".to_string(),
+                                Ok(false) => "no such pending candidate".to_string(),
+                                Err(e) => format!("! [memory] {e}"),
+                            }
+                        }
+                    }
                     "reject" => match runtime.reject_candidate(id.trim(), &ctx.principal) {
                         Ok(true) => "rejected".to_string(),
                         Ok(false) => "no such pending candidate".to_string(),
                         Err(e) => format!("! [memory] {e}"),
                     },
                     _ => {
-                        "usage: /memory [files|review|search <q>|index [status|rebuild]|log|undo|accept <id>|reject <id>]"
+                        "usage: /memory [files|review|search <q>|index [status|rebuild]|dream|log|undo|accept <id> [supersede <old>]|reject <id>]"
                             .to_string()
                     }
                 }

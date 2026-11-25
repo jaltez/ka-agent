@@ -30,6 +30,31 @@ pub struct MemoryHit {
     pub valid_until: Option<String>,
 }
 
+fn insert_memory_fts_rows(
+    tx: &rusqlite::Transaction<'_>,
+    username: &str,
+    rows: &[MemoryIndexRow],
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO memory_fts
+         (id, username, file, text, keywords, source, accepted_ms, valid_until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for row in rows {
+        stmt.execute(params![
+            &row.id,
+            username,
+            &row.file,
+            &row.text,
+            &row.keywords,
+            &row.source,
+            row.accepted_ms,
+            row.valid_until.as_deref(),
+        ])?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Replace every FTS row for one user in one transaction. The caller
     /// rebuilds the rows from `MemoryStore::entries`, so a stale row can
@@ -45,25 +70,46 @@ impl Store {
             "DELETE FROM memory_fts WHERE username = ?1",
             params![username],
         )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO memory_fts
-                 (id, username, file, text, keywords, source, accepted_ms, valid_until)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for row in rows {
-                stmt.execute(params![
-                    &row.id,
-                    username,
-                    &row.file,
-                    &row.text,
-                    &row.keywords,
-                    &row.source,
-                    row.accepted_ms,
-                    row.valid_until.as_deref(),
-                ])?;
-            }
-        }
+        insert_memory_fts_rows(&tx, username, rows)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the FTS rows and drop the vectors in one transaction. The
+    /// memory-change refresh path uses this, so a forgotten bullet's
+    /// embedding cannot outlive its FTS row.
+    pub fn replace_memory_derived_for_user(
+        &self,
+        username: &str,
+        rows: &[MemoryIndexRow],
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM memory_fts WHERE username = ?1",
+            params![username],
+        )?;
+        insert_memory_fts_rows(&tx, username, rows)?;
+        tx.execute(
+            "DELETE FROM memory_vectors WHERE username = ?1",
+            params![username],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop both derived tables for a purged user in one transaction.
+    pub fn delete_memory_derived_for_user(&self, username: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM memory_fts WHERE username = ?1",
+            params![username],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_vectors WHERE username = ?1",
+            params![username],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -209,6 +255,31 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "mem_k");
+    }
+
+    #[test]
+    fn derived_replace_clears_vectors_in_one_call() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_memory_vectors_for_user(
+                "alice",
+                "test-model",
+                2,
+                &[crate::MemoryVectorRow {
+                    ref_id: "mem_old".into(),
+                    scope: None,
+                    vec: vec![1.0, 0.0],
+                    updated_ms: 1,
+                }],
+            )
+            .unwrap();
+        store
+            .replace_memory_derived_for_user("alice", &[row("mem_new", "new fact")])
+            .unwrap();
+        assert_eq!(store.count_memory_vectors_for_user("alice").unwrap(), 0);
+        let hits = store.search_memory_fts_for_user("alice", "new", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "mem_new");
     }
 
     #[test]

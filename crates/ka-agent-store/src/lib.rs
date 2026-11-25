@@ -39,6 +39,7 @@ mod sessions;
 mod skill_usage;
 mod tasks;
 pub use tasks::task_username;
+mod turn_origins;
 mod turn_sources;
 mod turns;
 mod users;
@@ -133,6 +134,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v19.sql"),
     include_str!("schema_v20.sql"),
     include_str!("schema_v21.sql"),
+    include_str!("schema_v22.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).
