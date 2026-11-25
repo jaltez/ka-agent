@@ -234,8 +234,7 @@ impl Runtime {
         if self.session_private_for(who) {
             return None;
         }
-        let scheduled = source == "cron" || source.starts_with("cron:") || source == "briefing";
-        if scheduled {
+        if ka_agent_core::is_scheduled_source(source) {
             return None;
         }
         let top_k = cfg.memory.recall.top_k.clamp(1, 20) as usize;

@@ -210,8 +210,9 @@ section, never an Adaptation.
   (`runtime/intake.rs:308`) submits into the creator's own session and
   partition (`runtime/scheduler.rs:376-392` resolves `fire_principal`), so the
   exclusion is source-scoped: turns whose source is `cron`, `cron:<id>`,
-  `briefing`, `trigger` or `trigger:<id>` (`is_scheduled` grows the trigger
-  arms, `runtime/events.rs:18`; feature 9's turns carry `trigger:<id>`).
+  `briefing`, or `trigger:sched:<id>` (`is_scheduled` uses the shared
+  `ka_agent_core::is_scheduled_source`; feature 9's schedule triggers carry
+  `trigger:sched:<id>`, webhooks carry `trigger:<id>` and are not scheduled).
 - Adaptation:
   - **Write exclusion**: the `memory_propose` handler
     (`crates/ka-agent-channels/src/tools/memory.rs:19`, private gate at `:22`)

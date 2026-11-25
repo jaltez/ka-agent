@@ -17,7 +17,7 @@ pub const FINAL_CHUNK_MAX: usize = 3800;
 
 /// Is this turn one a schedule started (cron / briefing)?
 pub(crate) fn is_scheduled(source: Option<&str>) -> bool {
-    source.is_some_and(|s| s == "cron" || s.starts_with("cron:") || s == "briefing")
+    source.is_some_and(ka_agent_core::is_scheduled_source)
 }
 
 /// Split a final answer into channel chunks at paragraph boundaries,

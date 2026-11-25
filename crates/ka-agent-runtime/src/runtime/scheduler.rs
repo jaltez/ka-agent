@@ -41,10 +41,21 @@ pub(super) fn trigger_next_after(
     )
 }
 
-/// The source string a trigger's turn carries (`trigger:<task id>`); the
-/// memory-exclusion and history filters key on this shape.
+/// The source string a trigger's turn carries. A schedule-kind trigger
+/// carries `trigger:sched:<id>` (the same shape cron uses for automation
+/// gates); a webhook carries `trigger:<id>`. The memory-exclusion and
+/// history filters key on this distinction.
 pub(super) fn trigger_source(task: &ka_agent_core::Task) -> String {
-    format!("trigger:{}", task.id.as_str())
+    let scheduled = task
+        .payload
+        .as_deref()
+        .and_then(ka_agent_core::TriggerSpec::from_payload)
+        .is_some_and(|spec| spec.kind == ka_agent_core::TriggerKind::Schedule);
+    if scheduled {
+        format!("trigger:sched:{}", task.id.as_str())
+    } else {
+        format!("trigger:{}", task.id.as_str())
+    }
 }
 
 /// A webhook delivery's turn text: the prompt with the normalized body
@@ -1679,6 +1690,41 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trigger_spec(kind: ka_agent_core::TriggerKind) -> ka_agent_core::TriggerSpec {
+        ka_agent_core::TriggerSpec {
+            kind,
+            text: "nightly check".into(),
+            source: "operator".into(),
+            session_id: "sess_test".into(),
+            role: None,
+            username: None,
+            tools: Vec::new(),
+            error_streak: 0,
+            recurrence_ms: None,
+            at_local: None,
+            weekdays: Vec::new(),
+            month_day: None,
+            gate: None,
+            hook_path: None,
+            secret: None,
+            filter: None,
+            max_body_bytes: None,
+            preflight: false,
+        }
+    }
+
+    #[test]
+    fn schedule_triggers_carry_the_scheduled_source() {
+        let mut task = ka_agent_core::Task::new("nightly".into(), "trigger", false);
+        task.payload = Some(trigger_spec(ka_agent_core::TriggerKind::Schedule).to_payload());
+        assert!(trigger_source(&task).starts_with("trigger:sched:"));
+        task.payload = Some(trigger_spec(ka_agent_core::TriggerKind::Webhook).to_payload());
+        let source = trigger_source(&task);
+        assert!(source.starts_with("trigger:"));
+        assert!(!source.starts_with("trigger:sched:"));
+        assert!(!ka_agent_core::is_scheduled_source(&source));
+    }
 
     #[test]
     fn notify_at_the_boundary_once_then_none() {

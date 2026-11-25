@@ -28,7 +28,7 @@ pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         // Automation turns never write personal memory: a cron reading
         // what an earlier cron proposed is a feedback loop (B15b).
         if let Some(src) = super::turnctx(ctx, "source")
-            && (src == "cron" || src.starts_with("cron:") || src == "briefing")
+            && ka_agent_core::is_scheduled_source(&src)
         {
             return Err("this turn is scheduled — automation turns cannot propose memory".into());
         }

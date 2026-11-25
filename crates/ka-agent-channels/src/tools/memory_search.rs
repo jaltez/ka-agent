@@ -31,7 +31,7 @@ pub(crate) fn run<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             return Err("this is a private conversation — memory search is off here".into());
         }
         if let Some(src) = turnctx(ctx, "source")
-            && (src == "cron" || src.starts_with("cron:") || src == "briefing")
+            && ka_agent_core::is_scheduled_source(&src)
         {
             return Err("this turn is scheduled — memory search is off here".into());
         }

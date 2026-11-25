@@ -322,7 +322,7 @@ impl Runtime {
             if fact.is_empty() || fact.eq_ignore_ascii_case("NONE") {
                 continue;
             }
-            if fact.len() > 300 || ka_agent_memory::screen_proposal(fact).is_err() {
+            if fact.chars().count() > 300 || ka_agent_memory::screen_proposal(fact).is_err() {
                 report.refused += 1;
                 continue;
             }
@@ -484,6 +484,8 @@ mod tests {
         assert!(is_scheduled(Some("cron")));
         assert!(is_scheduled(Some("cron:nightly")));
         assert!(is_scheduled(Some("briefing")));
+        assert!(is_scheduled(Some("trigger:sched:task_1")));
+        assert!(!is_scheduled(Some("trigger:task_1")));
         assert!(!is_scheduled(Some("console")));
         assert!(!is_scheduled(Some("telegram")));
     }

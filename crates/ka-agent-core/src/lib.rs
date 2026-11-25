@@ -82,6 +82,16 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Is this turn source one a schedule started? Cron, briefing, and a
+/// schedule-kind trigger carry these shapes. A webhook trigger carries
+/// `trigger:<id>` and is not a scheduled turn.
+pub fn is_scheduled_source(source: &str) -> bool {
+    source == "cron"
+        || source.starts_with("cron:")
+        || source == "briefing"
+        || source.starts_with("trigger:sched:")
+}
+
 /// Day index since the Unix epoch (UTC) — the budget window key.
 pub fn day_key(now_ms: i64) -> i64 {
     now_ms.div_euclid(86_400_000)
@@ -98,4 +108,19 @@ pub fn expand_home(path: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod scheduled_source_tests {
+    use super::is_scheduled_source;
+
+    #[test]
+    fn schedule_sources_are_distinct_from_webhooks() {
+        for source in ["cron", "cron:nightly", "briefing", "trigger:sched:task_1"] {
+            assert!(is_scheduled_source(source), "{source}");
+        }
+        for source in ["console", "telegram", "trigger:task_1", "webhook"] {
+            assert!(!is_scheduled_source(source), "{source}");
+        }
+    }
 }

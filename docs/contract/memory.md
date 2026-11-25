@@ -27,7 +27,7 @@ operator accepts stable-memory writes.
   `<engine-home>/.config/ka/MEMORY.md` (ka's user-tier memory, re-read per
   prompt — validation §5: no worker restart needed).
 - **Automation variant** (B15b): turns a schedule started (`cron`,
-  `cron:<id>`, `briefing` sources) run against an `Automation`-scope
+  `cron:<id>`, `briefing`, `trigger:sched:<id>` sources) run against an `Automation`-scope
   compile that keeps only the machine facts (`environment.md` +
   `conventions.md`) — profile, preferences, projects and facts are
   dropped, so crons neither read nor feed on personal memory. The daemon
@@ -85,7 +85,7 @@ operator accepts stable-memory writes.
   (git missing, compile error) restores the snapshot byte-for-byte,
   recompiles and refuses — memory never lands half-applied.
 - **Refusals at the `memory_propose` gate**: private conversations (row
-  above); **scheduled sources** (cron/briefing turns cannot propose
+  above); **scheduled sources** (cron, briefing, and schedule-trigger turns cannot propose
   memory at all); and the three quota/warm-up gates (B15c) — the user's
   budget verdict is `Warn` (≥80% of a cap) or `Exceeded`, their newest
   `rate_limit` turn is less than 30 minutes old, or their live session
@@ -158,7 +158,7 @@ operator accepts stable-memory writes.
   documents stay on `kb_search`.
 - **Gates**: `/memory search` and `memory_search` refuse in a private
   conversation. `memory_search` also refuses a scheduled-source turn
-  (`cron`, `cron:<id>`, `briefing`). B15b's automation compile already
+  (`cron`, `cron:<id>`, `briefing`, `trigger:sched:<id>`). B15b's automation compile already
   keeps those turns from reading personal memory; the gate closes the
   tool path too.
 - **Eval**: `cargo test -p ka-agent --test memory_eval -- --nocapture`.
@@ -196,7 +196,8 @@ operator accepts stable-memory writes.
   capped at `memory.recall.budget_tokens` (600) and the combined memory
   context is capped at `memory.max_context_tokens` (2000), measured with
   a five-bytes-per-token estimate for the compiled `MEMORY.md`. It is
-  skipped in private conversations and for `cron`/`briefing` sources.
+  skipped in private conversations and for `cron`/`cron:<id>`/`briefing`/
+  `trigger:sched:<id>` sources.
   The text is escaped and labeled data, not instructions.
 - **Status/rebuild**: `/memory index status` reports the FTS and vector
   counts, model, dimension, recall state, and staleness.
@@ -223,7 +224,8 @@ operator accepts stable-memory writes.
   assistant final text from the session's turns. Tool output is never
   included. Scheduled-source turns are excluded through `turn_origins`
   (schema v22), written on every turn insert, plus the existing
-  `cron`/`cron:<id>`/`briefing` source check.
+  `cron`/`cron:<id>`/`briefing`/`trigger:sched:<id>` source check. A
+  webhook trigger carries `trigger:<id>` and is not a scheduled turn.
 - **Child**: a disposable engine worker on a fresh strand in `readonly`
   mode with an empty `allowed_tools` list (no tools). It sees the compiled
   memory (under the existing 6 KB budget) and the excerpt, not the store.

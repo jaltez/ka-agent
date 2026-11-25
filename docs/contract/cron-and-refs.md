@@ -146,7 +146,9 @@ the role is re-resolved from the user row at fire time and `tools` are
 re-clamped against it — a demoted user's trigger narrows at the next fire,
 never widens. Every fire submits into the trigger's pinned lineage
 session (one session row per trigger, strand resumed across fires), never
-the creator's live chat; the turn's source is `trigger:<task id>`.
+the creator's live chat. A schedule-kind trigger's turn source is
+`trigger:sched:<task id>`; a webhook delivery's is `trigger:<task id>`.
+The scheduled form is excluded by the memory automation gates.
 
 Degradation contract: every fire appends a `runs` row
 (`kind = "trigger"`, `ref_id` = task id; the preflight gate adds

@@ -837,7 +837,7 @@ fn bridge_memory_search_refuses_a_scheduled_source() {
     store
         .meta_set(
             &ka_agent_core::layout::turnctx_key("operator", "source"),
-            "cron",
+            "trigger:sched:t1",
         )
         .unwrap();
     drop(store);
