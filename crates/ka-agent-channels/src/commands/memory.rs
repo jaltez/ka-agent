@@ -54,6 +54,16 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
         let runtime = ctx.runtime;
         let rest = ctx.args;
+        // The engine never reads personal memory in a private session.
+        // The operator-facing list stays available, but a search is a
+        // read surface, so it is off here.
+        if (rest == "search" || rest.starts_with("search "))
+            && runtime.session_private_for(&ctx.principal)
+        {
+            return Outcome::Reply(
+                "this is a private conversation — memory search is off here".into(),
+            );
+        }
         let reply = match rest {
             "log" => match runtime.memory_log(10, &ctx.principal) {
                 Ok(rows) if rows.is_empty() => "no memory commits yet".to_string(),
@@ -157,6 +167,44 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             other => {
                 let (verb, id) = other.split_once(' ').unwrap_or((other, ""));
                 match verb {
+                    "search" => {
+                        let query = id.trim();
+                        if query.is_empty() {
+                            "usage: /memory search <query>".to_string()
+                        } else {
+                            match runtime.search_memory_and_episodes(query, 5, &ctx.principal) {
+                                Ok(hits) if hits.is_empty() => {
+                                    format!("no memory or history matches {query:?}")
+                                }
+                                Ok(hits) => {
+                                    let now = runtime.now_zoned();
+                                    hits.into_iter()
+                                        .map(|h| {
+                                            let date = jiff::Timestamp::from_millisecond(h.at_ms)
+                                                .map(|ts| ts.to_zoned(now.time_zone().clone()))
+                                                .map(|d| {
+                                                    format!(
+                                                        "{:04}-{:02}-{:02}",
+                                                        d.year(),
+                                                        d.month() as u8,
+                                                        d.day()
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                            let tag = if h.kind == "memory" {
+                                                format!("mem:{}", short_id(&h.id))
+                                            } else {
+                                                format!("turn:{}", short_id(&h.id))
+                                            };
+                                            format!("[{tag}] {} ({}, {date})", h.snippet, h.detail)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                }
+                                Err(e) => format!("! [memory] {e}"),
+                            }
+                        }
+                    }
                     "accept" => match runtime.accept_candidate(id.trim(), &ctx.principal) {
                         Ok(true) => "accepted into stable memory".to_string(),
                         Ok(false) => "no such pending candidate".to_string(),
@@ -167,7 +215,10 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                         Ok(false) => "no such pending candidate".to_string(),
                         Err(e) => format!("! [memory] {e}"),
                     },
-                    _ => "usage: /memory [files|review|accept <id>|reject <id>]".to_string(),
+                    _ => {
+                        "usage: /memory [files|review|search <q>|log|undo|accept <id>|reject <id>]"
+                            .to_string()
+                    }
                 }
             }
         };

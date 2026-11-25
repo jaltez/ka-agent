@@ -536,6 +536,26 @@ impl Store {
 /// that are nothing but quotes are dropped, so an empty or quote-only
 /// query yields no phrases and matches nothing.
 pub(crate) fn fts_and_query(query: &str) -> String {
+    fts_terms(query)
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// The recall-oriented variant used by memory search: every term is a
+/// quoted prefix, ORed together. BM25 still ranks documents that match
+/// more terms higher, but one missing word no longer hides a relevant
+/// bullet. Prefixes let `deploy` match `deploys` without a stemmer.
+pub(crate) fn fts_or_query(query: &str) -> String {
+    fts_terms(query)
+        .iter()
+        .map(|t| format!("\"{}\"*", t.trim_matches('"').replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn fts_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
@@ -563,11 +583,9 @@ pub(crate) fn fts_and_query(query: &str) -> String {
         terms.push(cur);
     }
     terms
-        .iter()
+        .into_iter()
         .filter(|t| !t.trim_matches('"').is_empty())
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND ")
+        .collect()
 }
 
 #[cfg(test)]

@@ -603,6 +603,35 @@ impl MemoryStore {
     }
 }
 
+/// Deterministic FTS keyword expansion for one accepted bullet
+/// (LongMemEval's fact-augmented keys, without a model call): up to eight
+/// distinct lowercased tokens of three or more characters, minus common
+/// function words. The result goes only into the derived `memory_fts`
+/// mirror; the Markdown bullet is unchanged.
+pub fn keywords(text: &str) -> String {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "are", "was",
+        "were", "has", "have", "had", "not", "but", "its", "que", "los", "las", "una", "uno",
+        "por", "para", "con", "sin", "del", "como", "más", "mas", "sus", "este", "esta", "son",
+        "fue", "ser", "hay",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for token in text.split(|c: char| !c.is_alphanumeric()) {
+        let lower = token.to_lowercase();
+        if lower.chars().count() < 3 || STOP.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+        }
+        if out.len() == 8 {
+            break;
+        }
+    }
+    out.join(" ")
+}
+
 fn valid_slug(slug: &str) -> bool {
     (1..=32).contains(&slug.len())
         && slug
@@ -1202,5 +1231,23 @@ mod b15_tests {
                 .all(|e| e.text != "likes coffee")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod keyword_tests {
+    use super::keywords;
+
+    #[test]
+    fn keywords_are_bounded_deduped_and_lowercase() {
+        let out = keywords("Prefers concise Spanish answers. Prefers concise replies in Telegram.");
+        assert!(out.contains("prefers"));
+        assert!(out.contains("spanish"));
+        assert!(out.contains("telegram"));
+        assert!(!out.contains(" in "));
+        assert_eq!(out.split_whitespace().count(), 6, "{out}");
+        let many = keywords("alpha beta gamma delta epsilon zeta eta theta iota kappa");
+        assert_eq!(many.split_whitespace().count(), 8, "{many}");
+        assert_eq!(keywords(""), "");
     }
 }

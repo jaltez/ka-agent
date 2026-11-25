@@ -781,6 +781,94 @@ fn bridge_history_tools_find_and_show_past_turns() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A: the bridge exposes `memory_search` over the accepted-memory FTS
+/// mirror, and a scheduled turn is refused before it reads anything.
+#[test]
+fn bridge_memory_search_finds_a_bullet_and_refuses_scheduled_turns() {
+    use std::io::Write as _;
+    let root = temp_root("memory-tool");
+    let data = root.join("data");
+    std::fs::create_dir_all(data.join("memory")).unwrap();
+    std::fs::write(
+        data.join("memory/facts.md"),
+        "# Facts\n- The release branch is release/2026.\n<!-- id: mem_tool1; source: operator; accepted: 2026-01-01T00:00:00.000Z; valid_until: - -->\n",
+    )
+    .unwrap();
+    let cfg = write_config(&root);
+    let _host = start_host(&data, &cfg);
+    let mut child = ka(&data)
+        .arg("__mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"release branch"}}}"#.to_string(),
+    ] {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+    }
+    drop(child.stdin.take());
+    let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned();
+    let line = out
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .unwrap_or_default();
+    assert!(line.contains("2026"), "{line}");
+    assert!(line.contains("mem:"), "{line}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn bridge_memory_search_refuses_a_scheduled_source() {
+    use std::io::Write as _;
+    let root = temp_root("memory-tool-cron");
+    let data = root.join("data");
+    std::fs::create_dir_all(data.join("memory")).unwrap();
+    std::fs::write(
+        data.join("memory/facts.md"),
+        "# Facts\n- The release branch is release/2026.\n<!-- id: mem_tool2; source: operator; accepted: 2026-01-01T00:00:00.000Z; valid_until: - -->\n",
+    )
+    .unwrap();
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    store
+        .meta_set(
+            &ka_agent_core::layout::turnctx_key("operator", "source"),
+            "cron",
+        )
+        .unwrap();
+    drop(store);
+    let cfg = write_config(&root);
+    let _host = start_host(&data, &cfg);
+    let mut child = ka(&data)
+        .arg("__mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"release branch"}}}"#.to_string(),
+    ] {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+    }
+    drop(child.stdin.take());
+    let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned();
+    let line = out
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .unwrap_or_default();
+    assert!(line.contains("scheduled"), "{line}");
+    assert!(line.contains("\"isError\":true"), "{line}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A16: `config schema` (rows) and `--json` are a published contract —
 /// the format and the field set must not drift.
 #[test]

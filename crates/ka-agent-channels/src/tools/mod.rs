@@ -22,6 +22,7 @@ pub mod history;
 pub mod http;
 pub mod kb;
 pub mod memory;
+pub mod memory_search;
 pub mod notes;
 pub mod plans;
 pub mod plugins;
@@ -105,6 +106,13 @@ pub static BUILTINS: &[ToolSpec] = &[
         schema: memory::propose_schema,
         effect: Effect::Propose,
         run: memory::propose,
+    },
+    ToolSpec {
+        name: "memory_search",
+        description: "Search accepted memory and past conversation turns by words. Returns snippets with ids and dates. Read-only; unavailable in private or scheduled turns. For knowledge-base documents use kb_search.",
+        schema: memory_search::schema,
+        effect: Effect::Read,
+        run: memory_search::run,
     },
     ToolSpec {
         name: "history_search",

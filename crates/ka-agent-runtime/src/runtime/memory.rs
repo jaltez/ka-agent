@@ -6,6 +6,41 @@ use ka_agent_core::Principal;
 /// Meta key: `created_ms` of the newest memory candidate already offered.
 const MEMORY_ANNOUNCED_KEY: &str = "memory.announced_ms";
 
+/// One hit from the memory search surfaces (`/memory search`, the
+/// `memory_search` tool). `kind` is `"memory"` or `"episode"`.
+#[derive(Debug, Clone)]
+pub struct MemorySearchHit {
+    pub kind: &'static str,
+    pub id: String,
+    pub snippet: String,
+    pub detail: String,
+    pub at_ms: i64,
+}
+
+/// FNV-1a over the accepted entries, used to detect an external edit of
+/// the Markdown source of truth. The mirror is derived state; the hash
+/// only needs to change when the entries change.
+fn memory_fingerprint(entries: &[ka_agent_memory::Entry]) -> u64 {
+    fn feed(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+        *h ^= 0xff;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+    let mut h = 0xcbf29ce484222325u64;
+    for e in entries {
+        feed(&mut h, e.id.as_bytes());
+        feed(&mut h, e.file.as_bytes());
+        feed(&mut h, e.text.as_bytes());
+        feed(&mut h, e.source.as_bytes());
+        feed(&mut h, &e.accepted_ms.to_le_bytes());
+        feed(&mut h, e.valid_until.as_deref().unwrap_or("-").as_bytes());
+    }
+    h
+}
+
 impl Runtime {
     /// The memory store of one user, opened at their own root on first use.
     pub fn memory_store(&self, username: &str) -> Result<ka_agent_memory::MemoryStore, Error> {
@@ -16,6 +51,82 @@ impl Runtime {
         let store = ka_agent_memory::MemoryStore::open(&self.sh.paths.user_memory(username))?;
         map.insert(username.to_string(), store.clone());
         Ok(store)
+    }
+
+    /// Rebuild the user's FTS mirror when the Markdown source changed.
+    /// Called after every accepted memory mutation and lazily before a
+    /// search, so an external `ka-agent memory edit` is picked up too.
+    pub fn ensure_memory_index_for(&self, username: &str) -> Result<(), Error> {
+        let memory = self.memory_store(username)?;
+        let mut entries = memory.entries()?;
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        let fingerprint = format!("{:016x}", memory_fingerprint(&entries));
+        let key = format!("memory.fts.{username}.hash");
+        let indexed = self.sh.store.count_memory_fts_for_user(username)?;
+        if indexed == entries.len()
+            && self.sh.store.meta_get(&key)?.as_deref() == Some(fingerprint.as_str())
+        {
+            return Ok(());
+        }
+        let rows: Vec<ka_agent_store::MemoryIndexRow> = entries
+            .iter()
+            .map(|e| ka_agent_store::MemoryIndexRow {
+                id: e.id.clone(),
+                file: e.file.clone(),
+                text: e.text.clone(),
+                source: e.source.clone(),
+                keywords: ka_agent_memory::keywords(&e.text),
+                accepted_ms: e.accepted_ms,
+                valid_until: e.valid_until.clone(),
+            })
+            .collect();
+        self.sh.store.replace_memory_fts_for_user(username, &rows)?;
+        self.sh.store.meta_set(&key, &fingerprint)?;
+        Ok(())
+    }
+
+    /// Search accepted memory and past turns in one call. Memory hits come
+    /// first; episodes are user-scoped unless the caller is the admin.
+    /// Read callers (the tool and `/memory search`) enforce the private
+    /// and scheduled-source gates.
+    pub fn search_memory_and_episodes(
+        &self,
+        query: &str,
+        limit: usize,
+        who: &Principal,
+    ) -> Result<Vec<MemorySearchHit>, Error> {
+        self.ensure_memory_index_for(&who.username)?;
+        let limit = limit.clamp(1, 50);
+        let mut hits = Vec::new();
+        for h in self
+            .sh
+            .store
+            .search_memory_fts_for_user(&who.username, query, limit)?
+        {
+            hits.push(MemorySearchHit {
+                kind: "memory",
+                id: h.id,
+                snippet: h.snippet,
+                detail: format!("{} · {}", h.file, h.source),
+                at_ms: h.accepted_ms,
+            });
+        }
+        for h in self.history_search_filtered(
+            query,
+            limit,
+            &ka_agent_store::EpisodeFilter::default(),
+            who,
+        )? {
+            hits.push(MemorySearchHit {
+                kind: "episode",
+                id: h.turn,
+                snippet: h.snippet,
+                detail: h.role,
+                at_ms: h.at_ms,
+            });
+        }
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// `/remember <fact>`: explicit acceptance (SEED.md §4.4 path 1) —
@@ -329,6 +440,7 @@ impl Runtime {
             ka_agent_memory::DEFAULT_BUDGET_BYTES,
             &memory_preamble(&self.cfg()),
         )?;
+        self.ensure_memory_index_for(username)?;
         Ok(())
     }
 

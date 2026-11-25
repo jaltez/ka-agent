@@ -108,6 +108,7 @@ fn scenario_file(root: &std::path::Path, body: &str) -> std::path::PathBuf {
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ka-agent-m3-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -213,6 +214,44 @@ fn candidate_review_accept_flow() {
     // Review is empty again.
     chat.send("/memory review");
     chat.expect("no pending candidates", Duration::from_secs(10));
+
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A: `/memory search` finds an accepted bullet and refuses to read in a
+/// private conversation.
+#[test]
+fn memory_search_finds_a_remembered_fact_and_refuses_in_private() {
+    let root = temp_root("search");
+    let sc = scenario_file(
+        &root,
+        r#"{ "steps": [ {"text": "ok"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc);
+    chat.expect("local session", Duration::from_secs(60));
+
+    chat.send("/remember The release branch is release/2026.");
+    chat.expect("remembered", Duration::from_secs(20));
+
+    chat.send("/memory search release branch");
+    chat.expect("facts.md", Duration::from_secs(20));
+    let out = chat.seen();
+    assert!(
+        out.contains("mem:"),
+        "the hit must carry its memory id:\n{out}"
+    );
+
+    chat.send("/memory search zzz-no-such-fact");
+    chat.expect("no memory or history matches", Duration::from_secs(20));
+
+    chat.send("/new private");
+    chat.expect("private session", Duration::from_secs(20));
+    chat.send("/memory search release");
+    chat.expect(
+        "this is a private conversation — memory search is off here",
+        Duration::from_secs(20),
+    );
 
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();

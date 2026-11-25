@@ -27,6 +27,7 @@ mod identities;
 mod intents;
 mod kb_sources;
 mod kbs;
+mod memory_search;
 mod outbox;
 mod plans;
 mod presets;
@@ -48,6 +49,7 @@ pub use checkpoints::CheckpointRow;
 pub use groups::{GroupRow, model_allowed, model_matches};
 pub use kb_sources::KbSourceRow;
 pub use kbs::{KbDocInfo, KbHit, KbRow};
+pub use memory_search::{MemoryHit, MemoryIndexRow};
 pub use plans::{PlanRow, PlanStatus};
 pub use retention::PruneReport;
 pub use skill_usage::SkillUsage;
@@ -127,6 +129,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v17.sql"),
     include_str!("schema_v18.sql"),
     include_str!("schema_v19.sql"),
+    include_str!("schema_v20.sql"),
 ];
 
 /// One run of a background job (task runner, memory compaction, ...).

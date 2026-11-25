@@ -315,7 +315,7 @@ impl Setup {
                 if self.voice.is_none() || !self.confirm_and_write().await? {
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
-                crate::config_cli::apply_live(&self.args.config);
+                let _ = crate::config_cli::apply_live(&self.args.config);
                 println!("Voice notes on — restart the agent so the phone channels pick it up");
                 Ok(std::process::ExitCode::SUCCESS)
             }
@@ -333,7 +333,7 @@ impl Setup {
                 if self.search.is_none() || !self.confirm_and_write().await? {
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
-                crate::config_cli::apply_live(&self.args.config);
+                let _ = crate::config_cli::apply_live(&self.args.config);
                 println!("Web search is on — try: \"search the web for …\"");
                 Ok(std::process::ExitCode::SUCCESS)
             }

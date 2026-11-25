@@ -44,6 +44,8 @@ operator accepts stable-memory writes.
     recompiles, commits.
   - `/forget <id>` — removes the entry, recompiles, commits.
   - `/memory` — report: files, bytes, budget %, truncated flag.
+  - `/memory search <query>` — accepted-memory and past-turn search
+    (phase A). Refused in a private conversation.
   - `/memory review` — lists pending candidates with **full ids**.
   - `/memory accept <id>` / `/memory reject <id>` — candidate → stable
     memory (or rejected). `<id>` may be the full id or any unique prefix
@@ -121,6 +123,41 @@ operator accepts stable-memory writes.
     turns under the same predicates, the caller's own (every user's for
     the admin). Under a filter, episodes whose turn row was pruned drop
     out (the join turns inner) — accepted.
+
+## Search (`memory_fts`)
+
+- **Derived state, not the source of truth**: `memory_fts` (schema v20) is
+  one FTS5 row per accepted bullet. The Markdown tree plus git remains the
+  source. Rows: `id`, `username`, `file`, `text`, `keywords`, `source`,
+  `accepted_ms`, `valid_until`.
+- **Refresh**: rebuilt after every accepted change (`/remember`, `/forget`,
+  candidate accept, `/memory undo`) and lazily before a search when the
+  entry fingerprint differs. An external `ka-agent memory edit` is picked
+  up on the next search. `ka-agent user purge` deletes the user's rows
+  after removing the tree.
+- **Keywords**: `ka_agent_memory::keywords` takes up to eight distinct
+  lowercased tokens of three or more characters, minus common function
+  words. Deterministic, no model call. The FTS match searches the text and
+  the keywords.
+- **Query semantics**: `memory_fts` uses an OR of quoted prefixes ranked by
+  BM25. This is recall-oriented, unlike `/history`'s AND-of-terms. A
+  missing word does not hide a relevant bullet, and `deploy` matches
+  `deploys`.
+- **Surfaces**: `/memory search <query>` (shared router) and
+  `kagent__memory_search` (read-only MCP tool). Both return accepted
+  memory first, then the caller's past turns, with `[mem:<id>]` or
+  `[turn:<id>]`, a date, and the file/source or role. Knowledge-base
+  documents stay on `kb_search`.
+- **Gates**: `/memory search` and `memory_search` refuse in a private
+  conversation. `memory_search` also refuses a scheduled-source turn
+  (`cron`, `cron:<id>`, `briefing`). B15b's automation compile already
+  keeps those turns from reading personal memory; the gate closes the
+  tool path too.
+- **Eval**: `cargo test -p ka-agent --test memory_eval -- --nocapture`.
+  The corpus deliberately exceeds the 6 KB compile budget, so the
+  compiled-`MEMORY.md` baseline misses truncated bullets while FTS finds
+  them. It prints Recall@5 per class and p50 FTS latency; phase A asserts
+  the lexical gain and no class regression.
 
 ## What does NOT auto-update memory
 

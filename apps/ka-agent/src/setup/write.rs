@@ -239,7 +239,7 @@ impl Setup {
             self.pair_telegram().await?;
             paired = true;
         }
-        self.step_service()?;
+        let _ = self.step_service()?;
         self.step_first_reply().await?;
         self.final_lines(paired);
         Self::import_hint();
