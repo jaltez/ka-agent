@@ -22,10 +22,13 @@ operator accepts stable-memory writes.
   priority order (profile → persona → preferences → environment →
   conventions → projects → facts) under a `# Ka Agent memory` header,
   stripping provenance comments, enforcing `DEFAULT_BUDGET_BYTES = 6144`.
-  Files that don't fit are truncated entry-by-entry; later files are
-  replaced by a one-line omission marker. The result is written to
-  `<engine-home>/.config/ka/MEMORY.md` (ka's user-tier memory, re-read per
-  prompt — validation §5: no worker restart needed).
+  Bullets whose `valid_until` has passed are excluded from the current
+  compile; the Markdown and git history keep them, and an `as_of` search
+  can still read them by date. Files that don't fit are truncated
+  entry-by-entry; later files are replaced by a one-line omission marker.
+  The result is written to `<engine-home>/.config/ka/MEMORY.md` (ka's
+  user-tier memory, re-read per prompt — validation §5: no worker restart
+  needed).
 - **Automation variant** (B15b): turns a schedule started (`cron`,
   `cron:<id>`, `briefing`, `trigger:sched:<id>` sources) run against an `Automation`-scope
   compile that keeps only the machine facts (`environment.md` +
@@ -36,9 +39,11 @@ operator accepts stable-memory writes.
   (`turn_finished` before any drain, `idle` before any drain,
   engine-closed) and the Err arms of both bracketed submit paths (a
   submit failure marks the turn `interrupted` and no port event ever
-  arrives). Limits: only daemon death inside a scheduled span leaves the
-  lean compile until the next boot or memory change — degraded answers,
-  never a leak; two processes refreshing mid-span race benignly.
+  arrives). A schedule-trigger fire publishes the same per-user turn
+  context as a chat turn, so the bridge gates read the trigger source.
+  Limits: only daemon death inside a scheduled span leaves the lean
+  compile until the next boot or memory change — degraded answers, never a
+  leak; two processes refreshing mid-span race benignly.
 - **Commands** (shared router: console, Telegram, Matrix):
   - `/remember <fact>` — explicit operator acceptance, appends to facts.md,
     recompiles, commits.
@@ -141,8 +146,9 @@ operator accepts stable-memory writes.
 - **Refresh**: rebuilt after every accepted change (`/remember`, `/forget`,
   candidate accept, `/memory undo`) and lazily before a search when the
   entry fingerprint differs. An external `ka-agent memory edit` is picked
-  up on the next search. `ka-agent user purge` deletes the user's rows
-  after removing the tree.
+  up on the next search: the FTS mirror is rebuilt and the vector cache is
+  cleared and re-embedded in the background. `ka-agent user purge` deletes
+  the user's rows after removing the tree.
 - **Keywords**: `ka_agent_memory::keywords` takes up to eight distinct
   lowercased tokens of three or more characters, minus common function
   words. Deterministic, no model call. The FTS match searches the text and
@@ -150,12 +156,17 @@ operator accepts stable-memory writes.
 - **Query semantics**: `memory_fts` uses an OR of quoted prefixes ranked by
   BM25. This is recall-oriented, unlike `/history`'s AND-of-terms. A
   missing word does not hide a relevant bullet, and `deploy` matches
-  `deploys`.
+  `deploys`. The current view excludes bullets whose `valid_until` has
+  passed and bullets accepted after the as-of date. `as_of` reads the
+  bullets that were valid on that date.
 - **Surfaces**: `/memory search <query>` (shared router) and
   `kagent__memory_search` (read-only MCP tool). Both return accepted
   memory first, then the caller's past turns, with `[mem:<id>]` or
-  `[turn:<id>]`, a date, and the file/source or role. Knowledge-base
-  documents stay on `kb_search`.
+  `[turn:<id>]`, a date, and the file/source or role. Retrieved memory is
+  labeled data, not instructions. `memory_search` also accepts
+  `session:<id-or-prefix>`, `after:YYYY-MM-DD`, `before:YYYY-MM-DD`,
+  `as_of:YYYY-MM-DD`, and `expand:0..2`; `expand` returns the neighboring
+  turns of an episode hit. Knowledge-base documents stay on `kb_search`.
 - **Gates**: `/memory search` and `memory_search` refuse in a private
   conversation. `memory_search` also refuses a scheduled-source turn
   (`cron`, `cron:<id>`, `briefing`, `trigger:sched:<id>`). B15b's automation compile already
@@ -164,8 +175,11 @@ operator accepts stable-memory writes.
 - **Eval**: `cargo test -p ka-agent --test memory_eval -- --nocapture`.
   The corpus deliberately exceeds the 6 KB compile budget, so the
   compiled-`MEMORY.md` baseline misses truncated bullets while FTS finds
-  them. It prints Recall@5 per class and p50 FTS latency; phase A asserts
-  the lexical gain and no class regression.
+  them. It prints Recall@5 per class and p50 latency; phase A asserts the
+  lexical gain and no class regression. The next-round test covers
+  expired-current versus as-of, state recovery from the artifact, a
+  retrieval-level task proxy, and p50/p95 latency. A real embedding model
+  is opt-in through `KA_MEMORY_EVAL_EMBEDDING_MODEL` and `--ignored`.
 
 ## Recall and embeddings (B1)
 

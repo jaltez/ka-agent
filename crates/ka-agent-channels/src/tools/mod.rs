@@ -109,7 +109,7 @@ pub static BUILTINS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "memory_search",
-        description: "Search accepted memory and past conversation turns by words. Returns snippets with ids and dates. Read-only; unavailable in private or scheduled turns. For knowledge-base documents use kb_search.",
+        description: "Search accepted memory and past conversation turns by words. Narrow with session, after, before, as_of; expand an episode hit with neighboring turns. Returns labeled data with ids and dates. Read-only; unavailable in private or scheduled turns. For knowledge-base documents use kb_search.",
         schema: memory_search::schema,
         effect: Effect::Read,
         run: memory_search::run,

@@ -50,6 +50,7 @@ use config::publish_timezone;
 pub use config::{ReloadReport, memory_preamble};
 pub use events::split_final_text;
 pub use identity::{LEGACY_AGENTS_MD_SHA256, compile_identity, legacy_agents_md_status};
+pub use memory::{MemorySearchFilter, MemorySearchHit};
 pub use scheduler::CancelOutcome;
 pub use worker::Backoff;
 

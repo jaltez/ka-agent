@@ -63,7 +63,7 @@ pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             }
         }
         let text = args["text"].as_str().ok_or("missing 'text'")?;
-        if text.is_empty() || text.len() > 300 {
+        if !proposal_len_ok(text) {
             return Err("text must be 1-300 chars".into());
         }
         ka_agent_memory::screen_proposal(text)?;
@@ -92,4 +92,22 @@ pub(crate) fn propose<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             "proposed for review: {id} (the operator will see it in /memory review)"
         ))
     })
+}
+
+/// The contract says 300 characters, not 300 bytes: a Spanish accented
+/// proposal near the limit must not be over-refused.
+fn proposal_len_ok(text: &str) -> bool {
+    let chars = text.chars().count();
+    chars > 0 && chars <= 300
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn proposal_length_counts_characters_not_bytes() {
+        assert!(super::proposal_len_ok(&"ñ".repeat(151)));
+        assert!(super::proposal_len_ok(&"a".repeat(300)));
+        assert!(!super::proposal_len_ok(&"ñ".repeat(301)));
+        assert!(!super::proposal_len_ok(""));
+    }
 }

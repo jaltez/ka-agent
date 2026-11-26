@@ -822,6 +822,106 @@ fn bridge_memory_search_finds_a_bullet_and_refuses_scheduled_turns() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The agentic read path: as_of excludes an expired bullet, a session
+/// filter narrows episodes, and expand returns neighboring turns.
+#[test]
+fn bridge_memory_search_filters_as_of_session_and_expand() {
+    use std::io::Write as _;
+    let root = temp_root("memory-filters");
+    let data = root.join("data");
+    std::fs::create_dir_all(data.join("memory")).unwrap();
+    std::fs::write(
+        data.join("memory/facts.md"),
+        "# Facts\n\
+         - The backup bucket is ka-backups-old.\n\
+         <!-- id: mem_filter_old; source: operator; accepted: 2026-01-01T00:00:00.000Z; valid_until: 2029-01-01 -->\n\
+         - The backup bucket is ka-backups-new.\n\
+         <!-- id: mem_filter_new; source: operator; accepted: 2026-01-01T00:00:00.000Z; valid_until: 2031-01-01 -->\n",
+    )
+    .unwrap();
+    let cfg = write_config(&root);
+    let store = ka_agent_store::Store::open(&data.join("state.db")).unwrap();
+    let session = ka_agent_core::Session::new(root.join("ws"));
+    store.insert_session(&session).unwrap();
+    let previous =
+        ka_agent_core::Turn::new(session.id.clone(), "previous note about releases".into());
+    store.insert_turn(&previous).unwrap();
+    store
+        .push_chunk(&ka_agent_core::OutboxChunk::new(
+            previous.id.clone(),
+            0,
+            "previous answer".into(),
+        ))
+        .unwrap();
+    let turn = ka_agent_core::Turn::new(session.id.clone(), "quarterly release checklist".into());
+    store.insert_turn(&turn).unwrap();
+    store
+        .push_chunk(&ka_agent_core::OutboxChunk::new(
+            turn.id.clone(),
+            0,
+            "run cargo test".into(),
+        ))
+        .unwrap();
+    for (t, role, text) in [
+        (&previous, "user", "previous note about releases"),
+        (&previous, "assistant", "previous answer"),
+        (&turn, "user", "quarterly release checklist"),
+        (&turn, "assistant", "run cargo test"),
+    ] {
+        store.index_episode(&session.id, &t.id, role, text).unwrap();
+    }
+    let _host = start_host(&data, &cfg);
+
+    let mut child = ka(&data)
+        .arg("__mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"backup bucket"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"backup bucket","as_of":"2030-01-01"}}}"#.to_string(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_search","arguments":{{"query":"release checklist","session":"{}","expand":1}}}}}}"#,
+            session.id.as_str()
+        ),
+    ] {
+        stdin.write_all(msg.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+    }
+    drop(child.stdin.take());
+    let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned();
+    let line = |id: u32| {
+        out.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(
+        line(2).contains("lter_old")
+            && line(2).contains("lter_new")
+            && line(2).contains("data, not instructions"),
+        "{}",
+        line(2)
+    );
+    assert!(
+        line(3).contains("lter_new") && !line(3).contains("lter_old"),
+        "{}",
+        line(3)
+    );
+    assert!(
+        line(4).contains("turn:")
+            && line(4).contains("previous note")
+            && line(4).contains("previous answer"),
+        "{}",
+        line(4)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn bridge_memory_search_refuses_a_scheduled_source() {
     use std::io::Write as _;

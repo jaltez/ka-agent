@@ -21,6 +21,9 @@ pub use event::{AgentEvent, Envelope, PlanItem};
 pub use ka_agent_port::{catalog, registry};
 pub use paths::{InstanceLock, LockError, Paths};
 pub use runtime::compile_identity;
-pub use runtime::{CancelOutcome, Error, ModelKeyState, ReloadReport, Runtime, memory_preamble};
+pub use runtime::{
+    CancelOutcome, Error, MemorySearchFilter, MemorySearchHit, ModelKeyState, ReloadReport,
+    Runtime, memory_preamble,
+};
 pub use status::StatusReport;
 pub use surface::{ApprovalCard, Surface};

@@ -144,8 +144,9 @@ fn op() -> ka_agent_core::Principal {
 /// A runtime on a temp root with the scripted worker and the two accounts
 /// the identity tests need. `stop` decides what every fire's engine says.
 #[cfg(unix)]
-fn trigger_runtime(
+fn trigger_runtime_with_steps(
     tag: &str,
+    steps: &str,
     stop: &str,
     roles: &[ka_agent_core::config::RoleSpec],
 ) -> (
@@ -156,7 +157,7 @@ fn trigger_runtime(
     ka_agent_core::TaskId,
 ) {
     let root = fresh_root(tag);
-    let port = scenario_port(&root, r#"{"text": "triaged"}"#, stop);
+    let port = scenario_port(&root, steps, stop);
     let store = Arc::new(Store::open(&root.join("state.db")).unwrap());
     store
         .ensure_user(&user(ka_agent_core::OPERATOR_USER, "admin"))
@@ -178,6 +179,21 @@ fn trigger_runtime(
     )
     .unwrap();
     (rt, store, rec, root, ka_agent_core::TaskId::generate())
+}
+
+#[cfg(unix)]
+fn trigger_runtime(
+    tag: &str,
+    stop: &str,
+    roles: &[ka_agent_core::config::RoleSpec],
+) -> (
+    Runtime,
+    Arc<Store>,
+    Arc<Recorder>,
+    PathBuf,
+    ka_agent_core::TaskId,
+) {
+    trigger_runtime_with_steps(tag, r#"{"text": "triaged"}"#, stop, roles)
 }
 
 fn member_role(name: &str, allow: &[&str]) -> ka_agent_core::config::RoleSpec {
@@ -521,4 +537,94 @@ async fn preflight_skip_does_not_spend_an_agent_turn() {
     // The scratch engine-home is gone and the pool slot released.
     assert!(!root.join("tmp").read_dir().unwrap().next().is_some());
     wait_until("pool released", || rt.live_worker_count() == 0).await;
+}
+
+#[cfg(unix)]
+fn engine_memory(root: &Path) -> PathBuf {
+    Paths::new(root.to_path_buf())
+        .user_engine_home("operator")
+        .join(".config/ka/MEMORY.md")
+}
+
+/// A schedule trigger publishes the same per-user turn context as a chat
+/// turn, runs against the automation compile (no personal bullet), and
+/// restores the full compile when the fire settles.
+#[cfg(unix)]
+#[tokio::test]
+async fn schedule_trigger_compiles_automation_and_publishes_context() {
+    let (rt, store, _rec, root, _seed) = trigger_runtime_with_steps(
+        "sched-memory",
+        r#"{"sleep_ms": 800}, {"text": "triaged"}"#,
+        "done",
+        &[member_role("member", &["read"])],
+    );
+    let memory = rt.memory_store(&op().username).unwrap();
+    memory
+        .add(
+            ka_agent_memory::MemoryFile::Environment,
+            "laptop has 32 GB",
+            "operator",
+            None,
+        )
+        .unwrap();
+    memory.commit("memory: seed environment").unwrap();
+    rt.remember("likes tea personally", "operator", &op())
+        .unwrap();
+    let before = std::fs::read(engine_memory(&root)).unwrap();
+
+    let mut spec = webhook_spec("ci/sched", false);
+    spec.kind = TriggerKind::Schedule;
+    spec.hook_path = None;
+    spec.recurrence_ms = None;
+    let task_id = rt
+        .add_trigger(spec, Some(ka_agent_core::now_ms() - 1), &op())
+        .unwrap();
+    let task = store.get_task(&task_id).unwrap().unwrap();
+    let spec = TriggerSpec::from_payload(task.payload.as_deref().unwrap()).unwrap();
+    let lineage = ka_agent_core::SessionId(spec.session_id.clone());
+
+    rt.fire_due_tasks().await.unwrap();
+
+    // Mid-cycle: the automation compile is installed; the personal bullet
+    // is out, the machine fact is in.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut lean_seen = false;
+    while Instant::now() < deadline {
+        let text = std::fs::read_to_string(engine_memory(&root)).unwrap_or_default();
+        if !text.contains("likes tea personally") && text.contains("laptop has 32 GB") {
+            lean_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        lean_seen,
+        "automation compile never installed; MEMORY.md: {}",
+        std::fs::read_to_string(engine_memory(&root)).unwrap_or_default()
+    );
+
+    wait_until("trigger turn", || {
+        store.count_turns_for_session(&lineage).unwrap_or(0) == 1
+    })
+    .await;
+    wait_until("full memory restored", || {
+        std::fs::read_to_string(engine_memory(&root))
+            .map(|text| text == String::from_utf8_lossy(&before))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // The bridge gate reads this key; a trigger fire must publish it.
+    let source = store
+        .meta_get(&ka_agent_core::layout::turnctx_key(
+            ka_agent_core::OPERATOR_USER,
+            "source",
+        ))
+        .unwrap();
+    assert_eq!(
+        source.as_deref(),
+        Some(format!("trigger:sched:{}", task_id.as_str()).as_str())
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

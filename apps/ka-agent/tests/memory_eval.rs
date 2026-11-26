@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ka_agent_memory::{DEFAULT_BUDGET_BYTES, Entry, MemoryFile, MemoryStore};
 use ka_agent_runtime::runtime::memory_vectors::{cosine_top_k, rrf_fuse};
-use ka_agent_store::{MemoryIndexRow, MemoryVectorRow, Store};
+use ka_agent_store::{MemoryAsOf, MemoryIndexRow, MemoryVectorRow, Store};
 
 struct Case {
     class: &'static str,
@@ -24,12 +24,14 @@ struct Case {
 }
 
 fn temp_root() -> std::path::PathBuf {
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!(
-        "ka-agent-memory-eval-{}-{stamp}",
+        "ka-agent-memory-eval-{}-{stamp}-{n}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -446,7 +448,12 @@ fn phase_b1_eval_hybrid_beats_fts() {
         let base = baseline_ids(&entries, &compiled, case.query, 5);
         let started = Instant::now();
         let fts = store
-            .search_memory_fts_for_user("eval", case.query, 10)
+            .search_memory_fts_for_user(
+                "eval",
+                case.query,
+                10,
+                &MemoryAsOf::new(ka_agent_core::now_ms(), "2099-12-31"),
+            )
             .unwrap();
         let query_vec = fixture_embed(case.query);
         let vector_hits = cosine_top_k(&query_vec, &vector_owned, 10);
@@ -571,5 +578,263 @@ fn phase_b1_eval_hybrid_beats_fts() {
         "the 600-token recall budget plus the compiled-memory estimate must fit the 2,000-token cap"
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The next-round eval: the current view must not return expired memory,
+/// an as-of view must, state recovery must be measured from the artifact,
+/// and a small task must succeed only when the required facts are present.
+#[test]
+fn phase_next_eval_validity_as_of_forgetting_and_recovery() {
+    let root = temp_root();
+    let memory = MemoryStore::open(&root.join("memory")).unwrap();
+    let expired_id = memory
+        .add(
+            MemoryFile::Facts,
+            "the staging URL is staging-old.example.com",
+            "operator",
+            Some("2020-01-01".into()),
+        )
+        .unwrap();
+    let current_id = memory
+        .add(
+            MemoryFile::Facts,
+            "the staging URL is staging-new.example.com",
+            "operator",
+            Some("2099-01-01".into()),
+        )
+        .unwrap();
+    let old_id = memory
+        .add(
+            MemoryFile::Facts,
+            "the backup bucket is ka-backups-old",
+            "operator",
+            Some("2029-01-01".into()),
+        )
+        .unwrap();
+    let new_id = memory
+        .add(
+            MemoryFile::Facts,
+            "the backup bucket is ka-backups-new",
+            "operator",
+            Some("2031-01-01".into()),
+        )
+        .unwrap();
+    let stable_id = memory
+        .add(
+            MemoryFile::Preferences,
+            "prefers concise Spanish answers",
+            "operator",
+            None,
+        )
+        .unwrap();
+    let required_a = memory
+        .add(
+            MemoryFile::Facts,
+            "the release checklist runs cargo test",
+            "operator",
+            None,
+        )
+        .unwrap();
+    let required_b = memory
+        .add(
+            MemoryFile::Facts,
+            "the release checklist updates the changelog",
+            "operator",
+            None,
+        )
+        .unwrap();
+    let forbidden_id = memory
+        .add(
+            MemoryFile::Facts,
+            "the release checklist deletes the branch",
+            "operator",
+            Some("2020-01-01".into()),
+        )
+        .unwrap();
+    let hidden = [
+        ("the operator name is Ana", "Ana"),
+        ("the office city is Madrid", "Madrid"),
+        ("the team is platform", "platform"),
+        ("the editor is Helix", "Helix"),
+        ("the database is Postgres", "Postgres"),
+        ("the deploy day is Friday", "Friday"),
+    ];
+    for (text, _) in hidden {
+        memory
+            .add(MemoryFile::Profile, text, "operator", None)
+            .unwrap();
+    }
+
+    let entries = memory.entries().unwrap();
+    let rows: Vec<MemoryIndexRow> = entries
+        .iter()
+        .map(|e| MemoryIndexRow {
+            id: e.id.clone(),
+            file: e.file.clone(),
+            text: e.text.clone(),
+            source: e.source.clone(),
+            keywords: ka_agent_memory::keywords(&e.text),
+            accepted_ms: e.accepted_ms,
+            valid_until: e.valid_until.clone(),
+        })
+        .collect();
+    let store = Store::open_in_memory().unwrap();
+    store
+        .replace_memory_fts_for_user("eval-next", &rows)
+        .unwrap();
+
+    let current = MemoryAsOf::new(ka_agent_core::now_ms(), "2026-11-26");
+    let hits = store
+        .search_memory_fts_for_user("eval-next", "staging URL", 10, &current)
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.id == current_id),
+        "current staging missing: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.id == expired_id),
+        "expired staging returned: {hits:?}"
+    );
+    assert!(hits.iter().all(|h| h.id != forbidden_id));
+
+    let before_expiry = MemoryAsOf::new(ka_agent_core::now_ms(), "2028-01-01");
+    let both = store
+        .search_memory_fts_for_user("eval-next", "backup bucket", 10, &before_expiry)
+        .unwrap();
+    assert!(both.iter().any(|h| h.id == old_id), "{both:?}");
+    assert!(both.iter().any(|h| h.id == new_id), "{both:?}");
+    let after_expiry = MemoryAsOf::new(ka_agent_core::now_ms(), "2030-01-01");
+    let only_new = store
+        .search_memory_fts_for_user("eval-next", "backup bucket", 10, &after_expiry)
+        .unwrap();
+    assert!(
+        only_new.iter().all(|h| h.id != old_id),
+        "old backup survived its expiry: {only_new:?}"
+    );
+    assert!(only_new.iter().any(|h| h.id == new_id));
+
+    let compiled = memory.compiled_text(DEFAULT_BUDGET_BYTES).unwrap();
+    assert!(compiled.contains("staging-new.example.com"), "{compiled}");
+    assert!(!compiled.contains("staging-old.example.com"), "{compiled}");
+    assert!(!compiled.contains("deletes the branch"), "{compiled}");
+    assert!(compiled.contains("concise Spanish answers"), "{compiled}");
+
+    // State recovery is measured from the memory artifact, not from a
+    // downstream answer: every hidden fact must be searchable.
+    let mut recovered = 0;
+    for (fact, query) in hidden {
+        let hits = store
+            .search_memory_fts_for_user("eval-next", query, 5, &current)
+            .unwrap();
+        if hits.iter().any(|h| h.text == fact) {
+            recovered += 1;
+        }
+    }
+    assert_eq!(
+        recovered,
+        hidden.len(),
+        "state recovery missed {} of {} facts",
+        hidden.len() - recovered,
+        hidden.len()
+    );
+
+    // A retrieval-level task proxy: the checklist needs both required
+    // facts and must not act on the expired instruction.
+    let task_hits = store
+        .search_memory_fts_for_user("eval-next", "release checklist", 10, &current)
+        .unwrap();
+    let ids: Vec<&str> = task_hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(ids.contains(&required_a.as_str()), "{ids:?}");
+    assert!(ids.contains(&required_b.as_str()), "{ids:?}");
+    assert!(!ids.contains(&forbidden_id.as_str()), "{ids:?}");
+
+    // Cost: p50/p95 over the current search path.
+    let mut latencies = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        let _ = store
+            .search_memory_fts_for_user("eval-next", "staging URL", 10, &current)
+            .unwrap();
+        latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = latencies[latencies.len() / 2];
+    let p95 = latencies[(latencies.len() * 95) / 100];
+    println!(
+        "\nphase next eval: current={current_id} old={old_id} new={new_id} stable={stable_id}\n\
+         state recovery {}/{}; p50 {p50:.2} ms; p95 {p95:.2} ms\n",
+        recovered,
+        hidden.len()
+    );
+    assert!(p95 < 100.0, "p95 memory search too slow: {p95:.2} ms");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Opt-in real-model check. The fixture embedder above proves the fusion
+/// path, not model quality. Run with, for example:
+/// `KA_MEMORY_EVAL_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B cargo test -p ka-agent \
+///  --test memory_eval phase_next_eval_real_model_opt_in -- --ignored --nocapture`
+#[test]
+#[ignore = "opt-in real embedding model; set KA_MEMORY_EVAL_EMBEDDING_MODEL"]
+fn phase_next_eval_real_model_opt_in() {
+    use ka_agent_core::config::{DaemonConfig, Memory, MemoryEmbeddings};
+    use ka_agent_runtime::Paths;
+    use ka_agent_runtime::runtime::memory_embed::build_embedder;
+
+    let model = std::env::var("KA_MEMORY_EVAL_EMBEDDING_MODEL").expect("model");
+    let provider =
+        std::env::var("KA_MEMORY_EVAL_EMBEDDING_PROVIDER").unwrap_or_else(|_| "local".into());
+    let cfg = DaemonConfig {
+        memory: Memory {
+            embeddings: MemoryEmbeddings {
+                provider,
+                model: Some(model),
+                ..MemoryEmbeddings::default()
+            },
+            ..Memory::default()
+        },
+        ..DaemonConfig::default()
+    };
+    let root = temp_root();
+    let paths = Paths::new(root.clone());
+    let embedder = build_embedder(&cfg, &paths)
+        .expect("embedder")
+        .expect("provider none");
+    let texts = [
+        "the staging URL is staging-new.example.com",
+        "prefers concise Spanish answers",
+        "the release checklist runs cargo test",
+    ];
+    let vectors = embedder
+        .embed(&texts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .expect("embed");
+    let mut query = embedder
+        .embed(&["where is staging".to_string()])
+        .expect("query")
+        .remove(0);
+    let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut query {
+            *v /= norm;
+        }
+    }
+    let rows: Vec<(String, Vec<f32>)> = texts
+        .iter()
+        .zip(vectors)
+        .map(|(text, mut vec)| {
+            let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for v in &mut vec {
+                    *v /= norm;
+                }
+            }
+            (text.to_string(), vec)
+        })
+        .collect();
+    let top = cosine_top_k(&query, &rows, 3);
+    println!("\nreal model {}: top={top:?}", embedder.model());
+    assert!(!top.is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }

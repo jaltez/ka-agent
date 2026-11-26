@@ -384,19 +384,37 @@ impl MemoryStore {
             bullets: Vec<String>,
         }
         let mut secs = Vec::new();
+        // The current view excludes bullets whose `valid_until` has
+        // passed. The Markdown keeps them; `as_of` search can still read
+        // them by date. `entries()` stays the full historical set.
+        let today = rfc3339(ka_agent_core::now_ms());
+        let today = today.get(..10).unwrap_or("");
         for rel in self.scan_files(scope)? {
             let content = std::fs::read_to_string(self.root.join(&rel))?;
             let title = MemoryFile::from_rel(&rel)
                 .map(|m| m.title())
                 .unwrap_or_else(|| rel.trim_end_matches(".md").to_string());
+            let lines: Vec<&str> = content.lines().collect();
+            let bullets = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| {
+                    if !line.starts_with("- ") {
+                        return None;
+                    }
+                    let expired = lines
+                        .get(i + 1)
+                        .copied()
+                        .and_then(parse_comment)
+                        .and_then(|(_, _, _, valid_until)| valid_until)
+                        .is_some_and(|valid_until| valid_until.as_str() < today);
+                    (!expired).then(|| (*line).to_string())
+                })
+                .collect();
             secs.push(Sec {
                 bytes: content.len(),
                 header: format!("## {title}\n"),
-                bullets: content
-                    .lines()
-                    .filter(|l| l.starts_with("- "))
-                    .map(|l| l.to_string())
-                    .collect(),
+                bullets,
                 rel,
             });
         }
@@ -1155,6 +1173,40 @@ mod tests {
             .find(|e| e.id == id)
             .unwrap();
         assert_eq!(e.valid_until.as_deref(), Some("2026-12-31"));
+    }
+
+    #[test]
+    fn compile_skips_expired_but_keeps_the_history() {
+        let root = tmp_root("expiry");
+        let store = MemoryStore::open(&root).unwrap();
+        store
+            .add(
+                MemoryFile::Facts,
+                "expired staging URL is staging-old.example.com",
+                "operator",
+                Some("2020-01-01".into()),
+            )
+            .unwrap();
+        store
+            .add(
+                MemoryFile::Facts,
+                "current staging URL is staging-new.example.com",
+                "operator",
+                Some("2099-01-01".into()),
+            )
+            .unwrap();
+
+        let text = store.compiled_text(DEFAULT_BUDGET_BYTES).unwrap();
+        assert!(!text.contains("staging-old.example.com"), "{text}");
+        assert!(text.contains("staging-new.example.com"), "{text}");
+        // The historical entry is still on disk and still parseable.
+        let entries = store.entries().unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.text.contains("staging-old.example.com"))
+        );
     }
 
     #[test]

@@ -445,15 +445,28 @@ pub fn users_purge(runtime: &Runtime, body: &[u8]) -> Response {
         None => " (no export on record — this is irreversible)".to_string(),
     };
     match ka_agent_runtime::user_ops::purge_user(&runtime.paths(), username) {
-        Ok(removed) => admin_page(
-            "Purge",
-            "",
-            "/users",
-            flash(
-                "ok",
-                &format!("purged {}: {}{}", username, removed.join(", "), warning),
-            ),
-        ),
+        Ok(removed) => {
+            if let Err(e) = runtime.store().delete_memory_derived_for_user(username) {
+                return admin_page(
+                    "Purge",
+                    "",
+                    "/users",
+                    flash(
+                        "bad",
+                        &format!("purged the trees but not the derived memory rows: {e}"),
+                    ),
+                );
+            }
+            admin_page(
+                "Purge",
+                "",
+                "/users",
+                flash(
+                    "ok",
+                    &format!("purged {}: {}{}", username, removed.join(", "), warning),
+                ),
+            )
+        }
         Err(e) => admin_page("Purge", "", "/users", flash("bad", &e)),
     }
 }
@@ -954,4 +967,79 @@ fn hex(bytes: usize) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use ka_agent_runtime::{Envelope, Paths, Runtime, surface::Surface};
+    use ka_agent_store::{MemoryIndexRow, MemoryVectorRow};
+    use std::sync::Arc;
+
+    struct Noop;
+
+    impl Surface for Noop {
+        fn emit(&self, _env: &Envelope) {}
+    }
+
+    #[test]
+    fn purge_deletes_derived_memory_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "ka-web-purge-{}-{}",
+            std::process::id(),
+            ka_agent_core::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::new(root.clone());
+        paths.ensure_dirs().unwrap();
+        paths.ensure_user_dirs("ana").unwrap();
+        let store = Arc::new(Store::open(&root.join("state.db")).unwrap());
+        store
+            .replace_memory_fts_for_user(
+                "ana",
+                &[MemoryIndexRow {
+                    id: "mem_web".into(),
+                    file: "facts.md".into(),
+                    text: "ana fact".into(),
+                    source: "operator".into(),
+                    keywords: String::new(),
+                    accepted_ms: 1,
+                    valid_until: None,
+                }],
+            )
+            .unwrap();
+        store
+            .replace_memory_vectors_for_user(
+                "ana",
+                "test-model",
+                2,
+                &[MemoryVectorRow {
+                    ref_id: "mem_web".into(),
+                    scope: None,
+                    vec: vec![1.0, 0.0],
+                    updated_ms: 1,
+                }],
+            )
+            .unwrap();
+        let cfg = ka_agent_core::DaemonConfig {
+            workspace: root.join("ws"),
+            ..ka_agent_core::DaemonConfig::default()
+        };
+        let rt = Runtime::new(
+            cfg,
+            paths,
+            Arc::clone(&store),
+            ka_agent_port::WorkerPort::default(),
+            Arc::new(Noop) as Arc<dyn Surface>,
+        )
+        .unwrap();
+
+        let resp = users_purge(&rt, b"username=ana&confirm=ana");
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(store.count_memory_fts_for_user("ana").unwrap(), 0);
+        assert_eq!(store.count_memory_vectors_for_user("ana").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

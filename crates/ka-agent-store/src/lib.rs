@@ -51,7 +51,7 @@ pub use checkpoints::CheckpointRow;
 pub use groups::{GroupRow, model_allowed, model_matches};
 pub use kb_sources::KbSourceRow;
 pub use kbs::{KbDocInfo, KbHit, KbRow};
-pub use memory_search::{MemoryHit, MemoryIndexRow};
+pub use memory_search::{MemoryAsOf, MemoryHit, MemoryIndexRow};
 pub use memory_vectors::MemoryVectorRow;
 pub use plans::{PlanRow, PlanStatus};
 pub use retention::PruneReport;

@@ -602,6 +602,11 @@ impl Runtime {
         gate_output: String,
     ) {
         let source = crate::runtime::scheduler::trigger_source(&task);
+        // The bridge gates (memory_search, memory_propose) read this
+        // per-user context; a trigger fire publishes it exactly like the
+        // queue and direct-submit paths.
+        publish_turn_context(&self.sh.store, &source, &who);
+        let scheduled = ka_agent_core::is_scheduled_source(&source);
         let text = delivered
             .as_ref()
             .map(|item| item.text.clone())
@@ -657,6 +662,25 @@ impl Runtime {
                 return;
             }
         }
+        // B15b: a schedule trigger runs against the automation compile
+        // (machine facts only), restored at every exit below. A webhook
+        // trigger is not a scheduled turn and keeps the creator's full
+        // compile, as ADR-0005 specifies.
+        if scheduled && let Err(e) = self.install_automation_memory_for(&who.username) {
+            self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                retryable: retryable_class("internal"),
+                message: format!("automation memory compile: {e}"),
+            });
+            record_trigger_run(
+                &self.sh.store,
+                &task.id,
+                "failed",
+                Some(&format!("automation memory compile: {e}")),
+            );
+            self.settle_trigger(&task, &spec, false).await;
+            return;
+        }
         match self
             .run_trigger_turn(
                 &task,
@@ -689,6 +713,13 @@ impl Runtime {
                 record_trigger_run(&self.sh.store, &task.id, "failed", Some(&why));
                 self.settle_trigger(&task, &spec, false).await;
             }
+        }
+        if scheduled && let Err(e) = self.refresh_compiled_memory_for(&who.username) {
+            self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                retryable: retryable_class("internal"),
+                message: format!("memory restore: {e}"),
+            });
         }
     }
 

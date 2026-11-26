@@ -18,6 +18,24 @@ pub struct MemoryIndexRow {
     pub valid_until: Option<String>,
 }
 
+/// The validity date a memory search runs at. `ms` bounds `accepted_ms`
+/// (a memory accepted after the as-of date was not knowable then); `date`
+/// is the `YYYY-MM-DD` compared with `valid_until`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAsOf {
+    pub ms: i64,
+    pub date: String,
+}
+
+impl MemoryAsOf {
+    pub fn new(ms: i64, date: impl Into<String>) -> Self {
+        Self {
+            ms,
+            date: date.into(),
+        }
+    }
+}
+
 /// One hit from [`Store::search_memory_fts_for_user`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryHit {
@@ -114,14 +132,17 @@ impl Store {
         Ok(())
     }
 
-    /// FTS search over one user's accepted memory. The raw query goes
-    /// through the same safe AND-of-quoted-terms tokenizer as `/history`,
-    /// so nothing is ever interpreted as FTS syntax.
+    /// FTS search over one user's accepted memory as of `as_of`. The raw
+    /// query goes through the same safe AND-of-quoted-terms tokenizer as
+    /// `/history`, so nothing is ever interpreted as FTS syntax. Expired
+    /// bullets and bullets accepted after `as_of` are excluded; pass the
+    /// as-of date to read history, today to read the current view.
     pub fn search_memory_fts_for_user(
         &self,
         username: &str,
         query: &str,
         limit: usize,
+        as_of: &MemoryAsOf,
     ) -> Result<Vec<MemoryHit>> {
         let match_expr = crate::turns::fts_or_query(query);
         if match_expr.is_empty() {
@@ -134,19 +155,24 @@ impl Store {
                     accepted_ms, valid_until
              FROM memory_fts
              WHERE memory_fts MATCH ?1 AND username = ?2
-             ORDER BY rank LIMIT ?3",
+               AND accepted_ms <= ?3
+               AND (valid_until IS NULL OR valid_until = '' OR valid_until >= ?4)
+             ORDER BY rank LIMIT ?5",
         )?;
-        let rows = stmt.query_map(params![match_expr, username, limit as i64], |r| {
-            Ok(MemoryHit {
-                id: r.get(0)?,
-                file: r.get(1)?,
-                text: r.get(2)?,
-                source: r.get(3)?,
-                snippet: r.get(4)?,
-                accepted_ms: r.get(5)?,
-                valid_until: r.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![match_expr, username, as_of.ms, as_of.date, limit as i64],
+            |r| {
+                Ok(MemoryHit {
+                    id: r.get(0)?,
+                    file: r.get(1)?,
+                    text: r.get(2)?,
+                    source: r.get(3)?,
+                    snippet: r.get(4)?,
+                    accepted_ms: r.get(5)?,
+                    valid_until: r.get(6)?,
+                })
+            },
+        )?;
         collect_rows(rows)
     }
 
@@ -180,6 +206,10 @@ mod tests {
 
     use super::*;
 
+    fn as_of(date: &str) -> MemoryAsOf {
+        MemoryAsOf::new(1_800_000_000_000, date)
+    }
+
     fn row(id: &str, text: &str) -> MemoryIndexRow {
         MemoryIndexRow {
             id: id.into(),
@@ -209,7 +239,7 @@ mod tests {
             .expect("index bob");
 
         let hits = store
-            .search_memory_fts_for_user("alice", "Spanish answers", 5)
+            .search_memory_fts_for_user("alice", "Spanish answers", 5, &as_of("2026-11-26"))
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "mem_a");
@@ -222,22 +252,60 @@ mod tests {
         );
         assert_eq!(
             store
-                .search_memory_fts_for_user("bob", "Spanish", 5)
+                .search_memory_fts_for_user("bob", "Spanish", 5, &as_of("2026-11-26"))
                 .expect("bob search")
                 .len(),
             0
         );
         assert_eq!(
             store
-                .search_memory_fts_for_user("bob", "English", 5)
+                .search_memory_fts_for_user("bob", "English", 5, &as_of("2026-11-26"))
                 .expect("bob search")
                 .len(),
             1
         );
         assert!(
             !store
-                .search_memory_fts_for_user("alice", "concise", 5)
+                .search_memory_fts_for_user("alice", "concise", 5, &as_of("2026-11-26"))
                 .expect("alice search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_filters_expired_and_honors_as_of() {
+        let store = Store::open_in_memory().expect("store");
+        let mut old = row("mem_old", "the staging URL is staging-old");
+        old.valid_until = Some("2029-01-01".into());
+        let mut new = row("mem_new", "the staging URL is staging-new");
+        new.valid_until = Some("2031-01-01".into());
+        store
+            .replace_memory_fts_for_user("alice", &[old, new])
+            .expect("index");
+
+        // Before the old entry expires, both are valid.
+        let both = store
+            .search_memory_fts_for_user("alice", "staging", 10, &as_of("2028-01-01"))
+            .expect("as-of 2028");
+        assert_eq!(both.len(), 2, "{both:?}");
+
+        // After the old entry expires, only the current one is returned.
+        let current = store
+            .search_memory_fts_for_user("alice", "staging", 10, &as_of("2030-01-01"))
+            .expect("as-of 2030");
+        assert_eq!(current.len(), 1, "{current:?}");
+        assert_eq!(current[0].id, "mem_new");
+
+        // Before the entries were accepted, nothing was knowable.
+        assert!(
+            store
+                .search_memory_fts_for_user(
+                    "alice",
+                    "staging",
+                    10,
+                    &MemoryAsOf::new(1_577_836_800_000, "2020-01-01"),
+                )
+                .expect("as-of 2020")
                 .is_empty()
         );
     }
@@ -251,7 +319,7 @@ mod tests {
             .replace_memory_fts_for_user("alice", &[with_keywords])
             .expect("index");
         let hits = store
-            .search_memory_fts_for_user("alice", "telegram", 5)
+            .search_memory_fts_for_user("alice", "telegram", 5, &as_of("2026-11-26"))
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "mem_k");
@@ -277,7 +345,9 @@ mod tests {
             .replace_memory_derived_for_user("alice", &[row("mem_new", "new fact")])
             .unwrap();
         assert_eq!(store.count_memory_vectors_for_user("alice").unwrap(), 0);
-        let hits = store.search_memory_fts_for_user("alice", "new", 5).unwrap();
+        let hits = store
+            .search_memory_fts_for_user("alice", "new", 5, &as_of("2026-11-26"))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "mem_new");
     }
@@ -309,19 +379,19 @@ mod tests {
             .replace_memory_fts_for_user("alice", &[row("mem_c", "new fact")])
             .expect("second");
         let alice = store
-            .search_memory_fts_for_user("alice", "new", 5)
+            .search_memory_fts_for_user("alice", "new", 5, &as_of("2026-11-26"))
             .expect("search");
         assert_eq!(alice.len(), 1);
         assert_eq!(alice[0].id, "mem_c");
         assert!(
             store
-                .search_memory_fts_for_user("alice", "old", 5)
+                .search_memory_fts_for_user("alice", "old", 5, &as_of("2026-11-26"))
                 .expect("old")
                 .is_empty()
         );
         assert_eq!(
             store
-                .search_memory_fts_for_user("bob", "bob", 5)
+                .search_memory_fts_for_user("bob", "bob", 5, &as_of("2026-11-26"))
                 .expect("bob")
                 .len(),
             1

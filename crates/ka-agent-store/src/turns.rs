@@ -17,8 +17,12 @@ pub struct EpisodeFilter {
     pub model: Option<String>,
     /// Inclusive lower bound on `turns.created_ms`.
     pub after_ms: Option<i64>,
+    /// Exclusive upper bound on `turns.created_ms`.
+    pub before_ms: Option<i64>,
     /// One of the turn statuses (`queued`, `done`, `error`, …).
     pub status: Option<String>,
+    /// Restrict to one lineage session id.
+    pub session: Option<String>,
 }
 
 /// The `AND t.… = ?N` predicates for an [`EpisodeFilter`], binding into
@@ -36,9 +40,20 @@ fn filter_preds(filter: &EpisodeFilter, binds: &mut Vec<String>) -> String {
             binds.len()
         ));
     }
+    if let Some(before) = filter.before_ms {
+        binds.push(before.to_string());
+        sql.push_str(&format!(
+            " AND t.created_ms < CAST(?{} AS INTEGER)",
+            binds.len()
+        ));
+    }
     if let Some(status) = &filter.status {
         binds.push(status.clone());
         sql.push_str(&format!(" AND t.status = ?{}", binds.len()));
+    }
+    if let Some(session) = &filter.session {
+        binds.push(session.clone());
+        sql.push_str(&format!(" AND t.session = ?{}", binds.len()));
     }
     sql
 }
@@ -175,6 +190,43 @@ impl Store {
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         out.reverse();
         Ok(out)
+    }
+
+    /// The turns nearest `turn` in the same session, excluding it, for
+    /// `memory_search` context expansion. `limit` bounds the total.
+    pub fn turns_around(
+        &self,
+        session: &SessionId,
+        turn: &TurnId,
+        limit: usize,
+    ) -> Result<Vec<Turn>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let center: Option<i64> = conn
+            .query_row(
+                "SELECT created_ms FROM turns WHERE id = ?1 AND session = ?2",
+                params![turn.as_str(), session.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(center) = center else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT id, session, inbound_text, status, stop, error_class, error_message,
+                    cost_usd, tokens, model, created_ms, updated_ms
+             FROM turns
+             WHERE session = ?1 AND id != ?2
+             ORDER BY ABS(created_ms - ?3) ASC, created_ms ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![session.as_str(), turn.as_str(), center, limit as i64],
+            row_to_turn,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Number of turns recorded for one session — the `@session:` header.

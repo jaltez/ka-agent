@@ -15,6 +15,24 @@ pub struct MemorySearchHit {
     pub snippet: String,
     pub detail: String,
     pub at_ms: i64,
+    /// `YYYY-MM-DD` when the accepted memory expires; the current view
+    /// never returns an expired bullet, an `as_of` view can.
+    pub valid_until: Option<String>,
+    /// The lineage session of an episode hit, for context expansion.
+    pub session: Option<String>,
+    /// Neighboring turns for an episode hit (`expand` > 0).
+    pub context: Vec<String>,
+}
+
+/// Read-time controls for agentic memory search (ReFind-style): narrow by
+/// session/date, read a past validity view, and expand an episode hit with
+/// its neighboring turns.
+#[derive(Debug, Clone, Default)]
+pub struct MemorySearchFilter {
+    pub episode: ka_agent_store::EpisodeFilter,
+    pub as_of: Option<ka_agent_store::MemoryAsOf>,
+    /// Neighboring turns per episode hit, 0..=2.
+    pub expand: u8,
 }
 
 /// FNV-1a over the accepted entries, used to detect an external edit of
@@ -96,6 +114,11 @@ impl Runtime {
         let rows = memory_index_rows(&entries);
         self.sh.store.replace_memory_fts_for_user(username, &rows)?;
         self.sh.store.meta_set(&key, &fingerprint)?;
+        // An external `ka-agent memory edit` changed the source: the FTS
+        // mirror is current now, but the vectors still describe the old
+        // bullets. Drop the cache and rebuild in the background.
+        self.sh.clear_vector_cache(username);
+        self.spawn_vector_reindex(username);
         Ok(())
     }
 
@@ -127,9 +150,40 @@ impl Runtime {
         limit: usize,
         who: &Principal,
     ) -> Result<Vec<MemorySearchHit>, Error> {
+        self.search_memory_and_episodes_filtered(query, limit, who, &MemorySearchFilter::default())
+    }
+
+    /// [`search_memory_and_episodes`](Self::search_memory_and_episodes)
+    /// with session/date narrowing, a past validity view, and context
+    /// expansion. The current view never returns an expired bullet; an
+    /// `as_of` view returns the bullets that were valid on that date.
+    pub fn search_memory_and_episodes_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        who: &Principal,
+        filter: &MemorySearchFilter,
+    ) -> Result<Vec<MemorySearchHit>, Error> {
         self.ensure_memory_index_for(&who.username)?;
         let limit = limit.clamp(1, 50);
         let window = (limit * 4).clamp(10, 50);
+        let as_of = filter.as_of.clone().unwrap_or_else(|| {
+            let now = self.now_zoned();
+            ka_agent_store::MemoryAsOf::new(
+                ka_agent_core::now_ms(),
+                format!(
+                    "{:04}-{:02}-{:02}",
+                    now.year(),
+                    now.month() as u8,
+                    now.day()
+                ),
+            )
+        });
+        let after_ms = filter.episode.after_ms;
+        let before_ms = filter.episode.before_ms;
+        let in_range = |ms: i64| {
+            after_ms.is_none_or(|after| ms >= after) && before_ms.is_none_or(|before| ms < before)
+        };
         let mut by_key: HashMap<String, MemorySearchHit> = HashMap::new();
         let mut ranked: Vec<Vec<String>> = Vec::new();
 
@@ -137,8 +191,11 @@ impl Runtime {
         for h in self
             .sh
             .store
-            .search_memory_fts_for_user(&who.username, query, window)?
+            .search_memory_fts_for_user(&who.username, query, window, &as_of)?
         {
+            if !in_range(h.accepted_ms) {
+                continue;
+            }
             let key = format!("mem:{}", h.id);
             fts_memory.push(key.clone());
             by_key.insert(
@@ -149,6 +206,9 @@ impl Runtime {
                     snippet: h.snippet,
                     detail: format!("{} · {}", h.file, h.source),
                     at_ms: h.accepted_ms,
+                    valid_until: h.valid_until,
+                    session: None,
+                    context: Vec::new(),
                 },
             );
         }
@@ -156,7 +216,8 @@ impl Runtime {
 
         // Semantic recall is optional and degrades to the FTS path on any
         // backend or index error. A vector-only hit still needs its text;
-        // the Markdown entries are the source for that.
+        // the Markdown entries are the source for that. Expired bullets and
+        // bullets accepted after the as-of date are dropped here too.
         if let Ok(vector_hits) = self.vector_top_k_for(&who.username, query, window) {
             let entries = self
                 .memory_store(&who.username)
@@ -170,6 +231,15 @@ impl Runtime {
                 let Some(entry) = by_id.get(id.as_str()) else {
                     continue;
                 };
+                if entry.accepted_ms > as_of.ms
+                    || !in_range(entry.accepted_ms)
+                    || entry
+                        .valid_until
+                        .as_deref()
+                        .is_some_and(|valid_until| valid_until < as_of.date.as_str())
+                {
+                    continue;
+                }
                 let key = format!("mem:{id}");
                 by_key.entry(key.clone()).or_insert_with(|| {
                     let mut snippet: String = entry.text.chars().take(160).collect();
@@ -182,6 +252,9 @@ impl Runtime {
                         snippet,
                         detail: format!("{} · {}", entry.file, entry.source),
                         at_ms: entry.accepted_ms,
+                        valid_until: entry.valid_until.clone(),
+                        session: None,
+                        context: Vec::new(),
                     }
                 });
                 vector_ids.push(key);
@@ -192,12 +265,7 @@ impl Runtime {
         }
 
         let mut episode_ids = Vec::new();
-        for h in self.history_search_filtered(
-            query,
-            window,
-            &ka_agent_store::EpisodeFilter::default(),
-            who,
-        )? {
+        for h in self.history_search_filtered(query, window, &filter.episode, who)? {
             let key = format!("turn:{}", h.turn);
             episode_ids.push(key.clone());
             by_key.insert(
@@ -208,16 +276,69 @@ impl Runtime {
                     snippet: h.snippet,
                     detail: h.role,
                     at_ms: h.at_ms,
+                    valid_until: None,
+                    session: Some(h.session),
+                    context: Vec::new(),
                 },
             );
         }
         ranked.push(episode_ids);
 
-        let fused = super::memory_vectors::rrf_fuse(&ranked, limit);
+        let mut fused = super::memory_vectors::rrf_fuse(&ranked, limit);
+        // A session filter is a relevance signal, not just a predicate:
+        // the named lineage wins ties against hits from other sessions.
+        if let Some(session) = filter.episode.session.as_deref() {
+            let in_session: std::collections::HashSet<String> = fused
+                .iter()
+                .filter(|(key, _)| {
+                    by_key
+                        .get(key)
+                        .is_some_and(|hit| hit.session.as_deref() == Some(session))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for (key, score) in &mut fused {
+                if in_session.contains(key) {
+                    *score += 1.0;
+                }
+            }
+            fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
         let mut out = Vec::with_capacity(fused.len());
         for (key, _) in fused {
             if let Some(hit) = by_key.remove(&key) {
                 out.push(hit);
+            }
+        }
+        if filter.expand > 0 {
+            for hit in &mut out {
+                if hit.kind != "episode" {
+                    continue;
+                }
+                let Some(session) = hit.session.clone() else {
+                    continue;
+                };
+                let Ok(turns) = self.sh.store.turns_around(
+                    &ka_agent_core::SessionId(session),
+                    &ka_agent_core::TurnId(hit.id.clone()),
+                    usize::from(filter.expand) * 2,
+                ) else {
+                    continue;
+                };
+                for turn in turns {
+                    let answer: String = self
+                        .sh
+                        .store
+                        .chunks_for_turn(&turn.id)
+                        .map(|chunks| chunks.into_iter().map(|c| c.text).collect())
+                        .unwrap_or_default();
+                    let user: String = turn.inbound_text.chars().take(180).collect();
+                    let assistant: String = answer.chars().take(180).collect();
+                    hit.context.push(format!(
+                        "[turn:{}] user: {user} → assistant: {assistant}",
+                        ka_agent_core::ids::short_id(turn.id.as_str())
+                    ));
+                }
             }
         }
         Ok(out)
@@ -852,6 +973,9 @@ mod recall_tests {
             snippet: snippet.into(),
             detail: "facts.md · operator".into(),
             at_ms: 0,
+            valid_until: None,
+            session: None,
+            context: Vec::new(),
         }
     }
 

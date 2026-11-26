@@ -148,7 +148,10 @@ never widens. Every fire submits into the trigger's pinned lineage
 session (one session row per trigger, strand resumed across fires), never
 the creator's live chat. A schedule-kind trigger's turn source is
 `trigger:sched:<task id>`; a webhook delivery's is `trigger:<task id>`.
-The scheduled form is excluded by the memory automation gates.
+Every fire publishes that source in the per-user turn context before it
+opens the worker, so the bridge gates read the trigger source. The
+scheduled form installs the automation memory compile and is excluded by
+the memory automation gates.
 
 Degradation contract: every fire appends a `runs` row
 (`kind = "trigger"`, `ref_id` = task id; the preflight gate adds
