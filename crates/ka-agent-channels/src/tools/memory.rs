@@ -115,10 +115,28 @@ fn proposal_len_ok(text: &str) -> bool {
 /// memory tools refuse it. A context without the field predates it and is
 /// not automation: the scheduled-source gate still covers those turns.
 pub(super) fn runs_with_automation_memory(ctx: &ToolCtx) -> bool {
-    super::turnctx(ctx, "memory_scope")
+    if super::turnctx(ctx, "memory_scope")
         .as_deref()
         .and_then(ka_agent_core::TriggerMemoryScope::parse)
         == Some(ka_agent_core::TriggerMemoryScope::Automation)
+    {
+        return true;
+    }
+    // A live turn can overwrite the per-user scope while an automation
+    // trigger runs. The per-trigger markers make that overlap fail closed:
+    // any fresh marker means at least one automation turn is active for
+    // this user, so no turn of theirs may read or propose personal memory.
+    let prefix = ka_agent_core::layout::automation_active_prefix(&ctx.actor.username);
+    let now = ka_agent_core::now_ms();
+    ctx.store
+        .meta_values_with_prefix(&prefix)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|started| started.parse::<i64>().ok())
+        .any(|started| {
+            started <= now
+                && now.saturating_sub(started) < ka_agent_core::layout::AUTOMATION_ACTIVE_TTL_MS
+        })
 }
 
 #[cfg(test)]
@@ -150,7 +168,7 @@ mod automation_scope_tests {
 
     /// Call one memory tool in a turn that carries the given memory scope.
     /// The source is a webhook's, so only the scope gate can refuse.
-    async fn call_with_scope(tool: &str, scope: &str) -> (String, bool) {
+    async fn call_with_scope(tool: &str, scope: &str, active: bool) -> (String, bool) {
         // The tests run in parallel: a per-call sequence, not the clock,
         // keeps two runtimes off one data root.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -182,6 +200,14 @@ mod automation_scope_tests {
                 scope,
             )
             .unwrap();
+        if active {
+            store
+                .meta_set(
+                    &ka_agent_core::layout::automation_active_key(&who.username, "task_1"),
+                    &ka_agent_core::now_ms().to_string(),
+                )
+                .unwrap();
+        }
         let ctx = super::ToolCtx {
             runtime,
             store: Arc::clone(&store),
@@ -201,7 +227,18 @@ mod automation_scope_tests {
     #[tokio::test]
     async fn memory_tools_refuse_a_turn_under_the_automation_scope() {
         for tool in ["memory_search", "memory_propose"] {
-            let (text, is_error) = call_with_scope(tool, "automation").await;
+            let (text, is_error) = call_with_scope(tool, "automation", false).await;
+            assert!(is_error, "{tool} should refuse: {text}");
+            assert!(text.contains("automation memory"), "{tool}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_tools_refuse_while_an_automation_trigger_is_active() {
+        // The live turn's own scope says creator; the concurrent
+        // automation marker must still close the gate.
+        for tool in ["memory_search", "memory_propose"] {
+            let (text, is_error) = call_with_scope(tool, "creator", true).await;
             assert!(is_error, "{tool} should refuse: {text}");
             assert!(text.contains("automation memory"), "{tool}: {text}");
         }
@@ -211,7 +248,7 @@ mod automation_scope_tests {
     async fn the_memory_scope_gate_lets_every_other_turn_through() {
         // The creator's opt-in, and a context that predates the field.
         for scope in ["creator", ""] {
-            let (text, is_error) = call_with_scope("memory_search", scope).await;
+            let (text, is_error) = call_with_scope("memory_search", scope, false).await;
             assert!(!is_error, "scope {scope:?}: {text}");
             assert!(text.contains("nothing found"), "scope {scope:?}: {text}");
         }

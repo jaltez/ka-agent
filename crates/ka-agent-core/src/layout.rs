@@ -68,6 +68,25 @@ pub fn turnctx_key(username: &str, field: &str) -> String {
     format!("turnctx:{username}:{field}")
 }
 
+/// Prefix for the per-trigger automation-active markers:
+/// `memory.automation.active.<username>.<task id>`. A fresh marker makes
+/// every memory tool for that user fail closed, even if a concurrent live
+/// turn last wrote the per-user `memory_scope` context.
+pub const AUTOMATION_ACTIVE_PREFIX: &str = "memory.automation.active.";
+
+/// How long a marker is trusted without a clear. A daemon crash while an
+/// automation trigger runs leaves the marker; after this window memory
+/// tools recover instead of staying closed forever.
+pub const AUTOMATION_ACTIVE_TTL_MS: i64 = 60 * 60 * 1000;
+
+pub fn automation_active_prefix(username: &str) -> String {
+    format!("{AUTOMATION_ACTIVE_PREFIX}{username}.")
+}
+
+pub fn automation_active_key(username: &str, task_id: &str) -> String {
+    format!("{}{task_id}", automation_active_prefix(username))
+}
+
 /// Process-wide profile chosen on the command line (`-p/--profile`).
 /// Set once by the binary before anything resolves a path.
 static PROFILE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

@@ -637,6 +637,8 @@ impl Runtime {
             spec.effective_memory_scope()
         };
         let automation = memory_scope == ka_agent_core::TriggerMemoryScope::Automation;
+        let active_key = automation
+            .then(|| ka_agent_core::layout::automation_active_key(&who.username, task.id.as_str()));
         // The bridge gates (memory_search, memory_propose) read this
         // per-user context; a trigger fire publishes it exactly like the
         // queue and direct-submit paths.
@@ -720,6 +722,27 @@ impl Runtime {
             self.settle_trigger(&task, &spec, false).await;
             return;
         }
+        if let Some(key) = active_key.as_deref()
+            && let Err(e) = self
+                .sh
+                .store
+                .meta_set(key, &ka_agent_core::now_ms().to_string())
+        {
+            self.sh.emit(AgentEvent::Error {
+                class: "internal".into(),
+                retryable: retryable_class("internal"),
+                message: format!("automation marker: {e}"),
+            });
+            record_trigger_run(
+                &self.sh.store,
+                &task.id,
+                "failed",
+                Some(&format!("automation marker: {e}")),
+            );
+            let _ = self.refresh_compiled_memory_for(&who.username);
+            self.settle_trigger(&task, &spec, false).await;
+            return;
+        }
         match self
             .run_trigger_turn(
                 &task,
@@ -753,12 +776,17 @@ impl Runtime {
                 self.settle_trigger(&task, &spec, false).await;
             }
         }
-        if automation && let Err(e) = self.refresh_compiled_memory_for(&who.username) {
-            self.sh.emit(AgentEvent::Error {
-                class: "internal".into(),
-                retryable: retryable_class("internal"),
-                message: format!("memory restore: {e}"),
-            });
+        if automation {
+            if let Some(key) = active_key.as_deref() {
+                let _ = self.sh.store.meta_set(key, "");
+            }
+            if let Err(e) = self.refresh_compiled_memory_for(&who.username) {
+                self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    retryable: retryable_class("internal"),
+                    message: format!("memory restore: {e}"),
+                });
+            }
         }
     }
 

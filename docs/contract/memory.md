@@ -60,8 +60,14 @@ operator accepts stable-memory writes.
   a later turn never inherits an earlier one's. An `automation` fire also
   gets no recall block and contributes nothing to dream input.
   Limit: the turn context is per user, so a trigger fire that overlaps its
-  creator's own live turn can read that turn's context — the limit
-  schedule-trigger fires already had for the scheduled-source gate.
+  creator's own live turn can read that turn's context. An `automation`
+  fire therefore also writes a per-trigger marker
+  (`memory.automation.active.<user>.<task>`); any fresh marker makes every
+  memory tool for that user fail closed while the fire runs. The marker is
+  cleared at the fire tail and ignored after one hour, so a crash cannot
+  block memory forever. Operators set the webhook scope with
+  `ka-agent trigger scope <id> automation|creator`; schedule triggers
+  refuse the command because they always run automation.
 - **Commands** (shared router: console, Telegram, Matrix):
   - `/remember <fact>` — explicit operator acceptance, appends to facts.md,
     recompiles, commits.

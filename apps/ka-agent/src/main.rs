@@ -35,6 +35,7 @@ mod service;
 mod setup;
 mod skills_cli;
 mod term;
+mod trigger_cli;
 mod triggers_cli;
 mod update_cli;
 mod usage_cli;
@@ -402,6 +403,7 @@ fn main() -> std::process::ExitCode {
         Command::Profile { action } => profile_cli::profile_action(action),
         Command::Briefing { action } => briefing_cli::briefing_action(action),
         Command::Cron { action, json } => cron_cli::cron_action(action, json),
+        Command::Trigger { action, json } => trigger_cli::trigger_action(action, json),
         Command::Import { action } => import_cli::import(action),
         Command::Update { action } => {
             update_cli::update(action.unwrap_or(UpdateAction::Run { version: None }))

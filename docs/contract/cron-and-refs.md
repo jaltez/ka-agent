@@ -157,7 +157,11 @@ runs inside the schedule-trigger bracket: it installs the automation
 memory compile and restores the full one when the fire settles (success
 or failure), gets no recall block, and is refused by `memory_search` and
 `memory_propose`. A schedule trigger always runs `automation`, whatever
-its payload says (`memory.md`, "Webhook memory scope").
+its payload says (`memory.md`, "Webhook memory scope"). Operators set a
+webhook's scope with `ka-agent trigger scope <id> automation|creator`;
+schedule triggers refuse the command. An `automation` fire also writes a
+per-trigger active marker so a concurrent live turn's memory tools fail
+closed, and clears it at the tail (stale markers expire after one hour).
 
 Degradation contract: every fire appends a `runs` row
 (`kind = "trigger"`, `ref_id` = task id; the preflight gate adds

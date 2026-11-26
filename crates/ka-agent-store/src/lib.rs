@@ -336,6 +336,17 @@ impl Store {
         Ok(())
     }
 
+    /// Every value under a key prefix, in key order. The automation-active
+    /// markers use this so a gate can see any concurrent trigger marker,
+    /// not just the per-user turn context a racing live turn overwrote.
+    pub fn meta_values_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT value FROM meta WHERE key LIKE ?1 || '%' ORDER BY key")?;
+        let rows = stmt.query_map(params![prefix], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Atomically clear a key only while it still holds `expected`
     /// (compare-and-swap): exactly one caller wins, which is what makes a
     /// one-shot token single-use under concurrent redemption.

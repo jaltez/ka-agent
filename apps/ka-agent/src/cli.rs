@@ -194,6 +194,15 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Inbound triggers: list, set the memory scope.
+    #[command(hide = true)]
+    Trigger {
+        #[command(subcommand)]
+        action: Option<TriggerAction>,
+        /// Machine-readable output (`list`).
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Pending approvals: list, allow (`y <id>`) or deny (`n <id>`).
     Approvals {
         #[command(subcommand)]
@@ -421,6 +430,14 @@ pub(crate) enum CronAction {
     Run { id: String },
     /// What happened on its last fires.
     Runs { id: String },
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum TriggerAction {
+    /// Live triggers, next fire first.
+    List,
+    /// `scope <id> automation|creator`; webhook only, creator is opt-in.
+    Scope { id: String, scope: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -903,7 +920,7 @@ pub(crate) enum SkillsAction {
 /// The footer of `ka-agent --help`: the commands kept out of the main list
 /// (they all work; `ka-agent <command> --help` explains each).
 const ADVANCED_HELP: &str = "\
-More commands: notify hooks persona usage memory mcp import logs briefing
+More commands: notify hooks persona usage memory trigger mcp import logs briefing
                run restart pair models key secret identity grant plugin
                skills backup restore export purge completions
                — `ka-agent <command> --help`";
