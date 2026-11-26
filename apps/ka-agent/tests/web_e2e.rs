@@ -2314,6 +2314,7 @@ fn seed_webhook_trigger(
         filter: filter.map(str::to_string),
         max_body_bytes: None,
         preflight,
+        memory_scope: ka_agent_core::TriggerMemoryScope::Automation,
     };
     let mut task = ka_agent_core::Task::new(format!("hook {hook}"), "trigger", false);
     task.session = Some(session.id.clone());

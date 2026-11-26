@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ka_agent_core::{DaemonConfig, TriggerKind, TriggerSpec};
+use ka_agent_core::{DaemonConfig, TriggerKind, TriggerMemoryScope, TriggerSpec};
 use ka_agent_port::WorkerPort;
 use ka_agent_runtime::event::AgentEvent;
 use ka_agent_runtime::surface::Surface;
@@ -225,6 +225,7 @@ fn webhook_spec(hook: &str, preflight: bool) -> TriggerSpec {
         filter: None,
         max_body_bytes: None,
         preflight,
+        memory_scope: TriggerMemoryScope::Automation,
     }
 }
 
@@ -625,6 +626,262 @@ async fn schedule_trigger_compiles_automation_and_publishes_context() {
         source.as_deref(),
         Some(format!("trigger:sched:{}", task_id.as_str()).as_str())
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One machine fact and one personal fact, both in the full compile;
+/// returns what the engine's MEMORY.md then holds.
+#[cfg(unix)]
+fn seed_memory(rt: &Runtime, root: &Path) -> String {
+    let memory = rt.memory_store(&op().username).unwrap();
+    memory
+        .add(
+            ka_agent_memory::MemoryFile::Environment,
+            "laptop has 32 GB",
+            "operator",
+            None,
+        )
+        .unwrap();
+    memory.commit("memory: seed environment").unwrap();
+    rt.remember("likes tea personally", "operator", &op())
+        .unwrap();
+    String::from_utf8_lossy(&std::fs::read(engine_memory(root)).unwrap()).into_owned()
+}
+
+/// The automation compile is installed: the machine fact is in, the
+/// personal bullet is out.
+#[cfg(unix)]
+fn is_lean(text: &str) -> bool {
+    !text.contains("likes tea personally") && text.contains("laptop has 32 GB")
+}
+
+#[cfg(unix)]
+fn scope_key() -> String {
+    ka_agent_core::layout::turnctx_key(ka_agent_core::OPERATOR_USER, "memory_scope")
+}
+
+/// Wait until the engine's MEMORY.md satisfies `check`; fail with what it
+/// holds if it never does (the same 30 s every fire wait allows here —
+/// scripted workers start slowly on a loaded machine).
+#[cfg(unix)]
+async fn wait_for_memory(tag: &str, root: &Path, mut check: impl FnMut(&str) -> bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = std::fs::read_to_string(engine_memory(root)).unwrap_or_default();
+        if check(&text) {
+            return text;
+        }
+        assert!(Instant::now() < deadline, "{tag}: MEMORY.md holds:\n{text}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Create a webhook trigger for the operator, arm it with `body` and set
+/// the scheduler on it.
+#[cfg(unix)]
+async fn fire_webhook(
+    rt: &Runtime,
+    store: &Store,
+    spec: TriggerSpec,
+    body: &str,
+) -> ka_agent_core::TaskId {
+    let task_id = rt.add_trigger(spec, None, &op()).unwrap();
+    let task = store.get_task(&task_id).unwrap().unwrap();
+    let spec = TriggerSpec::from_payload(task.payload.as_deref().unwrap()).unwrap();
+    rt.arm_trigger(&task, &spec, body).unwrap();
+    rt.fire_due_tasks().await.unwrap();
+    task_id
+}
+
+/// A webhook fire runs against the automation compile by default — the
+/// bracket a schedule trigger runs in — and publishes the scope the memory
+/// tools refuse on.
+#[cfg(unix)]
+#[tokio::test]
+async fn webhook_trigger_defaults_to_automation_memory() {
+    let (rt, store, _rec, root, _seed) = trigger_runtime_with_steps(
+        "hook-memory",
+        r#"{"sleep_ms": 800}, {"text": "triaged"}"#,
+        "done",
+        &[member_role("member", &["read"])],
+    );
+    let full = seed_memory(&rt, &root);
+    let task_id = fire_webhook(
+        &rt,
+        &store,
+        webhook_spec("ci/default", false),
+        r#"{"status":"passed"}"#,
+    )
+    .await;
+    let task = store.get_task(&task_id).unwrap().unwrap();
+    // A default-scoped trigger writes no scope: its payload is the one
+    // every webhook had before the scope existed.
+    assert!(!task.payload.as_deref().unwrap().contains("memory_scope"));
+    let lineage = ka_agent_core::SessionId(
+        TriggerSpec::from_payload(task.payload.as_deref().unwrap())
+            .unwrap()
+            .session_id,
+    );
+
+    // Mid-cycle: the personal bullet is out, the machine fact is in.
+    wait_for_memory("automation compile", &root, is_lean).await;
+    // The bridge gate reads this key; the fire is still a webhook turn.
+    assert_eq!(
+        store.meta_get(&scope_key()).unwrap().as_deref(),
+        Some("automation")
+    );
+    assert_eq!(
+        store
+            .meta_get(&ka_agent_core::layout::turnctx_key(
+                ka_agent_core::OPERATOR_USER,
+                "source",
+            ))
+            .unwrap()
+            .as_deref(),
+        Some(format!("trigger:{}", task_id.as_str()).as_str())
+    );
+
+    wait_until("trigger turn", || {
+        store.count_turns_for_session(&lineage).unwrap_or(0) == 1
+    })
+    .await;
+    wait_for_memory("full memory restored", &root, |text| text == full).await;
+
+    // The creator's next chat turn publishes its own scope: nothing
+    // inherits the fire's.
+    rt.handle_message_as("hello", "console", &op())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.meta_get(&scope_key()).unwrap().as_deref(),
+        Some("creator")
+    );
+    wait_until("chat turn idle", || {
+        rt.session_status_for(&op()) == ka_agent_core::SessionStatus::Idle
+    })
+    .await;
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `Creator` is the webhook creator's opt-in: the fire keeps the full
+/// compile for its whole span and publishes `creator`.
+#[cfg(unix)]
+#[tokio::test]
+async fn webhook_trigger_creator_scope_keeps_the_full_memory() {
+    let (rt, store, _rec, root, _seed) = trigger_runtime_with_steps(
+        "hook-creator",
+        r#"{"sleep_ms": 800}, {"text": "triaged"}"#,
+        "done",
+        &[member_role("member", &["read"])],
+    );
+    let full = seed_memory(&rt, &root);
+    let mut hook = webhook_spec("ci/creator", false);
+    hook.memory_scope = TriggerMemoryScope::Creator;
+    let task_id = fire_webhook(&rt, &store, hook, r#"{"status":"passed"}"#).await;
+    let task = store.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(
+        TriggerSpec::from_payload(task.payload.as_deref().unwrap())
+            .unwrap()
+            .effective_memory_scope(),
+        TriggerMemoryScope::Creator
+    );
+
+    // The personal bullet never leaves the compile while the fire runs.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = std::fs::read_to_string(engine_memory(&root)).unwrap();
+        assert!(
+            text.contains("likes tea personally"),
+            "the creator scope dropped the personal bullet:\n{text}"
+        );
+        if !trigger_runs(&store, task_id.as_str()).is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the fire did not settle");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        store.meta_get(&scope_key()).unwrap().as_deref(),
+        Some("creator")
+    );
+    assert_eq!(std::fs::read_to_string(engine_memory(&root)).unwrap(), full);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A schedule trigger always runs the automation bracket, whatever its
+/// payload says about the memory scope.
+#[cfg(unix)]
+#[tokio::test]
+async fn schedule_trigger_ignores_a_creator_memory_scope() {
+    let (rt, store, _rec, root, _seed) = trigger_runtime_with_steps(
+        "sched-creator",
+        r#"{"sleep_ms": 800}, {"text": "triaged"}"#,
+        "done",
+        &[member_role("member", &["read"])],
+    );
+    let full = seed_memory(&rt, &root);
+    let mut spec = webhook_spec("ci/sched-creator", false);
+    spec.kind = TriggerKind::Schedule;
+    spec.hook_path = None;
+    spec.recurrence_ms = None;
+    spec.memory_scope = TriggerMemoryScope::Creator;
+    let task_id = rt
+        .add_trigger(spec, Some(ka_agent_core::now_ms() - 1), &op())
+        .unwrap();
+    let lineage = ka_agent_core::SessionId(
+        TriggerSpec::from_payload(
+            store
+                .get_task(&task_id)
+                .unwrap()
+                .unwrap()
+                .payload
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap()
+        .session_id,
+    );
+
+    rt.fire_due_tasks().await.unwrap();
+    wait_for_memory("automation compile", &root, is_lean).await;
+    assert_eq!(
+        store.meta_get(&scope_key()).unwrap().as_deref(),
+        Some("automation")
+    );
+    wait_until("trigger turn", || {
+        store.count_turns_for_session(&lineage).unwrap_or(0) == 1
+    })
+    .await;
+    wait_for_memory("full memory restored", &root, |text| text == full).await;
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A failed fire still puts the full compile back: the restore is not on
+/// the success path only.
+#[cfg(unix)]
+#[tokio::test]
+async fn webhook_trigger_failed_fire_restores_the_full_memory() {
+    let (rt, store, _rec, root, _seed) =
+        trigger_runtime("hook-failed", "error", &[member_role("member", &["read"])]);
+    let full = seed_memory(&rt, &root);
+    let task_id = fire_webhook(
+        &rt,
+        &store,
+        webhook_spec("ci/failed", false),
+        r#"{"status":"passed"}"#,
+    )
+    .await;
+    wait_until("failed run row", || {
+        trigger_runs(&store, task_id.as_str())
+            .iter()
+            .any(|r| r.status == "failed")
+    })
+    .await;
+    wait_for_memory("full memory restored", &root, |text| text == full).await;
 
     let _ = std::fs::remove_dir_all(&root);
 }

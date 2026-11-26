@@ -740,7 +740,7 @@ pub static KEYS: &[KeySpec] = &[
         default: "unset",
         apply: Apply::Live,
         web: true,
-        doc: "embedding model name (HTTP) or fastembed model name (local)",
+        doc: "embedding model name (HTTP) or local name: embeddinggemma-300m, embeddinggemma-300m-q4, all-minilm-l6-v2, qwen3-embedding-0.6b",
     },
     KeySpec {
         path: "memory.embeddings.dimensions",
@@ -773,6 +773,22 @@ pub static KEYS: &[KeySpec] = &[
         apply: Apply::Live,
         web: true,
         doc: "texts per embedding request",
+    },
+    KeySpec {
+        path: "memory.rerank.enabled",
+        kind: Kind::Bool,
+        default: "false",
+        apply: Apply::Live,
+        web: true,
+        doc: "rerank recalled memory with a local cross-encoder (needs a local-embeddings build)",
+    },
+    KeySpec {
+        path: "memory.rerank.model",
+        kind: Kind::Str,
+        default: "BAAI/bge-reranker-v2-m3",
+        apply: Apply::Live,
+        web: true,
+        doc: "local reranker name; downloaded on first use under <data>/models",
     },
     KeySpec {
         path: "memory.dream.enabled",

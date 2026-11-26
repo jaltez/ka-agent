@@ -22,12 +22,24 @@ jiff = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 fastembed = { version = "7", optional = true, default-features = false, features = ["onnx", "fancy-regex", "hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+# Qwen3 embeddings run on fastembed's candle backend: its GGUF loader
+# takes a `candle_core::Device`, and the weights download through
+# `hf-hub`, the client fastembed itself uses for its ONNX models.
+candle-core = { version = "0.11", optional = true }
+hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq"] }
 
 [features]
 # Optional local embedding backend. Off by default: the HTTP backend
 # needs no model download and the whole index stays FTS-only with
 # `provider = "none"`.
 local-embeddings = ["dep:fastembed"]
+# Adds the Qwen3-Embedding text models (fastembed's candle backend).
+local-qwen3 = [
+    "local-embeddings",
+    "fastembed/qwen3-text",
+    "dep:candle-core",
+    "dep:hf-hub",
+]
 
 [dev-dependencies]
 # Feature-enabled so `ka-port-test-worker` builds for this crate's

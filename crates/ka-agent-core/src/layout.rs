@@ -60,10 +60,10 @@ pub const TURN_USER_META_KEY: &str = "turn.username";
 pub const TURN_ID_META_KEY: &str = "turn.id";
 
 /// Per-user turn-context key: `turnctx:<username>:<field>` with fields
-/// `source | role | username | id`. The global `turn.*` rows cannot carry
-/// per-turn context once users' turns run in parallel (ADR-0003), so every
-/// writer/reader is namespaced by the acting account (each worker — and so
-/// each bridge — serves exactly one user).
+/// `source | role | username | memory_scope | id`. The global `turn.*` rows
+/// cannot carry per-turn context once users' turns run in parallel
+/// (ADR-0003), so every writer/reader is namespaced by the acting account
+/// (each worker — and so each bridge — serves exactly one user).
 pub fn turnctx_key(username: &str, field: &str) -> String {
     format!("turnctx:{username}:{field}")
 }

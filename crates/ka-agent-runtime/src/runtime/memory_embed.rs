@@ -2,8 +2,9 @@
 //!
 //! The default is `none`. An OpenAI-compatible HTTP endpoint adds no big
 //! dependency; `local` uses fastembed behind the `local-embeddings`
-//! feature. The runtime normalizes the returned vectors and owns the
-//! index; this module only talks to the model.
+//! feature, and the Qwen3-Embedding models add `local-qwen3` on top. The
+//! runtime normalizes the returned vectors and owns the index; this
+//! module only talks to the model.
 
 use std::sync::Arc;
 #[cfg(feature = "local-embeddings")]
@@ -36,6 +37,15 @@ pub trait Embedder: Send + Sync {
     /// Configured dimension, or 0 when the backend discovers it per call.
     fn dim(&self) -> usize;
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// Embed one query for the vector scan. A backend that prompts
+    /// queries differently from documents overrides this; the default
+    /// embeds the text as given.
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>, EmbedError> {
+        let mut vectors = self.embed(&[query.to_string()])?;
+        vectors
+            .pop()
+            .ok_or_else(|| EmbedError::Other("embedder returned no query vector".into()))
+    }
 }
 
 /// Build the configured backend. `None` is the `provider = "none"` case.
@@ -211,11 +221,7 @@ fn build_local(
         "embeddinggemma-300m" => (EmbeddingModel::EmbeddingGemma300M, 768),
         "embeddinggemma-300m-q4" => (EmbeddingModel::EmbeddingGemma300MQ4, 768),
         "all-minilm-l6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
-        other => {
-            return Err(EmbedError::Other(format!(
-                "unknown local embedding model {other:?}: embeddinggemma-300m | embeddinggemma-300m-q4 | all-minilm-l6-v2"
-            )));
-        }
+        other => return build_qwen3(other, emb, paths),
     };
     if emb.dimensions.is_some_and(|d| d as usize != dim) {
         return Err(EmbedError::Other(format!(
@@ -269,8 +275,186 @@ impl Embedder for LocalEmbedder {
             .lock()
             .map_err(|_| EmbedError::Other("local embedder lock poisoned".into()))?;
         inner
-            .embed(texts.to_vec(), None)
+            .embed(texts, None)
             .map_err(|e| EmbedError::Other(format!("local embed: {e}")))
+    }
+}
+
+/// One Qwen3-Embedding model (`local-qwen3`).
+#[cfg(feature = "local-qwen3")]
+struct Qwen3Model {
+    /// The `memory.embeddings.model` name.
+    name: &'static str,
+    /// Hub repo with the Q8_0 GGUF weights: half the f16 download, and
+    /// within 0.5% cosine of the f32 model (fastembed's own measurement).
+    gguf_repo: &'static str,
+    gguf_file: &'static str,
+    /// Hub repo with the matching `tokenizer.json`.
+    tokenizer_repo: &'static str,
+    /// Vector length at full size.
+    dim: usize,
+}
+
+#[cfg(feature = "local-qwen3")]
+const QWEN3_MODELS: &[Qwen3Model] = &[Qwen3Model {
+    name: "qwen3-embedding-0.6b",
+    gguf_repo: "Qwen/Qwen3-Embedding-0.6B-GGUF",
+    gguf_file: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+    tokenizer_repo: "Qwen/Qwen3-Embedding-0.6B",
+    dim: 1024,
+}];
+
+/// The instruction Qwen3-Embedding prefixes to a retrieval query. Its
+/// model card recommends one, written for the task at hand; documents go
+/// in as they are.
+#[cfg(any(feature = "local-qwen3", test))]
+const QWEN3_QUERY_INSTRUCTION: &str =
+    "Given a question about the user, retrieve the memory notes that answer it";
+
+/// `query` in the Qwen3 query format, `Instruct: <task>\nQuery:<query>`.
+#[cfg(any(feature = "local-qwen3", test))]
+fn qwen3_query_prompt(query: &str) -> String {
+    format!("Instruct: {QWEN3_QUERY_INSTRUCTION}\nQuery:{query}")
+}
+
+/// fastembed's Qwen3 loader takes its cache directory from the
+/// `FASTEMBED_CACHE_DIR` environment variable, not from the caller, so it
+/// would not use `<data>/models`. The Qwen3 path downloads into the model
+/// cache itself and loads the weights with the path-taking `from_gguf`.
+#[cfg(feature = "local-qwen3")]
+fn build_qwen3(
+    name: &str,
+    emb: &ka_agent_core::config::MemoryEmbeddings,
+    paths: &Paths,
+) -> Result<Option<Arc<dyn Embedder>>, EmbedError> {
+    use candle_core::Device;
+    use fastembed::Qwen3TextEmbedding;
+
+    /// Tokens per text. Memory bullets and recall queries are short; this
+    /// bounds the attention cost of a long one, as it does for the ONNX
+    /// models.
+    const MAX_TOKENS: usize = 512;
+
+    let Some(spec) = qwen3_spec(name) else {
+        return Err(unknown_local_model(name));
+    };
+    if emb.dimensions.is_some_and(|d| d as usize != spec.dim) {
+        return Err(EmbedError::Other(format!(
+            "memory.embeddings.dimensions does not match {name}'s {}",
+            spec.dim
+        )));
+    }
+    let cache_dir = model_cache_dir(paths);
+    let weights = hub_file(&cache_dir, spec.gguf_repo, spec.gguf_file)?;
+    let tokenizer = hub_file(&cache_dir, spec.tokenizer_repo, "tokenizer.json")?;
+    let inner = Qwen3TextEmbedding::from_gguf(&weights, &tokenizer, &Device::Cpu, MAX_TOKENS)
+        .map_err(|e| EmbedError::Other(format!("qwen3 embedder: {e}")))?;
+    Ok(Some(Arc::new(Qwen3Embedder {
+        name: name.to_string(),
+        dim: spec.dim,
+        inner,
+    })))
+}
+
+#[cfg(all(feature = "local-embeddings", not(feature = "local-qwen3")))]
+fn build_qwen3(
+    name: &str,
+    _emb: &ka_agent_core::config::MemoryEmbeddings,
+    _paths: &Paths,
+) -> Result<Option<Arc<dyn Embedder>>, EmbedError> {
+    Err(EmbedError::Other(format!(
+        "unknown local embedding model {name:?}: embeddinggemma-300m | embeddinggemma-300m-q4 | all-minilm-l6-v2 (qwen3-embedding-0.6b needs a build with --features local-qwen3)"
+    )))
+}
+
+/// `name`'s Qwen3-Embedding row, when it names one.
+#[cfg(feature = "local-qwen3")]
+fn qwen3_spec(name: &str) -> Option<&'static Qwen3Model> {
+    QWEN3_MODELS.iter().find(|model| model.name == name)
+}
+
+#[cfg(feature = "local-qwen3")]
+fn unknown_local_model(name: &str) -> EmbedError {
+    EmbedError::Other(format!(
+        "unknown local embedding model {name:?}: embeddinggemma-300m | embeddinggemma-300m-q4 | all-minilm-l6-v2 | qwen3-embedding-0.6b"
+    ))
+}
+
+/// The model cache: `HF_HOME` wins, as it does for the ONNX models
+/// fastembed downloads itself.
+#[cfg(feature = "local-qwen3")]
+fn model_cache_dir(paths: &Paths) -> std::path::PathBuf {
+    std::env::var_os("HF_HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths.root().join("models"))
+}
+
+/// The path of `file` from `repo` in `cache_dir`, downloaded on first
+/// use. `HF_ENDPOINT` and `HF_TOKEN` apply as they do to fastembed's own
+/// downloads.
+#[cfg(feature = "local-qwen3")]
+fn hub_file(
+    cache_dir: &std::path::Path,
+    repo: &str,
+    file: &str,
+) -> Result<std::path::PathBuf, EmbedError> {
+    use hf_hub::{Cache, api::sync::ApiBuilder};
+
+    let builder = ApiBuilder::from_cache(Cache::new(cache_dir.to_path_buf()))
+        .with_progress(false)
+        // Set explicitly: unset, the builder would read a `token` file
+        // next to the cache directory.
+        .with_token(
+            std::env::var("HF_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty()),
+        );
+    let builder = match std::env::var("HF_ENDPOINT") {
+        Ok(endpoint) if !endpoint.trim().is_empty() => builder.with_endpoint(endpoint),
+        _ => builder,
+    };
+    let api = builder
+        .build()
+        .map_err(|e| EmbedError::Other(format!("huggingface client: {e}")))?;
+    api.model(repo.to_string())
+        .get(file)
+        .map_err(|e| EmbedError::Other(format!("download {repo}/{file}: {e}")))
+}
+
+#[cfg(feature = "local-qwen3")]
+struct Qwen3Embedder {
+    name: String,
+    dim: usize,
+    /// `embed` takes `&self`, so calls run in parallel without a lock.
+    inner: fastembed::Qwen3TextEmbedding,
+}
+
+#[cfg(feature = "local-qwen3")]
+impl Embedder for Qwen3Embedder {
+    fn model(&self) -> &str {
+        &self.name
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner
+            .embed(texts)
+            .map_err(|e| EmbedError::Other(format!("qwen3 embed: {e}")))
+    }
+
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>, EmbedError> {
+        let mut vectors = self.embed(&[qwen3_query_prompt(query)])?;
+        vectors
+            .pop()
+            .ok_or_else(|| EmbedError::Other("qwen3 returned no query vector".into()))
     }
 }
 
@@ -278,7 +462,28 @@ impl Embedder for LocalEmbedder {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::embeddings_url;
+    use super::{EmbedError, Embedder, embeddings_url, qwen3_query_prompt};
+
+    /// One zero vector per text, `Some(width)` numbers wide; `None` is
+    /// a backend that answers nothing.
+    struct StubEmbedder(Option<usize>);
+
+    impl Embedder for StubEmbedder {
+        fn model(&self) -> &str {
+            "stub"
+        }
+
+        fn dim(&self) -> usize {
+            self.0.unwrap_or(0)
+        }
+
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            let Some(width) = self.0 else {
+                return Ok(Vec::new());
+            };
+            Ok(texts.iter().map(|_| vec![0.0; width]).collect())
+        }
+    }
 
     #[test]
     fn url_appends_the_path_once() {
@@ -294,5 +499,32 @@ mod tests {
             embeddings_url("http://x/openai/v1/embeddings"),
             "http://x/openai/v1/embeddings"
         );
+    }
+
+    #[test]
+    fn the_default_query_embedding_is_the_query_embedded_as_given() {
+        assert_eq!(
+            StubEmbedder(Some(2)).embed_query("ka_staging").unwrap(),
+            vec![0.0, 0.0]
+        );
+        // A backend that answers nothing is an error, not an empty vector.
+        assert!(StubEmbedder(None).embed_query("ka_staging").is_err());
+    }
+
+    #[test]
+    fn qwen3_queries_carry_the_instruction() {
+        assert_eq!(
+            qwen3_query_prompt("staging server"),
+            "Instruct: Given a question about the user, retrieve the memory notes that answer it\nQuery:staging server"
+        );
+    }
+
+    #[cfg(feature = "local-qwen3")]
+    #[test]
+    fn qwen3_names_resolve_and_others_do_not() {
+        let spec = super::qwen3_spec("qwen3-embedding-0.6b").expect("qwen3 row");
+        assert_eq!(spec.dim, 1024);
+        assert!(super::qwen3_spec("qwen3-embedding-4b").is_none());
+        assert!(super::qwen3_spec("Qwen3-Embedding-0.6B").is_none());
     }
 }

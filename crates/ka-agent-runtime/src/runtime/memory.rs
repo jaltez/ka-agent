@@ -13,6 +13,8 @@ pub struct MemorySearchHit {
     pub kind: &'static str,
     pub id: String,
     pub snippet: String,
+    /// Full text for reranking; the snippet is what surfaces show.
+    pub text: String,
     pub detail: String,
     pub at_ms: i64,
     /// `YYYY-MM-DD` when the accepted memory expires; the current view
@@ -72,6 +74,16 @@ fn memory_fingerprint(entries: &[ka_agent_memory::Entry]) -> u64 {
         feed(&mut h, e.valid_until.as_deref().unwrap_or("-").as_bytes());
     }
     h
+}
+
+/// The `key:value` notes of a candidate's provenance (`session:…;
+/// supersedes:…; valid_until:…`), in order.
+fn provenance_notes(provenance: Option<&str>) -> impl Iterator<Item = (&str, &str)> {
+    provenance
+        .into_iter()
+        .flat_map(|p| p.split("; "))
+        .filter_map(|part| part.split_once(':'))
+        .map(|(key, value)| (key, value.trim()))
 }
 
 impl Runtime {
@@ -203,6 +215,7 @@ impl Runtime {
                 MemorySearchHit {
                     kind: "memory",
                     id: h.id,
+                    text: h.text,
                     snippet: h.snippet,
                     detail: format!("{} · {}", h.file, h.source),
                     at_ms: h.accepted_ms,
@@ -249,6 +262,7 @@ impl Runtime {
                     MemorySearchHit {
                         kind: "memory",
                         id: id.clone(),
+                        text: entry.text.clone(),
                         snippet,
                         detail: format!("{} · {}", entry.file, entry.source),
                         at_ms: entry.accepted_ms,
@@ -273,6 +287,7 @@ impl Runtime {
                 MemorySearchHit {
                     kind: "episode",
                     id: h.turn,
+                    text: h.snippet.clone(),
                     snippet: h.snippet,
                     detail: h.role,
                     at_ms: h.at_ms,
@@ -461,6 +476,37 @@ impl Runtime {
         Ok(removed)
     }
 
+    /// `/memory expire <id> <YYYY-MM-DD>`: set — or with `None`, clear —
+    /// the validity of one accepted entry. The Markdown keeps the bullet;
+    /// the current compile drops it once the date has passed, and an
+    /// `as_of` search still reads it. `Ok(false)` for an unknown id.
+    pub fn expire_memory(
+        &self,
+        id: &str,
+        date: Option<&str>,
+        who: &Principal,
+    ) -> Result<bool, Error> {
+        let memory = self.memory_store(&who.username)?;
+        let updated = memory.set_valid_until(id, date)?;
+        if updated {
+            self.refresh_compiled_memory_for(&who.username)?;
+            memory.commit(&format!(
+                "memory: expire {id} {}",
+                date.unwrap_or("cleared")
+            ))?;
+            self.audit_for(
+                who,
+                audit_actions::MEMORY_EDIT,
+                id,
+                Some(match date {
+                    Some(date) => format!("expire {date}"),
+                    None => "expire cleared".into(),
+                }),
+            )?;
+        }
+        Ok(updated)
+    }
+
     /// `/memory`: what is injected and at what budget.
     pub fn memory_report_for(
         &self,
@@ -582,6 +628,9 @@ impl Runtime {
         // filed: re-run the screen on the stored text before anything
         // moves (B15a).
         ka_agent_memory::screen_proposal(&row.text).map_err(Error::Refused)?;
+        // A dream's `VALID_UNTIL` rides in the provenance and lands with
+        // the bullet.
+        let valid_until = Self::candidate_valid_until(&row)?;
         let file = Self::memory_file_of(row.file.as_deref())?;
         // The proposal lands in the memory root of the user whose turn
         // proposed it, never the decider's by accident.
@@ -591,7 +640,7 @@ impl Runtime {
         let snapshot = memory.snapshot_file(&file)?;
         let applied: Result<String, Error> = (|| {
             let mem_id = memory
-                .add(file.clone(), &row.text, &row.source, None)
+                .add(file.clone(), &row.text, &row.source, valid_until)
                 .map_err(Error::Memory)?;
             self.refresh_compiled_memory_for(&row.username)?;
             memory
@@ -661,6 +710,7 @@ impl Runtime {
                 ));
             }
         };
+        let valid_until = Self::candidate_valid_until(&row)?;
         let target = Self::memory_file_of(row.file.as_deref())?;
         let target_rel = target.name();
         let old_rel = old.file.clone();
@@ -671,7 +721,7 @@ impl Runtime {
         }
         let applied: Result<String, Error> = (|| {
             let new_id = memory
-                .add(target.clone(), &row.text, &row.source, None)
+                .add(target.clone(), &row.text, &row.source, valid_until)
                 .map_err(Error::Memory)?;
             if !memory.remove(&old.id)? {
                 return Err(Error::Refused("the superseded memory disappeared".into()));
@@ -831,9 +881,10 @@ impl Runtime {
         self.reindex_memory_derived_for(username)
     }
 
-    /// Install the automation compile (machine facts only, B15b) for a
-    /// scheduled turn — the lean variant the daemon swaps in before a
-    /// cron/briefing submit and swaps out at every cycle exit.
+    /// Install the automation compile (machine facts only, B15b) — the
+    /// lean variant the daemon swaps in before a cron/briefing submit or
+    /// an automation-scoped trigger fire, and swaps out at every exit of
+    /// that bracket.
     pub(super) fn install_automation_memory_for(&self, username: &str) -> Result<(), Error> {
         let memory = self.memory_store(username)?;
         memory.install_compiled_scoped(
@@ -880,6 +931,134 @@ impl Runtime {
         let (preview, after) =
             memory.dry_run_add(file, &row.text, ka_agent_memory::DEFAULT_BUDGET_BYTES)?;
         Ok((preview, before.total_bytes, after))
+    }
+
+    /// The `supersedes:`/`conflicts:`/`overlaps:` notes in a candidate's
+    /// provenance, each resolved to the accepted entry it names — what
+    /// `/memory review` shows beside the diff. A note that names no
+    /// accepted entry of the candidate's owner is left out.
+    pub fn candidate_relations(
+        &self,
+        row: &ka_agent_store::CandidateRow,
+    ) -> Result<Vec<(&'static str, ka_agent_memory::Entry)>, Error> {
+        let notes: Vec<(&'static str, &str)> = provenance_notes(row.provenance.as_deref())
+            .filter_map(|(kind, id)| match kind {
+                "supersedes" => Some(("supersedes", id)),
+                "conflicts" => Some(("conflicts", id)),
+                "overlaps" => Some(("overlaps", id)),
+                _ => None,
+            })
+            .collect();
+        if notes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = self.memory_store(&row.username)?.entries()?;
+        Ok(notes
+            .into_iter()
+            .filter_map(|(kind, id)| {
+                let entry = entries.iter().find(|e| e.id == id)?;
+                Some((kind, entry.clone()))
+            })
+            .collect())
+    }
+
+    /// The `valid_until:<YYYY-MM-DD>` a candidate's provenance carries (a
+    /// dream's `VALID_UNTIL` field), applied when the candidate is
+    /// accepted. A note that is not a real date refuses the acceptance
+    /// instead of being dropped unnoticed.
+    fn candidate_valid_until(row: &ka_agent_store::CandidateRow) -> Result<Option<String>, Error> {
+        let Some(date) = provenance_notes(row.provenance.as_deref())
+            .find(|(key, _)| *key == "valid_until")
+            .map(|(_, value)| value)
+        else {
+            return Ok(None);
+        };
+        if !ka_agent_memory::valid_date(date) {
+            return Err(Error::Refused(format!(
+                "candidate names a valid_until that is not a YYYY-MM-DD date ({date:?})"
+            )));
+        }
+        Ok(Some(date.to_string()))
+    }
+
+    /// `/memory skill <id>`: one accepted procedural memory becomes a
+    /// skill *candidate* — a slug name, a one-line description and a body
+    /// derived from the bullet, no model call. Operator-gated like every
+    /// skill proposal: `/skills review|accept|reject` decides, and nothing
+    /// is installed or enabled here. `Ok(None)` for an unknown memory id.
+    pub fn memory_skill_candidate(
+        &self,
+        id: &str,
+        who: &Principal,
+    ) -> Result<Option<String>, Error> {
+        let memory = self.memory_store(&who.username)?;
+        let Some(entry) = memory.entries()?.into_iter().find(|e| e.id == id) else {
+            return Ok(None);
+        };
+        if !ka_agent_memory::is_procedural(&entry.text) {
+            return Err(Error::Refused(
+                "not a procedural memory — /memory skill turns a how-to or a lesson with steps into a skill candidate".into(),
+            ));
+        }
+        let description = ka_agent_memory::skill_description_for(&entry.text);
+        let Some(name) =
+            ka_agent_memory::skill_name_for(&entry.text).filter(|_| !description.is_empty())
+        else {
+            return Err(Error::Refused(
+                "the memory has no word a skill name or description could use".into(),
+            ));
+        };
+        // One skill per name: a library skill or a pending proposal that
+        // already has it means this memory, or its twin, was linked
+        // before. The operator settles that in /skills review.
+        let library = crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username));
+        let taken = library.available().iter().any(|s| s.name == name)
+            || ka_agent_core::layout::base_dir()
+                .join("skills")
+                .join(&name)
+                .exists()
+            || self
+                .sh
+                .store
+                .pending_skill_candidates()?
+                .iter()
+                .any(|c| c.name == name);
+        if taken {
+            return Err(Error::Refused(format!(
+                "a skill named {name} already exists or is pending — /skills review"
+            )));
+        }
+        // The body is the procedure itself, then the link back to the
+        // memory it came from. Same screen as `skill_propose`: a skill is
+        // instructions, so the instruction-shape rule does not apply.
+        let accepted = ka_agent_memory::rfc3339(entry.accepted_ms);
+        let body = format!(
+            "{}\n\n<!-- from memory {} (source: {}, accepted {}) -->\n",
+            entry.text.trim(),
+            entry.id,
+            entry.source,
+            accepted.get(..10).unwrap_or_default()
+        );
+        if body.len() > 8192 {
+            return Err(Error::Refused(
+                "the memory is over the 8 KiB skill body cap".into(),
+            ));
+        }
+        ka_agent_memory::screen_invisible(&body).map_err(Error::Refused)?;
+        ka_agent_memory::screen_credentials(&body).map_err(Error::Refused)?;
+        let skill_id = format!(
+            "skill_{}",
+            ka_agent_core::ids::short_id(&ka_agent_core::MemoryId::generate().to_string())
+        );
+        self.sh
+            .store
+            .add_skill_candidate(&skill_id, &name, &description, &body)?;
+        self.sh.emit(AgentEvent::SkillProposal {
+            id: skill_id.clone(),
+            name,
+            description,
+        });
+        Ok(Some(skill_id))
     }
 
     /// Offer each new `memory_propose` candidate to its user once (the bridge
@@ -968,6 +1147,7 @@ mod recall_tests {
 
     fn hit(id: &str, snippet: &str) -> MemorySearchHit {
         MemorySearchHit {
+            text: snippet.into(),
             kind: "memory",
             id: id.into(),
             snippet: snippet.into(),
@@ -1005,5 +1185,155 @@ mod recall_tests {
         assert!(block.chars().count() / 4 <= 320, "{}", block.len());
         assert!(block.matches("[mem:").count() < 20);
         assert!(Runtime::render_recall_block(Vec::new(), 6, 600, &now).is_none());
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+
+    use super::{Runtime, provenance_notes};
+    use crate::event::Envelope;
+    use crate::surface::Surface;
+    use ka_agent_core::{MemoryId, Principal};
+    use ka_agent_port::WorkerPort;
+    use ka_agent_store::Store;
+
+    struct Noop;
+
+    impl Surface for Noop {
+        fn emit(&self, _ev: &Envelope) {}
+    }
+
+    /// A runtime on its own temp root.
+    async fn runtime() -> Runtime {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ka-mem-provenance-{}-{n}", std::process::id()));
+        let store = Arc::new(Store::open(&root.join("state.db")).unwrap());
+        let cfg = ka_agent_core::DaemonConfig {
+            workspace: root.join("ws"),
+            ..ka_agent_core::DaemonConfig::default()
+        };
+        Runtime::new(
+            cfg,
+            crate::paths::Paths::new(root),
+            store,
+            WorkerPort::default(),
+            Arc::new(Noop),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn notes_split_on_the_first_colon_of_each_part() {
+        let notes: Vec<(&str, &str)> = provenance_notes(Some(
+            "session:sess_1; conflicts:mem_old; valid_until: 2099-12-31",
+        ))
+        .collect();
+        assert_eq!(
+            notes,
+            [
+                ("session", "sess_1"),
+                ("conflicts", "mem_old"),
+                ("valid_until", "2099-12-31")
+            ]
+        );
+        assert_eq!(provenance_notes(None).count(), 0);
+        assert_eq!(provenance_notes(Some("turn-9")).count(), 0);
+    }
+
+    /// A dream candidate's provenance, end to end: the review resolves its
+    /// notes to accepted entries, an accept lands its `valid_until` with
+    /// the bullet, and a date that is not a real day refuses the accept.
+    #[tokio::test]
+    async fn a_candidates_notes_reach_the_review_and_the_accept() {
+        let rt = runtime().await;
+        let op = Principal::operator();
+        let memory = rt.memory_store(&op.username).unwrap();
+        let old = memory
+            .add(
+                ka_agent_memory::MemoryFile::Facts,
+                "The staging URL is staging-old.example.com",
+                "operator",
+                None,
+            )
+            .unwrap();
+        let dated = MemoryId::generate();
+        rt.store()
+            .add_candidate_for_user(
+                &dated,
+                "dream",
+                "The staging URL is staging-new.example.com.",
+                Some(&format!(
+                    "session:sess_1; conflicts:{old}; valid_until:2099-12-31"
+                )),
+                None,
+                "admin",
+                &op.username,
+            )
+            .unwrap();
+        let row = rt.pending_candidates_for(&op).unwrap().remove(0);
+        let relations = rt.candidate_relations(&row).unwrap();
+        assert_eq!(relations.len(), 1, "{relations:?}");
+        assert_eq!(relations[0].0, "conflicts");
+        assert_eq!(
+            (relations[0].1.id.as_str(), relations[0].1.text.as_str()),
+            (old.as_str(), "The staging URL is staging-old.example.com")
+        );
+
+        // Accept: the date lands with the bullet; the conflict note is the
+        // operator's call, so the old entry stays.
+        assert!(rt.accept_candidate(dated.as_str(), &op).unwrap());
+        let new: Vec<_> = memory
+            .entries()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.text.contains("staging-new"))
+            .collect();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].valid_until.as_deref(), Some("2099-12-31"));
+        assert_eq!(new[0].source, "dream");
+        assert!(
+            memory.entries().unwrap().iter().any(|e| e.id == old),
+            "a plain accept keeps both bullets"
+        );
+
+        // A date that is not a real day refuses the acceptance outright.
+        let bad = MemoryId::generate();
+        rt.store()
+            .add_candidate_for_user(
+                &bad,
+                "dream",
+                "likes tea",
+                Some("session:sess_1; valid_until:2026-02-30"),
+                None,
+                "admin",
+                &op.username,
+            )
+            .unwrap();
+        let err = rt
+            .accept_candidate(bad.as_str(), &op)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("valid_until"), "{err}");
+        assert!(
+            rt.pending_candidates_for(&op)
+                .unwrap()
+                .iter()
+                .any(|c| c.id == bad),
+            "the refused candidate stays pending"
+        );
+        assert!(
+            !memory
+                .entries()
+                .unwrap()
+                .iter()
+                .any(|e| e.text == "likes tea"),
+            "nothing was written"
+        );
     }
 }

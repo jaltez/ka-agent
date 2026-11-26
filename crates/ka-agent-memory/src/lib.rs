@@ -238,22 +238,60 @@ impl MemoryStore {
 
     /// Delete the bullet + provenance comment for `id`. `Ok(false)` when unknown.
     pub fn remove(&self, id: &str) -> Result<bool, Error> {
+        self.rewrite_comment(id, |_| None)
+    }
+
+    /// Set, change or clear (`None`) the `valid_until` of one accepted
+    /// entry by rewriting its provenance comment in place — the bullet,
+    /// its source and its accept date stay as they are. A date that is not
+    /// a real `YYYY-MM-DD` day is refused before anything is written;
+    /// `Ok(false)` for an unknown id.
+    pub fn set_valid_until(&self, id: &str, date: Option<&str>) -> Result<bool, Error> {
+        if let Some(v) = date
+            && !valid_date(v)
+        {
+            return Err(Error::BadValidUntil(v.to_string()));
+        }
+        let value = date.unwrap_or("-");
+        self.rewrite_comment(id, |line| Some(with_field(line, "valid_until", value)))
+    }
+
+    /// Rewrite the provenance comment of `id` in the one file that holds
+    /// it. `edit` gets the comment line and returns its replacement, or
+    /// `None` to drop the entry (its bullet goes with it). `Ok(false)`
+    /// when no file has that id.
+    fn rewrite_comment(
+        &self,
+        id: &str,
+        edit: impl Fn(&str) -> Option<String>,
+    ) -> Result<bool, Error> {
         for rel in self.scan_files(CompileScope::Full)? {
             let path = self.root.join(&rel);
             let content = std::fs::read_to_string(&path)?;
-            let mut out = String::new();
-            let mut removed = false;
+            let mut out = String::with_capacity(content.len());
+            let mut found = false;
             let mut pending_bullet: Option<String> = None;
             for line in content.lines() {
                 if line.starts_with("- ") {
                     pending_bullet = Some(line.to_string());
                     continue;
                 }
-                if let Some(fields) = parse_comment(line)
-                    && fields.0 == id
+                if !found
+                    && let Some((found_id, ..)) = parse_comment(line)
+                    && found_id == id
                 {
-                    removed = true;
-                    pending_bullet = None; // drop the paired bullet
+                    found = true;
+                    match edit(line) {
+                        Some(replacement) => {
+                            if let Some(b) = pending_bullet.take() {
+                                out.push_str(&b);
+                                out.push('\n');
+                            }
+                            out.push_str(&replacement);
+                            out.push('\n');
+                        }
+                        None => pending_bullet = None, // drop the paired bullet
+                    }
                     continue;
                 }
                 if let Some(b) = pending_bullet.take() {
@@ -263,7 +301,13 @@ impl MemoryStore {
                 out.push_str(line);
                 out.push('\n');
             }
-            if removed {
+            // A bullet the file ends on, before it has a comment, is the
+            // operator's text too: keep it.
+            if let Some(b) = pending_bullet.take() {
+                out.push_str(&b);
+                out.push('\n');
+            }
+            if found {
                 std::fs::write(&path, out)?;
                 return Ok(true);
             }
@@ -700,16 +744,27 @@ fn valid_slug(slug: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-fn valid_date(v: &str) -> bool {
+/// `YYYY-MM-DD` naming a real calendar day: the shape, then a round trip
+/// through the civil-date helpers (which rejects February 30th and the
+/// like). The one validator for every `valid_until` write.
+pub fn valid_date(v: &str) -> bool {
     let b = v.as_bytes();
-    b.len() == 10
-        && b[0..4].iter().all(u8::is_ascii_digit)
+    if !(b.len() == 10
         && b[4] == b'-'
-        && b[5..7].iter().all(u8::is_ascii_digit)
         && b[7] == b'-'
-        && b[8..10].iter().all(u8::is_ascii_digit)
-        && v[5..7].parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
-        && v[8..10].parse::<u8>().is_ok_and(|d| (1..=31).contains(&d))
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let num = |r: std::ops::Range<usize>| v.get(r).and_then(|s| s.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else {
+        return false;
+    };
+    (1..=12).contains(&m)
+        && (1..=31).contains(&d)
+        && civil_from_days(days_from_civil(y, m, d)) == (y, m as u32, d as u32)
 }
 
 /// Parse `<!-- id: …; source: …; accepted: …; valid_until: … -->`.
@@ -738,6 +793,44 @@ fn parse_comment(line: &str) -> Option<(String, String, i64, Option<String>)> {
         Some(v) => Some(v.to_string()),
     };
     Some((id, source, accepted_ms, valid_until))
+}
+
+/// One provenance comment with its `key: value` part `key` set to `value`
+/// (appended when absent). Every other byte of the line is kept, so a
+/// hand-written extra field survives an edit.
+fn with_field(line: &str, key: &str, value: &str) -> String {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix("<!-- ")
+        .and_then(|t| t.strip_suffix(" -->"))
+    else {
+        return line.to_string();
+    };
+    let mut out = String::with_capacity(line.len() + value.len());
+    let mut replaced = false;
+    for (i, part) in inner.split("; ").enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        if part
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.starts_with(": "))
+        {
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(value);
+            replaced = true;
+        } else {
+            out.push_str(part);
+        }
+    }
+    if !replaced {
+        out.push_str("; ");
+        out.push_str(key);
+        out.push_str(": ");
+        out.push_str(value);
+    }
+    format!("<!-- {out} -->")
 }
 
 /// Format epoch milliseconds as RFC3339 UTC (`1970-01-01T00:00:00Z`).
@@ -926,6 +1019,171 @@ pub fn screen_proposal(text: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The verbs a procedure's clauses start with, English and Spanish. A
+/// clause is what sits between `.`, `;`, `:`, `,` or a newline.
+const ACTION_VERBS: &[&str] = &[
+    "run",
+    "use",
+    "execute",
+    "install",
+    "deploy",
+    "restart",
+    "reboot",
+    "check",
+    "verify",
+    "ensure",
+    "always",
+    "never",
+    "avoid",
+    "remember",
+    "keep",
+    "make",
+    "restore",
+    "rebuild",
+    "commit",
+    "publish",
+    "enable",
+    "disable",
+    "upgrade",
+    "reinstall",
+    "reset",
+    "regenerate",
+    "rotate",
+    "reload",
+    "ejecuta",
+    "ejecutar",
+    "usa",
+    "usar",
+    "instala",
+    "instalar",
+    "despliega",
+    "desplegar",
+    "reinicia",
+    "reiniciar",
+    "comprueba",
+    "comprobar",
+    "verifica",
+    "verificar",
+    "siempre",
+    "nunca",
+    "evita",
+    "evitar",
+];
+
+/// The connectors that order steps; any of them makes a bullet a sequence.
+const SEQUENCE_WORDS: &[&str] = &[
+    "then",
+    "afterward",
+    "afterwards",
+    "finally",
+    "luego",
+    "despues",
+    "después",
+    "finalmente",
+];
+
+/// Is this bullet a procedure — a how-to, a lesson with steps, a rule
+/// about what to do — rather than a plain fact about the operator? A
+/// clause that opens on an action verb (`run …`, `to deploy, …`, `para
+/// desplegar, …`), a `how to`, a step connector, or a command chain
+/// (`&&`, a ` --flag`) makes it one. `/memory skill` turns only these
+/// into skill candidates: a skill is instructions, a fact is data.
+pub fn is_procedural(text: &str) -> bool {
+    if text.contains("&&") || text.contains(" --") {
+        return true;
+    }
+    let word = |w: &str| {
+        let w = w
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        (!w.is_empty()).then_some(w)
+    };
+    if text
+        .split_whitespace()
+        .filter_map(word)
+        .any(|w| SEQUENCE_WORDS.contains(&w.as_str()))
+    {
+        return true;
+    }
+    text.split(['.', ';', ':', ',', '\n']).any(|clause| {
+        let mut words = clause.split_whitespace().filter_map(word);
+        let Some(first) = words.next() else {
+            return false;
+        };
+        if ACTION_VERBS.contains(&first.as_str()) {
+            return true;
+        }
+        let Some(second) = words.next() else {
+            return false;
+        };
+        (ACTION_VERBS.contains(&second.as_str()) && matches!(first.as_str(), "to" | "para"))
+            || (first == "how" && second == "to")
+    })
+}
+
+/// A skill name for a procedural memory: its first keywords joined by
+/// dashes (`deploy-release-train`), within the skill-name rule
+/// (`[a-z0-9-]`, at most 48 characters). `None` when the text has no
+/// keyword that rule admits.
+pub fn skill_name_for(text: &str) -> Option<String> {
+    let mut name = String::new();
+    for token in keywords(text).split_whitespace() {
+        // A non-ASCII word cannot be part of a skill name; one very long
+        // keyword (a hash, a path fragment) is cut so it still can be.
+        if !token.is_ascii() {
+            continue;
+        }
+        let token: String = token.chars().take(16).collect();
+        if name.len() + 1 + token.len() > 48 {
+            continue;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(&token);
+        if name.matches('-').count() == 3 {
+            break;
+        }
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+/// The longest skill description worth advertising.
+const SKILL_DESCRIPTION_CHARS: usize = 120;
+
+/// The one-line skill description for a procedural memory: its words in
+/// order, cut at a word boundary under [`SKILL_DESCRIPTION_CHARS`]
+/// characters and reduced to letters, digits and single spaces. The
+/// accept path writes the description unquoted into the skill's TOML
+/// frontmatter, so nothing TOML-special may survive. Empty when the text
+/// has no word.
+pub fn skill_description_for(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for word in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        let width = word.chars().count();
+        let gap = usize::from(!out.is_empty());
+        if chars + gap + width > SKILL_DESCRIPTION_CHARS {
+            // The opening word alone is too long: cut it and keep the
+            // rest out. Any later word ends the description where it is.
+            if !out.is_empty() {
+                break;
+            }
+            out.extend(word.chars().take(SKILL_DESCRIPTION_CHARS));
+            return out;
+        }
+        if gap == 1 {
+            out.push(' ');
+        }
+        out.push_str(word);
+        chars += gap + width;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1344,5 +1602,225 @@ mod keyword_tests {
         let many = keywords("alpha beta gamma delta epsilon zeta eta theta iota kappa");
         assert_eq!(many.split_whitespace().count(), 8, "{many}");
         assert_eq!(keywords(""), "");
+    }
+}
+
+#[cfg(test)]
+mod validity_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("ka-mem-validity-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn valid_until_of(entries: &[Entry], id: &str) -> Option<String> {
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.valid_until.clone())
+    }
+
+    #[test]
+    fn valid_date_admits_only_real_days() {
+        for date in ["2026-12-31", "2028-02-29", "0000-01-01", "9999-12-31"] {
+            assert!(valid_date(date), "{date}");
+        }
+        for date in [
+            "2026-02-29",
+            "2026-02-30",
+            "2026-04-31",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-12-00",
+            "31-12-2026",
+            "2026-1-01",
+            "20261231",
+            "2026-12-31 ",
+            "202a-12-31",
+            "２０２６-12-31",
+            "",
+        ] {
+            assert!(!valid_date(date), "{date}");
+        }
+    }
+
+    #[test]
+    fn set_valid_until_edits_the_comment_and_nothing_else() {
+        let root = tmp_root("edit");
+        let store = MemoryStore::open(&root).unwrap();
+        let id = store
+            .add(
+                MemoryFile::Facts,
+                "staging URL is staging-old.example.com",
+                "operator",
+                None,
+            )
+            .unwrap();
+        let other = store
+            .add(
+                MemoryFile::Preferences,
+                "prefers concise answers",
+                "operator",
+                Some("2099-01-01".into()),
+            )
+            .unwrap();
+        // A hand-edited file: an extra provenance field, and a bullet that
+        // has no comment yet. Both are the operator's text.
+        let facts_path = root.join("facts.md");
+        let mut facts = std::fs::read_to_string(&facts_path).unwrap();
+        facts = facts.replace(
+            "valid_until: - -->",
+            "valid_until: -; note: hand-written -->",
+        );
+        facts.push_str("- hand-written bullet, no comment yet\n");
+        std::fs::write(&facts_path, &facts).unwrap();
+        let before = store.entries().unwrap();
+        let untouched_before: Vec<Entry> = before.iter().filter(|e| e.id != id).cloned().collect();
+        let old = before.iter().find(|e| e.id == id).unwrap().clone();
+
+        // Set: the comment's field changes and nothing else does.
+        assert!(store.set_valid_until(&id, Some("2026-12-31")).unwrap());
+        let facts = std::fs::read_to_string(&facts_path).unwrap();
+        assert!(
+            facts.contains("valid_until: 2026-12-31; note: hand-written -->"),
+            "{facts}"
+        );
+        assert!(
+            facts.contains("- hand-written bullet, no comment yet\n"),
+            "{facts}"
+        );
+        let after = store.entries().unwrap();
+        let new = after.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(new.valid_until.as_deref(), Some("2026-12-31"));
+        assert_eq!(
+            (
+                new.text.as_str(),
+                new.file.as_str(),
+                new.source.as_str(),
+                new.accepted_ms
+            ),
+            (
+                old.text.as_str(),
+                old.file.as_str(),
+                old.source.as_str(),
+                old.accepted_ms
+            )
+        );
+        let untouched_after: Vec<Entry> = after.iter().filter(|e| e.id != id).cloned().collect();
+        assert_eq!(untouched_after, untouched_before);
+
+        // Change, then clear: the dash spelling comes back.
+        assert!(store.set_valid_until(&id, Some("2027-01-31")).unwrap());
+        assert_eq!(
+            valid_until_of(&store.entries().unwrap(), &id).as_deref(),
+            Some("2027-01-31")
+        );
+        assert!(store.set_valid_until(&id, None).unwrap());
+        assert_eq!(valid_until_of(&store.entries().unwrap(), &id), None);
+        assert!(
+            std::fs::read_to_string(&facts_path)
+                .unwrap()
+                .contains("valid_until: -; note: hand-written -->")
+        );
+        assert_eq!(
+            valid_until_of(&store.entries().unwrap(), &other).as_deref(),
+            Some("2099-01-01")
+        );
+
+        // An impossible date is refused before anything is written; an
+        // unknown id is a plain false.
+        let snapshot = store.snapshot_file(&MemoryFile::Facts).unwrap();
+        assert!(matches!(
+            store.set_valid_until(&id, Some("2026-02-30")),
+            Err(Error::BadValidUntil(_))
+        ));
+        assert_eq!(store.snapshot_file(&MemoryFile::Facts).unwrap(), snapshot);
+        assert!(
+            !store
+                .set_valid_until("mem_unknown", Some("2026-12-31"))
+                .unwrap()
+        );
+        assert!(!store.set_valid_until("mem_unknown", None).unwrap());
+
+        // A date in the past takes the bullet out of the current compile;
+        // the Markdown keeps it.
+        store.set_valid_until(&id, Some("2020-01-01")).unwrap();
+        let compiled = store.compiled_text(DEFAULT_BUDGET_BYTES).unwrap();
+        assert!(!compiled.contains("staging-old.example.com"), "{compiled}");
+        assert!(compiled.contains("prefers concise answers"), "{compiled}");
+        assert_eq!(store.entries().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod skill_link_tests {
+    use super::*;
+
+    #[test]
+    fn procedures_are_clauses_that_open_on_an_action_or_a_sequence() {
+        for text in [
+            "To deploy the release train, run scripts/deploy.sh, then check the staging URL",
+            "When a release is cut, run scripts/deploy.sh",
+            "Always verify the gate output before merging",
+            "Make a backup before touching the production bucket",
+            "Open the terminal then run make test",
+            "Rebuild the index with cargo build --release",
+            "Para desplegar, ejecuta scripts/deploy.sh",
+            "How to rotate the token: run ka-agent user key",
+        ] {
+            assert!(is_procedural(text), "{text}");
+        }
+        for text in [
+            "lives in Madrid",
+            "likes tea",
+            "The release train leaves on Friday at 09:00 from platform 3",
+            "Team lead is Ana",
+            "Laptop has 32 GB",
+            "Prefers concise Spanish answers",
+            "The staging URL is staging-new.example.com",
+            "",
+        ] {
+            assert!(!is_procedural(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn skill_name_and_description_follow_from_the_text() {
+        let text = "To deploy the release train, run scripts/deploy.sh, then check the staging URL";
+        assert_eq!(
+            skill_name_for(text).as_deref(),
+            Some("deploy-release-train-run")
+        );
+        assert_eq!(
+            skill_description_for(text),
+            "To deploy the release train run scripts deploy sh then check the staging URL"
+        );
+        assert_eq!(
+            skill_name_for("lives in Madrid").as_deref(),
+            Some("lives-madrid")
+        );
+        // A non-ASCII keyword is left out, a text without keywords has no name.
+        assert_eq!(
+            skill_name_for("Despliega ñandú release").as_deref(),
+            Some("despliega-release")
+        );
+        assert_eq!(skill_name_for("el de y"), None);
+        assert_eq!(skill_description_for("---"), "");
+
+        // Bounded: the name by the skill-name rule, the description at a
+        // word boundary.
+        let long = format!("run {}", "word ".repeat(60).trim_end());
+        assert!(skill_name_for(&long).is_some_and(|n| n.len() <= 48));
+        let description = skill_description_for(&long);
+        assert!(description.chars().count() <= 120, "{description}");
+        assert!(description.ends_with("word"), "{description}");
+        let one_long_word = "a".repeat(200);
+        assert_eq!(skill_description_for(&one_long_word).chars().count(), 120);
     }
 }

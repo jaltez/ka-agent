@@ -285,12 +285,9 @@ impl Runtime {
         let Some(embedder) = self.ensure_vector_index_for(username)? else {
             return Ok(Vec::new());
         };
-        let mut vectors = embedder
-            .embed(&[query.to_string()])
+        let mut query_vec = embedder
+            .embed_query(query)
             .map_err(|e| Error::Refused(e.to_string()))?;
-        let mut query_vec = vectors
-            .pop()
-            .ok_or_else(|| Error::Refused("embedder returned no query vector".into()))?;
         if !normalize(&mut query_vec) {
             return Ok(Vec::new());
         }

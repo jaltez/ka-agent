@@ -693,6 +693,7 @@ pub struct Memory {
     pub max_context_tokens: u32,
     pub recall: MemoryRecall,
     pub embeddings: MemoryEmbeddings,
+    pub rerank: MemoryRerank,
     pub dream: MemoryDream,
 }
 
@@ -729,7 +730,8 @@ pub struct MemoryEmbeddings {
     /// Base URL for an HTTP endpoint. `/v1/embeddings` is appended when
     /// the URL does not already name the embeddings path.
     pub base_url: Option<String>,
-    /// Model name. For `local`, one of the fastembed model names.
+    /// Model name. For `local`, `embeddinggemma-300m`, `embeddinggemma-300m-q4`,
+    /// `all-minilm-l6-v2`, or `qwen3-embedding-0.6b` (a `local-qwen3` build).
     pub model: Option<String>,
     /// Expected dimension; `None` discovers it from the backend.
     pub dimensions: Option<u32>,
@@ -740,6 +742,43 @@ pub struct MemoryEmbeddings {
     pub timeout_secs: u64,
     /// Texts per embedding request.
     pub batch_size: u32,
+}
+
+/// The reranker `[memory.rerank] model` names when it is unset.
+pub const DEFAULT_RERANKER_MODEL: &str = "BAAI/bge-reranker-v2-m3";
+
+/// Optional reranker (`[memory.rerank]`): a local cross-encoder that
+/// re-scores recalled candidates by how well each answers the query. Off
+/// by default; it needs a `local-embeddings` build.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct MemoryRerank {
+    /// Rerank the recalled candidates with the local cross-encoder.
+    pub enabled: bool,
+    /// Reranker name. Unset keeps `BAAI/bge-reranker-v2-m3`, a
+    /// multilingual model (about 2.3 GB, downloaded on first use under
+    /// `<data>/models`).
+    pub model: Option<String>,
+}
+
+impl MemoryRerank {
+    /// The reranker to load: the configured name, or the default.
+    pub fn model_name(&self) -> &str {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(DEFAULT_RERANKER_MODEL)
+    }
+}
+
+impl Default for MemoryRerank {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: Some(DEFAULT_RERANKER_MODEL.into()),
+        }
+    }
 }
 
 /// Background memory extraction (`[memory.dream]`). Off by default; the
@@ -791,6 +830,7 @@ impl Default for Memory {
             max_context_tokens: 2_000,
             recall: MemoryRecall::default(),
             embeddings: MemoryEmbeddings::default(),
+            rerank: MemoryRerank::default(),
             dream: MemoryDream::default(),
         }
     }
@@ -1211,6 +1251,18 @@ impl DaemonConfig {
         if self.memory.embeddings.batch_size == 0 || self.memory.embeddings.batch_size > 128 {
             return Err(Error::Validate(
                 "memory.embeddings.batch_size must be in 1..=128".into(),
+            ));
+        }
+        if self
+            .memory
+            .rerank
+            .model
+            .as_deref()
+            .is_some_and(|m| m.trim().is_empty())
+        {
+            return Err(Error::Validate(
+                "memory.rerank.model must not be blank; unset it to use the default reranker"
+                    .into(),
             ));
         }
         if self.memory.dream.idle_hours > 720 {
@@ -2057,6 +2109,32 @@ digest_time = "07:30"
         assert!(!cfg.web.enabled);
         assert_eq!(cfg.web.port, 9000);
         assert_eq!(cfg.calendar.digest_time, "07:30");
+    }
+
+    #[test]
+    fn memory_rerank_defaults_off_and_resolves_its_model() {
+        let cfg = DaemonConfig::default();
+        assert!(!cfg.memory.rerank.enabled);
+        assert_eq!(cfg.memory.rerank.model_name(), DEFAULT_RERANKER_MODEL);
+
+        // Enabled without a model: valid, and the default reranker applies.
+        let cfg = DaemonConfig::parse_toml("[memory.rerank]\nenabled = true\n").unwrap();
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.memory.rerank.enabled);
+        assert_eq!(cfg.memory.rerank.model_name(), DEFAULT_RERANKER_MODEL);
+
+        let cfg = DaemonConfig::parse_toml(
+            "[memory.rerank]\nenabled = true\nmodel = \" bge-reranker-base \"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.memory.rerank.model_name(), "bge-reranker-base");
+
+        // A blank name is a typo in the file, not the default; an unknown
+        // key is refused at parse time.
+        let cfg = DaemonConfig::parse_toml("[memory.rerank]\nmodel = \"  \"\n").unwrap();
+        assert!(cfg.validate().is_err());
+        assert!(DaemonConfig::parse_toml("[memory.rerank]\nenabledd = true\n").is_err());
     }
 
     #[test]

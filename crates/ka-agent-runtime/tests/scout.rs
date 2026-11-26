@@ -41,6 +41,47 @@ fn mock__worker() {
     });
 }
 
+/// The `__mcp` side of the same binary. Every worker the port spawns boots
+/// a `kagent` MCP server as this executable with `__mcp`, and ka-engine
+/// cannot tell a bridge that exited without answering from a slow one: it
+/// waits out its whole connect timeout before every turn. With no bridge
+/// hosted here each turn started with a 20 s stall (the `mcp kagent:
+/// connect timed out` engine error), which under a loaded workspace test
+/// run ate the scout's deadline. This stub answers the handshake at once
+/// and advertises no tools.
+#[test]
+#[allow(non_snake_case)]
+fn mock__mcp() {
+    use std::io::{BufRead, Write};
+
+    if !std::env::args().any(|a| a == "__mcp") {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let (Some(id), Some(method)) = (msg.get("id"), msg["method"].as_str()) else {
+            continue; // a notification: nothing to answer
+        };
+        let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "scout-test-bridge", "version": "0"}
+            }),
+            "tools/list" => serde_json::json!({"tools": []}),
+            _ => serde_json::json!({}),
+        };
+        let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
+            break;
+        }
+    }
+}
+
 /// Everything the runtime told the surface, in order.
 #[derive(Default)]
 struct Recorder(Mutex<Vec<AgentEvent>>);

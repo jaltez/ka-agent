@@ -777,12 +777,22 @@ fn phase_next_eval_validity_as_of_forgetting_and_recovery() {
 /// `KA_MEMORY_EVAL_EMBEDDING_MODEL=embeddinggemma-300m cargo test -p ka-agent \
 ///  --features local-embeddings --test memory_eval phase_next_eval_real_model_opt_in \
 ///  -- --ignored --nocapture`
+///
+/// `KA_MEMORY_EVAL_RERANK=1` adds the local cross-encoder
+/// (`memory.rerank`, model `BAAI/bge-reranker-v2-m3` unless
+/// `KA_MEMORY_EVAL_RERANK_MODEL` names another) and prints both paths:
+/// the dense top 3 as scored here, and the reranking of the dense top
+/// `RERANK_CANDIDATES`. Both models download on first use.
 #[test]
 #[ignore = "opt-in real embedding model; set KA_MEMORY_EVAL_EMBEDDING_MODEL"]
 fn phase_next_eval_real_model_opt_in() {
-    use ka_agent_core::config::{DaemonConfig, Memory, MemoryEmbeddings};
+    use ka_agent_core::config::{DaemonConfig, Memory, MemoryEmbeddings, MemoryRerank};
     use ka_agent_runtime::Paths;
     use ka_agent_runtime::runtime::memory_embed::build_embedder;
+    use ka_agent_runtime::runtime::memory_rerank::build_reranker;
+
+    /// Dense candidates the cross-encoder re-scores when reranking is on.
+    const RERANK_CANDIDATES: usize = 10;
 
     #[derive(Debug, Default)]
     struct RealStats {
@@ -790,6 +800,55 @@ fn phase_next_eval_real_model_opt_in() {
         hits1: usize,
         hits3: usize,
         mrr: f64,
+    }
+
+    impl RealStats {
+        fn record(&mut self, rank: Option<usize>) {
+            self.cases += 1;
+            if rank == Some(1) {
+                self.hits1 += 1;
+            }
+            if rank.is_some_and(|rank| rank <= 3) {
+                self.hits3 += 1;
+            }
+            self.mrr += rank.map_or(0.0, |rank| 1.0 / rank as f64);
+        }
+    }
+
+    /// The best expected id's 1-based rank in `ids`, or `None`.
+    fn rank_of(expected: &[&str], ids: &[&str]) -> Option<usize> {
+        expected
+            .iter()
+            .find_map(|want| ids.iter().position(|id| id == want))
+            .map(|position| position + 1)
+    }
+
+    /// The p50 and p95 of `samples`, in milliseconds.
+    fn p50_p95(samples: &mut [f64]) -> (f64, f64) {
+        samples.sort_by(f64::total_cmp);
+        let at = |q: usize| samples[(samples.len() - 1).min(samples.len() * q / 100)];
+        (at(50), at(95))
+    }
+
+    fn print_table(title: &str, stats: &BTreeMap<&'static str, RealStats>, overall: &RealStats) {
+        println!("\n{title}");
+        println!(
+            "{:<12} {:>5} {:>8} {:>8} {:>8}",
+            "class", "cases", "r@1", "r@3", "mrr"
+        );
+        let row = |name: &str, stats: &RealStats| {
+            println!(
+                "{name:<12} {:>5} {:>7.0}% {:>7.0}% {:>8.3}",
+                stats.cases,
+                stats.hits1 as f64 / stats.cases as f64 * 100.0,
+                stats.hits3 as f64 / stats.cases as f64 * 100.0,
+                stats.mrr / stats.cases as f64
+            );
+        };
+        for (class, stats) in stats {
+            row(class, stats);
+        }
+        row("overall", overall);
     }
 
     struct Case {
@@ -801,12 +860,17 @@ fn phase_next_eval_real_model_opt_in() {
     let model = std::env::var("KA_MEMORY_EVAL_EMBEDDING_MODEL").expect("model");
     let provider =
         std::env::var("KA_MEMORY_EVAL_EMBEDDING_PROVIDER").unwrap_or_else(|_| "local".into());
+    let rerank = std::env::var("KA_MEMORY_EVAL_RERANK").is_ok_and(|value| value != "0");
     let cfg = DaemonConfig {
         memory: Memory {
             embeddings: MemoryEmbeddings {
                 provider,
                 model: Some(model),
                 ..MemoryEmbeddings::default()
+            },
+            rerank: MemoryRerank {
+                enabled: rerank,
+                model: std::env::var("KA_MEMORY_EVAL_RERANK_MODEL").ok(),
             },
             ..Memory::default()
         },
@@ -817,6 +881,7 @@ fn phase_next_eval_real_model_opt_in() {
     let embedder = build_embedder(&cfg, &paths)
         .expect("embedder")
         .expect("provider none");
+    let reranker = build_reranker(&cfg, &paths).expect("reranker");
 
     let corpus: &[(&str, &str)] = &[
         ("staging_new", "the staging URL is staging-new.example.com"),
@@ -1057,45 +1122,49 @@ fn phase_next_eval_real_model_opt_in() {
         }
         rows.push(((*id).to_string(), vec));
     }
+    let text_of: BTreeMap<&str, &str> = corpus.iter().map(|(id, text)| (*id, *text)).collect();
 
     let mut stats: BTreeMap<&'static str, RealStats> = BTreeMap::new();
     let mut overall = RealStats::default();
+    let mut rerank_stats: BTreeMap<&'static str, RealStats> = BTreeMap::new();
+    let mut rerank_overall = RealStats::default();
+    let mut rerank_ms: Vec<f64> = Vec::new();
+    let mut embed_ms: Vec<f64> = Vec::new();
     println!(
-        "\nreal model {} ({} corpus entries, {} queries)",
+        "\nreal model {} ({} corpus entries, {} queries){}",
         embedder.model(),
         corpus.len(),
-        cases.len()
+        cases.len(),
+        reranker
+            .as_ref()
+            .map_or_else(String::new, |reranker| format!(
+                ", reranked with {} over the top {RERANK_CANDIDATES}",
+                reranker.model()
+            ))
     );
     for case in cases {
-        let mut query = embedder
-            .embed(&[case.query.to_string()])
-            .expect("embed query")
-            .remove(0);
+        let embed_started = Instant::now();
+        let mut query = embedder.embed_query(case.query).expect("embed query");
+        embed_ms.push(embed_started.elapsed().as_secs_f64() * 1000.0);
         let norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
         if norm > 0.0 {
             for value in &mut query {
                 *value /= norm;
             }
         }
-        let top = cosine_top_k(&query, &rows, 3);
-        let ids: Vec<&str> = top.iter().map(|(id, _)| id.as_str()).collect();
-        let rank = case
-            .expected
-            .iter()
-            .find_map(|want| ids.iter().position(|id| *id == *want))
-            .map(|position| position + 1);
-        let record = |stats: &mut RealStats| {
-            stats.cases += 1;
-            if rank == Some(1) {
-                stats.hits1 += 1;
-            }
-            if rank.is_some_and(|rank| rank <= 3) {
-                stats.hits3 += 1;
-            }
-            stats.mrr += rank.map_or(0.0, |rank| 1.0 / rank as f64);
-        };
-        record(stats.entry(case.class).or_default());
-        record(&mut overall);
+        let top = cosine_top_k(
+            &query,
+            &rows,
+            if reranker.is_some() {
+                RERANK_CANDIDATES
+            } else {
+                3
+            },
+        );
+        let ids: Vec<&str> = top.iter().take(3).map(|(id, _)| id.as_str()).collect();
+        let rank = rank_of(case.expected, &ids);
+        stats.entry(case.class).or_default().record(rank);
+        overall.record(rank);
         println!(
             "{:<12} {:<36} expected={:<20} rank={:<4?} top={:?}",
             case.class,
@@ -1104,29 +1173,60 @@ fn phase_next_eval_real_model_opt_in() {
             rank,
             ids
         );
-    }
-
-    println!(
-        "\n{:<12} {:>5} {:>8} {:>8} {:>8}",
-        "class", "cases", "r@1", "r@3", "mrr"
-    );
-    for (class, stats) in &stats {
+        let Some(cross_encoder) = reranker.as_ref() else {
+            continue;
+        };
+        let candidates: Vec<(String, String)> = top
+            .iter()
+            .map(|(id, _)| (id.clone(), text_of[id.as_str()].to_string()))
+            .collect();
+        let started = Instant::now();
+        let reranked = cross_encoder
+            .rerank(case.query, &candidates)
+            .expect("rerank");
+        rerank_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let reranked_ids: Vec<&str> = reranked.iter().take(3).map(|(id, _)| id.as_str()).collect();
+        let rerank_rank = rank_of(case.expected, &reranked_ids);
+        rerank_stats
+            .entry(case.class)
+            .or_default()
+            .record(rerank_rank);
+        rerank_overall.record(rerank_rank);
         println!(
-            "{class:<12} {:>5} {:>7.0}% {:>7.0}% {:>8.3}",
-            stats.cases,
-            stats.hits1 as f64 / stats.cases as f64 * 100.0,
-            stats.hits3 as f64 / stats.cases as f64 * 100.0,
-            stats.mrr / stats.cases as f64
+            "{:<12} {:<36} rerank rank={:?} top=({})",
+            "",
+            "",
+            rerank_rank,
+            reranked
+                .iter()
+                .take(3)
+                .map(|(id, score)| format!("{id} {score:.2}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
-    println!(
-        "{:<12} {:>5} {:>7.0}% {:>7.0}% {:>8.3}",
-        "overall",
-        overall.cases,
-        overall.hits1 as f64 / overall.cases as f64 * 100.0,
-        overall.hits3 as f64 / overall.cases as f64 * 100.0,
-        overall.mrr / overall.cases as f64
-    );
+
+    print_table("dense top 3", &stats, &overall);
+    let (embed_p50, embed_p95) = p50_p95(&mut embed_ms);
+    println!("\nquery embed latency p50 {embed_p50:.0} ms, p95 {embed_p95:.0} ms");
+    if reranker.is_some() {
+        print_table(
+            &format!("reranked top {RERANK_CANDIDATES}"),
+            &rerank_stats,
+            &rerank_overall,
+        );
+        // Comparison only: the assertions below stay on the dense path.
+        let (rerank_p50, rerank_p95) = p50_p95(&mut rerank_ms);
+        let points = |before: usize, after: usize| {
+            (after as f64 - before as f64) / overall.cases as f64 * 100.0
+        };
+        println!(
+            "\nrerank minus dense: r@1 {:+.0} pts, r@3 {:+.0} pts, mrr {:+.3}; rerank latency p50 {rerank_p50:.0} ms, p95 {rerank_p95:.0} ms",
+            points(overall.hits1, rerank_overall.hits1),
+            points(overall.hits3, rerank_overall.hits3),
+            (rerank_overall.mrr - overall.mrr) / overall.cases as f64
+        );
+    }
 
     let lexical = stats.get("lexical").expect("lexical");
     let paraphrase = stats.get("paraphrase").expect("paraphrase");

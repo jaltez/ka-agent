@@ -1,8 +1,9 @@
 //! `memory_search`: accepted memory and past turns in one read-only call.
 //!
 //! The engine sees this through `kagent__memory_search`. It never writes,
-//! and it is off in private conversations and scheduled turns: those
-//! sessions must not read personal memory (B15b, privacy contract).
+//! and it is off in private conversations, scheduled turns and turns under
+//! the `Automation` memory scope: those sessions must not read personal
+//! memory (B15b, privacy contract).
 //!
 //! The read path is agentic on purpose: the engine can narrow by session
 //! and date, read a past validity view, and expand an episode hit with its
@@ -11,7 +12,8 @@
 use serde_json::{Value, json};
 
 use super::{ToolCtx, ToolFuture, turn_principal, turnctx};
-use ka_agent_runtime::MemorySearchFilter;
+use ka_agent_runtime::runtime::memory_rerank::Reranker;
+use ka_agent_runtime::{MemorySearchFilter, MemorySearchHit};
 use ka_agent_store::MemoryAsOf;
 
 pub(crate) fn schema() -> Value {
@@ -72,6 +74,11 @@ pub(crate) fn run<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         {
             return Err("this turn is scheduled — memory search is off here".into());
         }
+        // A webhook fire under the automation memory scope (the default)
+        // is an automation turn too: it reads no personal memory.
+        if super::memory::runs_with_automation_memory(ctx) {
+            return Err("this turn runs with automation memory — memory search is off here".into());
+        }
         let query = args["query"].as_str().unwrap_or("").trim();
         if query.is_empty() {
             return Err("missing 'query'".into());
@@ -127,7 +134,7 @@ pub(crate) fn run<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             .runtime
             .search_memory_and_episodes_filtered(query, window, &who, &filter)
             .map_err(|e| format!("memory search: {e}"))?;
-        let hits: Vec<_> = hits
+        let mut hits: Vec<_> = hits
             .into_iter()
             .filter(|h| match kind {
                 "memory" => h.kind == "memory",
@@ -136,6 +143,12 @@ pub(crate) fn run<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
             })
             .take(limit)
             .collect();
+        // Rerank only the explicit memory_search tool path, never the
+        // per-turn recall block. A disabled or failing reranker keeps the
+        // fused order; retrieval never fails because of it.
+        if let Ok(Some(reranker)) = ctx.runtime.reranker() {
+            apply_rerank(&mut hits, query, reranker.as_ref());
+        }
         if hits.is_empty() {
             return Ok(format!("nothing found for {query:?}"));
         }
@@ -171,4 +184,97 @@ pub(crate) fn run<'a>(ctx: &'a ToolCtx, args: Value) -> ToolFuture<'a> {
         out.push_str("</memory_search_results>\n");
         Ok(out)
     })
+}
+
+/// Reorder fused hits by the reranker's scores. A disabled or failing
+/// reranker keeps the fused order; retrieval never fails because of it.
+fn apply_rerank(hits: &mut [MemorySearchHit], query: &str, reranker: &dyn Reranker) {
+    if hits.len() < 2 {
+        return;
+    }
+    let candidates: Vec<(String, String)> = hits
+        .iter()
+        .map(|hit| (hit.id.clone(), hit.text.clone()))
+        .collect();
+    let Ok(scored) = reranker.rerank(query, &candidates) else {
+        return;
+    };
+    hits.sort_by_key(|hit| {
+        scored
+            .iter()
+            .position(|(id, _)| id == &hit.id)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{MemorySearchHit, Reranker, apply_rerank};
+
+    struct Reverse;
+
+    impl Reranker for Reverse {
+        fn model(&self) -> &str {
+            "reverse-fixture"
+        }
+
+        fn rerank(
+            &self,
+            _query: &str,
+            candidates: &[(String, String)],
+        ) -> Result<Vec<(String, f32)>, ka_agent_runtime::Error> {
+            Ok(candidates
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(index, (id, _))| (id.clone(), -(index as f32)))
+                .collect())
+        }
+    }
+
+    fn hit(id: &str) -> MemorySearchHit {
+        MemorySearchHit {
+            kind: "memory",
+            id: id.into(),
+            snippet: id.into(),
+            text: id.into(),
+            detail: "facts.md · operator".into(),
+            at_ms: 0,
+            valid_until: None,
+            session: None,
+            context: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rerank_reorders_by_score_and_keeps_a_failed_reranker_fused() {
+        let mut hits = vec![hit("a"), hit("b"), hit("c")];
+        apply_rerank(&mut hits, "query", &Reverse);
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
+
+        struct Broken;
+        impl Reranker for Broken {
+            fn model(&self) -> &str {
+                "broken"
+            }
+            fn rerank(
+                &self,
+                _query: &str,
+                _candidates: &[(String, String)],
+            ) -> Result<Vec<(String, f32)>, ka_agent_runtime::Error> {
+                Err(ka_agent_runtime::Error::Refused("broken".into()))
+            }
+        }
+        let mut hits = vec![hit("a"), hit("b")];
+        apply_rerank(&mut hits, "query", &Broken);
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
 }

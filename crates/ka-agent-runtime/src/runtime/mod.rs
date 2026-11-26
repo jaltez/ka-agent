@@ -38,6 +38,7 @@ mod intake;
 mod invariants;
 mod memory;
 pub mod memory_embed;
+pub mod memory_rerank;
 pub mod memory_vectors;
 mod policy;
 mod roles;
@@ -229,6 +230,8 @@ struct Shared {
     memories: Mutex<HashMap<String, ka_agent_memory::MemoryStore>>,
     /// Lazy embedding backend, keyed by the config fields that built it.
     embedder: Mutex<Option<(String, Arc<dyn memory_embed::Embedder>)>>,
+    /// Lazy local reranker, keyed by the config fields that built it.
+    reranker: Mutex<Option<(String, Arc<dyn memory_rerank::Reranker>)>>,
     /// Per-user vectors for the exact scan, loaded from the store on first
     /// use and invalidated when the index rebuilds.
     vector_cache: Mutex<HashMap<String, Arc<memory_embed::CachedVectors>>>,
@@ -564,6 +567,7 @@ impl Runtime {
                 store,
                 memories: Mutex::new(memories),
                 embedder: Mutex::new(None),
+                reranker: Mutex::new(None),
                 vector_cache: Mutex::new(HashMap::new()),
                 port,
                 surface,

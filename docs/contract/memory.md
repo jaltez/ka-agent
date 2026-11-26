@@ -29,6 +29,9 @@ operator accepts stable-memory writes.
   The result is written to `<engine-home>/.config/ka/MEMORY.md` (ka's
   user-tier memory, re-read per prompt — validation §5: no worker restart
   needed).
+  An entry's `valid_until` is set when it is accepted (a dream's
+  `VALID_UNTIL`, below) or later by `/memory expire`; it must name a real
+  `YYYY-MM-DD` day, and the entry stays valid through that day.
 - **Automation variant** (B15b): turns a schedule started (`cron`,
   `cron:<id>`, `briefing`, `trigger:sched:<id>` sources) run against an `Automation`-scope
   compile that keeps only the machine facts (`environment.md` +
@@ -44,11 +47,34 @@ operator accepts stable-memory writes.
   Limits: only daemon death inside a scheduled span leaves the lean
   compile until the next boot or memory change — degraded answers, never a
   leak; two processes refreshing mid-span race benignly.
+- **Webhook memory scope**: a webhook trigger's payload carries
+  `memory_scope` — `automation` (the default; absent in every payload
+  written before the scope existed) or `creator`. An `automation` fire
+  runs inside the schedule-trigger bracket: the automation compile goes in
+  before the submit and the full compile comes back when the fire settles,
+  on success or failure. `creator` is the creator's explicit opt-in: the
+  fire keeps the full compile. A schedule trigger always runs
+  `automation`, whatever its payload says. Every turn — a fire, a cron, a
+  chat message — publishes its scope as the per-user turn-context field
+  `memory_scope` (`automation`/`creator`), so the bridge gates read it and
+  a later turn never inherits an earlier one's. An `automation` fire also
+  gets no recall block and contributes nothing to dream input.
+  Limit: the turn context is per user, so a trigger fire that overlaps its
+  creator's own live turn can read that turn's context — the limit
+  schedule-trigger fires already had for the scheduled-source gate.
 - **Commands** (shared router: console, Telegram, Matrix):
   - `/remember <fact>` — explicit operator acceptance, appends to facts.md,
     recompiles, commits.
   - `/forget <id>` — removes the entry, recompiles, commits.
-  - `/memory` — report: files, bytes, budget %, truncated flag.
+  - `/memory expire <id> <YYYY-MM-DD | clear>` — set, change or lift the
+    validity of one accepted entry: its provenance comment is edited in
+    place (the bullet, source and accept date stay), then recompile and
+    commit (`memory: expire <id> <date>`). The entry leaves the current
+    compile the day after its last valid day; the Markdown and an `as_of`
+    search keep it. A date that is not a real day is refused before
+    anything is written.
+  - `/memory` — report: files, bytes, budget %, truncated flag; a listed
+    entry shows `· until <date>` when it has an expiry.
   - `/memory search <query>` — accepted-memory and past-turn search
     (phase A; hybrid when embeddings are configured). Refused in a
     private conversation.
@@ -56,13 +82,18 @@ operator accepts stable-memory writes.
     dimension, staleness, and a rebuild (embeddings optional).
   - `/memory dream` — one review-gated extraction pass (disabled by
     default; see "Dream extraction").
-  - `/memory review` — lists pending candidates with **full ids**.
+  - `/memory review` — lists pending candidates with **full ids**, and
+    the accepted entries a candidate supersedes, conflicts with or
+    overlaps.
   - `/memory accept <id>` / `/memory reject <id>` — candidate → stable
     memory (or rejected). `<id>` may be the full id or any unique prefix
     (`/cron rm` rule); an ambiguous prefix is refused, never guessed.
     `/memory accept <id> supersede <old>` adds the candidate and removes
     the named stable entry in one rollback-protected step; git history
     keeps the old text. Removal stays operator-only.
+  - `/memory skill <id>` — turns one accepted procedural memory into a
+    skill candidate (see "Memory to skill"); nothing is installed until
+    `/skills accept`.
 - **CLI** (`ka-agent memory …`): `path` prints the memory directory,
   `show [file]` prints one file, `edit [file]` opens `$EDITOR` on it and
   recompiles + git-commits the result (SEED.md §9.1 `ka-agent memory
@@ -82,16 +113,24 @@ operator accepts stable-memory writes.
   pending candidate as a bullet diff — target file, the `+ <text>` line,
   the entry it lands after — plus the dry-run compile impact
   (`compiled NB of BB`, and whether the budget would then truncate).
-  The web review inbox rides the same accept path unchanged.
+  The web review inbox rides the same accept path unchanged. A dream
+  candidate's links to accepted entries — `supersedes [id]`, `conflicts
+  with [id]`, `overlaps [id]`, each with the entry's bullet — follow the
+  provenance line.
 - **Accept is screen → apply → rollback** (B15a): accepting re-runs
   `screen_proposal` on the stored text (rules may have tightened since
   filing — a candidate that fails today's screen is refused), then
   snapshots the target file, applies, recompiles and commits; any failure
   (git missing, compile error) restores the snapshot byte-for-byte,
-  recompiles and refuses — memory never lands half-applied.
+  recompiles and refuses — memory never lands half-applied. A
+  `valid_until:<date>` note in the provenance (a dream's `VALID_UNTIL`)
+  lands with the bullet; one that is not a real `YYYY-MM-DD` day refuses
+  the acceptance.
 - **Refusals at the `memory_propose` gate**: private conversations (row
   above); **scheduled sources** (cron, briefing, and schedule-trigger turns cannot propose
-  memory at all); and the three quota/warm-up gates (B15c) — the user's
+  memory at all); **the `automation` memory scope** (a webhook fire under
+  its default scope, for the same reason); and the three quota/warm-up
+  gates (B15c) — the user's
   budget verdict is `Warn` (≥80% of a cap) or `Exceeded`, their newest
   `rate_limit` turn is less than 30 minutes old, or their live session
   has fewer than `[memory] extraction_min_turns` recorded turns (default
@@ -168,10 +207,13 @@ operator accepts stable-memory writes.
   `as_of:YYYY-MM-DD`, and `expand:0..2`; `expand` returns the neighboring
   turns of an episode hit. Knowledge-base documents stay on `kb_search`.
 - **Gates**: `/memory search` and `memory_search` refuse in a private
-  conversation. `memory_search` also refuses a scheduled-source turn
-  (`cron`, `cron:<id>`, `briefing`, `trigger:sched:<id>`). B15b's automation compile already
-  keeps those turns from reading personal memory; the gate closes the
-  tool path too.
+  conversation. `memory_search` and `memory_propose` also refuse a turn
+  whose turn context carries `memory_scope = automation` — a webhook fire
+  under its default scope — and, as before, a scheduled-source turn
+  (`cron`, `cron:<id>`, `briefing`, `trigger:sched:<id>`). B15b's
+  automation compile already keeps those turns from reading personal
+  memory; the gates close the tool paths too. A context without the field
+  predates it and is not automation.
 - **Eval**: `cargo test -p ka-agent --test memory_eval -- --nocapture`.
   The corpus deliberately exceeds the 6 KB compile budget, so the
   compiled-`MEMORY.md` baseline misses truncated bullets while FTS finds
@@ -205,13 +247,27 @@ operator accepts stable-memory writes.
   `local-embeddings` build feature; the model is downloaded on first use
   under `<data>/models`. `provider = "none"` is the default and keeps
   the binary lean.
+- **Qwen3 embeddings**: a `local-qwen3` build adds `model =
+  "qwen3-embedding-0.6b"` to `provider = "local"`. It downloads
+  `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q8_0, about 639 MB) and the tokenizer
+  from `Qwen/Qwen3-Embedding-0.6B` into `<data>/models` on first use, and
+  loads them through the safe `from_gguf` path. Vectors are 1024 wide.
+  Recall queries carry the model card's `Instruct:` prefix; documents do
+  not.
+- **Reranker**: `[memory.rerank] enabled = false` by default, `model`
+  defaults to `BAAI/bge-reranker-v2-m3` (about 2.3 GB on first use). A
+  `local-embeddings` build exposes `runtime::memory_rerank::build_reranker`.
+  Only the explicit `memory_search` tool reranks its fused top-k; the
+  per-turn recall block does not. A disabled or failing reranker keeps the
+  fused order.
 - **Recall block**: interactive turns with `[memory.recall] enabled`
   get a `<recalled_memory source="ka-agent">` prefix. The block is
   capped at `memory.recall.budget_tokens` (600) and the combined memory
   context is capped at `memory.max_context_tokens` (2000), measured with
   a five-bytes-per-token estimate for the compiled `MEMORY.md`. It is
-  skipped in private conversations and for `cron`/`cron:<id>`/`briefing`/
-  `trigger:sched:<id>` sources.
+  skipped in private conversations, for `cron`/`cron:<id>`/`briefing`/
+  `trigger:sched:<id>` sources, and for a webhook fire under the
+  `automation` memory scope.
   The text is escaped and labeled data, not instructions.
 - **Status/rebuild**: `/memory index status` reports the FTS and vector
   counts, model, dimension, recall state, and staleness.
@@ -239,7 +295,11 @@ operator accepts stable-memory writes.
   included. Scheduled-source turns are excluded through `turn_origins`
   (schema v22), written on every turn insert, plus the existing
   `cron`/`cron:<id>`/`briefing`/`trigger:sched:<id>` source check. A
-  webhook trigger carries `trigger:<id>` and is not a scheduled turn.
+  webhook trigger carries `trigger:<id>` and is not a scheduled turn, but
+  its turns are left out the same way unless the trigger's memory scope is
+  `creator`: a fire under the default `automation` scope is an automation
+  turn for the dream too. An origin whose trigger no longer resolves
+  counts as automation.
 - **Child**: a disposable engine worker on a fresh strand in `readonly`
   mode with an empty `allowed_tools` list (no tools). It sees the compiled
   memory (under the existing 6 KB budget) and the excerpt, not the store.
@@ -248,17 +308,54 @@ operator accepts stable-memory writes.
   (`memory.dream`) record the pass.
 - **Output**: lines of the form
   `FACT: <text> | FILE: facts|preferences|environment|profile |
-  SUPERSEDES: <exact existing bullet or ->`. The daemon screens every
-  fact with `screen_proposal`, drops text over 300 chars, and dedupes
-  against stable memory and pending candidates by keyword Jaccard
-  (`>= 0.8` duplicate; `0.5..0.8` sets an `overlaps:<id>` provenance
-  note). A resolved `SUPERSEDES` becomes `supersedes:<id>`. Candidates
-  are staged only; nothing is auto-accepted.
-- **Review**: `/memory review` shows the provenance line, so an operator
-  can copy the old id into `/memory accept <id> supersede <old>`.
+  SUPERSEDES: <exact existing bullet or -> | VALID_UNTIL: <YYYY-MM-DD or ->`.
+  The last three fields are optional. The daemon screens every fact with
+  `screen_proposal`, and refuses a line that is over 300 chars, names an
+  unknown file, or carries a `VALID_UNTIL` that is not a real
+  `YYYY-MM-DD` day. A valid date is stored in the candidate's provenance
+  as `valid_until:<date>` and lands with the bullet when the candidate is
+  accepted. Candidates are staged only; nothing is auto-accepted.
+- **Consolidation**: each fact is compared with the accepted entries and
+  the caller's pending candidates by keyword Jaccard. A score of `>= 0.8`
+  with the same values is a duplicate and is dropped. The same words
+  around a *changed value* — a number, date, version, host, path or id
+  that each side names and the other does not — is not a duplicate:
+  `Laptop has 64 GB` is a change when memory says `32 GB`. For what is
+  staged, the closest accepted entry at or above `0.5` is noted in the
+  provenance: a resolved `SUPERSEDES` wins (`supersedes:<id>`); otherwise
+  a changed value gives `conflicts:<id>`, and shared keywords without one
+  give `overlaps:<id>`. Notes only — the operator decides.
+- **Review**: `/memory review` shows the provenance line and, for each
+  note, the accepted entry's id and bullet, so an operator can copy the
+  old id into `/memory accept <id> supersede <old>` — for a conflict that
+  is the replace; a plain accept keeps both bullets.
 - **Zero auto-apply** is the contract: dream can only call
   `add_candidate_for_user`; it cannot accept, forget, or edit stable
   memory. Removal and supersession require the operator.
+
+## Memory to skill
+
+`/memory skill <id>` turns one accepted **procedural** memory into a
+skill *candidate*. A procedure is a bullet with a clause that opens on an
+action verb (`run …`, `to deploy, …`, `para desplegar, …`), a `how to`, a
+step connector (`then`, `luego`) or a command chain (`&&`, a ` --flag`);
+a plain fact (`lives in Madrid`) is refused. No model call is made:
+
+- the name is the bullet's first keywords joined by dashes
+  (`deploy-release-train`), within the skill-name rule (`[a-z0-9-]`, at
+  most 48 characters);
+- the description is the bullet's words cut at a word boundary under 120
+  characters, reduced to letters, digits and spaces — the skill accept
+  path writes it unquoted into TOML frontmatter, so nothing TOML-special
+  may survive;
+- the body is the bullet itself, followed by a comment naming the memory
+  it came from (`<!-- from memory mem_… -->`), under the same invisible
+  and credential screens and the 8 KiB cap as `skill_propose`.
+
+The candidate joins the `skill_propose` queue — `/skills review|accept|
+reject` — so it is operator-gated: `/memory skill` installs and enables
+nothing. A name that a library skill or a pending proposal already has is
+refused, not suffixed.
 
 ## What does NOT auto-update memory
 

@@ -148,10 +148,16 @@ never widens. Every fire submits into the trigger's pinned lineage
 session (one session row per trigger, strand resumed across fires), never
 the creator's live chat. A schedule-kind trigger's turn source is
 `trigger:sched:<task id>`; a webhook delivery's is `trigger:<task id>`.
-Every fire publishes that source in the per-user turn context before it
-opens the worker, so the bridge gates read the trigger source. The
-scheduled form installs the automation memory compile and is excluded by
-the memory automation gates.
+Every fire publishes that source — and its memory scope — in the per-user
+turn context before it opens the worker, so the bridge gates read them.
+**Memory scope**: the payload's `memory_scope` is `automation` (the
+default; absent in every payload written before the scope existed) or
+`creator`, the webhook creator's explicit opt-in. An `automation` fire
+runs inside the schedule-trigger bracket: it installs the automation
+memory compile and restores the full one when the fire settles (success
+or failure), gets no recall block, and is refused by `memory_search` and
+`memory_propose`. A schedule trigger always runs `automation`, whatever
+its payload says (`memory.md`, "Webhook memory scope").
 
 Degradation contract: every fire appends a `runs` row
 (`kind = "trigger"`, `ref_id` = task id; the preflight gate adds

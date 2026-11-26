@@ -6,9 +6,16 @@ use super::worker::rt_on_engine_closed;
 use super::*;
 use ka_agent_core::Principal;
 
-/// Who started the turn being submitted and which user/role it acts as: the
-/// bridge's loop guard and its per-user notes/memory targets.
-fn publish_turn_context(store: &Store, source: &str, who: &Principal) {
+/// Who started the turn being submitted, which user/role it acts as, and
+/// which memory it runs with: the bridge's loop guard and its per-user
+/// notes/memory targets. `memory_scope` is written on every path, so a
+/// later turn never inherits an earlier one's automation scope.
+fn publish_turn_context(
+    store: &Store,
+    source: &str,
+    who: &Principal,
+    memory_scope: ka_agent_core::TriggerMemoryScope,
+) {
     // Per-user keys: one worker (and one bridge) serves exactly one user, so
     // this context can never be crossed between concurrent turns. The
     // globals stay written for pre-users readers only.
@@ -16,6 +23,7 @@ fn publish_turn_context(store: &Store, source: &str, who: &Principal) {
         ("source", source.to_string()),
         ("role", who.role.clone()),
         ("username", who.username.clone()),
+        ("memory_scope", memory_scope.as_str().to_string()),
     ] {
         let _ = store.meta_set(
             &ka_agent_core::layout::turnctx_key(&who.username, field),
@@ -25,6 +33,17 @@ fn publish_turn_context(store: &Store, source: &str, who: &Principal) {
     let _ = store.meta_set(ka_agent_core::layout::TURN_SOURCE_META_KEY, source);
     let _ = store.meta_set(ka_agent_core::layout::TURN_ROLE_META_KEY, &who.role);
     let _ = store.meta_set(ka_agent_core::layout::TURN_USER_META_KEY, &who.username);
+}
+
+/// The memory scope of an ordinary turn (queue drain or direct submit): a
+/// scheduled source runs under the automation bracket (B15b), every other
+/// source under its user's full memory. A trigger fire decides its own.
+fn turn_memory_scope(source: &str) -> ka_agent_core::TriggerMemoryScope {
+    if ka_agent_core::is_scheduled_source(source) {
+        ka_agent_core::TriggerMemoryScope::Automation
+    } else {
+        ka_agent_core::TriggerMemoryScope::Creator
+    }
 }
 
 /// A per-turn override (`/skill` allowed_tools, a cron's tool list) can
@@ -307,7 +326,12 @@ pub(super) async fn drain_queue(sh: &Arc<Shared>, who: &Principal, st: &UserHand
         source: item.source.clone(),
         text: item.text.clone(),
     });
-    publish_turn_context(&sh.store, &item.source, who);
+    publish_turn_context(
+        &sh.store,
+        &item.source,
+        who,
+        turn_memory_scope(&item.source),
+    );
     // Background turns may run on the background model; the selector the
     // runtime submits on is recorded with the turn (per-model spend).
     let background = item.source.starts_with("cron")
@@ -602,20 +626,35 @@ impl Runtime {
         gate_output: String,
     ) {
         let source = crate::runtime::scheduler::trigger_source(&task);
+        let scheduled = ka_agent_core::is_scheduled_source(&source);
+        // B15b, extended to webhooks: a fire runs against the automation
+        // compile (machine facts only) when its source is scheduled or its
+        // memory scope is `Automation` — the webhook default. `Creator` is
+        // the creator's explicit opt-in into their full memory.
+        let memory_scope = if scheduled {
+            ka_agent_core::TriggerMemoryScope::Automation
+        } else {
+            spec.effective_memory_scope()
+        };
+        let automation = memory_scope == ka_agent_core::TriggerMemoryScope::Automation;
         // The bridge gates (memory_search, memory_propose) read this
         // per-user context; a trigger fire publishes it exactly like the
         // queue and direct-submit paths.
-        publish_turn_context(&self.sh.store, &source, &who);
-        let scheduled = ka_agent_core::is_scheduled_source(&source);
+        publish_turn_context(&self.sh.store, &source, &who, memory_scope);
         let text = delivered
             .as_ref()
             .map(|item| item.text.clone())
             .unwrap_or_else(|| spec.text.clone());
         // The one line of chat-shaped context the model sees (its clock,
-        // its channel); scheduled turns name their origin.
-        let recall = self
-            .recall_block_for(&who, &source, &text)
-            .unwrap_or_default();
+        // its channel); scheduled turns name their origin. An
+        // automation-scoped fire reads no personal memory, so it gets no
+        // recall block either.
+        let recall = if automation {
+            String::new()
+        } else {
+            self.recall_block_for(&who, &source, &text)
+                .unwrap_or_default()
+        };
         let mut wire = format!("{}\n{}{}", context_line(&self.sh, &source), recall, text);
         if !gate_output.trim().is_empty() {
             wire = format!(
@@ -662,11 +701,11 @@ impl Runtime {
                 return;
             }
         }
-        // B15b: a schedule trigger runs against the automation compile
-        // (machine facts only), restored at every exit below. A webhook
-        // trigger is not a scheduled turn and keeps the creator's full
-        // compile, as ADR-0005 specifies.
-        if scheduled && let Err(e) = self.install_automation_memory_for(&who.username) {
+        // The automation bracket: the lean compile goes in here and the
+        // full one comes back at every exit below (the tail of this
+        // function — nothing between returns early). A fire that cannot
+        // install it fails rather than run on the full memory.
+        if automation && let Err(e) = self.install_automation_memory_for(&who.username) {
             self.sh.emit(AgentEvent::Error {
                 class: "internal".into(),
                 retryable: retryable_class("internal"),
@@ -714,7 +753,7 @@ impl Runtime {
                 self.settle_trigger(&task, &spec, false).await;
             }
         }
-        if scheduled && let Err(e) = self.refresh_compiled_memory_for(&who.username) {
+        if automation && let Err(e) = self.refresh_compiled_memory_for(&who.username) {
             self.sh.emit(AgentEvent::Error {
                 class: "internal".into(),
                 retryable: retryable_class("internal"),
@@ -1434,7 +1473,12 @@ impl Runtime {
         let st = self.ensure_user(who)?;
         // The bridge reads the turn's source, user and role from the store
         // while the turn runs.
-        publish_turn_context(&self.sh.store, source.unwrap_or("console"), who);
+        publish_turn_context(
+            &self.sh.store,
+            source.unwrap_or("console"),
+            who,
+            turn_memory_scope(source.unwrap_or("console")),
+        );
         if let Err(msg) = self.preflight(who) {
             self.sh.emit_from(AgentEvent::Notice { text: msg }, source);
             let mut g = st.lock();

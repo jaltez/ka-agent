@@ -387,6 +387,13 @@
             "enabled": true,
             "top_k": 6
           }
+        },
+        "rerank": {
+          "$ref": "#/$defs/MemoryRerank",
+          "default": {
+            "enabled": false,
+            "model": "BAAI/bge-reranker-v2-m3"
+          }
         }
       },
       "type": "object"
@@ -469,7 +476,7 @@
         },
         "model": {
           "default": null,
-          "description": "Model name. For `local`, one of the fastembed model names.",
+          "description": "Model name. For `local`, `embeddinggemma-300m`, `embeddinggemma-300m-q4`,\n`all-minilm-l6-v2`, or `qwen3-embedding-0.6b` (a `local-qwen3` build).",
           "type": [
             "string",
             "null"
@@ -512,6 +519,26 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "MemoryRerank": {
+      "additionalProperties": false,
+      "description": "Optional reranker (`[memory.rerank]`): a local cross-encoder that\nre-scores recalled candidates by how well each answers the query. Off\nby default; it needs a `local-embeddings` build.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Rerank the recalled candidates with the local cross-encoder.",
+          "type": "boolean"
+        },
+        "model": {
+          "default": "BAAI/bge-reranker-v2-m3",
+          "description": "Reranker name. Unset keeps `BAAI/bge-reranker-v2-m3`, a\nmultilingual model (about 2.3 GB, downloaded on first use under\n`<data>/models`).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -1116,6 +1143,10 @@
           "budget_tokens": 600,
           "enabled": true,
           "top_k": 6
+        },
+        "rerank": {
+          "enabled": false,
+          "model": "BAAI/bge-reranker-v2-m3"
         }
       },
       "description": "Memory extraction gating (`[memory]`)."

@@ -346,6 +346,46 @@ pub enum TriggerKind {
     Webhook,
 }
 
+/// Which memory a trigger fire runs with — B15b's automation bracket,
+/// extended to webhooks. `Automation` is the machine-facts compile with
+/// `memory_search` and `memory_propose` refused; `Creator` is the
+/// creator's full memory and memory tools, an explicit opt-in recorded in
+/// the payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerMemoryScope {
+    /// Machine facts only — the default, so every payload written before
+    /// the scope existed loads closed.
+    #[default]
+    Automation,
+    /// The creator's full memory.
+    Creator,
+}
+
+impl TriggerMemoryScope {
+    /// The per-user turn-context spelling (`turnctx:<user>:memory_scope`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automation => "automation",
+            Self::Creator => "creator",
+        }
+    }
+
+    /// Read the scope back from its [`as_str`](Self::as_str) spelling;
+    /// `None` for anything else (a turn context that predates the field).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "automation" => Some(Self::Automation),
+            "creator" => Some(Self::Creator),
+            _ => None,
+        }
+    }
+
+    fn is_automation(&self) -> bool {
+        matches!(self, Self::Automation)
+    }
+}
+
 /// One inbound trigger (C2/B14, ADR-0005), persisted as the `payload` of a
 /// `kind = "trigger"` task row beside the cron entries. Fires run as the
 /// creator (role re-resolved from the user row at fire time) and submit
@@ -414,6 +454,13 @@ pub struct TriggerSpec {
     /// scratch engine-home, no tools) before spending the real turn.
     #[serde(default)]
     pub preflight: bool,
+    /// Which memory a webhook fire runs with ([`TriggerMemoryScope`]).
+    /// Absent = `Automation`: every payload written before the scope
+    /// existed loads closed, and a default-scoped trigger's payload stays
+    /// byte-identical. A schedule trigger always runs `Automation`,
+    /// whatever this says ([`TriggerSpec::effective_memory_scope`]).
+    #[serde(default, skip_serializing_if = "TriggerMemoryScope::is_automation")]
+    pub memory_scope: TriggerMemoryScope,
 }
 
 impl TriggerSpec {
@@ -448,6 +495,16 @@ impl TriggerSpec {
         }
     }
 
+    /// The memory scope a fire of this trigger runs under: a schedule
+    /// trigger is always [`TriggerMemoryScope::Automation`] (B15b), a
+    /// webhook follows its own `memory_scope`.
+    pub fn effective_memory_scope(&self) -> TriggerMemoryScope {
+        match self.kind {
+            TriggerKind::Schedule => TriggerMemoryScope::Automation,
+            TriggerKind::Webhook => self.memory_scope,
+        }
+    }
+
     /// The days an anchored (`at_local`) recurrence fires on.
     pub fn day_rule(&self) -> crate::when::DayRule {
         day_rule_of(self.month_day, &self.weekdays)
@@ -477,6 +534,7 @@ impl TriggerSpec {
             filter: None,
             max_body_bytes: None,
             preflight: false,
+            memory_scope: TriggerMemoryScope::Automation,
         }
     }
 }
@@ -618,6 +676,7 @@ mod trigger_tests {
             filter: Some(r#""action":\s*"opened""#.into()),
             max_body_bytes: None,
             preflight: false,
+            memory_scope: TriggerMemoryScope::Automation,
         }
     }
 
@@ -654,6 +713,50 @@ mod trigger_tests {
         // A zero cap degrades to the default, never to zero.
         spec.max_body_bytes = Some(0);
         assert_eq!(spec.body_cap(), TriggerSpec::DEFAULT_BODY_BYTES);
+    }
+
+    #[test]
+    fn triggerspec_memory_scope_defaults_closed_and_roundtrips() {
+        // The default is not written: a payload written today stays
+        // byte-identical to one written before the scope existed.
+        let payload = webhook_spec().to_payload();
+        assert!(!payload.contains("memory_scope"), "{payload}");
+        let old = TriggerSpec::from_payload(
+            r#"{"kind":"webhook","text":"triage","source":"operator","session_id":"sess_x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.memory_scope, TriggerMemoryScope::Automation);
+        assert_eq!(old.effective_memory_scope(), TriggerMemoryScope::Automation);
+
+        // The opt-in survives the payload; a schedule trigger ignores it.
+        let mut spec = webhook_spec();
+        spec.memory_scope = TriggerMemoryScope::Creator;
+        let payload = spec.to_payload();
+        assert!(payload.contains(r#""memory_scope":"creator""#), "{payload}");
+        let mut back = TriggerSpec::from_payload(&payload).unwrap();
+        assert_eq!(back.effective_memory_scope(), TriggerMemoryScope::Creator);
+        back.kind = TriggerKind::Schedule;
+        assert_eq!(
+            back.effective_memory_scope(),
+            TriggerMemoryScope::Automation
+        );
+        let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);
+        let (cron, _first_at) = CronSpec::from_words(
+            &["every", "day", "at", "09:00", "check CI"],
+            "operator",
+            &now,
+        )
+        .unwrap();
+        assert_eq!(
+            TriggerSpec::from_schedule(cron, "sess_x".into()).effective_memory_scope(),
+            TriggerMemoryScope::Automation
+        );
+
+        // The turn-context spelling reads back; anything else is not a scope.
+        for scope in [TriggerMemoryScope::Automation, TriggerMemoryScope::Creator] {
+            assert_eq!(TriggerMemoryScope::parse(scope.as_str()), Some(scope));
+        }
+        assert_eq!(TriggerMemoryScope::parse("personal"), None);
     }
 
     #[test]

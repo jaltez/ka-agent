@@ -454,6 +454,7 @@ mod tests {
                 filter: None,
                 max_body_bytes: None,
                 preflight: false,
+                memory_scope: ka_agent_core::TriggerMemoryScope::Automation,
             }
             .to_payload(),
         );

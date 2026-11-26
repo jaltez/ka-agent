@@ -19,33 +19,17 @@ pub(super) fn run_remember<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
 
 pub(super) fn run_forget<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
-        let runtime = ctx.runtime;
         let prefix = ctx.args;
         if prefix.is_empty() {
             return Outcome::Reply("usage: /forget <id> — /memory lists them".into());
         }
-        let entries = match runtime.memory_entries(&ctx.principal) {
-            Ok(e) => e,
-            Err(e) => return Outcome::Reply(format!("! [memory] {e}")),
-        };
-        let matches: Vec<_> = entries
-            .iter()
-            .filter(|e| id_matches(&e.id, prefix))
-            .collect();
-        match matches.as_slice() {
-            [] => Outcome::Reply(format!("no memory matches {prefix}")),
-            [one] => match runtime.forget(&one.id, &ctx.principal) {
+        match resolve_entry(ctx.runtime, &ctx.principal, prefix) {
+            Err(reply) => Outcome::Reply(reply),
+            Ok(entry) => match ctx.runtime.forget(&entry.id, &ctx.principal) {
                 Ok(true) => Outcome::Reply("forgotten".into()),
                 Ok(false) => Outcome::Reply("no such memory id".into()),
                 Err(e) => Outcome::Reply(format!("! [memory] {e}")),
             },
-            many => Outcome::Reply(format!(
-                "ambiguous — matches: {}",
-                many.iter()
-                    .map(|e| short_id(&e.id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
         }
     })
 }
@@ -123,8 +107,9 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                                         .as_deref()
                                         .map(|p| format!("\n  provenance: {p}"))
                                         .unwrap_or_default();
+                                    let relations = relation_lines(runtime, &c);
                                     format!(
-                                        "[{}] ({}) → {}{}\n  + {}\n  compiled {}B of {}B (now {}B{}){prov}",
+                                        "[{}] ({}) → {}{}\n  + {}\n  compiled {}B of {}B (now {}B{}){prov}{relations}",
                                         short_id(c.id.as_str()),
                                         c.source,
                                         diff.file,
@@ -164,7 +149,12 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                         .take(15)
                         .map(|e| {
                             let text: String = e.text.chars().take(80).collect();
-                            format!("[{}] {}", short_id(&e.id), text)
+                            let until = e
+                                .valid_until
+                                .as_deref()
+                                .map(|date| format!(" · until {date}"))
+                                .unwrap_or_default();
+                            format!("[{}] {}{until}", short_id(&e.id), text)
                         })
                         .collect();
                     lines.push(format!(
@@ -199,12 +189,13 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                                         "dream: no idle session with enough turns".to_string()
                                     }
                                     Some(sid) => format!(
-                                        "dream: {} candidate(s) from {} ({} chars); {} duplicate(s), {} refused",
+                                        "dream: {} candidate(s) from {} ({} chars); {} duplicate(s), {} refused, {} conflict(s)",
                                         report.candidates,
                                         short_id(&sid),
                                         report.excerpt_chars,
                                         report.duplicates,
-                                        report.refused
+                                        report.refused,
+                                        report.conflicts
                                     ),
                                 },
                                 Err(e) => format!("! [memory] {e}"),
@@ -296,8 +287,10 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
                         Ok(false) => "no such pending candidate".to_string(),
                         Err(e) => format!("! [memory] {e}"),
                     },
+                    "expire" => expire_entry(&ctx, id),
+                    "skill" => skill_from_memory(&ctx, id.trim()),
                     _ => {
-                        "usage: /memory [files|review|search <q>|index [status|rebuild]|dream|log|undo|accept <id> [supersede <old>]|reject <id>]"
+                        "usage: /memory [files|review|search <q>|index [status|rebuild]|dream|log|undo|accept <id> [supersede <old>]|reject <id>|expire <id> <YYYY-MM-DD|clear>|skill <id>]"
                             .to_string()
                     }
                 }
@@ -305,6 +298,121 @@ pub(super) fn run_memory<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         };
         Outcome::Reply(reply)
     })
+}
+
+/// The one accepted entry an id names — the full id or any unique prefix
+/// (`/cron rm`'s rule) — or the reply that says why there is none.
+fn resolve_entry(
+    runtime: &ka_agent_runtime::Runtime,
+    principal: &ka_agent_core::Principal,
+    prefix: &str,
+) -> Result<ka_agent_memory::Entry, String> {
+    let entries = match runtime.memory_entries(principal) {
+        Ok(entries) => entries,
+        Err(e) => return Err(format!("! [memory] {e}")),
+    };
+    let matches: Vec<_> = entries
+        .iter()
+        .filter(|e| id_matches(&e.id, prefix))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(format!("no memory matches {prefix}")),
+        many => Err(format!(
+            "ambiguous — matches: {}",
+            many.iter()
+                .map(|e| short_id(&e.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// `/memory expire <id> <YYYY-MM-DD | clear>`: set the validity of one
+/// accepted entry, or lift it again with `clear`. The entry stays in the
+/// Markdown; the current compile drops it once the date has passed.
+fn expire_entry(ctx: &Ctx<'_>, args: &str) -> String {
+    const USAGE: &str = "usage: /memory expire <id> <YYYY-MM-DD | clear>";
+    let mut words = args.split_whitespace();
+    let (Some(prefix), Some(date), None) = (words.next(), words.next(), words.next()) else {
+        return USAGE.into();
+    };
+    let valid_until = (date != "clear").then_some(date);
+    match resolve_entry(ctx.runtime, &ctx.principal, prefix) {
+        Err(reply) => reply,
+        Ok(entry) => match ctx
+            .runtime
+            .expire_memory(&entry.id, valid_until, &ctx.principal)
+        {
+            Ok(true) => match valid_until {
+                Some(date) => format!("{} valid until {date}", short_id(&entry.id)),
+                None => format!("{} no longer expires", short_id(&entry.id)),
+            },
+            Ok(false) => "no such memory id".into(),
+            Err(e) => format!("! [memory] {e}"),
+        },
+    }
+}
+
+/// `/memory skill <id>`: turn one accepted procedural memory into a skill
+/// candidate. Nothing is installed until `/skills accept` says so.
+fn skill_from_memory(ctx: &Ctx<'_>, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return "usage: /memory skill <id>".into();
+    }
+    match resolve_entry(ctx.runtime, &ctx.principal, prefix) {
+        Err(reply) => reply,
+        Ok(entry) => match ctx
+            .runtime
+            .memory_skill_candidate(&entry.id, &ctx.principal)
+        {
+            Ok(Some(skill)) => {
+                format!("skill candidate {skill} staged — /skills review, /skills accept {skill}")
+            }
+            Ok(None) => "no such memory id".into(),
+            Err(e) => format!("! [memory] {e}"),
+        },
+    }
+}
+
+/// The lines `/memory review` adds for a candidate's links to accepted
+/// entries — what it supersedes, conflicts with or overlaps — each with
+/// the entry's own bullet, so the operator can judge it in place.
+fn relation_lines(
+    runtime: &ka_agent_runtime::Runtime,
+    row: &ka_agent_store::CandidateRow,
+) -> String {
+    let Ok(relations) = runtime.candidate_relations(row) else {
+        return String::new();
+    };
+    relations
+        .into_iter()
+        .map(|(kind, entry)| {
+            let text: String = entry.text.chars().take(100).collect();
+            let hint = if kind == "conflicts" {
+                format!(
+                    " — /memory accept {} supersede {} replaces it",
+                    short_id(row.id.as_str()),
+                    short_id(&entry.id)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "\n  {} [{}] {text}{hint}",
+                relation_label(kind),
+                short_id(&entry.id)
+            )
+        })
+        .collect()
+}
+
+/// The verb `/memory review` words a link kind with.
+fn relation_label(kind: &'static str) -> &'static str {
+    match kind {
+        "conflicts" => "conflicts with",
+        other => other,
+    }
 }
 
 fn format_memory_index(
