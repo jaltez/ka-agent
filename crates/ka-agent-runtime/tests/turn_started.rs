@@ -264,6 +264,14 @@ async fn cycle_turns_keep_the_answer_durable_in_the_outbox() {
                 .any(|e| matches!(e, AgentEvent::Session { status } if status == "Idle"))
     })
     .await;
+    // `Session Idle` can be announced by the finish handler before the
+    // `Idle` delivery boundary runs. Wait for the chunk the boundary emits
+    // after `mark_sent`, then inspect the durable row.
+    wait_until("cycle delivered", &rec, |evs| {
+        evs.iter()
+            .any(|e| matches!(e, AgentEvent::FinalChunk { .. }))
+    })
+    .await;
 
     let sid = rt.session_id_for(&op()).unwrap();
     let turns = store.latest_turns_for_session(&sid, 1, 0).unwrap();
