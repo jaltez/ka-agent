@@ -287,6 +287,14 @@ pub static KEYS: &[KeySpec] = &[
         doc: "delete attachment files older than this many days; 0 keeps forever",
     },
     KeySpec {
+        path: "retention.strands_days",
+        kind: Kind::Int { min: 0, max: 3650 },
+        default: "0",
+        apply: Apply::Live,
+        web: true,
+        doc: "delete session strands older than this many days — never one a live, open or retained session still needs; 0 keeps forever",
+    },
+    KeySpec {
         path: "git.name",
         kind: Kind::Str,
         default: "unset (ka-agent (<username>))",
@@ -881,6 +889,14 @@ pub static KEYS: &[KeySpec] = &[
         web: true,
         doc: "cap on the summary a scout returns to its parent",
     },
+    KeySpec {
+        path: "recap.idle_minutes",
+        kind: Kind::Int { min: 0, max: 1440 },
+        default: "0",
+        apply: Apply::Worker,
+        web: true,
+        doc: "minutes of quiet before the engine recaps where the session stands (needs background_model); 0 turns recaps off",
+    },
 ];
 
 /// Exact key lookup, else the longest registered table prefix.
@@ -1129,6 +1145,15 @@ mod tests {
         cfg.worker_idle_timeout_secs = 604_800;
         assert!(cfg.validate().is_ok());
         cfg.worker_idle_timeout_secs = 604_801;
+        assert!(cfg.validate().is_err());
+
+        let recap = lookup("recap.idle_minutes").unwrap();
+        assert!(matches!(recap.kind, Kind::Int { min: 0, max: 1_440 }));
+        assert_eq!(recap.apply, Apply::Worker);
+        cfg.worker_idle_timeout_secs = 900;
+        cfg.recap.idle_minutes = 1_440;
+        assert!(cfg.validate().is_ok());
+        cfg.recap.idle_minutes = 1_441;
         assert!(cfg.validate().is_err());
     }
 }

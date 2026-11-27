@@ -170,7 +170,8 @@ pub fn valid_feature_spec(s: &str) -> bool {
         (min..=max).contains(&s.len()) && s.chars().all(ok)
     }
     match s {
-        "agents" | "skills" | "mcp" | "hooks" | "web" | "lsp" | "debug" => true,
+        "agents" | "skills" | "mcp" | "hooks" | "web" | "lsp" | "debug" | "cron" | "monitor"
+        | "generate_image" => true,
         _ => {
             if let Some(n) = s.strip_prefix("mcp:") {
                 name(n, 1, 32, |c| {
@@ -207,15 +208,20 @@ pub struct HookSpec {
     /// `reminder_fired`, `cron_finished`, `session_paused`,
     /// `memory_proposed`) or an engine event (`pre_tool_use`,
     /// `post_tool_use`, `user_prompt_submit`, `session_start`,
-    /// `session_end`, `stop`, `turn_end`, `pre_compact`).
+    /// `session_end`, `stop`, `turn_end`, `pre_compact`,
+    /// `subagent_start`, `subagent_stop`, `pre_model_switch`,
+    /// `post_model_switch`, `post_compact`, `permission_request`,
+    /// `permission_denied`).
     pub on: String,
     /// `sh -c <command>` (agent events) / the engine's own hook contract
     /// (engine events).
     pub command: String,
     /// Only this tool (engine tool-call events only).
     pub tool: Option<String>,
-    /// Agent-event timeout (1–60 s; default 10). Engine events use the
-    /// engine's own 30 s ceiling.
+    /// Hook timeout in seconds (1–60; unset = the runner's default, 10).
+    /// An agent event keeps it here; an engine event is forwarded as the
+    /// engine's own `timeout_secs` (the engine takes 1–600 and defaults
+    /// to 10, so every value this file accepts is valid there too).
     pub timeout_secs: Option<u64>,
 }
 
@@ -231,7 +237,9 @@ pub const AGENT_HOOK_EVENTS: &[&str] = &[
     "memory_proposed",
 ];
 
-/// The engine-event names a `[[hooks]]` entry may use.
+/// The engine-event names a `[[hooks]]` entry may use (the engine's
+/// `HookEvent` vocabulary). The port re-checks every emitted row with
+/// the engine's own parser before a worker spawns.
 pub const ENGINE_HOOK_EVENTS: &[&str] = &[
     "pre_tool_use",
     "post_tool_use",
@@ -241,6 +249,13 @@ pub const ENGINE_HOOK_EVENTS: &[&str] = &[
     "stop",
     "turn_end",
     "pre_compact",
+    "subagent_start",
+    "subagent_stop",
+    "pre_model_switch",
+    "post_model_switch",
+    "post_compact",
+    "permission_request",
+    "permission_denied",
 ];
 
 /// The Matrix channel (Phase 6): strict `[matrix]` section.
@@ -678,6 +693,11 @@ pub struct Retention {
     pub turns_days: u32,
     /// Delete attachment files older than this many days.
     pub attachments_days: u32,
+    /// Delete session strand files older than this many days — the
+    /// engine's own transcript, which a resumed session replays. Only a
+    /// strand nothing needs goes: never that of a session with a live
+    /// worker, an open turn or a turn still in the store.
+    pub strands_days: u32,
 }
 /// Memory extraction gating (`[memory]`, B15c) plus phase B1 recall and
 /// embedding settings. Every default keeps today's behavior: no automatic
@@ -885,6 +905,20 @@ impl Default for Scout {
     }
 }
 
+/// Idle recaps (`[recap]`): after this many idle minutes the engine's
+/// fast role summarizes where the session stands. The note reaches the
+/// runtime as a recap event and is recorded on the strand
+/// (`x.ka.recap`). The engine needs a fast role for it: `[roles] fast`,
+/// which the engine layer composes from `background_model` when that is
+/// set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct Recap {
+    /// Minutes of quiet before a recap fires (1–1440). `0` (default)
+    /// keeps the engine's idle task off.
+    pub idle_minutes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonConfig {
@@ -988,6 +1022,9 @@ pub struct DaemonConfig {
     /// Read-only research children (`[scout]`).
     #[serde(default)]
     pub scout: Scout,
+    /// Idle recaps (`[recap]`).
+    #[serde(default)]
+    pub recap: Recap,
 }
 
 impl Default for DaemonConfig {
@@ -1033,6 +1070,7 @@ impl Default for DaemonConfig {
             memory: Memory::default(),
             checkpoint: Checkpoint::default(),
             scout: Scout::default(),
+            recap: Recap::default(),
         }
     }
 }
@@ -1294,6 +1332,11 @@ impl DaemonConfig {
             return Err(Error::Validate(
                 "retention.turns_days/attachments_days must be 0 (keep forever) or at most 3650"
                     .into(),
+            ));
+        }
+        if self.retention.strands_days > 3650 {
+            return Err(Error::Validate(
+                "retention.strands_days must be 0 (keep forever) or at most 3650".into(),
             ));
         }
         if let Some(effort) = &self.effort
@@ -1579,7 +1622,8 @@ impl DaemonConfig {
         for spec in &self.tools.disable {
             if !valid_feature_spec(spec) {
                 return Err(Error::Validate(format!(
-                    "tools.disable spec {spec:?}: agents|skills|mcp|hooks|web|lsp|debug \
+                    "tools.disable spec {spec:?}: \
+                     agents|skills|mcp|hooks|web|lsp|debug|cron|monitor|generate_image \
                      or mcp:<server>|skill:<name>|tool:<hand>|agent:<name>"
                 )));
             }
@@ -1588,6 +1632,13 @@ impl DaemonConfig {
                     "tools.disable spec {spec:?} is listed twice"
                 )));
             }
+        }
+        // The registry's bounds for `recap.idle_minutes` equal these
+        // edges (`registry_int_bounds_match_validate_edges`).
+        if self.recap.idle_minutes > 1_440 {
+            return Err(Error::Validate(
+                "recap.idle_minutes must be 0 (off) or at most 1440".into(),
+            ));
         }
         self.validate_roles()?;
         Ok(())
@@ -1647,7 +1698,8 @@ impl DaemonConfig {
             for spec in &role.disable {
                 if !valid_feature_spec(spec) {
                     return Err(Error::Validate(format!(
-                        "role {:?}: disable spec {spec:?}: agents|skills|mcp|hooks|web|lsp|debug \
+                        "role {:?}: disable spec {spec:?}: \
+                         agents|skills|mcp|hooks|web|lsp|debug|cron|monitor|generate_image \
                          or mcp:<server>|skill:<name>|tool:<hand>|agent:<name>",
                         role.name
                     )));
@@ -2319,6 +2371,9 @@ digest_time = "07:30"
             "web",
             "lsp",
             "debug",
+            "cron",
+            "monitor",
+            "generate_image",
             "mcp:github",
             "mcp:my_server-2",
             "skill:release-notes",
@@ -2354,6 +2409,85 @@ digest_time = "07:30"
         cfg.tools.disable = vec!["tool:bash".into(), "tool:bash".into()];
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("listed twice"), "{err}");
+    }
+
+    #[test]
+    fn recap_idle_minutes_is_off_by_default_and_bounded() {
+        let cfg: DaemonConfig = toml::from_str("[recap]\nidle_minutes = 30\n").unwrap();
+        assert_eq!(cfg.recap.idle_minutes, 30);
+        assert!(cfg.validate().is_ok());
+        // Default: the idle task is off.
+        assert_eq!(DaemonConfig::default().recap.idle_minutes, 0);
+        // The edges the registry publishes.
+        let mut cfg = DaemonConfig::default();
+        cfg.recap.idle_minutes = 1_440;
+        assert!(cfg.validate().is_ok());
+        cfg.recap.idle_minutes = 1_441;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("recap.idle_minutes must be 0 (off) or at most 1440"),
+            "{err}"
+        );
+        // Strict: an unknown key under [recap] is refused.
+        let err = toml::from_str::<DaemonConfig>("[recap]\nminutes = 5\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("minutes"), "{err}");
+    }
+
+    /// `retention.strands_days`: off by default like its neighbours, and
+    /// bounded to the registry's 3650.
+    #[test]
+    fn retention_strands_days_is_off_by_default_and_bounded() {
+        let cfg: DaemonConfig = toml::from_str("[retention]\nstrands_days = 90\n").unwrap();
+        assert_eq!(cfg.retention.strands_days, 90);
+        assert!(cfg.validate().is_ok());
+        assert_eq!(DaemonConfig::default().retention.strands_days, 0);
+        let mut cfg = DaemonConfig::default();
+        cfg.retention.strands_days = 3650;
+        assert!(cfg.validate().is_ok());
+        cfg.retention.strands_days = 3651;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("retention.strands_days must be 0 (keep forever) or at most 3650"),
+            "{err}"
+        );
+    }
+
+    /// Hooks v2: every engine event the engine knows is accepted here,
+    /// with a per-hook timeout; an agent event and an engine event never
+    /// share a name (the "did you mean" lookup chains both lists).
+    #[test]
+    fn hooks_v2_engine_events_validate_with_a_timeout() {
+        for event in ENGINE_HOOK_EVENTS {
+            assert!(
+                !AGENT_HOOK_EVENTS.contains(event),
+                "engine event {event:?} must not double as an agent event"
+            );
+        }
+        let mut cfg = DaemonConfig::default();
+        for event in ["permission_request", "post_compact", "subagent_stop"] {
+            cfg.hooks.push(HookSpec {
+                on: event.to_string(),
+                command: "true".to_string(),
+                tool: None,
+                timeout_secs: Some(30),
+            });
+        }
+        assert!(cfg.validate().is_ok());
+        // The vocabulary is closed: a misspelling is refused, and the
+        // nearest real name is named.
+        cfg.hooks.push(HookSpec {
+            on: "permission_ask".to_string(),
+            command: "true".to_string(),
+            tool: None,
+            timeout_secs: None,
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown hook event \"permission_ask\""),
+            "{err}"
+        );
     }
 
     #[test]

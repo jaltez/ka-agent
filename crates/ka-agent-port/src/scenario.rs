@@ -391,6 +391,7 @@ mod tests {
             schema: None,
             native_search: false,
             session_id: None,
+            service_tier: None,
         }
     }
 

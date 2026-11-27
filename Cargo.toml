@@ -25,17 +25,24 @@ repository = "https://github.com/jaltez/ka-agent"
 [workspace.dependencies]
 # Ka engine crates, pinned to the exact released version (SEED.md §3.4:
 # exact pin, upgraded deliberately with the contract suite green).
-# v0.7.0+ (247e99e): mcp meta/lazy hands registered once at bootstrap
-# (ka-harness#1 - the duplicate-tool-name 400s), strand power-loss
-# durability, leaf-merged dialect overlays, landlock /dev surface,
-# permission-language rename (ask|accept_edits|allow|readonly; the old
-# guarded/plan spellings stay aliases). All from one source so the
-# dialect/strand types crossing into ka-engine stay unified.
-ka-protocol = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
-ka-engine = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
-ka-dialect = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
-ka-strand = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
-ka-sandbox = { git = "https://github.com/jaltez/ka-harness.git", rev = "247e99e" }
+# v0.12.2 (f41ecf9): everything of the v0.7.0+ line (mcp meta/lazy hands
+# registered once at bootstrap — ka-harness#1, strand power-loss
+# durability, leaf-merged dialect overlays, landlock /dev surface, the
+# ask|accept_edits|allow|readonly permission language; guarded/free/plan
+# stay aliases) plus hooks v2 (seven events, `timeout_secs`, HTTP
+# handlers), the embedded models.dev catalog with a runtime layer,
+# `[features] allow`, the `session_diff` / `context_breakdown` /
+# `side_question` commands, idle recaps, and child voices inheriting the
+# parent's posture. The hands new at this pin (cron, monitor, team,
+# checkpoint, generate_image) are disabled by the worker's security
+# overlay (docs/design/harness-0.12-integration.md, decision 2). All
+# from one source so the dialect/strand types crossing into ka-engine
+# stay unified.
+ka-protocol = { git = "https://github.com/jaltez/ka-harness.git", rev = "f41ecf9" }
+ka-engine = { git = "https://github.com/jaltez/ka-harness.git", rev = "f41ecf9" }
+ka-dialect = { git = "https://github.com/jaltez/ka-harness.git", rev = "f41ecf9" }
+ka-strand = { git = "https://github.com/jaltez/ka-harness.git", rev = "f41ecf9" }
+ka-sandbox = { git = "https://github.com/jaltez/ka-harness.git", rev = "f41ecf9" }
 
 ka-agent-core = { path = "crates/ka-agent-core" }
 ka-agent-port = { path = "crates/ka-agent-port" }

@@ -5,9 +5,12 @@
 #
 # SECURITY OVERLAY: whatever is configured here, the worker ALWAYS applies
 # its own security layer last, which wins over this file:
-#   mode = "guarded"
+#   mode = the one the daemon sends with every open (else "ask")
 #   [tools.bash] background_after_ms = 0   (no detaching bash jobs, gap G15)
-#   [features] disable = ["tool:remember"] (memory goes through Ka Agent)
+#   [features] disable = ["tool:remember", "tool:cron", "tool:monitor",
+#                         "tool:team", "tool:checkpoint", "tool:generate_image"]
+#                         (memory goes through Ka Agent; the automation
+#                         hands have no place in a daemon-driven session)
 #   [guards] spend_usd from the daemon budgets
 # So this file can tune the engine, never loosen policy.
 
@@ -15,18 +18,41 @@
 # `model`, which is re-asserted after every attach).
 model = "anthropic/claude-sonnet-4-5"
 
-# Permission mode; the worker's overlay forces "guarded" for daemon-driven
-# sessions regardless of this value.
-mode = "guarded"
+# Permission mode. Documentation only for daemon-driven sessions: the
+# worker's overlay applies the mode the daemon sends with every `open`
+# (`ask` unless a session or a role sets another) after this layer. `ask`
+# is the canonical word (with `accept_edits`, `allow`, `readonly`; the old
+# `guarded`/`free`/`plan` spellings still parse as aliases).
+mode = "ask"
 
-# Allow read-only bash commands without an ask. ka evaluates [[rules]] as
-# data, first match wins. Ka Agent adds its own rules on top; remote
-# channels never send "always".
+# Permission profiles are not supported: a `[permissions] profile`
+# activation puts its rules ahead of every `[[rules]]` row — and so ahead
+# of the exact-tool allow rules the worker inserts for Ka Agent's approval
+# profile — and the daemon refuses a layer that carries one. `[[rules]]`
+# below is the supported form.
+#
+# Web search is a fallback chain: `[[search]]` rows are tried in order.
+# Ka Agent's own row (`[search]` in ka-agent.toml) always goes first; rows
+# written here follow as fallbacks.
+
+# Permission rules. ka evaluates [[rules]] as data ahead of its mode logic,
+# first match wins. The shape is `tool` (an engine hand name), an optional
+# `pattern` (a glob on the call's primary argument: the bash command line,
+# a file path) and a `verdict` of `allow`, `ask` or `deny`. Nothing else
+# parses — strictly — and a layer that does not parse refuses every worker
+# spawn.
+#
+# Read-only bash commands never ask, in any mode: the engine classifies
+# them itself, so they need no rule. An `allow` rule is a real widening —
+# a glob prefix `cargo test*` also matches `cargo test; …` — so prefer
+# `/y <id> always`, which validates the command shape before it stores a
+# rule (docs/contract/grants.md, "Durable allow-rules"). The rule below
+# only tightens: in `accept_edits` or `allow` mode a push still raises its
+# card.
 [[rules]]
 tool = "bash"
-allow = true
-# Read-only commands only: any write, network or pipe still asks.
-readonly = true
+pattern = "git push*"
+verdict = "ask"
 
 [tools.bash]
 # Detach bash jobs immediately? The overlay forces 0 (never background),

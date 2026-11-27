@@ -57,9 +57,10 @@ fn key_url(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The ka-dialect embedded catalog, parsed once per process:
-/// `embedded()` walks ~200 KB of TOML and the runtime validates a
-/// selector on every submitted message.
+/// The daemon-side view of ka-dialect's embedded catalog, parsed once
+/// per process: selectors are validated against it on every submitted
+/// message. (The worker's engine runs on the runtime-aware merge,
+/// `worker::engine_catalog`.)
 pub fn catalog() -> &'static Catalog {
     static CACHED: std::sync::LazyLock<Catalog> = std::sync::LazyLock::new(Catalog::embedded);
     &CACHED
@@ -79,16 +80,33 @@ fn info(p: &Provider) -> ProviderInfo {
     }
 }
 
-/// Every known provider in display order (`vendor_rank`, stable).
+/// Whether ka-dialect serves a provider through ka-passport
+/// (`auth = "passport"`): a subscription token from a registered
+/// `TokenSource`, never an env key. Ka Agent does not integrate
+/// ka-passport, and without a source every turn on such a row is an auth
+/// failure — which pauses the instance. These providers stay out of the
+/// pickers and are refused by name.
+fn needs_passport(p: &Provider) -> bool {
+    p.auth == Some("passport")
+}
+
+/// Every provider Ka Agent can offer, in display order (`vendor_rank`,
+/// stable).
 pub fn providers() -> Vec<ProviderInfo> {
-    let mut all: Vec<&Provider> = providers::PROVIDERS.iter().collect();
+    let mut all: Vec<&Provider> = providers::PROVIDERS
+        .iter()
+        .filter(|p| !needs_passport(p))
+        .collect();
     all.sort_by_key(|p| providers::vendor_rank(p.name));
     all.into_iter().map(info).collect()
 }
 
-/// Look a provider up by vendor prefix (legacy z.ai aliases accepted).
+/// Look an offered provider up by vendor prefix (legacy z.ai aliases
+/// accepted).
 pub fn provider(name: &str) -> Option<ProviderInfo> {
-    providers::find(name).map(info)
+    providers::find(name)
+        .filter(|p| !needs_passport(p))
+        .map(info)
 }
 
 /// The first provider (display order) whose key lives in `env`.
@@ -157,6 +175,18 @@ pub fn validate_selector(sel: &str) -> Result<SelectorInfo, String> {
         None => model_id.clone(),
     };
     let catalog = catalog();
+    // A subscription row (curated or synthesized) authenticates through
+    // ka-passport, which Ka Agent does not integrate (`needs_passport`).
+    if catalog
+        .get(&model_id)
+        .is_some_and(|d| d.auth.as_deref() == Some("passport"))
+        || providers::find(&parsed.vendor).is_some_and(needs_passport)
+    {
+        return Err(format!(
+            "{sel:?} authenticates through ka-passport (a subscription plan), which Ka Agent \
+             does not integrate — use an API-key provider"
+        ));
+    }
     if let Some(d) = catalog.get(&model_id) {
         let key_env = d.api_key_env.clone().or_else(|| {
             providers::find(&parsed.vendor).and_then(|p| p.key_env.map(str::to_string))
@@ -448,6 +478,33 @@ mod tests {
             "unknown model \"nope/zzz\" — use provider/model, e.g. anthropic/claude-sonnet-5"
         );
         assert!(validate_selector("noslash").is_err());
+    }
+
+    /// Subscription plans authenticate through ka-passport, which Ka Agent
+    /// does not integrate: never offered, refused by name — curated rows
+    /// and synthesized selectors alike.
+    #[test]
+    fn passport_vendors_are_never_offered() {
+        let names: Vec<&str> = providers().iter().map(|p| p.name).collect();
+        assert!(!names.contains(&"claude-plan"), "{names:?}");
+        assert!(provider("claude-plan").is_none());
+        let curated = catalog()
+            .dialects
+            .keys()
+            .find(|k| k.starts_with("claude-plan/"))
+            .cloned()
+            .expect("the pinned catalog carries claude-plan rows");
+        for sel in [curated.as_str(), "claude-plan/whatever@high"] {
+            let err = validate_selector(sel).unwrap_err();
+            assert!(err.contains("ka-passport"), "{sel}: {err}");
+        }
+        // The keyed community vendors new at v0.12 are offered, with
+        // their key.
+        let perplexity = provider("perplexity").unwrap();
+        assert_eq!(perplexity.key_env, Some("PERPLEXITY_API_KEY"));
+        let sel = validate_selector("perplexity/sonar-pro").unwrap();
+        assert!(!sel.in_catalog);
+        assert_eq!(sel.key_env.as_deref(), Some("PERPLEXITY_API_KEY"));
     }
 
     #[test]

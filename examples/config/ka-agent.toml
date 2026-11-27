@@ -117,6 +117,13 @@ enabled = false
 # [search]
 # provider = "tavily"   # tavily | brave | bing
 
+# Idle recaps: after this many minutes of quiet, the engine's fast role
+# posts a short recap of where the session stands. The fast role is the
+# `background_model` — without one the engine has nobody to ask and says
+# so in a note. 0 (default) turns recaps off; range 1..=1440.
+# [recap]
+# idle_minutes = 30
+
 # Roles for linked identities (ADR-0002): one daemon, one bot token, and
 # each identity acts as a role with its own session, memory root, notes,
 # workspace, grants, toolset, budget and command surface. `admin` is
@@ -125,7 +132,9 @@ enabled = false
 # [[role]]
 # name = "guest"                  # [a-z0-9-], never "admin"
 # mode = "readonly"               # ceiling AND default: ask|accept_edits|allow|readonly
-# allow = ["read", "grep"]        # per-turn toolset allowlist (or `disable`, not both)
+# allow = ["read", "grep"]        # the role's toolset, per turn and as the
+#                                 # engine's session allowlist (or `disable`,
+#                                 # not both); `kagent__<tool>` names the bridge
 # disable = ["tool:bash"]
 # workspace = "~/projects/shared" # default <data>/roles/guest/workspace
 # budget_daily_usd = 2.0          # unset = the profile [budgets] apply

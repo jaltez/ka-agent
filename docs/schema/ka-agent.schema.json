@@ -208,12 +208,12 @@
         },
         "on": {
           "default": "",
-          "description": "The event to react to: an agent event (`message_received`,\n`turn_finished`, `approval_requested`, `approval_settled`,\n`reminder_fired`, `cron_finished`, `session_paused`,\n`memory_proposed`) or an engine event (`pre_tool_use`,\n`post_tool_use`, `user_prompt_submit`, `session_start`,\n`session_end`, `stop`, `turn_end`, `pre_compact`).",
+          "description": "The event to react to: an agent event (`message_received`,\n`turn_finished`, `approval_requested`, `approval_settled`,\n`reminder_fired`, `cron_finished`, `session_paused`,\n`memory_proposed`) or an engine event (`pre_tool_use`,\n`post_tool_use`, `user_prompt_submit`, `session_start`,\n`session_end`, `stop`, `turn_end`, `pre_compact`,\n`subagent_start`, `subagent_stop`, `pre_model_switch`,\n`post_model_switch`, `post_compact`, `permission_request`,\n`permission_denied`).",
           "type": "string"
         },
         "timeout_secs": {
           "default": null,
-          "description": "Agent-event timeout (1–60 s; default 10). Engine events use the\nengine's own 30 s ceiling.",
+          "description": "Hook timeout in seconds (1–60; unset = the runner's default, 10).\nAn agent event keeps it here; an engine event is forwarded as the\nengine's own `timeout_secs` (the engine takes 1–600 and defaults\nto 10, so every value this file accepts is valid there too).",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -577,6 +577,20 @@
       ],
       "type": "object"
     },
+    "Recap": {
+      "additionalProperties": false,
+      "description": "Idle recaps (`[recap]`): after this many idle minutes the engine's\nfast role summarizes where the session stands. The note reaches the\nruntime as a recap event and is recorded on the strand\n(`x.ka.recap`). The engine needs a fast role for it: `[roles] fast`,\nwhich the engine layer composes from `background_model` when that is\nset.",
+      "properties": {
+        "idle_minutes": {
+          "default": 0,
+          "description": "Minutes of quiet before a recap fires (1–1440). `0` (default)\nkeeps the engine's idle task off.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "Retention": {
       "additionalProperties": false,
       "description": "Retention knobs (D12): 0 = keep forever, the default (an internal tool\nkeeps everything unless an organization asks otherwise).",
@@ -584,6 +598,13 @@
         "attachments_days": {
           "default": 0,
           "description": "Delete attachment files older than this many days.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "strands_days": {
+          "default": 0,
+          "description": "Delete session strand files older than this many days — the\nengine's own transcript, which a resumed session replays. Only a\nstrand nothing needs goes: never that of a session with a live\nworker, an open turn or a turn still in the store.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -1170,10 +1191,18 @@
         "quiet_hours": null
       }
     },
+    "recap": {
+      "$ref": "#/$defs/Recap",
+      "default": {
+        "idle_minutes": 0
+      },
+      "description": "Idle recaps (`[recap]`)."
+    },
     "retention": {
       "$ref": "#/$defs/Retention",
       "default": {
         "attachments_days": 0,
+        "strands_days": 0,
         "turns_days": 0
       },
       "description": "Data retention (`[retention]`): 0 = keep forever."

@@ -4,8 +4,11 @@
 //!
 //! Trust invariant (SEED §3.1.5): only the allowlisted ka commands are
 //! ever constructed here — `prompt`, `abort`, `answer`, `set_model`,
-//! `set_mode`, `set_name`, `compact`. `shell`, `set_feature`,
-//! `set_sandbox`, `save_api_key` and `save_settings` have no code path.
+//! `set_mode`, `set_name`, `set_effort`, `steer`, `undo_file`, `compact`,
+//! `session_diff`, `context_breakdown`, `side_question`. `shell`,
+//! `set_feature`, `set_sandbox`, `save_api_key`, `save_settings` and
+//! the session-scoped automation (`goal`, `loop`, `checkpoint`,
+//! `restore_checkpoint`) have no code path.
 //!
 //! Exit codes: 0 clean (`close` or stdin EOF), 3 engine closed without a
 //! trailing `idle` (ka gap G13 — engine death is silent in ka, the worker
@@ -58,7 +61,9 @@ pub fn run_worker(run: WorkerRun) -> Result<(), String> {
 /// (`ask|accept_edits|allow|readonly`); the old words
 /// (`guarded|accept_edits|free|plan`) stay accepted as aliases — the
 /// daemon normalizes at load, so an old word here means an unpinned
-/// caller (`open` from a test or an older client).
+/// caller (`open` from a test or an older client). The engine's
+/// `dont_ask` (v0.12) is refused: it is not part of the daemon's mode
+/// vocabulary, and no neighbouring mode is a safe reading of it.
 pub fn parse_mode(s: &str) -> Option<Mode> {
     match s {
         "ask" | "guarded" => Some(Mode::Ask),
@@ -258,6 +263,20 @@ fn strand_path(workspace: &Path, id: &str) -> Option<String> {
     }
 }
 
+/// Resolve a `spill://<id>` pointer carried by an engine note (the
+/// `/diff` summary parks the full diff on the spill store) to the file
+/// that holds the full text. `state_dir` is the worker's
+/// `XDG_STATE_HOME` (`WorkerEnv::state_dir`): ka parks spills under
+/// `ka/spills` inside it (`ka_engine::hands::spills_root` — which reads
+/// the calling process's environment, i.e. the worker's, so the daemon
+/// passes the root explicitly). `None` for anything but a
+/// single-component spill id: a pointer is engine text, never a path.
+pub fn spill_path(state_dir: &Path, pointer: &str) -> Option<PathBuf> {
+    let id = pointer.strip_prefix("spill://")?;
+    let plain = !id.is_empty() && !matches!(id, "." | "..") && !id.contains(['/', '\\', '\0']);
+    plain.then(|| state_dir.join("ka/spills").join(id))
+}
+
 /// After `replay`, re-assert the requested model and mode. This both
 /// pins policy for the session (a strand recorded in a looser mode would
 /// otherwise restore loose) and persists fresh `Change` records, making
@@ -284,16 +303,45 @@ async fn reassert_policy(engine: &mut Option<EngineMeta>, commands: Option<&Send
 }
 
 /// The engine's own wire word for a mode — the canonical permission
-/// language of v0.7.0 (guarded/free/plan stay serde aliases, so strands
-/// written by older engines replay unchanged).
+/// language (guarded/free/plan stay serde aliases, so strands written
+/// by older engines replay unchanged). `dont_ask` is the engine's
+/// unattended mode, never one the daemon requests (`parse_mode` refuses
+/// it); the arm only keeps the match total.
 fn mode_word(mode: Mode) -> &'static str {
     match mode {
         Mode::Ask => "ask",
         Mode::AcceptEdits => "accept_edits",
         Mode::Allow => "allow",
         Mode::Readonly => "readonly",
+        Mode::DontAsk => "dont_ask",
     }
 }
+
+/// The engine hands the worker's security overlay always disables
+/// (`[features] disable`), whatever the engine layer — or the engine
+/// version — offers. Each has a Ka Agent counterpart, or no place in a
+/// daemon-driven session:
+///
+/// - `remember`: memory proposals go through Ka Agent (§4.4), never the
+///   engine's own memory inbox.
+/// - `cron`: the hand schedules self-prompt turns inside the engine,
+///   outside the daemon scheduler (no principal, budget or run rows).
+/// - `monitor`: detached output streams escape cancellation — the same
+///   reason bash auto-backgrounding is off (gap G15).
+/// - `team`: child engines without the role's toolset, audit or budget.
+/// - `checkpoint`: duplicates the shadow-git net under `/rewind`
+///   (`[checkpoint]`); a second restore authority is one too many.
+/// - `generate_image`: a paid API without a grant model.
+///
+/// `tool_search` stays on: it lists the tools the posture already admits.
+const OVERLAY_DISABLED_HANDS: &[&str] = &[
+    "tool:remember",
+    "tool:cron",
+    "tool:monitor",
+    "tool:team",
+    "tool:checkpoint",
+    "tool:generate_image",
+];
 
 /// The per-open overlay inputs (kept together: the engine config chain is
 /// one concern).
@@ -338,13 +386,15 @@ async fn open_engine(
     };
     // Security overlay: explicit-or-ask mode, bash auto-backgrounding
     // off (a detached job would escape cancellation, gap G15), and the
-    // engine's `remember` hand off — memory proposals go through Ka
-    // Agent (§4.4). The overlay always wins over the engine layer.
+    // hands of `OVERLAY_DISABLED_HANDS` off. The overlay always wins over
+    // the engine layer.
     let mode = requested_mode.unwrap_or(Mode::Ask);
     cfg.mode = Some(mode);
     cfg.tools.bash.background_after_ms = Some(0);
-    if !cfg.features.disable.iter().any(|s| s == "tool:remember") {
-        cfg.features.disable.push("tool:remember".to_string());
+    for spec in OVERLAY_DISABLED_HANDS {
+        if !cfg.features.disable.iter().any(|s| s == spec) {
+            cfg.features.disable.push((*spec).to_string());
+        }
     }
     cfg.cwd = Some(workspace.to_string_lossy().into_owned());
 
@@ -376,6 +426,12 @@ async fn open_engine(
                 event: ka_engine::config::HookEvent::PreToolUse,
                 tool: Some(tool.to_string()),
                 command: format!("{:?} __guard", exe),
+                // The guard is a local binary that answers in
+                // milliseconds; 30 s only bounds a wedged one (the
+                // engine's default is 10 s, its ceiling 600).
+                timeout_secs: Some(30),
+                async_: None,
+                url: None,
             });
         }
     }
@@ -424,6 +480,19 @@ async fn open_engine(
                 env: mcp_env,
                 url: None,
                 headers: Vec::new(),
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                // Never `auto`: it would skip the daemon's `Effect`
+                // gate for every bridge tool. The bridge's calls are
+                // gated in the daemon; the engine keeps its default ask.
+                approval: None,
+                tool_timeout_secs: None,
+                output_limit: None,
+                oauth: None,
+                oauth_client_id: None,
+                oauth_scopes: Vec::new(),
+                bearer_token_env: None,
+                headers_helper: None,
             });
         }
     }
@@ -438,12 +507,12 @@ async fn open_engine(
     };
 
     let scenario_path = scenario.or_else(|| run.scenario.clone());
+    let mut catalog = engine_catalog()?;
     let (handle, assert_model) = if let Some(path) = scenario_path {
         // Scripted run: the scenario model must exist in the catalog for
         // the live (scripted) voice to be used at all — without a model
         // the engine falls back to the canned speaker and skips tools.
         let scenario = Scenario::load(&path)?;
-        let mut catalog = ka_dialect::Catalog::embedded();
         let overlay = ka_dialect::Catalog::parse(SCENARIO_CATALOG)
             .map_err(|e| format!("internal: scenario catalog: {e}"))?;
         catalog.overlay(overlay);
@@ -465,14 +534,10 @@ async fn open_engine(
         if let Some(model) = &model {
             cfg.model = Some(model.clone());
         }
-        (
-            // the pinned ka-dialect registers every provider ka-agent
-            // knows (opencode-go included, with its native per-session
-            // routing header) — the embedded catalog, parsed once per
-            // process
-            ka_engine::spawn_full(cfg, crate::catalog::catalog().clone(), strand_choice),
-            model,
-        )
+        // the pinned ka-dialect registers every provider ka-agent knows
+        // (opencode-go included, with its native per-session routing
+        // header); the engine only ever sees this catalog
+        (ka_engine::spawn_full(cfg, catalog, strand_choice), model)
     };
 
     Ok((
@@ -484,6 +549,24 @@ async fn open_engine(
         handle.commands,
         handle.events,
     ))
+}
+
+/// The catalog the engine runs on: ka-dialect's runtime-aware merge —
+/// the embedded table (curated rows over the generated models.dev one)
+/// with ka's runtime layer, `<KA_DATA_DIR>/catalog.json`, leaf-merged
+/// over it when that file is fresh (ka-dialect gates it on its own
+/// version). A runtime catalog that does not merge refuses the open,
+/// naming the file: a layer dropped silently would run a model on the
+/// wrong wire.
+fn engine_catalog() -> Result<ka_dialect::Catalog, String> {
+    let data_dir = ka_strand::data_dir();
+    let runtime = ka_dialect::dialects::load_runtime_catalog(&data_dir);
+    ka_dialect::Catalog::merged_embedded_with_runtime(runtime.as_ref(), []).map_err(|e| {
+        format!(
+            "runtime catalog {}: {e}",
+            data_dir.join("catalog.json").display()
+        )
+    })
 }
 
 enum Handled {
@@ -595,6 +678,18 @@ async fn forward(cmd: WorkerCommand, commands: Option<&Sender<Command>>) -> Hand
             send_cmd(tx, Command::UndoFile).await;
             Handled::Other
         }
+        W::SessionDiff => {
+            send_cmd(tx, Command::SessionDiff).await;
+            Handled::Other
+        }
+        W::ContextBreakdown => {
+            send_cmd(tx, Command::ContextBreakdown).await;
+            Handled::Other
+        }
+        W::SideQuestion { text } => {
+            send_cmd(tx, Command::SideQuestion { text }).await;
+            Handled::Other
+        }
     }
 }
 
@@ -622,5 +717,112 @@ async fn drain_to_idle(out: &Out, engine_rx: &mut Option<Receiver<Event>>, turn_
             return;
         }
         out.emit_ka(ev).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// The shipped engine-layer example documents ka's strict format, and
+    /// an operator who references it hands it to `open_engine` verbatim:
+    /// a key the engine does not know refuses every worker spawn. It must
+    /// parse with the engine's own parser — and still parse after the
+    /// daemon composed its own entries over it (`engine_layer::compose`
+    /// re-serializes the document).
+    #[test]
+    fn the_example_engine_layer_parses_with_the_engine() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/config/engine.toml");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let layer = ka_engine::Config::parse_layer(&text, "examples/config/engine.toml").unwrap();
+        // What the file documents is what the engine reads.
+        assert_eq!(layer.mode, Some(ka_protocol::Mode::Ask));
+        assert_eq!(layer.tools.bash.background_after_ms, Some(0));
+        assert_eq!(layer.rules.len(), 1);
+        let rule = &layer.rules[0];
+        assert_eq!(rule.tool, "bash");
+        assert_eq!(rule.pattern.as_deref(), Some("git push*"));
+        assert_eq!(rule.verdict, ka_engine::config::Verdict::Ask);
+
+        let mut cfg = ka_agent_core::DaemonConfig::default();
+        cfg.budgets.daily_usd = Some(5.0);
+        let no_secret = |_: &str| -> Result<String, String> { Err("no secrets in a test".into()) };
+        let composed = crate::engine_layer::compose(&cfg, Some(&text), &no_secret)
+            .unwrap()
+            .unwrap();
+        let over = ka_engine::Config::parse_layer(&composed, "composed").unwrap();
+        assert_eq!(
+            over.rules.len(),
+            1,
+            "the operator's rule survives the composition"
+        );
+        assert_eq!(over.guards.spend_usd, Some(5.0));
+    }
+
+    /// `dont_ask` is the engine's unattended mode: it has a wire word
+    /// (the match stays total) and is never a mode the daemon requests.
+    #[test]
+    fn dont_ask_has_a_wire_word_but_is_never_requested() {
+        assert_eq!(mode_word(Mode::DontAsk), "dont_ask");
+        assert_eq!(parse_mode("dont_ask"), None);
+        assert_eq!(parse_mode("dont-ask"), None);
+        for (word, expected) in [
+            ("ask", "ask"),
+            ("guarded", "ask"),
+            ("accept_edits", "accept_edits"),
+            ("accept-edits", "accept_edits"),
+            ("allow", "allow"),
+            ("free", "allow"),
+            ("readonly", "readonly"),
+            ("plan", "readonly"),
+        ] {
+            assert_eq!(mode_word(parse_mode(word).unwrap()), expected, "{word}");
+        }
+    }
+
+    /// A spill pointer is engine text: only a plain id resolves, and
+    /// only under the state dir the caller names (the worker's).
+    #[test]
+    fn spill_pointers_resolve_to_one_file_under_the_state_dir() {
+        let state = Path::new("/data/engine-state");
+        assert_eq!(
+            spill_path(state, "spill://1730000000000-7").as_deref(),
+            Some(Path::new("/data/engine-state/ka/spills/1730000000000-7"))
+        );
+        assert_eq!(
+            spill_path(state, "spill://job-1730000000000-2").as_deref(),
+            Some(Path::new(
+                "/data/engine-state/ka/spills/job-1730000000000-2"
+            ))
+        );
+        for pointer in [
+            "spill://",
+            "spill://.",
+            "spill://..",
+            "spill://../x",
+            "spill://a/b",
+            "spill://a\\b",
+            "spill://x\0y",
+            "1730000000000-7",
+            "",
+        ] {
+            assert_eq!(spill_path(state, pointer), None, "{pointer:?}");
+        }
+    }
+
+    /// The overlay's hands are engine feature specs the engine knows,
+    /// and `tool_search` is not one of them.
+    #[test]
+    fn overlay_hands_parse_with_the_engine() {
+        let hands: Vec<String> = OVERLAY_DISABLED_HANDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = ka_engine::features::parse_specs(&hands).unwrap();
+        assert_eq!(parsed.len(), OVERLAY_DISABLED_HANDS.len());
+        assert!(!hands.iter().any(|s| s == "tool:tool_search"));
     }
 }
