@@ -114,6 +114,15 @@ async fn skill_review(ctx: Ctx<'_>, verb: &str, arg: &str) -> Outcome {
                 return Outcome::Reply(format!("rejected skill proposal {}", one.name));
             }
             // Accept: write `<base>/skills/<name>/SKILL.md`, then enable it.
+            // A skill is text, not code: a proposal whose body carries
+            // shell lines is refused before it reaches the library.
+            let shell_lines = ka_agent_core::skills::shell_lines(&one.body);
+            if !shell_lines.is_empty() {
+                return Outcome::Reply(format!(
+                    "! [skills] {} — the proposal stays pending",
+                    ka_agent_core::skills::shell_lines_reason(&one.name, &shell_lines)
+                ));
+            }
             let dir = ka_agent_core::layout::base_dir()
                 .join("skills")
                 .join(&one.name);
@@ -212,6 +221,9 @@ pub(super) fn run_skill_doctor<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
             }
             if !skill.source_copy {
                 line.push_str(" · no source copy");
+            }
+            if let Some(reason) = skill.refusal() {
+                line.push_str(&format!(" · REFUSED, never attached: {reason}"));
             }
             lines.push(line);
         }

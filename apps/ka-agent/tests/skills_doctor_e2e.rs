@@ -319,3 +319,71 @@ fn skill_doctor_prices_context() {
     chat.send("/quit");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A skill whose body carries `!`command`` lines is refused at enable; a
+/// copy that reached the engine home before that rule is never attached
+/// (trigger or explicit) and `/skill-doctor` lists it as refused.
+#[test]
+fn skill_with_shell_lines_is_refused_and_never_attached() {
+    let root = temp_root("shell-lines");
+    let cfg_home = root.join("cfg-home");
+    let sneaky_md = cfg_home.join("ka-agent/skills/sneaky/SKILL.md");
+    std::fs::create_dir_all(sneaky_md.parent().unwrap()).unwrap();
+    std::fs::write(
+        &sneaky_md,
+        "---\nname = \"sneaky\"\ndescription = \"ship it\"\ntriggers = [\"sneaky\"]\n---\n\nShip.\n! `git push --force`\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
+        .args(["skills", "enable", "sneaky"])
+        .env("KA_AGENT_DATA_DIR", root.join("data"))
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("skill \"sneaky\" runs shell commands without approval (lines 8)"),
+        "{stderr}"
+    );
+    // The operator's copy is never stripped.
+    assert!(
+        std::fs::read_to_string(&sneaky_md)
+            .unwrap()
+            .contains("! `git push")
+    );
+
+    // An engine home populated before the rule: the copy sits there already.
+    let engine_md = root.join("data/engine-home/.config/ka/skills/sneaky/SKILL.md");
+    std::fs::create_dir_all(engine_md.parent().unwrap()).unwrap();
+    std::fs::copy(&sneaky_md, &engine_md).unwrap();
+    let sc = scenario_file(
+        &root,
+        "sneaky.json",
+        r#"{ "steps": [ {"text": "sneaky-ack"} ], "stop": "done", "cost_usd": 0.0, "tokens": 1 }"#,
+    );
+    let mut chat = spawn_chat(&root, &sc, &cfg_home, "guarded", "");
+    chat.expect("local session", Duration::from_secs(60));
+
+    // The trigger word fires nothing: the skill stays off the wire.
+    chat.send("run the sneaky thing");
+    chat.expect("sneaky-ack", Duration::from_secs(30));
+    chat.expect("turn done", Duration::from_secs(10));
+
+    let mark = chat.mark();
+    chat.send("/skill sneaky do it");
+    chat.expect_from(
+        "runs shell commands without approval (lines 8)",
+        mark,
+        Duration::from_secs(10),
+    );
+
+    chat.send("/skill-doctor");
+    chat.expect("REFUSED, never attached", Duration::from_secs(10));
+    let transcript = chat.transcript();
+    let line = line_with(&transcript, "sneaky ");
+    assert!(line.contains("never attached"), "{line}");
+    assert!(!line.contains("(trigger)"), "{line}");
+    chat.send("/quit");
+    std::fs::remove_dir_all(&root).ok();
+}

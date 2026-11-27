@@ -16,6 +16,7 @@ use ka_agent_core::{ApprovalDecision, AuditRecord, Principal, RunId, now_ms};
 use ka_agent_port::{PortEvent, StrandSelector};
 use ka_agent_store::RunRow;
 
+use super::approvals::answer_ask;
 use super::*;
 
 /// The header every scout answer carries: the parent model must treat the
@@ -277,11 +278,16 @@ impl Runtime {
                 match rx.recv().await {
                     Some(PortEvent::DeltaText(delta)) => text.push_str(&delta),
                     Some(PortEvent::Ask {
-                        ask_id, question, ..
+                        ask_id,
+                        question,
+                        options,
+                        ..
                     }) => {
                         // Fail closed: a scout can never widen its own
-                        // permissions. The denial is audited per ask.
-                        port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                        // permissions. The denial is audited per ask, and
+                        // goes out by the ask's shape — the decline is its
+                        // own last option, index 2 only for a permission ask.
+                        answer_ask(&port, ask_id, ApprovalDecision::Deny, &options)
                             .await
                             .ok();
                         let subject = format!("scout:{}", run_id.as_str());

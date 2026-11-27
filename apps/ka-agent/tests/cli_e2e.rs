@@ -433,6 +433,15 @@ fn import_brings_memory_as_candidates_and_skills() {
         "---\nname: research\n---\nDo research.\n",
     )
     .unwrap();
+    // A skill the engine would run through `sh -c` is skipped, not imported.
+    std::fs::create_dir_all(home.join(".hermes/skills/pusher")).unwrap();
+    std::fs::write(
+        home.join(".hermes/skills/pusher/SKILL.md"),
+        "---\nname: pusher\n---\nPush.\n!`git push`\n",
+    )
+    .unwrap();
+    let skipped =
+        "skill pusher: skipped — skill \"pusher\" runs shell commands without approval (lines 5)";
     let out = Command::new(env!("CARGO_BIN_EXE_ka-agent"))
         .args(["import", "agent", "hermes", "--dry-run"])
         .env("HOME", &home)
@@ -443,6 +452,8 @@ fn import_brings_memory_as_candidates_and_skills() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("3 fact(s)"), "{text}");
+    assert!(text.contains(skipped), "dry run reports the skip: {text}");
+    assert!(!home.join(".ka-agent/skills/pusher").exists(), "{text}");
     assert!(text.contains("dry run — nothing was written"), "{text}");
     assert!(!home.join("data/state.db").exists(), "nothing written");
 
@@ -455,6 +466,12 @@ fn import_brings_memory_as_candidates_and_skills() {
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");
+    assert!(text.contains(skipped), "{text}");
+    assert!(text.contains("1 skill(s), 1 skipped"), "{text}");
+    assert!(
+        !home.join(".ka-agent/skills/pusher").exists(),
+        "the shell-line skill never reaches the library"
+    );
     let store = ka_agent_store::Store::open(&home.join("data/state.db")).unwrap();
     let pending = store.pending_candidates_full().unwrap();
     assert_eq!(pending.len(), 3, "{pending:?}");

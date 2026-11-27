@@ -100,8 +100,8 @@ without changing access. `doctor` also lists
 
 ### Why `mode = "allow"` composes no sandbox
 
-The pinned engine (ka rev 247e99e, `crates/ka-engine/src/voice.rs`
-~2880-2955) poses a "sandbox grant for `…`" ask even when the
+The pinned engine (ka rev f41ecf9, `crates/ka-engine/src/voice.rs`
+~3750-3790, the `Gate::Allow` arm of the bash gate) poses a "sandbox grant for `…`" ask even when the
 permission gate already returned `Gate::Allow` — an exec call that
 computes sandbox grants (paths beyond the policy) asks regardless. So
 `mode = "allow"` (and `grants.full`) must keep the sandbox off
@@ -127,11 +127,11 @@ covers both the command and its grants.
 ### Ordering: hook pre-approve vs operator engine rules
 
 The pinned engine runs `pre_tool_use` hooks before the permission gate
-(`crates/ka-engine/src/voice.rs:2737-2820`, rev 247e99e), and a hook
+(`crates/ka-engine/src/voice.rs:3607-3660`, rev f41ecf9), and a hook
 pre-approve may only *downgrade an ask*: with `hook_allowed` set it
 computes the normal gate first and IGNORES the pre-approve when that
-gate is a `Gate::Deny` (`voice.rs:2638-2660`, "hook pre-approve ignored").
-Rules are evaluated inside `gate` (`voice.rs:3113`), so the effective
+gate is a `Gate::Deny` (`voice.rs:3663-3680`, "hook pre-approve ignored").
+Rules are evaluated inside `gate` (`voice.rs:4241`), so the effective
 order is:
 
 1. the guard's own blocks (protected files, deny grants) — exit 2,
@@ -162,6 +162,15 @@ admin), so a granted dir never widens into another subject's tree.
 absence of a future card for matching asks, never a grant (the engine's
 permission gate, path grants and role ceilings all still apply upstream).
 
+- **Permission asks only**: a rule — like allow-for-session and `always` —
+  exists solely for an ask whose options are exactly `allow`, `always`,
+  `deny` (`ka_agent_core::approval::is_permission_ask`). Every other ask on
+  the engine's `ask` event (its `continue`/`stop` session guards, a
+  checkpoint confirmation, an MCP elicitation) carries its own options and
+  is answered once, by them: `allow` takes the first, `deny` the decline
+  (always the last). `/y <id> always` and `/y <id> session` on such an ask
+  are refused with `that ask offers its own options — …`, before anything
+  is stored or remembered.
 - **Shapes** (`grant_rules.kind`): `command` (a provably-plain bash prefix —
   `cargo test` also answers `cargo test --color never`, never
   `cargo test && …`), `call_key` (a byte-identical bash command — the

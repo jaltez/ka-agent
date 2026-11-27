@@ -1,5 +1,6 @@
 // Inbound handling per user: principal resolution, preflight, submit, the
 // durable queue, retry and stop. Split from runtime.rs (moves only).
+use super::approvals::answer_ask;
 use super::events::is_scheduled;
 use super::scheduler::record_trigger_run;
 use super::worker::rt_on_engine_closed;
@@ -88,11 +89,24 @@ fn plan_skill_attach(
     if !conversational {
         return out;
     }
-    let resolved = crate::skills::Skills::new(&sh.paths.user_engine_home(&who.username)).resolved();
+    // A skill whose engine copy carries shell lines is never submitted —
+    // not by trigger, paths or an explicit name (engine homes populated
+    // before the rule; `/skill-doctor` lists them as refused).
+    let resolved: Vec<crate::skills::ResolvedSkill> =
+        crate::skills::Skills::new(&sh.paths.user_engine_home(&who.username))
+            .resolved()
+            .into_iter()
+            .filter(|skill| skill.refusal().is_none())
+            .collect();
     let hits = crate::skills::matched_triggers(text, &resolved);
     let mut names: Vec<String> = Vec::new();
     if let Some(explicit) = explicit_names {
-        names.extend(explicit.iter().cloned());
+        names.extend(
+            explicit
+                .iter()
+                .filter(|name| resolved.iter().any(|skill| skill.info.name == **name))
+                .cloned(),
+        );
     }
     for hit in &hits {
         if !names.contains(hit) {
@@ -1029,9 +1043,14 @@ impl Runtime {
                     last_activity = std::time::Instant::now();
                 }
                 Some(PortEvent::Ask {
-                    ask_id, question, ..
+                    ask_id,
+                    question,
+                    options,
+                    ..
                 }) => {
-                    port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                    // Fail closed by shape: the decline is the ask's own
+                    // last option — index 2 only for a permission ask.
+                    answer_ask(&port, ask_id, ApprovalDecision::Deny, &options)
                         .await
                         .ok();
                     let mut rec = AuditRecord::new(
@@ -1365,10 +1384,14 @@ impl Runtime {
     ) -> Result<(), Error> {
         let st = self.ensure_user(who)?;
         let skills = crate::skills::Skills::new(&self.sh.paths.user_engine_home(&who.username));
-        if !skills.is_enabled(name)? {
+        let resolved = skills.resolved();
+        let Some(skill) = resolved.iter().find(|skill| skill.info.name == name) else {
             return Err(Error::Refused(format!(
                 "skill {name:?} is not enabled — `ka-agent skills enable {name}`"
             )));
+        };
+        if let Some(reason) = skill.refusal() {
+            return Err(Error::Refused(reason));
         }
         if text.trim().is_empty() {
             return Err(Error::Refused("usage: /skill <name> <text>".into()));

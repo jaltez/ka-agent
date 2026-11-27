@@ -19,9 +19,11 @@ operator accepts stable-memory writes.
   `memory: forget <id>`). The compiled `MEMORY.md` is gitignored (derived
   state). `git log` is the memory audit trail.
 - **Compilation**: `MemoryStore::compile(budget)` concatenates files in
-  priority order (profile → persona → preferences → environment →
-  conventions → projects → facts) under a `# Ka Agent memory` header,
+  priority order (profile → preferences → environment → conventions →
+  projects → facts) under a `# Ka Agent memory` header,
   stripping provenance comments, enforcing `DEFAULT_BUDGET_BYTES = 6144`.
+  `persona.md` is not one of them: it is free-form instructions, compiled
+  into `IDENTITY.md` (`ka-agent-memory/src/lib.rs`, `MemoryFile`).
   Bullets whose `valid_until` has passed are excluded from the current
   compile; the Markdown and git history keep them, and an `as_of` search
   can still read them by date. Files that don't fit are truncated

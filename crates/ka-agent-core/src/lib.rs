@@ -22,6 +22,7 @@ pub mod queue;
 pub mod rules;
 pub mod secret;
 pub mod session;
+pub mod skills;
 pub mod task;
 pub mod time;
 pub mod turn;

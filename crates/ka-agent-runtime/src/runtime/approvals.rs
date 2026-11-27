@@ -1,13 +1,54 @@
 // Approval decisions: D9 routing, explicit and latest-card settles, expiry,
 // the session-allow set. Split from runtime.rs (moves only).
+//
+// Every answer to the engine goes through its ask's shape (core
+// `is_permission_ask`): only the engine's fixed allow/always/deny triple is
+// a permission ask, the one kind a grant may answer. Any other ask (the
+// engine's continue/stop session guards, a checkpoint confirmation, an MCP
+// elicitation) is answered once, by its own options.
 use super::events::rt_maybe_idle;
 use super::*;
+use ka_agent_core::approval::{NOT_A_PERMISSION_ASK, is_permission_ask};
 use ka_agent_core::{ApprovalDecision, ApprovalId, ApprovalKind, ApprovalStatus, Principal};
 
 /// The identity of a gated call for "allow for this session": the exact
 /// question and detail the operator saw.
 pub(super) fn session_allow_key(question: &str, detail: Option<&str>) -> String {
     format!("{question}\n{}", detail.unwrap_or(""))
+}
+
+/// The options of the engine ask behind `approval`. Empty for an intent
+/// card, which has no engine ask.
+pub(super) fn ask_options(approval: &Approval) -> &[String] {
+    match &approval.kind {
+        ApprovalKind::KaAsk { options, .. } => options,
+        ApprovalKind::Intent { .. } => &[],
+    }
+}
+
+/// Answer one pending engine ask and never guess an index: the decision
+/// maps through the ask's own options
+/// ([`ApprovalDecision::ka_choice_for`]), and a decision that ask cannot
+/// express ends the cycle instead — the engine takes an index as it comes,
+/// so a wrong one accepts a real option. Fail closed.
+pub(super) async fn answer_ask(
+    port: &PortSession,
+    ask_id: String,
+    decision: ApprovalDecision,
+    options: &[String],
+) -> Result<(), PortError> {
+    match decision.ka_choice_for(options) {
+        Some(choice) => port.answer(ask_id, choice).await,
+        None => port.abort().await,
+    }
+}
+
+/// The engine ask a settle answers: its id and its own options — the two
+/// halves `answer` needs to send the right index.
+#[derive(Clone, Copy)]
+pub(super) struct PendingAsk<'a> {
+    pub(super) id: &'a str,
+    pub(super) options: &'a [String],
 }
 
 impl Runtime {
@@ -81,6 +122,11 @@ impl Runtime {
                 format!("approvals are decided by the admin role ({reason})")
             }));
         }
+        // `always` grants; a grant only exists on a permission ask. An ask
+        // with its own options is answered once, by its options.
+        if decision == ApprovalDecision::Always && !is_permission_ask(ask_options(&row)) {
+            return Err(Error::Refused(NOT_A_PERMISSION_ASK.into()));
+        }
         // Re-authorization at execute time (D9): withdrawn access voids a
         // queued approval instead of executing it. The asking worker gets its
         // deny too, or its turn never settles (pending asks disarm the
@@ -97,7 +143,7 @@ impl Runtime {
                     })
                 }
             {
-                port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                answer_ask(&port, ask_id, ApprovalDecision::Deny, ask_options(&row))
                     .await
                     .ok();
                 let mut g = st.lock();
@@ -166,7 +212,7 @@ impl Runtime {
             ApprovalDecision::Deny => ApprovalStatus::Denied,
         };
         if status == ApprovalStatus::Denied {
-            port.answer(ask_id.clone(), decision.ka_choice()).await?;
+            answer_ask(&port, ask_id, decision, ask_options(&row)).await?;
             self.sh
                 .store
                 .decide_approval(&id, status, ka_agent_core::now_ms())?;
@@ -195,12 +241,24 @@ impl Runtime {
         // The one Allow settle site: every allow-class path — an operator
         // `/y`, the session-allow set, a durable rule — settles through
         // [`Runtime::answer_allow`] and nowhere else.
+        // The audit label names what the engine received: on an ask with
+        // its own options, `Allow` accepted one concrete value.
+        let options = ask_options(&row);
+        let label = match (decision, options.first()) {
+            (ApprovalDecision::Allow, Some(first)) if !is_permission_ask(options) => {
+                format!("{decision:?} (first option: {first:?})")
+            }
+            _ => format!("{decision:?}"),
+        };
         self.answer_allow(
             &st,
             &who,
             Some((&row, status)),
-            ask_id,
-            &format!("{decision:?}"),
+            PendingAsk {
+                id: ask_id.as_str(),
+                options,
+            },
+            &label,
             source,
         )
         .await
@@ -209,21 +267,22 @@ impl Runtime {
     /// The single Allow settle site (v4 B7): answer the ask Allow, settle
     /// the approval row when there is one, audit with a caller label, and
     /// return the session to Running. `approval` is `None` for asks
-    /// answered before any card existed (the session-allow set), and the
-    /// label names the path (`Allow`, `Allow (session)`, `Allow (rule …)`)
-    /// in the audit row.
+    /// answered before any card existed (the session-allow set), `ask` is
+    /// the engine ask being answered — allow is index 0 on every shape —
+    /// and the label names the path (`Allow`, `Allow (session)`,
+    /// `Allow (rule …)`) in the audit row.
     pub(super) async fn answer_allow(
         &self,
         st: &UserHandle,
         who: &Principal,
         approval: Option<(&Approval, ApprovalStatus)>,
-        ask_id: String,
+        ask: PendingAsk<'_>,
         label: &str,
         source: &str,
     ) -> Result<(), Error> {
         let approval_id = approval
             .map(|(row, _)| row.id.to_string())
-            .unwrap_or_else(|| ask_id.clone());
+            .unwrap_or_else(|| ask.id.to_string());
         let port = st.lock().live.as_ref().map(|l| Arc::clone(&l.port));
         let Some(port) = port else {
             return Err(Error::UnknownApproval(approval_id));
@@ -280,14 +339,20 @@ impl Runtime {
                     .map_err(|t| illegal_session(from, t))?;
             }
         }
-        port.answer(ask_id, ApprovalDecision::Allow.ka_choice())
-            .await?;
+        answer_ask(
+            &port,
+            ask.id.to_string(),
+            ApprovalDecision::Allow,
+            ask.options,
+        )
+        .await?;
         Ok(())
     }
 
     /// "Allow for this session": allow this approval and every identical one
-    /// (same question and detail) until `/new`. Terminal and web only — the
-    /// caller enforces the surface.
+    /// (same question and detail) until `/new`. A permission ask only — any
+    /// other ask is answered once, by its options. Terminal and web only —
+    /// the caller enforces the surface.
     pub async fn decide_for_session(&self, approval_id: &str, source: &str) -> Result<(), Error> {
         let who = self
             .principal_for_source(source)
@@ -297,13 +362,19 @@ impl Runtime {
             .store
             .get_approval(&ApprovalId(approval_id.to_string()))
             .map_err(|_| Error::UnknownApproval(approval_id.to_string()))?;
+        // Refused before anything is remembered: a session-allow is a
+        // grant, and only a permission ask can carry one.
         if let ApprovalKind::KaAsk {
             question, detail, ..
         } = &approval.kind
-            && let Some(st) = self.user_handle(&who.username)
         {
-            let key = session_allow_key(question, detail.as_deref());
-            st.lock().session_allow.insert(key);
+            if !is_permission_ask(ask_options(&approval)) {
+                return Err(Error::Refused(NOT_A_PERMISSION_ASK.into()));
+            }
+            if let Some(st) = self.user_handle(&who.username) {
+                let key = session_allow_key(question, detail.as_deref());
+                st.lock().session_allow.insert(key);
+            }
         }
         self.decide(approval_id, ApprovalDecision::Allow, source)
             .await
@@ -339,6 +410,10 @@ impl Runtime {
         else {
             return Err(Error::Refused("only engine asks can become rules".into()));
         };
+        // A rule is a grant: it answers permission asks only.
+        if !is_permission_ask(ask_options(&row)) {
+            return Err(Error::Refused(NOT_A_PERMISSION_ASK.into()));
+        }
         // The rule lands in the asking user's partition (a member's card an
         // admin approved still writes the member's rule, never the
         // admin's), and carries the asking user's effective mode.
@@ -388,6 +463,17 @@ impl Runtime {
             .unwrap_or_else(|| ka_agent_core::OPERATOR_USER.to_string());
         self.user_handle(&asking)
             .and_then(|st| st.lock().live.as_ref().and_then(|l| l.last_call.clone()))
+    }
+
+    /// The options of the engine ask behind approval `id` — what a settle
+    /// that only holds the id (the expiry sweep, an orphan at turn finish)
+    /// answers by. Empty when the row is gone, and then no index is sent.
+    pub(super) fn approval_options(&self, id: &str) -> Vec<String> {
+        self.sh
+            .store
+            .get_approval(&ApprovalId(id.to_string()))
+            .map(|a| ask_options(&a).to_vec())
+            .unwrap_or_default()
     }
 
     /// `/rules`: the caller's own durable rules; the admin sees (and may
@@ -457,7 +543,8 @@ impl Runtime {
     // ---- lifecycle ------------------------------------------------------
 
     /// Expiry sweep (timer-driven): pending approvals past their TTL are
-    /// denied, answered to the engine, and audited (fail closed).
+    /// declined — the ask's own decline option — answered to the engine,
+    /// and audited (fail closed).
     pub async fn expire_approvals(&self) -> Result<Vec<ApprovalId>, Error> {
         let expired = self.sh.store.expire_pending(ka_agent_core::now_ms())?;
         if expired.is_empty() {
@@ -484,14 +571,20 @@ impl Runtime {
             if answers.is_empty() {
                 continue;
             }
+            // One lock for both fields. The state mutex is not reentrant:
+            // a second `st.lock()` inside the same expression (the shape
+            // this had) never returned, and took the maintenance loop and
+            // the user's whole session down with it.
+            let actor = {
+                let g = st.lock();
+                Principal::new(g.session.username.as_str(), g.role.as_str())
+            };
             for (id, port, ask_id) in answers {
-                self.audit_for(
-                    &Principal::new(st.lock().session.username.as_str(), st.lock().role.as_str()),
-                    audit_actions::APPROVAL_EXPIRE,
-                    &id,
-                    None,
-                )?;
-                port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                self.audit_for(&actor, audit_actions::APPROVAL_EXPIRE, &id, None)?;
+                // Fail closed by shape: the decline is the ask's own last
+                // option — index 2 only for the permission triple.
+                let options = self.approval_options(&id);
+                answer_ask(&port, ask_id, ApprovalDecision::Deny, &options)
                     .await
                     .ok();
                 self.sh.emit(AgentEvent::ApprovalSettled {

@@ -1,9 +1,11 @@
-//! One failed turn, then `/retry` re-sends it on the same scripted worker.
+//! One failed turn, then `/retry` re-sends it on the same scripted worker;
+//! and the throttle stamp a terminal rate-limit report sets (A6).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ka_agent_port::WorkerPort;
@@ -126,5 +128,81 @@ async fn retry_resends_after_a_protocol_error() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A6: records, for every engine `rate_limit` report that reaches the
+/// surface, whether `/status` showed the throttle at that moment — the
+/// window between the report and the turn's finish, which clears the stamp
+/// again.
+#[derive(Default)]
+struct ThrottleWatch {
+    runtime: OnceLock<Runtime>,
+    stamped: Mutex<Vec<bool>>,
+    finished: AtomicBool,
+}
+
+impl Surface for ThrottleWatch {
+    fn emit(&self, env: &Envelope) {
+        match &env.ev {
+            AgentEvent::Error { class, .. } if class == "rate_limit" => {
+                let rt = self.runtime.get().unwrap();
+                let stamped = rt.status_report_for(&op()).unwrap().throttled_since_ms;
+                self.stamped.lock().unwrap().push(stamped.is_some());
+            }
+            AgentEvent::TurnFinished { .. } => self.finished.store(true, Ordering::SeqCst),
+            _ => {}
+        }
+    }
+}
+
+/// The engine's terminal report always carries `retryable: false` — its own
+/// backoff and fallback hops are spent by then — so the class alone stamps
+/// the throttle: `/status` shows the cooldown from the report until the
+/// turn's finish clears it. Keying on the flag never stamped anything.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_rate_limit_report_stamps_the_throttle() {
+    let root = std::env::temp_dir().join(format!("ka-throttle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let store = Arc::new(Store::open(&root.join("state.db")).unwrap());
+    let watch = Arc::new(ThrottleWatch::default());
+    let cfg = ka_agent_core::DaemonConfig {
+        workspace: root.join("ws"),
+        sandbox: "off".into(),
+        ..ka_agent_core::DaemonConfig::default()
+    };
+    let rt = Runtime::new(
+        cfg,
+        Paths::new(root.clone()),
+        Arc::clone(&store),
+        scripted_port(
+            &root,
+            r#"{"fail": {"class": "rate_limit", "retryable": false, "message": "429 from the provider"}}"#,
+        ),
+        Arc::clone(&watch) as Arc<dyn Surface>,
+    )
+    .unwrap();
+    watch.runtime.set(rt.clone()).ok();
+    rt.handle_message("please answer", "console").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !watch.finished.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the turn never finished");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stamped = watch.stamped.lock().unwrap().clone();
+    assert_eq!(
+        stamped,
+        [true],
+        "the rate-limit report did not find the throttle stamped"
+    );
+    assert!(
+        rt.status_report_for(&op())
+            .unwrap()
+            .throttled_since_ms
+            .is_none(),
+        "the settled turn must clear the stamp"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

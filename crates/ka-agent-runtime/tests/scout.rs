@@ -158,10 +158,11 @@ fn capture_port(root: &Path, steps: &str) -> WorkerPort {
     port
 }
 
-/// A fake worker that emits one permission ask and then finishes: the child
-/// ask-deny path has no seam in the scripted speaker.
+/// A fake worker that emits one ask — `options` is its JSON option array —
+/// and then finishes: the child ask-deny path has no seam in the scripted
+/// speaker.
 #[cfg(unix)]
-fn ask_port(root: &Path, answer_log: &Path) -> WorkerPort {
+fn ask_port(root: &Path, answer_log: &Path, options: &str) -> WorkerPort {
     let wrapper = root.join("ask.sh");
     write_executable(
         &wrapper,
@@ -172,7 +173,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"op":"open"'*) printf '%s\n' '{{"ev":"strand","id":"strand_test","path":null}}' ;;
     *'"op":"submit"'*)
-      printf '%s\n' '{{"ev":"ka","event":{{"type":"ask","id":"ask_1","questions":[{{"text":"run bash?","options":["allow","always","deny"]}}]}}}}'
+      printf '%s\n' '{{"ev":"ka","event":{{"type":"ask","id":"ask_1","questions":[{{"text":"run bash?","options":{}}}]}}}}'
       IFS= read -r answer
       printf '%s\n' "$answer" >> '{}'
       printf '%s\n' '{{"ev":"ka","event":{{"type":"delta","kind":{{"text":"answered after deny"}}}}}}'
@@ -183,7 +184,8 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            answer_log.display()
+            options,
+            answer_log.display(),
         ),
     );
     WorkerPort {
@@ -373,7 +375,13 @@ async fn scout_wedge_hits_its_deadline_and_errors() {
 async fn scout_child_ask_is_denied_fail_closed() {
     let (rt, store, _rec, root) = scout_runtime(
         "ask",
-        |root| ask_port(root, &root.join("answer.jsonl")),
+        |root| {
+            ask_port(
+                root,
+                &root.join("answer.jsonl"),
+                r#"["allow","always","deny"]"#,
+            )
+        },
         |cfg| cfg.scout.timeout_secs = 30,
     );
     let answer_log = root.join("answer.jsonl");
@@ -381,6 +389,44 @@ async fn scout_child_ask_is_denied_fail_closed() {
     assert!(reply.contains("answered after deny"), "{reply}");
     let answer = std::fs::read_to_string(&answer_log).unwrap();
     assert!(answer.contains(r#""choice":2"#), "not a deny: {answer}");
+    let audit = store.recent_audit(10).unwrap();
+    assert!(
+        audit.iter().any(|row| {
+            row.action == "approval.decide"
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("scout child may not ask"))
+        }),
+        "no scout ask audit row: {audit:?}"
+    );
+}
+
+/// The same fail-closed decline on an ask with its own options: the scout
+/// answers its decline — the last option — never a fixed index that would
+/// accept a real value (`c` here).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn scout_child_declines_an_ask_with_its_own_options() {
+    let (rt, store, _rec, root) = scout_runtime(
+        "ask-shape",
+        |root| {
+            ask_port(
+                root,
+                &root.join("answer.jsonl"),
+                r#"["a","b","c","decline"]"#,
+            )
+        },
+        |cfg| cfg.scout.timeout_secs = 30,
+    );
+    let answer_log = root.join("answer.jsonl");
+    let reply = rt.run_scout(&op(), "does the build pass?").await.unwrap();
+    assert!(reply.contains("answered after deny"), "{reply}");
+    let answer = std::fs::read_to_string(&answer_log).unwrap();
+    assert!(
+        answer.contains(r#""choice":3"#),
+        "not the ask's own decline: {answer}"
+    );
     let audit = store.recent_audit(10).unwrap();
     assert!(
         audit.iter().any(|row| {

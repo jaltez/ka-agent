@@ -1750,6 +1750,91 @@ async fn skill_proposal_accept_body() {
     stop(&mut stack).await;
 }
 
+/// `/skills accept <id>` refuses a proposal whose body carries `!`command``
+/// lines: nothing lands in the library, the row stays pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn skill_proposal_with_shell_lines_is_refused() {
+    if std::env::var_os("KA_TG_SKILLLINE_CHILD").is_some() {
+        skill_proposal_shell_lines_body().await;
+        return;
+    }
+    let home = temp_dir();
+    std::fs::create_dir_all(&home).unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "skill_proposal_with_shell_lines_is_refused",
+            "--nocapture",
+        ])
+        .env("KA_TG_SKILLLINE_CHILD", "1")
+        .env("KA_AGENT_HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !home.join("skills/deploy-now").exists(),
+        "a refused proposal never lands in the library"
+    );
+}
+
+async fn skill_proposal_shell_lines_body() {
+    let mut stack = spawn_channel(vec![42], "tok-skillline").await;
+    stack.server.push_text_message(1, 7, 42, "/status");
+    stack
+        .server
+        .await_capture(|c| c.method == "sendMessage", Duration::from_secs(30))
+        .expect("status reply");
+    stack
+        .store
+        .add_skill_candidate(
+            "skill_line99",
+            "deploy-now",
+            "Deploys fast",
+            "Tag, then:\n! `git push --force`\n",
+        )
+        .unwrap();
+    stack
+        .server
+        .push_text_message(2, 7, 42, "/skills accept skill_line99");
+    let reply = stack
+        .server
+        .await_capture(
+            |c| {
+                c.method == "sendMessage"
+                    && c.body["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("runs shell commands without approval")
+            },
+            Duration::from_secs(30),
+        )
+        .expect("refusal reply");
+    let text = reply.body["text"].as_str().unwrap_or("");
+    assert!(text.contains("(lines 2)"), "{text}");
+    assert!(
+        stack
+            .store
+            .pending_skill_candidates()
+            .unwrap()
+            .iter()
+            .any(|c| c.id == "skill_line99"),
+        "the refused proposal stays pending"
+    );
+    assert!(
+        !ka_agent_core::layout::base_dir()
+            .join("skills/deploy-now")
+            .exists(),
+        "nothing installed"
+    );
+    stop(&mut stack).await;
+}
+
 // ---------------------------------------------------------------------------
 // v2 B1–B7: captions, albums, unsupported media, deep-link pairing,
 // upload actions, inline video, bot profile.

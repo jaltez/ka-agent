@@ -106,6 +106,18 @@ skills show no trigger echo. A `standing:` line totals the advertised tokens
 and body bytes. Counts live in the store's `skill_usage` table (schema v15)
 and are bumped only when a submit actually attached the skill.
 
+**Shell lines are refused.** The engine runs every `SKILL.md` line shaped
+`!`command`` (after leading whitespace; fenced blocks count) through `sh -c`
+when the skill is invoked — no permission ask, no ledger entry. A skill is
+text, not code, so such a skill is refused everywhere it enters, never
+stripped: `skills enable` fails with
+`skill "deploy" runs shell commands without approval (lines 12, 40): remove the !`…` lines`,
+`ka-agent import` skips it (dry run prints the reason), `/skills accept`
+refuses it, and an engine-home copy that predates the rule (or was edited in
+place) is never put in `Submit.skills` — not by trigger, `paths` or
+`/skill`, which answers with the same reason — and `/skill-doctor` marks it
+`REFUSED, never attached`.
+
 ## What skills never get
 
 No scopes, no grants, no sandbox carve-outs, no marketplace. Installing a

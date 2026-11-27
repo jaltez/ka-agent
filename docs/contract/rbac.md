@@ -34,9 +34,11 @@ Rules (all hard config errors):
 
 - `name`: `[a-z0-9-]{1,32}`, unique; `admin` is reserved (`reserved role
   name "admin" — it is implicit`).
-- `allow` XOR `disable`. `allow` entries are exact engine hand names;
-  `disable` entries use the engine's `[features] disable` grammar and are
-  validated with it before any worker spawns.
+- `allow` XOR `disable`. `allow` entries are exact engine hand names
+  (`kagent__<tool>` for the bridge); they narrow every turn and are the
+  engine's session allowlist (see Enforcement). `disable` entries use the
+  engine's `[features] disable` grammar and are validated with it before
+  any worker spawns.
 - `mode` is both the role's default and its **ceiling**.
 - `workspace`: absolute or `~`-relative; it may not nest with the profile
   workspace, ka-agent's own tree (`roles/` included), or another role's
@@ -138,6 +140,8 @@ default_role = "member"             # role an auto-provisioned user gets
 | Layer | Mechanism | Failure mode |
 | --- | --- | --- |
 | Spawn | `[features] disable` = `[tools]` + role `disable`, merged under the operator layer, cross-checked with the engine parser | worker refuses to spawn, spec named |
+| Session posture | `[features] allow` = role `allow` — hand names as they are, every `kagent__*` tool as `mcp:kagent` — intersected with the operator layer's own `features.allow`; the engine hides every other hand and rejects a stray call by name. The per-turn list (next row) still narrows each turn | composition refused, the role and the entry named: an allow entry that is a disable spec, or names an MCP server the role cannot see; a toolset that shares nothing with the operator allowlist (an empty allowlist would mean "every tool") |
+| Models (engine layer) | for a role, `[fallback]` — the profile's chain and the operator layer's own — and the fast role composed from `background_model` keep only models inside the user's `models_allow`; an empty chain emits no `[fallback]`. The operator's own sessions are not narrowed | the engine never switches to, or runs its chores on, a model the user may not use |
 | Turn | `Submit.allowed_tools` = role `allow` (or cron `tools` ∩ role allow) | tool filtered from the model specs and rejected at admit |
 | Scout | the child opens through the parent user's `prepare_open` (same HOME/`KA_DATA_DIR`/grants, its own partition) on a fresh strand in `readonly` mode; `Submit.allowed_tools` = the role allowlist ∩ `read, glob, grep, web_search, web_fetch`, and an empty intersection is an empty allowlist (never `null` = every tool). It sees the question, not the parent transcript. A scout answer is labeled non-authoritative by contract | a child ask is denied fail-closed (audited); a full worker pool or scout queue answers busy, it never spawns past the cap |
 | Mode | role `mode` ceiling; worker re-asserts it after strand replay | a looser `/mode` clamps to the ceiling |
@@ -148,6 +152,7 @@ default_role = "member"             # role an auto-provisioned user gets
 | History | FTS/`/history` scoped to the user's sessions | other users' turns are invisible |
 | Dream | the child opens through the parent user's `prepare_open` on a fresh strand in `readonly` mode; `Submit.allowed_tools = []` (no tools). It sees the daemon-assembled excerpt and compiled memory, never the store; scheduled-source turns and `automation`-scope webhook fires are excluded through `turn_origins` and the source/scope checks | a child ask is denied fail-closed (audited); a full pool answers busy; the pass stages candidates only, never accepts or removes |
 | Approvals | self-scope cards go to the acting user's surfaces and their decision; shared-resource, over-quota and `escalate` hits go to the admin queue; a foreign decision is refused and audited (D9); durable rules (`/y <id> always`) answer only non-escalated self-scope asks of the rule's own subject, after D9 routing, within the creation mode and looser (grants.md §Durable allow-rules) | `approvals are decided by the admin role` |
+| Non-permission asks | a permission ask is an ask with options exactly `allow`, `always`, `deny`; every other ask on the engine's `ask` event (its `continue`/`stop` session guards, a checkpoint confirmation, an MCP elicitation) is routed the same way (D9) but is never pre-answered: no session-allow, no durable rule, and `always` is refused. `allow` answers its first option, `deny` its decline (the last), and the scout, dream, preflight and automation children decline theirs the same way | `that ask offers its own options — …` |
 | Re-auth | every approved intent re-resolves the actor at execute time: disabled user, removed role or withdrawn grant ⇒ deny + `approval.stale` | the external write never happens |
 | Models | the user's groups' `models_allow` union; a non-allowed model is refused by name | named refusal |
 | KBs | KBs whose `kb_access` intersects the user's groups, plus owned, plus all for admin; `kagent__kb_search`, `@kb:` refs and the web KB route share the check | `no knowledge base matches` |

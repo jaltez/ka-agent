@@ -1,8 +1,9 @@
 //! Approval commands: the pending list and the y/n decisions.
 
 use super::{CmdFuture, Ctx, Outcome};
+use ka_agent_core::approval::{NOT_A_PERMISSION_ASK, is_permission_ask};
 use ka_agent_core::ids::{id_matches, short_id};
-use ka_agent_runtime::Runtime;
+use ka_agent_runtime::{ApprovalCard, Runtime};
 
 pub(super) fn run_approvals<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move {
@@ -36,6 +37,44 @@ pub(super) fn run_n<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
     Box::pin(async move { decide(ctx.runtime, ctx.source, false, ctx.args, &ctx.principal).await })
 }
 
+/// `always` and `session` are grants, and a grant only exists on a
+/// permission ask (`allow`, `always`, `deny`). On any other ask — the
+/// engine's `continue`/`stop` session guards, an MCP elicitation — the
+/// command refuses before anything is stored or answered. The runtime
+/// refuses the same asks too (`decide_always`, `decide_for_session`) for
+/// every surface; this keeps the reply a plain line.
+fn grant_refusal(card: &ApprovalCard) -> Option<Outcome> {
+    (!is_permission_ask(&card.options)).then(|| Outcome::Reply(NOT_A_PERMISSION_ASK.into()))
+}
+
+/// The one card `/y [id] always|session` acts on: the latest-expiring card
+/// when no id is given, else the id's match. `Err` is the reply that ends
+/// the command instead.
+fn grant_target(cards: &[ApprovalCard], prefix: &str) -> Result<ApprovalCard, Outcome> {
+    let pick: Vec<&ApprovalCard> = if prefix.is_empty() {
+        cards
+            .iter()
+            .max_by_key(|c| c.expires_at_ms)
+            .into_iter()
+            .collect()
+    } else {
+        cards
+            .iter()
+            .filter(|c| id_matches(&c.approval_id, prefix))
+            .collect()
+    };
+    match pick.as_slice() {
+        [one] => match grant_refusal(one) {
+            Some(reply) => Err(reply),
+            None => Ok((*one).clone()),
+        },
+        [] => Err(Outcome::Reply("no pending approval".into())),
+        _ => Err(Outcome::Reply(
+            "ambiguous approval id — /approvals lists them".into(),
+        )),
+    }
+}
+
 /// `/y [id] [session]` / `/n [id]`: the shared decision flow. `allow` picks
 /// the `ApprovalDecision`.
 pub(super) async fn decide(
@@ -67,25 +106,13 @@ pub(super) async fn decide(
             Ok(c) => c,
             Err(e) => return Outcome::Reply(format!("! [approval] {e}")),
         };
-        let pick: Vec<_> = if prefix.is_empty() {
-            cards
-                .iter()
-                .max_by_key(|c| c.expires_at_ms)
-                .into_iter()
-                .collect()
-        } else {
-            cards
-                .iter()
-                .filter(|c| id_matches(&c.approval_id, prefix))
-                .collect()
+        let one = match grant_target(&cards, prefix) {
+            Ok(one) => one,
+            Err(reply) => return reply,
         };
-        return match pick.as_slice() {
-            [one] => match runtime.decide_always(&one.approval_id, source).await {
-                Ok(text) => Outcome::Reply(text),
-                Err(e) => Outcome::Reply(format!("! [approval] {e}")),
-            },
-            [] => Outcome::Reply("no pending approval".into()),
-            _ => Outcome::Reply("ambiguous approval id — /approvals lists them".into()),
+        return match runtime.decide_always(&one.approval_id, source).await {
+            Ok(text) => Outcome::Reply(text),
+            Err(e) => Outcome::Reply(format!("! [approval] {e}")),
         };
     }
     // `/y [id] session`: allow this call and identical ones until
@@ -103,27 +130,13 @@ pub(super) async fn decide(
             Ok(c) => c,
             Err(e) => return Outcome::Reply(format!("! [approval] {e}")),
         };
-        let pick: Vec<_> = if prefix.is_empty() {
-            cards
-                .iter()
-                .max_by_key(|c| c.expires_at_ms)
-                .into_iter()
-                .collect()
-        } else {
-            cards
-                .iter()
-                .filter(|c| id_matches(&c.approval_id, prefix))
-                .collect()
+        let one = match grant_target(&cards, prefix) {
+            Ok(one) => one,
+            Err(reply) => return reply,
         };
-        return match pick.as_slice() {
-            [one] => match runtime.decide_for_session(&one.approval_id, source).await {
-                Ok(()) => {
-                    Outcome::Reply("allowed — identical requests are allowed until /new".into())
-                }
-                Err(e) => Outcome::Reply(format!("! [approval] {e}")),
-            },
-            [] => Outcome::Reply("no pending approval".into()),
-            _ => Outcome::Reply("ambiguous approval id — /approvals lists them".into()),
+        return match runtime.decide_for_session(&one.approval_id, source).await {
+            Ok(()) => Outcome::Reply("allowed — identical requests are allowed until /new".into()),
+            Err(e) => Outcome::Reply(format!("! [approval] {e}")),
         };
     }
     if prefix.is_empty() {
@@ -148,6 +161,78 @@ pub(super) async fn decide(
             },
             [] => Outcome::Reply(format!("no pending approval matches {prefix}")),
             _ => Outcome::Reply("ambiguous approval id — /approvals lists them".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn card(options: &[&str]) -> ApprovalCard {
+        ApprovalCard {
+            approval_id: "ap-1".into(),
+            question: "Which one?".into(),
+            detail: None,
+            options: options.iter().map(|o| o.to_string()).collect(),
+            expires_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn grants_are_refused_on_every_ask_but_a_permission_ask() {
+        assert!(grant_refusal(&card(&["allow", "always", "deny"])).is_none());
+        for options in [
+            &["a", "b", "c", "decline"][..],
+            &["true", "false", "decline"][..],
+            &["accept", "decline"][..],
+            &["continue", "stop"][..],
+        ] {
+            match grant_refusal(&card(options)) {
+                Some(Outcome::Reply(text)) => {
+                    assert_eq!(text, NOT_A_PERMISSION_ASK, "{options:?}");
+                }
+                None => panic!("{options:?}: a grant must be refused here"),
+                _ => panic!("{options:?}: a grant is refused with its reason"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_grant_never_lands_on_an_ask_with_its_own_options() {
+        let mut permission = card(&["allow", "always", "deny"]);
+        permission.approval_id = "ap-aaaa-1".into();
+        permission.expires_at_ms = 10;
+        let mut own = card(&["a", "b", "c", "decline"]);
+        own.approval_id = "ap-bbbb-2".into();
+        own.expires_at_ms = 20;
+        let cards = [permission, own];
+        // No id: the pick is the latest-expiring card — refused, with the
+        // reason, before the runtime is asked for anything.
+        match grant_target(&cards, "") {
+            Err(Outcome::Reply(text)) => assert_eq!(text, NOT_A_PERMISSION_ASK),
+            Err(_) => panic!("a refusal is always a reply"),
+            Ok(one) => panic!(
+                "a grant landed on {} with options {:?}",
+                one.approval_id, one.options
+            ),
+        }
+        // By id: the permission ask is the grant's target.
+        assert!(matches!(
+            grant_target(&cards, "ap-aaaa"),
+            Ok(one) if one.approval_id == "ap-aaaa-1"
+        ));
+        // Nothing (unambiguous) to act on.
+        for (cards, prefix) in [(&cards[..], "ap-zzzz"), (&cards[..0], "")] {
+            assert!(
+                matches!(
+                    &grant_target(cards, prefix),
+                    Err(Outcome::Reply(text)) if text == "no pending approval"
+                ),
+                "nothing to act on must say so ({prefix:?})"
+            );
         }
     }
 }

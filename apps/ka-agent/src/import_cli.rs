@@ -123,12 +123,26 @@ pub fn import(action: ImportAction) -> ExitCode {
 
     // Skills → the shared library (a directory holding SKILL.md files).
     let mut skills: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
     if let Ok(entries) = std::fs::read_dir(&src.skills) {
         for e in entries.flatten() {
             if e.path().join("SKILL.md").is_file()
                 && let Some(name) = e.file_name().to_str()
                 && ka_agent_core::layout::valid_profile_name(name)
             {
+                // A skill is text, not code: one the engine would run
+                // through `sh -c` never enters the library.
+                let shell_lines = std::fs::read_to_string(e.path().join("SKILL.md"))
+                    .map(|text| ka_agent_core::skills::shell_lines(&text))
+                    .unwrap_or_default();
+                if !shell_lines.is_empty() {
+                    println!(
+                        "skill {name}: skipped — {}",
+                        ka_agent_core::skills::shell_lines_reason(name, &shell_lines)
+                    );
+                    skipped += 1;
+                    continue;
+                }
                 skills.push(name.to_string());
             }
         }
@@ -178,9 +192,10 @@ pub fn import(action: ImportAction) -> ExitCode {
         }
     }
     println!(
-        "imported: {} memory candidate(s) (review: /memory review), {} skill(s)",
+        "imported: {} memory candidate(s) (review: /memory review), {} skill(s), {} skipped",
         candidates.len(),
-        skills.len()
+        skills.len(),
+        skipped
     );
     ExitCode::SUCCESS
 }
