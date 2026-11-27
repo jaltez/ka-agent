@@ -56,6 +56,7 @@ in your terminal too.
 | `/model [provider/model]` | switch model, applied live — bare `/model` lists providers, `/model <provider>` its models, `/model <n>` picks; Tab completes selectors |
 | `/new` · `/stop` · `/resume` | fresh session · abort reply · lift a pause |
 | `/retry` | re-send the last failed or interrupted question (also the ↻ button on Telegram) |
+| `/diff` · `/context` · `/btw <q>` | session diff (the whole diff is attached) · what fills the context window · a quick side question on the fast model, off the transcript |
 | `/remember <fact>` · `/forget <id>` | durable memory (git-backed; `/memory` lists ids) |
 | `/history [query]` · `/history show <id>` | past turns |
 | `/remind <when> <text>` · `/reminders` | notifications, no model turn |
@@ -398,11 +399,12 @@ sandbox). `docs/contract/` is one behavior contract per subsystem; `doctor`
 embeds their hash so support can compare builds.
 
 **The ka pin.** The `ka-*` engine crates are pinned to one ka-harness git
-revision, `247e99e` (the `v0.7.0+` line noted in `Cargo.toml`), which
+revision, `f41ecf9` (v0.12.2 — the line noted in `Cargo.toml`), which
 `doctor` reports as `KA_PIN`. Upgrades are deliberate: bump the revision
 in every `ka-*` dependency together, keep the contract suite green
 (SEED §11.3); `scripts/check-ka-deps.sh` fails CI if any one of those
-pins or the boundary drifts.
+pins or the boundary drifts. What the pin brings, and what Ka Agent
+does with it, is recorded in `docs/design/harness-0.12-integration.md`.
 
 **Build & test.**
 
