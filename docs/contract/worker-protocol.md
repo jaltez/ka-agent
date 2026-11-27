@@ -20,9 +20,9 @@ Direction: D→W (daemon to worker, written to the worker's stdin), W→D
 
 | op | line |
 |---|---|
-| `Open` — start/attach an engine on a strand | `{"op":"open","workspace":"/home/op/work","strand":"/home/op/.ka-agent/profiles/default/ka/strands/01J….jsonl","model":"anthropic/claude-sonnet-4-5","mode":"ask","engine_layer_toml":"/home/op/.config/ka-agent/engine.toml","scenario":null}` |
+| `Open` — start/attach an engine on a strand | `{"op":"open","workspace":"/home/op/work","strand":"/home/op/.ka-agent/profiles/default/ka/strands/01J….jsonl","model":"anthropic/claude-sonnet-4-5","mode":"ask","engine_layer_toml":"/home/op/.config/ka-agent/engine.toml","scenario":null,"auto_allow":[]}` |
 | `Submit` — one prompt (text, optional images, optional skills, optional tool allowlist) | `{"op":"submit","text":"fix the failing test","images":[],"skills":[],"allowed_tools":["read"]}` |
-| `Answer` — resolve a pending ask | `{"op":"answer","ask_id":"a-17","choice":"allow"}` |
+| `Answer` — resolve a pending ask | `{"op":"answer","ask_id":"ask-17","choice":2}` |
 | `Abort` — cancel the running cycle | `{"op":"abort"}` |
 | `SetModel` — set model selector | `{"op":"set_model","selector":"openai/gpt-5.2"}` |
 | `SetMode` — set permission mode | `{"op":"set_mode","mode":"readonly"}` |
@@ -31,6 +31,9 @@ Direction: D→W (daemon to worker, written to the worker's stdin), W→D
 | `Steer` — queue text into the live cycle (the engine drains it at turn/tool boundaries; settles into the queue when unconsumed) | `{"op":"steer","text":"also update the README"}` |
 | `UndoFile` — revert the engine's last file edit | `{"op":"undo_file"}` |
 | `Compact` — compact the strand | `{"op":"compact"}` |
+| `SessionDiff` — the session's cumulative file diff | `{"op":"session_diff"}` |
+| `ContextBreakdown` — the context-usage breakdown | `{"op":"context_breakdown"}` |
+| `SideQuestion` — ask the engine's fast role a side question | `{"op":"side_question","text":"why does the spill GC keep the newest file?"}` |
 | `Close` — close the engine and exit cleanly | `{"op":"close"}` |
 
 Field notes:
@@ -47,6 +50,23 @@ Field notes:
   worker's security overlay is applied **after** it and always wins.
 - `Open.scenario`: reserved for the scripted-speaker test scenario (contract
   tests, `spawn_with_speaker`); `null` in production.
+- `Open.auto_allow`: exact tool names that never ask (the daemon's approval
+  profile: reads, proposals and local writes); the worker inserts them as
+  allow rules ahead of every other rule. Absent = none.
+- `SessionDiff`, `ContextBreakdown`, `SideQuestion` (v0.12.2): the three
+  session queries. None starts a turn; each settles with its answer and
+  then `idle` — `context_breakdown` as the ka `context_breakdown` event,
+  the other two as ka `note` lines the port types by their marker
+  (`ka-port.md` §3). `side_question` is one provider call on the fast
+  role (`[roles] fast`).
+- Security overlay (always applied after the layer, always wins): `mode`
+  from `Open.mode` (else `ask`); `[tools.bash] background_after_ms = 0`;
+  `[features] disable` gains `tool:remember`, `tool:cron`, `tool:monitor`,
+  `tool:team`, `tool:checkpoint` and `tool:generate_image` (an entry the
+  layer already carries is not repeated); the `__guard` hooks; the
+  `kagent` MCP bridge (`mcp-bridge.md`). A `[permissions] profile`
+  activation in the layer refuses the open at composition time
+  (`ka-agent-port/src/engine_layer.rs`).
 
 ## 1.1 Worker lifetime and the idle reap
 
@@ -63,8 +83,13 @@ Verified by `idle_worker_is_stopped_then_restarted_on_demand` (chat e2e).
   exact hand names this turn may use (`null` = every tool the engine
   exposes). Absent = `null`, so an older daemon stays compatible.
 - `Answer.choice`: a **numeric index into the ask's `options`** in request
-  order (`0` = allow, `1` = always, `2` = deny for the standard engine
-  ordering). Remote channels never send the always index (gap G12).
+  order. A permission ask (`allow`, `always`, `deny`) takes `0` = allow,
+  `1` = always, `2` = deny — remote channels never send the always index
+  (gap G12). Any other ask on the same event (the engine's
+  `continue`/`stop` session guards, a checkpoint confirmation, an MCP
+  elicitation) is answered by its own options: `0` takes the first, the
+  last index is the decline, and the daemon never sends `always` for it
+  (`ka-port.md` §5).
 - After `open`, the daemon **must** send `set_mode` and `set_model` before
   the first `submit` (validation finding F-1; see `ka-port.md` §6).
 

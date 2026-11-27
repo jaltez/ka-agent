@@ -285,6 +285,25 @@ impl PortSession {
         self.send(WorkerCommand::UndoFile).await
     }
 
+    /// The cumulative file diff of this session (`/diff`). The answer
+    /// arrives as [`PortEvent::SessionDiff`], then [`PortEvent::Idle`].
+    pub async fn session_diff(&self) -> Result<(), super::PortError> {
+        self.send(WorkerCommand::SessionDiff).await
+    }
+
+    /// The context-usage breakdown (`/context`). The answer arrives as
+    /// [`PortEvent::ContextBreakdown`], then [`PortEvent::Idle`].
+    pub async fn context_breakdown(&self) -> Result<(), super::PortError> {
+        self.send(WorkerCommand::ContextBreakdown).await
+    }
+
+    /// Ask the fast role a side question (`/btw`). The answer arrives as
+    /// [`PortEvent::SideAnswer`] — a plain `Note` when the engine has no
+    /// `[roles] fast` — then [`PortEvent::Idle`].
+    pub async fn side_question(&self, text: String) -> Result<(), super::PortError> {
+        self.send(WorkerCommand::SideQuestion { text }).await
+    }
+
     /// Name (title) the session.
     pub async fn set_name(&self, name: String) -> Result<(), super::PortError> {
         self.send(WorkerCommand::SetName { name }).await
@@ -448,34 +467,46 @@ async fn stderr_task(
     }
 }
 
-/// SIGKILL a worker's process group. `unsafe_code` is forbidden in this
-/// workspace, so `libc::kill(2)` is out; `/bin/kill` signals the group
-/// via `-<pgid>` (the worker is its own group leader, pgid == pid) and
-/// Windows' `taskkill /T` walks the child tree the same way (plan 4.3).
-async fn kill_process_group(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
+/// SIGKILL a process tree, by its leader's pid — a worker's whole process
+/// group and a runtime shell gate's alike. `unsafe_code` is forbidden in
+/// this workspace, so `libc::kill(2)` is out: `/bin/kill` signals the
+/// group via `-<pgid>` (the leader heads its own group —
+/// `CommandExt::process_group(0)` — so pgid == pid) and Windows'
+/// `taskkill /T` walks the child tree the same way (plan 4.3).
+///
+/// `Err` only when the killer itself could not run. Its non-zero exit
+/// means there was nothing left to signal.
+pub fn kill_process_tree(pid: u32) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
     #[cfg(unix)]
-    let args: Vec<String> = vec!["-s".into(), "KILL".into(), "--".into(), format!("-{pid}")];
+    let (exe, args): (&str, Vec<String>) = (
+        "/bin/kill",
+        vec!["-s".into(), "KILL".into(), "--".into(), format!("-{pid}")],
+    );
     #[cfg(windows)]
-    let args: Vec<String> = vec![
-        "/T".into(), // the whole tree
-        "/F".into(),
-        "/PID".into(),
-        pid.to_string(),
-    ];
-    let exe = if cfg!(windows) {
-        "taskkill"
-    } else {
-        "/bin/kill"
-    };
-    let _ = Command::new(exe)
+    let (exe, args): (&str, Vec<String>) = (
+        "taskkill",
+        vec![
+            "/T".into(), // the whole tree
+            "/F".into(),
+            "/PID".into(),
+            pid.to_string(),
+        ],
+    );
+    Command::new(exe)
         .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(())
+}
+
+/// SIGKILL a worker's process group; a worker that is already gone
+/// (`pid` unset) is nothing to signal.
+async fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = kill_process_tree(pid);
+    }
 }
 
 #[cfg(test)]

@@ -16,8 +16,8 @@ mod events;
 mod session;
 
 pub use env::{GuardGrants, OpenRequest, StrandSelector, WorkerEnv};
-pub use events::PortEvent;
-pub use session::PortSession;
+pub use events::{PortEvent, SIDE_ANSWER_UNAVAILABLE};
+pub use session::{PortSession, kill_process_tree};
 
 use std::path::PathBuf;
 

@@ -156,6 +156,21 @@ pub enum WorkerCommand {
     },
     /// Compact the strand into a digest.
     Compact,
+    /// The cumulative file diff of this session (`/diff`). Read-only;
+    /// the answer is a ka note (`session diff: …`) the port projects to
+    /// `PortEvent::SessionDiff`.
+    SessionDiff,
+    /// The context-usage breakdown (`/context`). The answer is the ka
+    /// `context_breakdown` event the port projects to
+    /// `PortEvent::ContextBreakdown`.
+    ContextBreakdown,
+    /// Ask the fast role a side question (`/btw`): tools off, the answer
+    /// never enters the transcript. It arrives as a ka note (`btw: …`)
+    /// the port projects to `PortEvent::SideAnswer`.
+    SideQuestion {
+        /// The question text.
+        text: String,
+    },
     /// Close the engine and exit cleanly.
     Close,
 }
@@ -298,6 +313,11 @@ mod tests {
         round_trip(&WorkerCommand::Abort);
         round_trip(&WorkerCommand::SetModel {
             selector: "openai/gpt-5.2".into(),
+        });
+        round_trip(&WorkerCommand::SessionDiff);
+        round_trip(&WorkerCommand::ContextBreakdown);
+        round_trip(&WorkerCommand::SideQuestion {
+            text: "why does the spill GC keep the newest file?".into(),
         });
         round_trip(&WorkerCommand::SetMode {
             mode: "readonly".into(),

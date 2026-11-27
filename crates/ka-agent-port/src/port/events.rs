@@ -108,16 +108,54 @@ pub enum PortEvent {
     /// fallback hop, or a live selector change): surfaces show it as the
     /// model actually answering (F3).
     ModelChanged(String),
+    /// The context-usage breakdown answering `context_breakdown`
+    /// (`/context`): estimated tokens per component, in engine order,
+    /// plus the active window (0 = unknown). The engine appends
+    /// `hint:`-prefixed trim-opportunity rows: they are advice, not
+    /// usage, and surfaces leave them out of used/free totals.
+    ContextBreakdown {
+        /// `(component name, estimated tokens)`.
+        parts: Vec<(String, u64)>,
+        /// Context window of the active model (0 = unknown).
+        window: u64,
+    },
+    /// The fast role's answer to `side_question` (`/btw`). An engine
+    /// with no `[roles] fast` answers with a plain `Note`
+    /// (`side question unavailable`).
+    SideAnswer {
+        /// The answer text.
+        text: String,
+    },
+    /// The engine's answer to `session_diff` (`/diff`): the summary
+    /// line (`no changes`, or `N file(s), X +/- lines — full:
+    /// spill://<id>`), a blank line, then the 8k-capped excerpt. The
+    /// full diff is the spill file the pointer names
+    /// ([`crate::spill_path`]).
+    SessionDiff {
+        /// The summary line plus the excerpt.
+        summary: String,
+    },
+    /// An idle recap: what the fast role made of the session after
+    /// `[context] idle_minutes` of quiet (`recap.idle_minutes`). The
+    /// engine also records it on the strand (`x.ka.recap`). An engine
+    /// with no `[roles] fast` notes `idle recap unavailable: …` instead,
+    /// which stays a plain `Note`.
+    Recap {
+        /// The recap text.
+        text: String,
+    },
 }
 
 /// Map one ka event to its port projection; `None` drops it. Dropped by
 /// design: `session_info` (captured as strand identity), the bootstrap
 /// state echo (`model_changed`, `mode_changed`, `effort_changed`,
-/// `features_changed`), `context_breakdown`, call-kind deltas, and every
-/// surface-specific event. Bootstrap state is verified by contract tests,
-/// not streamed upward. `todos`, `context_meter`, `title`, `digest_*` and
-/// `inventory` project to their port forms (plan, context, title,
-/// compacting, inventory); the runtime decides what is broadcast.
+/// `features_changed`), call-kind deltas, and every surface-specific
+/// event. Bootstrap state is verified by contract tests, not streamed
+/// upward. `todos`, `context_meter`, `title`, `digest_*`, `inventory`
+/// and `context_breakdown` project to their port forms (plan, context,
+/// title, compacting, inventory, context breakdown); the answers ka
+/// carries on `Event::Note` are told apart in [`project_note`]; the
+/// runtime decides what is broadcast.
 pub(crate) fn map_ka_event(
     ev: ka_protocol::Event,
     strand_id: Option<&str>,
@@ -189,7 +227,14 @@ pub(crate) fn map_ka_event(
             tokens: usage.input + usage.output + usage.cache_read + usage.cache_write,
         },
         E::Idle => PortEvent::Idle,
-        E::Note { message } => PortEvent::Note(message),
+        E::ContextBreakdown { parts, window } => PortEvent::ContextBreakdown {
+            parts: parts
+                .into_iter()
+                .map(|part| (part.name, part.tokens))
+                .collect(),
+            window,
+        },
+        E::Note { message } => project_note(message),
         // A fallback hop or a live selector change must be visible: the
         // operator has to know which model actually answered (F3).
         E::ModelChanged { selector } => PortEvent::ModelChanged(selector),
@@ -205,6 +250,49 @@ pub(crate) fn map_ka_event(
         _ => return None,
     })
 }
+
+/// The prefixes ka puts on the notes that answer `side_question`
+/// (`Command::SideQuestion` → `btw: <answer>`), `session_diff`
+/// (`session diff: <summary>`), and on its idle recap (`idle recap:
+/// <recap>`) — ka `crates/ka-engine/src/engine.rs`. The engine has no
+/// event type for any of the three: each rides `Event::Note`, so the
+/// prefix is the one thing that sets them apart from every other note,
+/// and this is the only place that reads it. The engine's degrade notes
+/// (`side question unavailable`, `idle recap unavailable: …`) carry no
+/// answer and stay plain notes. Residual race, inherent to the wire: a
+/// note whose text something inside the engine controls (a `.ka/hooks`
+/// failure reason reaches `Event::Note` unprefixed) and that begins with
+/// one of these markers projects as that answer.
+const SIDE_ANSWER_PREFIX: &str = "btw: ";
+const SESSION_DIFF_PREFIX: &str = "session diff: ";
+const RECAP_PREFIX: &str = "idle recap: ";
+
+/// Project one ka note by its marker prefix (see the constants above).
+fn project_note(message: String) -> PortEvent {
+    if let Some(text) = message.strip_prefix(SIDE_ANSWER_PREFIX) {
+        PortEvent::SideAnswer {
+            text: text.to_string(),
+        }
+    } else if let Some(summary) = message.strip_prefix(SESSION_DIFF_PREFIX) {
+        PortEvent::SessionDiff {
+            summary: summary.to_string(),
+        }
+    } else if let Some(text) = message.strip_prefix(RECAP_PREFIX) {
+        PortEvent::Recap {
+            text: text.to_string(),
+        }
+    } else {
+        PortEvent::Note(message)
+    }
+}
+
+/// The marker of the engine's reply to a `side_question` it could not
+/// take — no `[roles] fast`, a failed or empty call. It carries no
+/// answer, so [`project_note`] leaves it a plain `Note`; but it is what
+/// the engine says to the command, and a runtime with a `/btw` in
+/// flight recognizes it by this prefix. Named here so the engine's
+/// markers stay in one crate.
+pub const SIDE_ANSWER_UNAVAILABLE: &str = "side question unavailable";
 
 fn stop_word(stop: ka_protocol::Stop) -> String {
     match stop {
@@ -394,6 +482,139 @@ mod tests {
                 stop: "aborted".into(),
                 cost_usd: 0.5,
                 tokens: 26,
+            })
+        );
+    }
+
+    /// The three answers ka carries on `Event::Note` project by their
+    /// marker prefix, and by nothing else: the engine's degrade notes
+    /// and any other note stay `Note`s.
+    #[test]
+    fn note_markers_project_the_three_answers() {
+        assert_eq!(
+            map_ka_event(
+                Event::Note {
+                    message: "btw: the spill GC keeps the newest file because …".into(),
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::SideAnswer {
+                text: "the spill GC keeps the newest file because …".into()
+            })
+        );
+        let summary = "1 file(s), 3 +/- lines — full: spill://1730000000000-0\n\n+hi";
+        assert_eq!(
+            map_ka_event(
+                Event::Note {
+                    message: format!("session diff: {summary}"),
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::SessionDiff {
+                summary: summary.into()
+            })
+        );
+        assert_eq!(
+            map_ka_event(
+                Event::Note {
+                    message: "session diff: no changes".into(),
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::SessionDiff {
+                summary: "no changes".into()
+            })
+        );
+        assert_eq!(
+            map_ka_event(
+                Event::Note {
+                    message: "idle recap: Fixing the parser; tests pending.".into(),
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::Recap {
+                text: "Fixing the parser; tests pending.".into()
+            })
+        );
+
+        // The markers are whole words: a near-miss is an ordinary note.
+        for plain in [
+            "side question unavailable",
+            "idle recap unavailable: no [roles] fast configured",
+            "idle recap unavailable: fast role failed",
+            "session diff",
+            "a btw: answer inside a sentence",
+            "idle_recap: underscored",
+            "↩ recovered interrupted turn",
+        ] {
+            let expected = PortEvent::Note(plain.to_string());
+            assert_eq!(
+                map_ka_event(
+                    Event::Note {
+                        message: plain.to_string(),
+                    },
+                    None,
+                    None
+                ),
+                Some(expected),
+                "{plain:?}"
+            );
+        }
+        // The unavailable reply stays a `Note` — and the marker a runtime
+        // matches a pending `/btw` on is exactly that first note.
+        assert!("side question unavailable".starts_with(SIDE_ANSWER_UNAVAILABLE));
+    }
+
+    #[test]
+    fn context_breakdown_projects_name_and_tokens() {
+        assert_eq!(
+            map_ka_event(
+                Event::ContextBreakdown {
+                    parts: vec![
+                        ka_protocol::ContextPart {
+                            name: "system".into(),
+                            tokens: 3_000,
+                        },
+                        ka_protocol::ContextPart {
+                            name: "tools".into(),
+                            tokens: 1_200,
+                        },
+                        ka_protocol::ContextPart {
+                            name: "hint:shake".into(),
+                            tokens: 40,
+                        },
+                    ],
+                    window: 200_000,
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::ContextBreakdown {
+                parts: vec![
+                    ("system".into(), 3_000),
+                    ("tools".into(), 1_200),
+                    ("hint:shake".into(), 40),
+                ],
+                window: 200_000,
+            })
+        );
+        // An unknown window is 0, not a dropped event.
+        assert_eq!(
+            map_ka_event(
+                Event::ContextBreakdown {
+                    parts: Vec::new(),
+                    window: 0,
+                },
+                None,
+                None
+            ),
+            Some(PortEvent::ContextBreakdown {
+                parts: Vec::new(),
+                window: 0,
             })
         );
     }

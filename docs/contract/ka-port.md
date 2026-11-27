@@ -3,10 +3,11 @@
 Status: M1 contract, 2026-10-15. This document defines the *only* surface
 through which Ka Agent talks to a Ka engine. Everything above `ka-agent-port`
 is written against the `KaPort` trait; swapping the boundary implementation
-(e.g. to `ka serve` once it qualifies, SEED §3.4) must stay a one-crate change.
+must stay a one-crate change (SEED §3.4).
 
 Evidence paths (`crates/…`) point into the Ka repository at commit
-`a56aae2d1b3a4c31c4910979e1033002eacc53a0`. Runtime probes (V-xx) are in
+`a56aae2d1b3a4c31c4910979e1033002eacc53a0`; paths marked *v0.12.2* point at
+the pinned revision `f41ecf9`. Runtime probes (V-xx) are in
 `docs/ka-interface-validation.md`.
 
 The wire format between the daemon and the worker process is specified in
@@ -35,7 +36,7 @@ to what they send over the worker protocol (`worker-protocol.md`):
 |---|---|---|
 | `open` | engine spawn + attach (`StrandSel::{New,Path}`) | Start or resume one engine on one strand, with explicit model/mode and Ka Agent's config layers. Returns a handle carrying the strand id (from `session_info`). |
 | `submit` | `prompt` | Begin one prompt cycle. Returns the span descriptor; live output is the event stream until `idle`. |
-| `answer` | `answer` | Resolve a pending Ka `ask` (`allow` / `always` / `deny`). |
+| `answer` | `answer` | Resolve a pending Ka `ask` by option index, decided by the ask's shape: a permission ask keeps `allow` / `always` / `deny` (0 / 1 / 2); any other ask takes `0` for allow and its last option — the decline — for deny (§5). |
 | `abort` | `abort` | Cancel the running prompt cycle; engine emits `turn_finished{stop:"aborted"}` then `idle`. |
 | `set_mode` | `set_mode` | Set permission mode; persists a `Change` record to the strand. |
 | `set_model` | `set_model` | Set model selector; persists a `Change` record to the strand. |
@@ -44,13 +45,17 @@ to what they send over the worker protocol (`worker-protocol.md`):
 | `steer` | `steer` | Queue text into the **live** cycle — the engine drains it at turn/tool boundaries and settles unconsumed steers into the session queue (`busy_messages = "steer"` default; not a second `submit`, so the single-writer rule holds). |
 | `undo_file` | `undo_file` | Ask the engine to revert its last file edit. |
 | `compact` | `compact` | Compact the strand into a digest (offered on `overflow`). |
+| `session_diff` | `session_diff` | The session's cumulative file diff (`/diff`): every file the session mutated, its pre-mutation original against the disk. Read-only. The answer is `SessionDiff`, then `idle` (§3). |
+| `context_breakdown` | `context_breakdown` | The context-usage breakdown (`/context`). The answer is `ContextBreakdown`, then `idle` (§3). |
+| `side_question` | `side_question` | Ask the engine's fast role (`[roles] fast`) a side question (`/btw`): tools off, the transcript and the context untouched, one provider call on the fast model. The answer is `SideAnswer`, then `idle` (§3). |
 | `close` | session drop | Close the engine and release the strand. |
 
 ## 2. Allowed command subset and the trust invariant
 
 **[Requirement]** Ka Agent forwards only these Ka `Command`s: `prompt`,
 `answer`, `abort`, `set_mode`, `set_model`, `set_name`, `set_effort`,
-`steer`, `undo_file`, `compact`.
+`steer`, `undo_file`, `compact`, `session_diff`, `context_breakdown`,
+`side_question` (the last three since the v0.12.2 pin).
 
 Everything else in Ka's `Command` enum is engine-internal or local-only, and
 **is NEVER forwarded**:
@@ -60,7 +65,13 @@ Everything else in Ka's `Command` enum is engine-internal or local-only, and
 - `set_feature`, `set_sandbox` — local-only surface controls
   (`crates/ka-protocol/src/lib.rs:355-379`);
 - `save_api_key`, `save_settings` — write configuration files
-  (`crates/ka-protocol/src/lib.rs:428-464`).
+  (`crates/ka-protocol/src/lib.rs:428-464`);
+- the session-scoped automation — `goal`, `loop`, `checkpoint` /
+  `restore_checkpoint`, `tan`, `switch_strand`, `fork_strand` — which
+  would run inside the engine with no principal, budget or run row, and
+  outside the daemon's scheduler and cancellation. The worker's overlay
+  disables the matching hands (`cron`, `monitor`, `team`, `checkpoint`;
+  `worker-protocol.md` §1).
 
 **Trust invariant:** no input arriving from a channel (Telegram today) can
 ever cause one of these commands to be sent. The port API above simply has no
@@ -73,19 +84,39 @@ gap G12); durable grants live in Ka Agent's own rules layer instead.
 
 | Ka event | PortEvent | Notes |
 |---|---|---|
-| `session_info` | `Bootstrap::Info{strand_id, …}` | Strand id capture; arrives first (probe V-03). |
-| `mode_changed`, `effort_changed`, `model_changed` | `Bootstrap::State{…}` | Bootstrap state echo. |
-| `replay` | `Bootstrap::Replay{…}` | Exactly one per attach (`crates/ka-protocol/src/lib.rs:561-566`). Never forwarded to a channel; used only for continuity checking (SEED §3.7). |
-| `inventory`, `todos`, `title`, `presence` | `Bootstrap::Meta{…}` | Post-replay metadata. |
-| `turn_started` | `TurnStarted{turn}` | Start of a turn inside the live cycle. |
-| `delta` (text/thought/call) | `Delta{kind, text}` | Streaming output. |
-| `call_started` / `call_output` / `call_finished` | `ToolCall{…}` phases | Tool activity rendering. |
-| `context_meter` | `ContextMeter{…}` | Budget accounting. |
-| `turn_finished` | `TurnFinished{stop, usage}` | Includes usage/cost; `stop ∈ {done, aborted, error, …}`. |
-| `ask` | `Ask{ask_id, subject, choices}` | Permission prompt; see §5. |
-| `error` | `Error{class, retryable, message}` | See §7. |
+| `session_info` | — (captured) | Strand identity: the worker resolves the id to its file and reports it as the `strand` line (`worker-protocol.md` §1); it fills `strand_id` / `strand_path` on the next `Bootstrap`. Arrives first (probe V-03). |
+| `replay` | `Bootstrap{strand_id, strand_path, replay_messages}` | Exactly one per attach. Never forwarded to a channel; used only for continuity checking (SEED §3.7). |
+| `mode_changed`, `effort_changed`, `features_changed` | — (dropped) | Bootstrap state echo, verified by contract tests rather than streamed. |
+| `model_changed` | `ModelChanged(selector)` | A fallback hop or a live selector change: surfaces show the model actually answering (F3). |
+| `inventory` | `Inventory{tools}` | The hands this engine offers (after the layer, the role's allowlist and the worker's overlay). |
+| `todos` | `Plan([(text, state)])` | Whole-list replacement, display order. |
+| `title` | `Title(title)` | |
+| `digest_started` / `digest_finished` | `Compacting{done}` | |
+| `turn_started` | `TurnStarted` | Start of a turn inside the live cycle. |
+| `delta` (text / thought) | `DeltaText(text)` / `DeltaThought(text)` | Streaming output. |
+| `delta` (call) | — (dropped) | `CallStarted` carries the same call. |
+| `call_started` / `call_finished` / `call_output` | `CallStarted{tool, id, detail}` / `CallFinished{tool, id, ok}` / `CallOutput{tool, id, excerpt, is_error}` | Tool activity rendering. |
+| `context_meter` | `Context{used, window}` | Budget accounting. |
+| `context_breakdown` | `ContextBreakdown{parts, window}` | The answer to `context_breakdown` (v0.12.2): `(name, tokens)` per component in engine order, `window` of the model in use (0 = unknown). |
+| `turn_finished` | `TurnFinished{stop, cost_usd, tokens}` | `tokens` sums input + output + cache read + cache write; `stop ∈ {done, length, aborted, error}`. |
+| `ask` | `Ask{ask_id, question, detail, options}` | The first question, verbatim: a permission prompt, or any other question the engine poses on the same event; see §5. |
+| `note` | `Note(text)` | Informational. Three notes carry an answer instead (below). |
+| `note` starting `btw: ` | `SideAnswer{text}` | The answer to `side_question`, the fast role's text with the marker removed. |
+| `note` starting `session diff: ` | `SessionDiff{summary}` | The answer to `session_diff`: `no changes`, or `N file(s), X +/- lines — full: spill://<id>`, a blank line, an 8k-capped excerpt. The full diff is the spill file: `ka_agent_port::spill_path(state_dir, pointer)` resolves the pointer under the worker's `XDG_STATE_HOME` (`<state>/ka/spills/<id>`, where ka parks spills). |
+| `note` starting `idle recap: ` | `Recap{text}` | An idle recap (`recap.idle_minutes`): what the fast role made of the session after the quiet interval; also recorded on the strand as `x.ka.recap`. |
+| `error` | `EngineError{class, retryable, message}` | See §7. A worker `Fatal` arrives as `EngineError{class: "fatal"}`. |
 | `idle` | `Idle` | **Prompt-cycle boundary**; see §4. |
-| unknown / future event types | `Unknown{raw}` | Lenient decode (gap G7: closed enums, no version field). Never fatal. |
+| `presence`, `shell_output`, `tasks`, `task_detail`, `debug_roster` | — (dropped) | Surface-specific. |
+| an undecodable line | — (dropped) | Lenient decode (gap G7: closed enums, no version field): the reader skips a line it cannot decode and keeps reading (`crates/ka-agent-port/src/port/session.rs`, `reader_task`). Never fatal, and never surfaced — there is no `Unknown` variant. |
+
+**Answers carried on notes (v0.12.2).** The engine has no event type for
+the `side_question` and `session_diff` answers or for an idle recap: each
+rides `note` with a marker prefix. The prefix is read in exactly one place
+(`crates/ka-agent-port/src/port/events.rs`, `project_note`); the engine's
+degrade notes (`side question unavailable`, `idle recap unavailable: …`)
+carry no answer and stay `Note`s. The markers are engine-authored, but a
+note is plain text: a `.ka/hooks` failure reason reaches `note` unprefixed,
+so a hook that prints one of these prefixes projects as that answer.
 
 **Bootstrap vs live:** on attach, everything up to and including `replay` (plus
 the post-replay metadata burst) is *bootstrap*: replayed history, not new
@@ -131,21 +162,35 @@ construction. (The refusal is runtime-owned; there is no `PortError::Busy`
 variant — the enum is `Spawn/Io/Protocol/Closed/EngineClosed`,
 `crates/ka-agent-port/src/port/mod.rs:30-50`.)
 
-## 5. Asks: TTL and deny-on-expiry
+## 5. Asks: shape, TTL and deny-on-expiry
 
 Ka asks block the engine until `answer` or `abort`, with **no timeout** (gap
 G3; `crates/ka-engine/src/voice.rs:2786-2823`). Ka Agent therefore owns expiry:
 
+**[Requirement — ask shape]** Ka Agent answers an ask by its shape
+(`crates/ka-agent-core/src/approval.rs`, `is_permission_ask` and
+`ka_choice_for`). A **permission ask** is an ask whose options are exactly
+`allow`, `always`, `deny` — the only kind a grant may answer (`always`,
+allow-for-session and the durable rules of `grants.md`). Every other ask
+arrives on the same `ask` event with its own options and ends with its
+decline option: the engine's `continue`/`stop` session guards, a
+checkpoint-restore confirmation, an MCP elicitation. For those, `allow`
+answers index 0 (the first option), `deny` the last index (the decline),
+`always` is refused, and the card shows the ask's own options. An ask that
+offers no option is never answered by index — the cycle is aborted instead,
+because the engine takes an index as it comes.
+
 - each `ask` becomes an approval card with `approval_ttl_secs` (daemon config,
   default 900 s);
-- if the TTL lapses with no operator decision, Ka Agent answers **`deny`**
-  (fail closed) and records the expiry in the audit log;
+- if the TTL lapses with no operator decision, Ka Agent answers the ask's
+  **decline** (`deny` on a permission ask; fail closed) and records the
+  expiry in the audit log;
 - `abort` while awaiting an ask is allowed and cancels the cycle;
 - an `ask` that arrives when no turn is open (the engine reported `idle`
-  before its gate, or the turn already finished) is answered **`deny`**
-  immediately and recorded as a settled approval: no surface could act on it,
-  and leaving it pending would block the engine on its permission gate
-  forever.
+  before its gate, or the turn already finished) is answered its
+  **decline** immediately and recorded as a settled approval: no surface
+  could act on it, and leaving it pending would block the engine on its
+  ask forever.
 
 ## 6. Resume and mandatory re-assertion
 
