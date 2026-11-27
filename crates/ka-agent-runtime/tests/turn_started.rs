@@ -162,6 +162,17 @@ async fn one_turn_started_per_live_turn() {
     })
     .await;
 
+    // The scripted speaker's steps belong to one worker process, so a
+    // worker kept across both turns would answer the second one empty and
+    // the empty-answer nudge would start a third turn — a race that has
+    // nothing to do with the announcement contract under test. Stopping the
+    // idle worker between turns respawns it on the next message, with a
+    // fresh scenario, exactly as the idle reap does in production.
+    assert!(
+        rt.stop_idle_worker_for(&op()).await,
+        "the first worker stops while idle"
+    );
+
     // The router resolves every source to a user: link this one (an
     // unlinked sender is refused silently, as on the channels).
     store
@@ -174,7 +185,11 @@ async fn one_turn_started_per_live_turn() {
     let turns = store
         .latest_turns_for_session(&rt.session_id_for(&op()).unwrap(), 10, 0)
         .unwrap();
-    assert_eq!(turns.len(), 2, "two runtime turns were recorded");
+    assert_eq!(
+        turns.len(),
+        2,
+        "two runtime turns were recorded; rows: {turns:#?}"
+    );
     assert_eq!(
         starts(&events),
         vec![
