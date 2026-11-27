@@ -777,6 +777,7 @@ mod tests {
             channels: Vec::new(),
             private: false,
             throttled_since_ms: None,
+            last_recap: None,
         });
         absorb(&mut v, &AgentEvent::Hello { report }, false);
         assert!(

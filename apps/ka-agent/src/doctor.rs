@@ -269,6 +269,30 @@ pub fn doctor(
         }
         None => rep.fail("no model — run `ka-agent setup`".into()),
     }
+    // Fast role: `auto_review` and the idle recaps run on `[roles] fast`.
+    // Without one the engine skips them silently, so say when they are on
+    // and inert.
+    if let Some(c) = &cfg
+        && (c.approvals.auto_review || c.recap.idle_minutes > 0)
+    {
+        let user_layer = c
+            .engine_layer_path()
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        let what = if c.approvals.auto_review {
+            "auto-review"
+        } else {
+            "idle recaps"
+        };
+        if ka_agent_port::engine_layer::has_fast_role(c, user_layer.as_deref()) {
+            rep.ok(format!("fast role set ({what})"));
+        } else {
+            rep.warn(&format!(
+                "{what} on but inert: no fast role — set background_model \
+                 (`ka-agent config set background_model '<provider/model>'`) \
+                 or [roles] fast in the engine layer"
+            ));
+        }
+    }
 
     // Capabilities the engine gets from Ka Agent's config.
     if let Some(cfg) = &cfg {

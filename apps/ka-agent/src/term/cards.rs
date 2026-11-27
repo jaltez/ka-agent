@@ -4,6 +4,7 @@
 //! and skill proposals: y keep · n discard).
 
 use super::paint;
+use ka_agent_core::approval::is_permission_ask;
 use ka_agent_runtime::{AgentEvent, Envelope};
 
 /// Print the card an envelope carries, when it carries one.
@@ -13,8 +14,8 @@ pub fn print_card(env: &Envelope) {
             id,
             question,
             detail,
+            options,
             expires_at_ms,
-            ..
         } => {
             let left = (expires_at_ms - ka_agent_core::now_ms()).max(0) / 60_000;
             println!(
@@ -29,10 +30,15 @@ pub fn print_card(env: &Envelope) {
             {
                 println!("{}", paint::dim(&format!("│ {detail}")));
             }
-            println!(
-                "{}",
-                paint::dim("└ y allow · n deny · s allow for this session")
-            );
+            // A permission ask has the engine's fixed `allow · always ·
+            // deny` triple; any other ask (MCP elicitation) has its own
+            // options, where `y` takes the first and `n` declines.
+            let hint = if is_permission_ask(options) {
+                "└ y allow · n deny · s allow for this session"
+            } else {
+                "└ y accept the first option · n decline"
+            };
+            println!("{}", paint::dim(hint));
         }
         AgentEvent::MemoryProposal { id, text } => {
             println!(
