@@ -124,6 +124,7 @@ impl Runtime {
             tokio::time::sleep(wait).await;
         }
         let (req, session, was_private) = self.prepare_open(who, &state, &cfg)?;
+        let worker_state_dir = req.env.state_dir.clone();
         let _ = was_private;
         let opened = match self.sh.port.open(req.clone()).await {
             Ok(p) => p,
@@ -158,6 +159,8 @@ impl Runtime {
                 last_call: None,
                 turn_from_nudge: false,
                 thought_tail: String::new(),
+                state_dir: worker_state_dir,
+                op: None,
             });
         }
         tokio::spawn(drive(
@@ -307,14 +310,23 @@ impl Runtime {
         // Ka Agent's own engine features (search, fallback, MCP servers, the
         // profile's and the role's feature toggles) join the operator's
         // layer; `secret:` values resolve here, in memory, from the secret
-        // store.
+        // store. The user's model policy (their groups' allowlist — the
+        // one `/model` enforces) narrows the models the layer names on
+        // their behalf: the fallback chain and the fast role. The
+        // operator is held to no role policy.
         let secrets_dir = self.sh.paths.root().join("secrets");
         let role_spec = (role != ka_agent_core::ADMIN_ROLE).then(|| self.effective_role(&role));
+        let (model_allow, _) = if is_admin {
+            (Vec::new(), None)
+        } else {
+            self.sh.store.model_policy_for(&who.username)?
+        };
         let engine_layer_toml = ka_agent_port::engine_layer::compose_for_role(
             cfg,
             role_spec.as_ref(),
             user_layer.as_deref(),
             &|name| ka_agent_core::secret::resolve(name, &secrets_dir).map_err(|e| e.to_string()),
+            &|model| ka_agent_store::model_allowed(&model_allow, model),
         )
         .map_err(Error::Refused)?;
         let selector = match (&session.strand_path, session.strand_id.as_ref()) {

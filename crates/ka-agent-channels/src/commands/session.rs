@@ -763,3 +763,50 @@ pub(super) fn run_archive<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
         }
     })
 }
+
+/// `/diff`: the session's cumulative file diff. The engine answers with
+/// the summary (and the whole diff as an attachment when it spills).
+pub(super) fn run_diff<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        match ctx.runtime.session_diff(&ctx.principal, ctx.source).await {
+            Ok(()) => Outcome::Silent,
+            Err(e) => Outcome::Reply(format!("! [diff] {e}")),
+        }
+    })
+}
+
+/// `/context`: what fills the context window, from the engine's meter.
+pub(super) fn run_context<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        match ctx
+            .runtime
+            .context_breakdown(&ctx.principal, ctx.source)
+            .await
+        {
+            Ok(()) => Outcome::Silent,
+            Err(e) => Outcome::Reply(format!("! [context] {e}")),
+        }
+    })
+}
+
+/// `/btw <question>`: a quick side question on the engine's fast model —
+/// no tools, and neither the transcript nor the context sees it.
+pub(super) fn run_btw<'a>(ctx: Ctx<'a>) -> CmdFuture<'a> {
+    Box::pin(async move {
+        let question = ctx.args.trim();
+        if question.is_empty() {
+            return Outcome::Reply(
+                "usage: /btw <question> — asks the fast model without tools, off the transcript"
+                    .into(),
+            );
+        }
+        match ctx
+            .runtime
+            .side_question(&ctx.principal, question, ctx.source)
+            .await
+        {
+            Ok(()) => Outcome::Silent,
+            Err(e) => Outcome::Reply(format!("! [btw] {e}")),
+        }
+    })
+}

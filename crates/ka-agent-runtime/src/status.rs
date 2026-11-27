@@ -58,6 +58,10 @@ pub struct StatusReport {
     /// runtime keeps retrying in-engine; the next settled turn clears it.
     #[serde(default)]
     pub throttled_since_ms: Option<i64>,
+    /// The latest idle recap (`recap.idle_minutes`), when the session
+    /// kept one; private conversations never do.
+    #[serde(default)]
+    pub last_recap: Option<LastRecap>,
 }
 
 /// One channel's poll health (`status` renders failing channels).
@@ -69,6 +73,15 @@ pub struct ChannelHealth {
     pub ok_since_ms: i64,
     /// The last poll error, when the link has not recovered since.
     pub last_error: Option<String>,
+}
+
+/// The latest idle recap the engine's fast role wrote for a session
+/// (`recap.idle_minutes`): where the work stands, and when it said so.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LastRecap {
+    pub text: String,
+    /// When the engine answered (ms since epoch).
+    pub at_ms: i64,
 }
 
 /// How full the compiled memory is (it truncates silently past the budget).
@@ -273,6 +286,13 @@ impl StatusReport {
         if let Some(version) = &self.update_available {
             out.push_str(&format!("\nupdate available: {version} — /update"));
         }
+        if let Some(recap) = &self.last_recap {
+            let at = jiff::Timestamp::from_millisecond(recap.at_ms)
+                .map(|t| t.to_zoned(now.time_zone().clone()))
+                .map(|z| format!("{:02}:{:02}", z.hour(), z.minute()))
+                .unwrap_or_else(|_| "--:--".to_string());
+            out.push_str(&format!("\nrecap {at}: {}", recap.text));
+        }
         out
     }
 }
@@ -339,6 +359,7 @@ mod tests {
             update_available: None,
             channels: Vec::new(),
             throttled_since_ms: None,
+            last_recap: None,
         }
     }
 

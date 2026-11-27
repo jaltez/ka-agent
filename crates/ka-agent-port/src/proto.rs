@@ -339,6 +339,31 @@ mod tests {
             serde_json::to_string(&WorkerCommand::Close).unwrap(),
             r#"{"op":"close"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&WorkerCommand::SessionDiff).unwrap(),
+            r#"{"op":"session_diff"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkerCommand::ContextBreakdown).unwrap(),
+            r#"{"op":"context_breakdown"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkerCommand::SideQuestion {
+                text: "why?".into()
+            })
+            .unwrap(),
+            r#"{"op":"side_question","text":"why?"}"#
+        );
+        // the bare ops carry no fields: an older line with extras still
+        // decodes, a bare line is all the daemon ever writes
+        assert_eq!(
+            from_line::<WorkerCommand>(r#"{"op":"session_diff"}"#).unwrap(),
+            WorkerCommand::SessionDiff
+        );
+        assert_eq!(
+            from_line::<WorkerCommand>(r#"{"op":"context_breakdown"}"#).unwrap(),
+            WorkerCommand::ContextBreakdown
+        );
         let set_mode = serde_json::to_string(&WorkerCommand::SetMode {
             mode: "allow".into(),
         })

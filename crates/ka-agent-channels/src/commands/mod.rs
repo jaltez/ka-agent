@@ -104,6 +104,36 @@ pub const COMMANDS: &[CommandSpec] = &[
         run: session::run_status,
     },
     CommandSpec {
+        name: "diff",
+        args: "",
+        summary: "the session's cumulative file diff (the whole diff is attached)",
+        example: "/diff",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_diff,
+    },
+    CommandSpec {
+        name: "context",
+        args: "",
+        summary: "what fills the context window (system, user, assistant, tools)",
+        example: "/context",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_context,
+    },
+    CommandSpec {
+        name: "btw",
+        args: "<question>",
+        summary: "a quick side question on the fast model, off the transcript",
+        example: "/btw what changed today?",
+        telegram: true,
+        aliases: &[],
+        reach: Reach::Everywhere,
+        run: session::run_btw,
+    },
+    CommandSpec {
         name: "new",
         args: "[private]",
         summary: "start a fresh session (stops the current worker); `private` = incognito — nothing is remembered",
@@ -683,6 +713,30 @@ mod tests {
         assert_eq!(
             route(&runtime, "console", "/quit").await,
             Outcome::Reply("/quit leaves the terminal chat — nothing to quit here".into())
+        );
+    }
+
+    #[test]
+    fn session_context_commands_are_registered() {
+        for name in ["diff", "context", "btw"] {
+            assert!(
+                COMMANDS.iter().any(|c| c.name == name),
+                "/{name} is not registered"
+            );
+        }
+        // /btw needs its question; without one it explains the usage.
+        assert!(help_for("btw").unwrap().contains("/btw <question>"));
+    }
+
+    #[tokio::test]
+    async fn btw_without_a_question_explains_its_usage() {
+        let runtime = test_runtime();
+        assert_eq!(
+            route(&runtime, "console", "/btw").await,
+            Outcome::Reply(
+                "usage: /btw <question> — asks the fast model without tools, off the transcript"
+                    .into()
+            )
         );
     }
 

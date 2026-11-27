@@ -44,6 +44,7 @@ mod policy;
 mod roles;
 mod scheduler;
 mod scout;
+mod session_ops;
 mod worker;
 
 use config::publish_timezone;
@@ -147,6 +148,12 @@ struct Live {
     /// [`THOUGHT_TAIL_MAX`] characters: what an empty-final give-up can
     /// quote as the model's last notes.
     thought_tail: String,
+    /// The worker's state dir (spills, the change journal): `spill://`
+    /// pointers in a `/diff` answer resolve under it.
+    state_dir: std::path::PathBuf,
+    /// A session command (`/diff`, `/context`, `/btw`) waiting for the
+    /// engine's typed answer on the event pump.
+    op: Option<session_ops::PendingOp>,
 }
 
 /// One user's conversational state: what `Inner` carried when the daemon
@@ -766,6 +773,7 @@ impl Runtime {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             channels,
+            last_recap: session_ops::last_recap(&self.sh.store, &sid).ok().flatten(),
         })
     }
 

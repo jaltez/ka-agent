@@ -557,3 +557,134 @@ async fn policy_reassert_after_replay() {
     );
     second.close().await.unwrap();
 }
+
+/// 8. The security overlay on a real engine: the inventory carries
+///    `tool_search` and none of the hands the worker disables.
+#[tokio::test]
+async fn inventory_lists_tool_search_and_none_of_the_disabled_hands() {
+    let env = Env::new("inventory");
+    let scenario = env.scenario("scen", r#"{"steps":[{"text":"hi"}]}"#);
+    let (session, mut rx) =
+        open_session(env.open(StrandSelector::New, None, None, Some(scenario))).await;
+    let events = collect_until(&mut rx, |e| matches!(e, PortEvent::Inventory { .. })).await;
+    let Some(PortEvent::Inventory { tools }) = events
+        .iter()
+        .find(|e| matches!(e, PortEvent::Inventory { .. }))
+    else {
+        unreachable!()
+    };
+    assert!(tools.iter().any(|t| t == "tool_search"), "{tools:?}");
+    for hand in [
+        "cron",
+        "monitor",
+        "team",
+        "checkpoint",
+        "remember",
+        "generate_image",
+    ] {
+        assert!(
+            !tools.iter().any(|t| t == hand),
+            "{hand} is off in the overlay: {tools:?}"
+        );
+    }
+    // The always-on hands are still offered.
+    for hand in ["read", "write", "bash", "todo"] {
+        assert!(tools.iter().any(|t| t == hand), "{hand}: {tools:?}");
+    }
+    session.close().await.unwrap();
+}
+
+/// 9. `context_breakdown` is answered through the worker protocol: the
+///    ka event projects to typed parts and the active window, then the
+///    cycle settles with `Idle`.
+#[tokio::test]
+async fn context_breakdown_is_answered_through_the_protocol() {
+    let env = Env::new("breakdown");
+    let scenario = env.scenario("scen", r#"{"steps":[{"text":"hi"}]}"#);
+    // The scenario model is the session model, and one turn has run: the
+    // engine measures the context of the model that answered (0s before
+    // the first turn).
+    let (session, mut rx) =
+        open_session(env.open(StrandSelector::New, Some("scen/m"), None, Some(scenario))).await;
+    collect_until(&mut rx, |e| matches!(e, PortEvent::Bootstrap { .. })).await;
+    session
+        .submit("hello".to_string(), Vec::new(), Vec::new())
+        .await
+        .unwrap();
+    collect_until_idle(&mut rx).await;
+
+    session.context_breakdown().await.unwrap();
+    let events = collect_until(&mut rx, |e| matches!(e, PortEvent::ContextBreakdown { .. })).await;
+    let Some(PortEvent::ContextBreakdown { parts, window }) = events
+        .iter()
+        .find(|e| matches!(e, PortEvent::ContextBreakdown { .. }))
+    else {
+        unreachable!()
+    };
+    // The scenario row's window, passed through, and the engine's four
+    // buckets in its order (trim hints may follow).
+    assert_eq!(*window, 1_000_000, "{events:?}");
+    let names: Vec<&str> = parts.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        &names[..4],
+        &["system", "user", "assistant", "tools"],
+        "{parts:?}"
+    );
+    let user = parts.iter().find(|(name, _)| name == "user").unwrap().1;
+    assert!(user > 0, "the prompt is in the context: {parts:?}");
+    // The cycle settles behind the answer.
+    let rest = collect_until(&mut rx, |e| matches!(e, PortEvent::Idle)).await;
+    assert!(
+        rest.last().is_some_and(|e| matches!(e, PortEvent::Idle)),
+        "the cycle settles: {rest:?}"
+    );
+    session.close().await.unwrap();
+}
+
+/// 10. `session_diff` is answered with a typed summary, and the full
+///     diff is the spill file its pointer names under the worker's state
+///     dir — the layout ka's own `spills_root` writes.
+#[tokio::test]
+async fn session_diff_answer_names_a_spill_file_the_daemon_can_read() {
+    let env = Env::new("diff");
+    // free mode: the write runs ungated
+    let scenario = env.scenario(
+        "scen",
+        r#"{"steps":[{"call":{"tool":"write","args":{"path":"notes.txt","content":"hello\n"}}},{"text":"done"}]}"#,
+    );
+    let (session, mut rx) =
+        open_session(env.open(StrandSelector::New, None, Some("free"), Some(scenario))).await;
+    collect_until(&mut rx, |e| matches!(e, PortEvent::Bootstrap { .. })).await;
+    session
+        .submit("write a note".to_string(), Vec::new(), Vec::new())
+        .await
+        .unwrap();
+    collect_until_idle(&mut rx).await;
+    assert_eq!(
+        std::fs::read_to_string(env.workspace().join("notes.txt")).unwrap(),
+        "hello\n"
+    );
+
+    session.session_diff().await.unwrap();
+    let events = collect_until(&mut rx, |e| matches!(e, PortEvent::Idle)).await;
+    let Some(PortEvent::SessionDiff { summary }) = events
+        .iter()
+        .find(|e| matches!(e, PortEvent::SessionDiff { .. }))
+    else {
+        panic!("no session diff in {events:?}")
+    };
+    assert!(summary.starts_with("1 file(s), "), "{summary}");
+    let (_, rest) = summary
+        .split_once("full: ")
+        .expect("the note carries a spill pointer");
+    let pointer = rest.split_whitespace().next().unwrap();
+    assert!(pointer.starts_with("spill://"), "{pointer}");
+    let path = ka_agent_port::spill_path(&env.root.join("state"), pointer)
+        .unwrap_or_else(|| panic!("not a spill pointer: {pointer:?}"));
+    let full = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        full.contains("notes.txt") && full.contains("+hello"),
+        "{full}"
+    );
+    session.close().await.unwrap();
+}

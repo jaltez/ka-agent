@@ -1,14 +1,16 @@
 // Event pump, one per live worker: port events -> that user's state + store +
 // surface, turn lifecycle, final-answer chunking. Split from runtime.rs
 // (moves only).
-use super::approvals::session_allow_key;
+use super::approvals::{PendingAsk, answer_ask, ask_options, session_allow_key};
 use super::intake::drain_queue;
 use super::policy::{self, AskContext};
+use super::scheduler::{GATE_TIMEOUT, ShellGate, run_shell_gate};
 use super::worker::rt_on_engine_closed;
 use super::*;
 use crate::event::{PlanItem, turn_text};
 use crate::surface::ApprovalCard;
 use ka_agent_core::Principal;
+use ka_agent_core::approval::is_permission_ask;
 use ka_agent_store::{PlanRow, PlanStatus};
 
 /// Final-answer chunk ceiling before splitting (Telegram 4096 minus margin;
@@ -83,6 +85,21 @@ fn readable_question(question: &str, last_call: Option<&(String, String)>) -> St
                 format!("use `{tool}` ({detail})?")
             }
         }
+        _ => question.to_string(),
+    }
+}
+
+/// The question a card shows for an ask with its own options — anything
+/// but the permission triple. Every renderer offers a fixed allow/deny
+/// pair, so the options ride the question: which one allow picks, which
+/// one deny answers (the decline, always last).
+fn ask_with_options(question: &str, options: &[String]) -> String {
+    match (options.first(), options.last()) {
+        (Some(first), Some(last)) => format!(
+            "{question}\noptions: {} — allow answers “{first}”, deny answers “{last}”",
+            options.join(" · ")
+        ),
+        // Nothing to choose from: the bare question.
         _ => question.to_string(),
     }
 }
@@ -272,6 +289,8 @@ pub(super) async fn drive(
                 }
             }
             PortEvent::TurnStarted => {
+                // A new cycle cannot answer a session command sent before it.
+                session_ops::clear_op(&st);
                 let (turn, source) = {
                     let g = st.lock();
                     (
@@ -467,12 +486,25 @@ pub(super) async fn drive(
                         g.live.as_ref().and_then(|l| l.last_call.clone()),
                     )
                 };
-                let question = readable_question(&question, last_call.as_ref());
+                // Answered by shape (core `is_permission_ask`). Only the
+                // engine's fixed allow/always/deny triple is a permission
+                // ask — the one kind the session-allow set and the durable
+                // rules may pre-answer. Every other ask on this event (the
+                // engine's continue/stop session guards, a checkpoint
+                // confirmation, an MCP elicitation) is decided card by
+                // card, on its own options: allow takes the first, deny
+                // answers the decline (always the last).
+                let permission = is_permission_ask(&options);
+                let question = if permission {
+                    readable_question(&question, last_call.as_ref())
+                } else {
+                    question
+                };
                 // Allowed for this session already: answer at once, no card
                 // (still audited).
                 let ask_detail = detail.clone();
                 let key = session_allow_key(&question, ask_detail.as_deref());
-                let pre_allowed = st.lock().session_allow.contains(&key);
+                let pre_allowed = permission && st.lock().session_allow.contains(&key);
                 if pre_allowed {
                     // The one Allow settle site (B7): the session-allow
                     // set answers before any card exists — `answer_allow`
@@ -485,7 +517,10 @@ pub(super) async fn drive(
                             &st,
                             &who,
                             None,
-                            ask_id.clone(),
+                            PendingAsk {
+                                id: &ask_id,
+                                options: &options,
+                            },
                             "Allow (session)",
                             "operator",
                         )
@@ -498,9 +533,17 @@ pub(super) async fn drive(
                     }
                     continue;
                 }
+                // Card text: every renderer offers a fixed allow/deny pair,
+                // so an ask with its own options carries them in its
+                // question — which one allow picks, which one deny answers.
+                let shown = if permission {
+                    question.clone()
+                } else {
+                    ask_with_options(&question, &options)
+                };
                 let kind = ApprovalKind::KaAsk {
                     ask_id: ask_id.clone(),
-                    question: question.clone(),
+                    question: shown.clone(),
                     detail: detail.clone(),
                     options: options.clone(),
                 };
@@ -534,9 +577,9 @@ pub(super) async fn drive(
                     // why it did not stay with the user.
                     approval.kind = ApprovalKind::KaAsk {
                         ask_id,
-                        question: format!("{question}\n[escalated: {reason}]"),
+                        question: format!("{shown}\n[escalated: {reason}]"),
                         detail,
-                        options,
+                        options: options.clone(),
                     };
                 }
                 let card = ApprovalCard::from_approval(&approval);
@@ -567,9 +610,10 @@ pub(super) async fn drive(
                 if awaiting {
                     // Durable rules (v4 B7): evaluated AFTER D9 routing and
                     // the awaiting transition, and only on non-escalated
-                    // asks — a rule answers exactly the asks the acting
-                    // user themselves decides, never the admin queue's.
-                    if !escalated {
+                    // permission asks — a rule answers exactly the asks the
+                    // acting user themselves decide, never the admin
+                    // queue's, and never an ask with its own options.
+                    if !escalated && permission {
                         let rt = Runtime {
                             sh: Arc::clone(&sh),
                         };
@@ -598,7 +642,10 @@ pub(super) async fn drive(
                                     &st,
                                     &who,
                                     Some((&approval, ApprovalStatus::Approved)),
-                                    ask,
+                                    PendingAsk {
+                                        id: &ask,
+                                        options: &options,
+                                    },
                                     &label,
                                     "runtime",
                                 )
@@ -631,12 +678,13 @@ pub(super) async fn drive(
                     continue;
                 }
                 if let Some(port) = live_port {
-                    let _ = port
-                        .answer(
-                            approval_ask_id(&approval),
-                            ApprovalDecision::Deny.ka_choice(),
-                        )
-                        .await;
+                    let _ = answer_ask(
+                        &port,
+                        approval_ask_id(&approval),
+                        ApprovalDecision::Deny,
+                        ask_options(&approval),
+                    )
+                    .await;
                 }
                 if let Err(e) = sh.store.decide_approval(
                     &approval.id,
@@ -749,7 +797,11 @@ pub(super) async fn drive(
                         .unwrap_or_default()
                 };
                 for (id, ask_id, port) in orphans {
-                    port.answer(ask_id, ApprovalDecision::Deny.ka_choice())
+                    let options = Runtime {
+                        sh: Arc::clone(&sh),
+                    }
+                    .approval_options(id.as_str());
+                    answer_ask(&port, ask_id, ApprovalDecision::Deny, &options)
                         .await
                         .ok();
                     sh.store
@@ -1090,16 +1142,46 @@ pub(super) async fn drive(
                 invariants::check_and_report(&sh, &st);
             }
             PortEvent::Note(t) => emit(AgentEvent::Note { text: t }),
+            // Engine notes the port types by their marker (ka v0.12).
+            // The three session commands (`/diff`, `/context`, `/btw`)
+            // answer here; the reply goes to the surface that asked.
+            PortEvent::SideAnswer { text } => {
+                let source = session_ops::take_source(&st, session_ops::SessionOp::Btw);
+                sh.emit_from(
+                    AgentEvent::Notice { text },
+                    source.as_deref().or(turn_source.as_deref()),
+                );
+            }
+            PortEvent::SessionDiff { summary } => {
+                match session_ops::take_source(&st, session_ops::SessionOp::Diff) {
+                    Some(source) => {
+                        session_ops::reply_diff(&sh, &st, &source, summary).await;
+                    }
+                    None => emit(AgentEvent::Notice { text: summary }),
+                }
+            }
+            PortEvent::ContextBreakdown { parts, window } => {
+                let text = session_ops::render_context_breakdown(&parts, window);
+                let source = session_ops::take_source(&st, session_ops::SessionOp::Context);
+                sh.emit_from(
+                    AgentEvent::Notice { text },
+                    source.as_deref().or(turn_source.as_deref()),
+                );
+            }
+            PortEvent::Recap { text } => session_ops::record_recap(&sh, &st, text),
             PortEvent::EngineError {
                 class,
                 message,
                 retryable,
             } => {
-                // A retryable rate limit keeps retrying in-engine (the
-                // port's backoff owns the loop): stamp the start so every
-                // status surface shows the cooldown instead of a bare
-                // error. The next settled turn clears it (TurnFinished).
-                if class == "rate_limit" && retryable {
+                // A rate limit stamps the start so every status surface
+                // shows the cooldown instead of a bare error (A6). The
+                // class alone decides: by the time a report reaches the
+                // runtime the engine has already spent its own backoff and
+                // fallback hops and always reports `retryable: false`, so
+                // keying on that flag never stamped anything. The next
+                // settled turn clears it (TurnFinished).
+                if class == "rate_limit" {
                     st.lock().throttled_since_ms = Some(ka_agent_core::now_ms());
                 }
                 emit(AgentEvent::Error {
@@ -1135,6 +1217,7 @@ pub(super) async fn drive(
                 }
             }
             PortEvent::EngineClosed => {
+                session_ops::clear_op(&st);
                 let interrupted = { st.lock().live.as_ref().and_then(|l| l.current_turn.clone()) };
                 if let Some(tid) = interrupted
                     && let Some(mut t) = sh.store.get_turn(&tid).ok().flatten()
@@ -1546,94 +1629,50 @@ async fn plan_verify_cycle(
 }
 
 /// Run one plan verify gate: `sh -c <gate>` (Windows `cmd /C`) in the
-/// session workspace, 30 s ceiling (kill), stdout+stderr capped at
-/// 4 KiB — the `run_gate` shape, sync so it can sit in
-/// `spawn_blocking`. Blocks the calling thread; never call from the
-/// drive task directly.
+/// session workspace, 30 s ceiling (the whole process tree is killed),
+/// stdout+stderr capped at 4 KiB — the `run_gate` shape, sync so it can
+/// sit in `spawn_blocking`. Blocks the calling thread; never call from
+/// the drive task directly.
 fn run_verify_gate(gate: &str, workspace: &std::path::Path) -> VerifyOutcome {
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", gate]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", gate]);
-        c
-    };
-    // A workspace that does not exist yet (a fresh instance, a test
-    // harness) falls back to the process cwd rather than failing the
-    // gate with ENOENT — the same fallback `run_gate` uses.
-    let cwd = if workspace.is_dir() {
-        workspace.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-    };
-    cmd.current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return VerifyOutcome::Fail {
-                output: String::new(),
-                exit: None,
-                why: format!("spawn: {e}"),
-            };
-        }
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut buf = Vec::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_end(&mut buf);
+    run_verify_gate_within(gate, workspace, GATE_TIMEOUT)
+}
+
+/// [`run_verify_gate`] with the ceiling made explicit (the tests inject a
+/// short one).
+fn run_verify_gate_within(
+    gate: &str,
+    workspace: &std::path::Path,
+    timeout: std::time::Duration,
+) -> VerifyOutcome {
+    match run_shell_gate(gate, workspace, timeout) {
+        ShellGate::Exited {
+            status,
+            stdout,
+            stderr,
+        } => {
+            let output: String = format!("{stdout}{stderr}").chars().take(4096).collect();
+            let code = status.code();
+            if status.success() {
+                VerifyOutcome::Pass {
+                    exit: code.unwrap_or(0),
                 }
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_end(&mut buf);
+            } else {
+                VerifyOutcome::Fail {
+                    output,
+                    exit: code,
+                    why: format!(
+                        "gate `{gate}` exited {}",
+                        code.map(|c| c.to_string())
+                            .unwrap_or_else(|| "by signal".into())
+                    ),
                 }
-                let output = String::from_utf8_lossy(&buf);
-                let output: String = output.chars().take(4096).collect();
-                let code = status.code();
-                return if status.success() {
-                    VerifyOutcome::Pass {
-                        exit: code.unwrap_or(0),
-                    }
-                } else {
-                    VerifyOutcome::Fail {
-                        output,
-                        exit: code,
-                        why: format!(
-                            "gate `{gate}` exited {}",
-                            code.map(|c| c.to_string())
-                                .unwrap_or_else(|| "by signal".into())
-                        ),
-                    }
-                };
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return VerifyOutcome::Fail {
-                        output: String::new(),
-                        exit: None,
-                        why: "timed out after 30s".into(),
-                    };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return VerifyOutcome::Fail {
-                    output: String::new(),
-                    exit: None,
-                    why: format!("wait: {e}"),
-                };
             }
         }
+        ShellGate::Failed(why) => VerifyOutcome::Fail {
+            output: String::new(),
+            exit: None,
+            why,
+        },
     }
 }
 
@@ -1698,6 +1737,34 @@ mod tests {
                 assert!(output.contains("bad"), "{output}");
             }
             other => panic!("expected fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_card_for_an_ask_with_its_own_options_names_them() {
+        let options = ["a", "b", "c", "decline"].map(String::from).to_vec();
+        let shown = super::ask_with_options("Which one?", &options);
+        assert!(
+            shown.starts_with("Which one?\noptions: a · b · c · decline"),
+            "{shown}"
+        );
+        assert!(shown.contains("allow answers “a”"), "{shown}");
+        assert!(shown.contains("deny answers “decline”"), "{shown}");
+        // An ask that offers nothing gets no affordance it cannot keep.
+        assert_eq!(super::ask_with_options("Anything?", &[]), "Anything?");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_verify_gate_past_its_ceiling_times_out() {
+        let ws = std::env::temp_dir();
+        let short = std::time::Duration::from_millis(300);
+        match super::run_verify_gate_within("sleep 30", &ws, short) {
+            super::VerifyOutcome::Fail { why, exit, .. } => {
+                assert_eq!(why, "timed out after 300ms");
+                assert_eq!(exit, None);
+            }
+            other => panic!("expected a timeout, got {other:?}"),
         }
     }
 
