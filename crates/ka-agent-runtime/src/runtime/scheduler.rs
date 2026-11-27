@@ -1,5 +1,6 @@
 // Scheduler: reminder/cron CRUD, firing, maintenance, briefings, the
 // no-agent registry. Split from runtime.rs (moves only).
+use super::approvals::answer_ask;
 use super::*;
 
 /// The end of the quiet window when `now` is inside it.
@@ -1270,6 +1271,7 @@ impl Runtime {
                 // their shadow repos follow (a session whose rows are
                 // all gone loses its repo).
                 let checkpoint_repos = self.prune_checkpoint_repos();
+                let strands = self.prune_strands(cfg.retention.strands_days, now);
                 let pruned = report.turns
                     + report.runs
                     + attachments
@@ -1280,7 +1282,8 @@ impl Runtime {
                     + report.outbox
                     + report.tasks
                     + report.checkpoints
-                    + checkpoint_repos;
+                    + checkpoint_repos
+                    + strands;
                 if pruned > 0 {
                     self.sh.emit(AgentEvent::Notice {
                         text: format!(
@@ -1297,6 +1300,78 @@ impl Runtime {
                 });
             }
         }
+    }
+
+    /// Session strand sweep (`retention.strands_days`): the engine's own
+    /// transcript files, once they are older than the window and nothing
+    /// needs them. Kept: the strand of any session with a live worker, a
+    /// turn in the store or a queued message — `@turn:`/`@session:` read
+    /// them and a resume replays them. A private conversation's strand
+    /// lives in its scratch dir and never reaches this sweep.
+    fn prune_strands(&self, days: u32, now_ms: i64) -> usize {
+        if days == 0 {
+            return 0;
+        }
+        let cutoff = now_ms - (days as i64) * 86_400_000;
+        let referenced = match self.sh.store.referenced_sessions() {
+            Ok(set) => set,
+            Err(e) => {
+                self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    retryable: retryable_class("internal"),
+                    message: format!("strand sweep: {e}"),
+                });
+                return 0;
+            }
+        };
+        let mut keep: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        // Live sessions hold their file open: deleting it would strand
+        // the worker's next append in an unlinked inode.
+        {
+            let users = self.sh.users.lock().unwrap_or_else(|e| e.into_inner());
+            for st in users.values() {
+                let g = st.lock();
+                if g.live.is_some()
+                    && let Some(path) = g.session.strand_path.as_ref()
+                {
+                    keep.insert(path.clone());
+                }
+            }
+        }
+        let mut usernames = vec![ka_agent_core::OPERATOR_USER.to_string()];
+        if let Ok(rows) = self.sh.store.list_users() {
+            for u in rows {
+                usernames.push(u.username);
+            }
+        }
+        for username in &usernames {
+            if let Ok(rows) = self.sh.store.sessions_for_user(username) {
+                for session in rows {
+                    if referenced.contains(session.id.as_str())
+                        && let Some(path) = session.strand_path.as_ref()
+                    {
+                        keep.insert(path.clone());
+                    }
+                }
+            }
+        }
+        let mut roots = vec![self.sh.paths.ka_data()];
+        for username in &usernames[1..] {
+            roots.push(self.sh.paths.user_ka_data(username));
+        }
+        let mut removed = 0;
+        for root in roots {
+            match ka_agent_port::gc_strands(&root, cutoff, &|path| keep.contains(path)) {
+                Ok(report) => removed += report.strands,
+                Err(e) => self.sh.emit(AgentEvent::Error {
+                    class: "internal".into(),
+                    retryable: retryable_class("internal"),
+                    message: format!("strand sweep {}: {e}", root.display()),
+                }),
+            }
+        }
+        removed
     }
 
     /// Remove checkpoint repo directories whose sessions no longer have
@@ -1438,6 +1513,7 @@ impl Runtime {
 }
 
 /// Outcome of one cron gate run.
+#[derive(Debug)]
 enum GateOutcome {
     /// Exit 0 with (capped) stdout.
     Pass(String),
@@ -1447,62 +1523,185 @@ enum GateOutcome {
     Fail(String),
 }
 
+/// How long a shell gate may run before its whole process tree is killed.
+/// Internal: production always gets these 30 s, the tests inject less.
+pub(super) const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run a cron gate: `sh -c <gate>` (Windows `cmd /C`) in the workspace,
 /// 30 s ceiling, stdout capped at 4 KiB.
 fn run_gate(gate: &str, workspace: &std::path::Path) -> GateOutcome {
-    use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", gate]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", gate]);
-        c
-    };
-    // Gates run in the workspace; a workspace that does not exist yet
-    // (a fresh instance, or a test harness) falls back to the process cwd
-    // rather than failing the gate with ENOENT.
+    run_gate_within(gate, workspace, GATE_TIMEOUT)
+}
+
+/// [`run_gate`] with the ceiling made explicit.
+fn run_gate_within(gate: &str, workspace: &std::path::Path, timeout: Duration) -> GateOutcome {
+    match run_shell_gate(gate, workspace, timeout) {
+        ShellGate::Exited { status, stdout, .. } if status.success() => {
+            GateOutcome::Pass(stdout.chars().take(4096).collect())
+        }
+        ShellGate::Exited { .. } => GateOutcome::Skip,
+        ShellGate::Failed(why) => GateOutcome::Fail(why),
+    }
+}
+
+/// One run of a shell gate: the shell exited with both pipes drained, or
+/// it never got there.
+pub(super) enum ShellGate {
+    Exited {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    },
+    /// Spawn error, wait error or the ceiling passed. The tree is dead
+    /// and `why` says which.
+    Failed(String),
+}
+
+/// Run one shell gate — `sh -c <gate>` (Windows `cmd /C`) in the
+/// workspace — and block until it settles. A workspace that does not
+/// exist yet (a fresh instance, a test harness) falls back to the process
+/// cwd rather than failing the gate with ENOENT.
+///
+/// The shell leads its own process group, and its whole tree —
+/// grandchildren included — is SIGKILLed when the ceiling passes, when
+/// waiting fails, or when the run is abandoned mid-flight
+/// ([`TreeChild`]). Nothing is signalled once the shell has exited, so a
+/// job the gate left behind on purpose is not hunted down. Both pipes are
+/// drained after the exit and decoded lossily; each caller keeps what
+/// its 4 KiB allows. Sync: cron gates run it on the scheduler tick, the
+/// plan verify gate wraps it in `spawn_blocking`.
+pub(super) fn run_shell_gate(
+    gate: &str,
+    workspace: &std::path::Path,
+    timeout: Duration,
+) -> ShellGate {
+    use std::process::Stdio;
     let cwd = if workspace.is_dir() {
         workspace.to_path_buf()
     } else {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
     };
+    let mut cmd = shell_command(gate);
     cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return GateOutcome::Fail(format!("spawn: {e}")),
+    let mut child = match TreeChild::spawn(&mut cmd) {
+        Ok(child) => child,
+        Err(e) => return ShellGate::Failed(format!("spawn: {e}")),
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    use std::io::Read as _;
-                    let mut buf = Vec::new();
-                    let _ = stdout.read_to_end(&mut buf);
-                    let text = String::from_utf8_lossy(&buf).into_owned();
-                    out = text.chars().take(4096).collect();
-                }
-                return if status.success() {
-                    GateOutcome::Pass(out)
-                } else {
-                    GateOutcome::Skip
-                };
-            }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.poll() {
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return GateOutcome::Fail("timed out after 30s".into());
+                    let why = format!("timed out after {}", ceiling_word(timeout));
+                    return ShellGate::Failed(match child.kill_tree() {
+                        Some(what) => format!("{why} ({what})"),
+                        None => why,
+                    });
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return GateOutcome::Fail(format!("wait: {e}")),
+            Err(e) => {
+                child.kill_tree();
+                return ShellGate::Failed(format!("wait: {e}"));
+            }
+        }
+    };
+    ShellGate::Exited {
+        status,
+        stdout: drain(child.child.stdout.take()),
+        stderr: drain(child.child.stderr.take()),
+    }
+}
+
+/// The shell a gate runs in: `sh -c <gate>` (Windows `cmd /C`).
+fn shell_command(gate: &str) -> std::process::Command {
+    if cfg!(windows) {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", gate]);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", gate]);
+        cmd
+    }
+}
+
+/// Everything a pipe still holds, decoded lossily.
+fn drain(pipe: Option<impl std::io::Read>) -> String {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The ceiling as it is read: whole seconds, else milliseconds.
+fn ceiling_word(timeout: Duration) -> String {
+    if timeout.subsec_nanos() == 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{}ms", timeout.as_millis())
+    }
+}
+
+/// A spawned shell gate and the duty that comes with it: as long as the
+/// shell has not exited, dropping this kills its whole tree — through
+/// the port's [`ka_agent_port::kill_process_tree`], the worker stop's own
+/// spell — and reaps it. Once it has, nothing is ever signalled again: the
+/// pid was released at the reap, so its number may already be someone
+/// else's.
+struct TreeChild {
+    child: std::process::Child,
+    exited: bool,
+}
+
+impl TreeChild {
+    fn spawn(cmd: &mut std::process::Command) -> std::io::Result<Self> {
+        // Own process group: the shell and every descendant it spawns
+        // are one killable unit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
+        Ok(Self {
+            child,
+            exited: false,
+        })
+    }
+
+    /// The shell's exit status once it exited (reaping it); `None` while
+    /// it runs.
+    fn poll(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.exited |= status.is_some();
+        Ok(status)
+    }
+
+    /// Kill the whole tree and reap the shell. Returns what kept the tree
+    /// from being killed as one unit — the killer itself failed to run,
+    /// so only the shell is dead.
+    fn kill_tree(&mut self) -> Option<String> {
+        let failed = ka_agent_port::kill_process_tree(self.child.id())
+            .err()
+            .map(|e| format!("tree kill unavailable: {e} — only the shell itself was killed"));
+        // The shell itself, whatever became of the group.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.exited = true;
+        failed
+    }
+}
+
+impl Drop for TreeChild {
+    fn drop(&mut self) {
+        if !self.exited {
+            self.kill_tree();
         }
     }
 }
@@ -1625,9 +1824,12 @@ impl Runtime {
             loop {
                 match rx.recv().await {
                     Some(ka_agent_port::PortEvent::DeltaText(delta)) => text.push_str(&delta),
-                    Some(ka_agent_port::PortEvent::Ask { ask_id, .. }) => {
+                    Some(ka_agent_port::PortEvent::Ask {
+                        ask_id, options, ..
+                    }) => {
                         // Fail closed on asks: the gate can never widen.
-                        port.answer(ask_id, ka_agent_core::ApprovalDecision::Deny.ka_choice())
+                        // Declined by shape — the ask's own last option.
+                        answer_ask(&port, ask_id, ApprovalDecision::Deny, &options)
                             .await
                             .ok();
                     }
@@ -1768,6 +1970,67 @@ mod tests {
                 silent_for_secs: 900
             }
         );
+    }
+
+    #[cfg(unix)]
+    fn gate_scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ka-gate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        dir
+    }
+
+    /// A gate under which `sh` leaves a grandchild behind: the shell
+    /// itself would run for half a minute, the grandchild would write
+    /// `late.txt` two seconds in.
+    #[cfg(unix)]
+    const STRAY_GRANDCHILD: &str = "sleep 30 & sh -c 'sleep 2; echo late > late.txt' & wait";
+
+    /// Sleep past the moment the stray grandchild would have written;
+    /// whether it did.
+    #[cfg(unix)]
+    fn stray_wrote(dir: &std::path::Path, started: Instant) -> bool {
+        let settle = Duration::from_secs(3);
+        std::thread::sleep(settle.saturating_sub(started.elapsed()));
+        dir.join("late.txt").exists()
+    }
+
+    /// The ceiling kills the whole tree, not just the shell: a grandchild
+    /// that would write after the ceiling never gets to.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_gate_kills_its_grandchildren() {
+        let ws = gate_scratch("timeout");
+        let started = Instant::now();
+        match run_gate_within(STRAY_GRANDCHILD, &ws, Duration::from_millis(500)) {
+            GateOutcome::Fail(why) => assert!(why.starts_with("timed out after 500ms"), "{why}"),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            !stray_wrote(&ws, started),
+            "the grandchild outlived the gate's ceiling"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A run abandoned mid-flight (its future dropped) takes its tree
+    /// down with it.
+    #[cfg(unix)]
+    #[test]
+    fn an_abandoned_gate_takes_its_tree_down() {
+        let ws = gate_scratch("abandoned");
+        let started = Instant::now();
+        let mut cmd = shell_command(STRAY_GRANDCHILD);
+        cmd.current_dir(&ws);
+        let mut child = TreeChild::spawn(&mut cmd).unwrap_or_else(|e| panic!("spawn: {e}"));
+        let running = child.poll().unwrap_or_else(|e| panic!("poll: {e}"));
+        assert!(running.is_none(), "the shell is still under way");
+        drop(child);
+        assert!(
+            !stray_wrote(&ws, started),
+            "the grandchild outlived the abandoned run"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

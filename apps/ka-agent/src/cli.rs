@@ -371,6 +371,16 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Render one session's transcript as a self-contained HTML page.
+    #[command(hide = true)]
+    Transcript {
+        /// Session id (or prefix); default: the newest session of this
+        /// profile.
+        session: Option<String>,
+        /// Output file (default: `<strand>.html` in the current dir).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// Export instance data to a directory.
     #[command(hide = true)]
     Export {
@@ -922,5 +932,5 @@ pub(crate) enum SkillsAction {
 const ADVANCED_HELP: &str = "\
 More commands: notify hooks persona usage memory trigger mcp import logs briefing
                run restart pair models key secret identity grant plugin
-               skills backup restore export purge completions
+               skills backup restore transcript export purge completions
                — `ka-agent <command> --help`";

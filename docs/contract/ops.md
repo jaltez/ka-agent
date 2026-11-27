@@ -23,6 +23,18 @@ root.
   profile, roles partition subjects (ADR-0002): the terminal/web/CLI
   remain the operator, linked identities act as their role.
 
+## Transcript export and strand retention
+
+- `ka-agent transcript [<session>] [-o PATH]` — one session's transcript as
+  the self-contained HTML page (`ka export --html`'s page, rendered from the
+  strand). A session with no strand file yet is named, never invented.
+- `retention.strands_days` (default 0 = keep forever) — the retention pass
+  deletes strand files older than the window and snapshot journals no strand
+  needs any more. A strand is always kept when its session has a live worker,
+  a turn still in the store or a queued message (`@turn:`/`@session:` read
+  them; a resume replays them). Private conversations live in a scratch root
+  and never reach the sweep.
+
 ## Backups and restore
 
 - `ka-agent backup <dir>` — consistent snapshot: `state.db` via SQLite

@@ -146,6 +146,26 @@ impl Store {
         tx.commit()?;
         Ok(report)
     }
+
+    /// The sessions the store still references, as ids: every session
+    /// with a turn row (retained by `retention.turns_days`, too fresh to
+    /// prune, or still open) and every session with a message still
+    /// queued. A strand sweep keeps the strands of exactly these —
+    /// `@turn:` and `@session:` read them, and a resumed session needs
+    /// its context — plus the live ones only the caller can know.
+    pub fn referenced_sessions(&self) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session FROM turns
+             UNION SELECT DISTINCT session FROM queue WHERE turned IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +344,44 @@ mod tests {
         // never pruned: turns, sessions, audit, identities, crons
         assert_eq!(count("sessions", &format!("id = '{s}'")), 1);
         assert_eq!(count("checkpoints", "id = 'ckpt-new'"), 1);
+    }
+
+    /// A strand sweep keeps the strands of exactly these sessions: one
+    /// with a turn row, one with a message still queued — never one whose
+    /// every turn was pruned.
+    #[test]
+    fn referenced_sessions_own_a_turn_or_a_queued_message() {
+        let store = Store::open_in_memory().unwrap();
+        let now = 1_800_000_000_000i64;
+        let with_turn = crate::session();
+        let queued = crate::session();
+        let bare = crate::session();
+        for s in [&with_turn, &queued, &bare] {
+            store.insert_session(s).unwrap();
+        }
+        let mut turn = ka_agent_core::Turn::new(with_turn.id.clone(), "hi".into());
+        turn.status = ka_agent_core::TurnStatus::Done;
+        turn.created_ms = now - 2 * 86_400_000;
+        store.insert_turn(&turn).unwrap();
+        store
+            .enqueue(&ka_agent_core::QueueItem::new(
+                queued.id.clone(),
+                "later".into(),
+                "console",
+            ))
+            .unwrap();
+        let referenced = store.referenced_sessions().unwrap();
+        assert!(referenced.contains(with_turn.id.as_str()), "{referenced:?}");
+        assert!(referenced.contains(queued.id.as_str()), "{referenced:?}");
+        assert!(!referenced.contains(bare.id.as_str()), "{referenced:?}");
+
+        // Its turns pruned, the session is no longer referenced.
+        assert_eq!(store.prune_with(now, 1).unwrap().turns, 1);
+        let referenced = store.referenced_sessions().unwrap();
+        assert!(
+            !referenced.contains(with_turn.id.as_str()),
+            "{referenced:?}"
+        );
+        assert!(referenced.contains(queued.id.as_str()));
     }
 }

@@ -414,6 +414,7 @@ fn main() -> std::process::ExitCode {
         Command::Grant { action } => grant::grant_action(action),
         Command::Backup { out, keep, config } => ops::backup_to(out, keep, config_path(&config)),
         Command::Restore { dir, force } => ops::restore_from(dir, force),
+        Command::Transcript { session, out } => ops::transcript(session.as_deref(), out),
         Command::Export { out } => ops::export(&out),
         Command::Purge { confirm } => ops::purge(confirm),
         Command::Identity { action } => identity::identity_action(action),

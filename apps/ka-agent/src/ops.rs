@@ -353,3 +353,83 @@ pub fn purge(confirm: bool) -> std::process::ExitCode {
         }
     }
 }
+
+/// `ka-agent transcript <session> [-o PATH]`: one session's transcript as
+/// the self-contained HTML page `ka export --html` writes. The session is
+/// the operator's own (the CLI acts as the operator); a missing strand
+/// file is named, never invented.
+pub fn transcript(session: Option<&str>, out: Option<PathBuf>) -> std::process::ExitCode {
+    let paths = Paths::new(Paths::default_root());
+    if !paths.state_db().exists() {
+        eprintln!(
+            "ka-agent: no store at {} — run `ka-agent setup`",
+            paths.state_db().display()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    let store = match Store::open(&paths.state_db()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ka-agent: store: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let row = match session {
+        Some(prefix) => match store.find_session_by_prefix(prefix) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                eprintln!("ka-agent: no session matches {prefix:?}");
+                return std::process::ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("ka-agent: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        None => match store.list_recent_sessions(1, true) {
+            Ok(mut rows) if !rows.is_empty() => rows.remove(0),
+            Ok(_) => {
+                eprintln!("ka-agent: no sessions yet");
+                return std::process::ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("ka-agent: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+    };
+    // A private conversation is the operator's own and its strand lives
+    // in a scratch dir that is gone once the session ends.
+    let Some(strand) = row.strand_path.as_deref() else {
+        eprintln!(
+            "ka-agent: session {} has no strand file yet — it is written after \
+             the first completed turn",
+            ka_agent_core::ids::short_id(row.id.as_str())
+        );
+        return std::process::ExitCode::FAILURE;
+    };
+    let page = match ka_agent_port::export_html(strand) {
+        Ok(page) => page,
+        Err(e) => {
+            eprintln!("ka-agent: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let target = out.unwrap_or_else(|| {
+        let stem = strand
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ka_agent_core::ids::short_id(row.id.as_str()).to_string());
+        PathBuf::from(format!("{stem}.html"))
+    });
+    match std::fs::write(&target, page) {
+        Ok(()) => {
+            println!("{}", target.display());
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ka-agent: cannot write {}: {e}", target.display());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
